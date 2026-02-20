@@ -13,6 +13,7 @@ pub mod utils;
 
 pub mod domain;
 mod node_map;
+pub mod redis_notifier;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Display};

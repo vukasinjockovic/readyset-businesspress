@@ -12,6 +12,7 @@ use tracing::{trace, warn};
 
 use crate::backlog;
 use crate::prelude::*;
+use crate::redis_notifier;
 
 #[derive(Serialize, Deserialize)]
 pub struct Reader {
@@ -123,6 +124,7 @@ impl Reader {
         m: &mut Option<Packet>,
         publish: bool,
         state: &mut backlog::WriteHandle,
+        cache_name: Option<&str>,
     ) {
         let m = m.as_mut().unwrap();
         m.handle_trace(
@@ -205,6 +207,11 @@ impl Reader {
         if publish {
             // TODO: skip if we didn't modify anything (inc. ts)
             state.publish();
+
+            // Tier 1: Notify Redis that this reader's cached data has changed
+            if let Some(name) = cache_name {
+                redis_notifier::notify_invalidation(name);
+            }
         }
     }
 

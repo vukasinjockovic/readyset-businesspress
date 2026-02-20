@@ -29,6 +29,7 @@ use super::wal_reader::{WalEvent, WalReader};
 use super::PUBLICATION_NAME;
 use crate::db_util::error_is_slot_not_found;
 use crate::noria_adapter::{Connector, ReplicationAction};
+use crate::redis_notifier;
 use crate::table_filter::TableFilter;
 
 /// A connector that connects to a PostgreSQL server and starts reading WAL from the "noria"
@@ -785,6 +786,9 @@ impl Connector for PostgresWalConnector {
                 } if cur_table.schema.as_deref() != Some(schema.as_str())
                     || cur_table.name != table.as_str() =>
                 {
+                    // Tier 2: notify Redis of table change
+                    redis_notifier::notify_table_change(schema, table);
+
                     // if next event is for another table, flush
                     if !actions.is_empty() {
                         self.peek = Some(Ok(event));
@@ -794,7 +798,18 @@ impl Connector for PostgresWalConnector {
                     }
                     event
                 }
-                _ => event,
+                _ => {
+                    // Tier 2: notify for same-table events too
+                    if let WalEvent::Insert { ref schema, ref table, .. }
+                        | WalEvent::DeleteRow { ref schema, ref table, .. }
+                        | WalEvent::DeleteByKey { ref schema, ref table, .. }
+                        | WalEvent::UpdateRow { ref schema, ref table, .. }
+                        | WalEvent::UpdateByKey { ref schema, ref table, .. } = event
+                    {
+                        redis_notifier::notify_table_change(schema, table);
+                    }
+                    event
+                }
             };
 
             match event {

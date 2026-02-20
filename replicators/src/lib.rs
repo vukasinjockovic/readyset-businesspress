@@ -2,6 +2,7 @@ pub mod db_util;
 pub(crate) mod mysql_connector;
 pub(crate) mod noria_adapter;
 pub(crate) mod postgres_connector;
+pub mod redis_notifier;
 pub mod table_filter;
 
 use std::time::{Duration, Instant};
