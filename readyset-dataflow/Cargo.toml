@@ -27,6 +27,7 @@ metrics = { workspace = true }
 pin-project = { workspace = true }
 proptest = { workspace = true }
 rand = { workspace = true }
+redis = { workspace = true }
 serde_with = { workspace = true }
 serde_json = { workspace = true }
 socket2 = { workspace = true }

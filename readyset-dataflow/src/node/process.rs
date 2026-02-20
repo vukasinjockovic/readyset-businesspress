@@ -213,7 +213,8 @@ impl Node {
             }
             NodeType::Reader(ref mut r) => {
                 if let Some(state) = env.reader_write_handles.get_mut(addr) {
-                    r.process(m, publish_reader, state);
+                    let cache_name = self.name.display_unquoted().to_string();
+                    r.process(m, publish_reader, state, Some(&cache_name));
                 }
             }
             NodeType::Egress(None) => internal!("tried to process through taken egress"),
