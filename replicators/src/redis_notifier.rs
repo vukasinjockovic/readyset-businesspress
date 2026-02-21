@@ -64,3 +64,67 @@ pub fn notify_table_change(schema: &str, table: &str) {
     let msg = format!("{}.{}", schema, table);
     let _ = get_or_init_tx().send(msg);
 }
+
+// --- Row-level change notifier (Tier 2b) ---
+
+static ROW_CHANGE_TX: OnceLock<mpsc::UnboundedSender<String>> = OnceLock::new();
+
+const ROW_CHANGES_CHANNEL: &str = "readyset:row_changes";
+
+fn get_or_init_row_tx() -> &'static mpsc::UnboundedSender<String> {
+    ROW_CHANGE_TX.get_or_init(|| {
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+        tokio::spawn(async move {
+            let redis_url = env::var("READYSET_REDIS_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+
+            let client = match redis::Client::open(redis_url.as_str()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(%e, "Failed to create Redis client for row change notifier");
+                    while rx.recv().await.is_some() {}
+                    return;
+                }
+            };
+
+            let mut conn = match client.get_multiplexed_async_connection().await {
+                Ok(c) => {
+                    info!(url = %redis_url, channel = ROW_CHANGES_CHANNEL, "Redis row change notifier connected");
+                    c
+                }
+                Err(e) => {
+                    error!(%e, "Failed to connect to Redis for row change notifier");
+                    while rx.recv().await.is_some() {}
+                    return;
+                }
+            };
+
+            while let Some(msg) = rx.recv().await {
+                if let Err(e) = redis::cmd("PUBLISH")
+                    .arg(ROW_CHANGES_CHANNEL)
+                    .arg(&msg)
+                    .query_async::<i64>(&mut conn)
+                    .await
+                {
+                    warn!(%e, %msg, "Failed to publish row change to Redis");
+                }
+            }
+        });
+
+        tx
+    })
+}
+
+/// Notify that a specific row has been modified via WAL replication.
+/// Publishes a JSON payload to `readyset:row_changes`:
+/// `{"table":"schema.table","pk":"pk_value","op":"INSERT|UPDATE|DELETE"}`
+pub fn notify_row_change(schema: &str, table: &str, pk: &str, op: &str) {
+    let msg = serde_json::json!({
+        "table": format!("{}.{}", schema, table),
+        "pk": pk,
+        "op": op,
+    })
+    .to_string();
+    let _ = get_or_init_row_tx().send(msg);
+}

@@ -789,6 +789,36 @@ impl Connector for PostgresWalConnector {
                     // Tier 2: notify Redis of table change
                     redis_notifier::notify_table_change(schema, table);
 
+                    // Tier 2b: notify Redis of row-level change
+                    match &event {
+                        WalEvent::Insert { schema, table, tuple, .. } => {
+                            if let Some(pk) = tuple.first() {
+                                redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "INSERT");
+                            }
+                        }
+                        WalEvent::DeleteRow { schema, table, tuple, .. } => {
+                            if let Some(pk) = tuple.first() {
+                                redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "DELETE");
+                            }
+                        }
+                        WalEvent::DeleteByKey { schema, table, key, .. } => {
+                            if let Some(pk) = key.first() {
+                                redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "DELETE");
+                            }
+                        }
+                        WalEvent::UpdateRow { schema, table, new_tuple, .. } => {
+                            if let Some(pk) = new_tuple.first() {
+                                redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "UPDATE");
+                            }
+                        }
+                        WalEvent::UpdateByKey { schema, table, key, .. } => {
+                            if let Some(pk) = key.first() {
+                                redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "UPDATE");
+                            }
+                        }
+                        _ => {}
+                    }
+
                     // if next event is for another table, flush
                     if !actions.is_empty() {
                         self.peek = Some(Ok(event));
@@ -800,13 +830,39 @@ impl Connector for PostgresWalConnector {
                 }
                 _ => {
                     // Tier 2: notify for same-table events too
-                    if let WalEvent::Insert { ref schema, ref table, .. }
-                        | WalEvent::DeleteRow { ref schema, ref table, .. }
-                        | WalEvent::DeleteByKey { ref schema, ref table, .. }
-                        | WalEvent::UpdateRow { ref schema, ref table, .. }
-                        | WalEvent::UpdateByKey { ref schema, ref table, .. } = event
-                    {
-                        redis_notifier::notify_table_change(schema, table);
+                    // Tier 2b: also notify row-level changes
+                    match &event {
+                        WalEvent::Insert { schema, table, tuple, .. } => {
+                            redis_notifier::notify_table_change(schema, table);
+                            if let Some(pk) = tuple.first() {
+                                redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "INSERT");
+                            }
+                        }
+                        WalEvent::DeleteRow { schema, table, tuple, .. } => {
+                            redis_notifier::notify_table_change(schema, table);
+                            if let Some(pk) = tuple.first() {
+                                redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "DELETE");
+                            }
+                        }
+                        WalEvent::DeleteByKey { schema, table, key, .. } => {
+                            redis_notifier::notify_table_change(schema, table);
+                            if let Some(pk) = key.first() {
+                                redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "DELETE");
+                            }
+                        }
+                        WalEvent::UpdateRow { schema, table, new_tuple, .. } => {
+                            redis_notifier::notify_table_change(schema, table);
+                            if let Some(pk) = new_tuple.first() {
+                                redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "UPDATE");
+                            }
+                        }
+                        WalEvent::UpdateByKey { schema, table, key, .. } => {
+                            redis_notifier::notify_table_change(schema, table);
+                            if let Some(pk) = key.first() {
+                                redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "UPDATE");
+                            }
+                        }
+                        _ => {}
                     }
                     event
                 }
