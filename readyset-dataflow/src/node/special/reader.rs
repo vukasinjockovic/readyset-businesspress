@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 use dataflow_expression::ReaderProcessing;
@@ -8,7 +9,7 @@ use readyset_client::{KeyColumnIdx, ViewPlaceholder};
 #[cfg(feature = "failure_injection")]
 use readyset_util::failpoints;
 use serde::{Deserialize, Serialize};
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::backlog;
 use crate::prelude::*;
@@ -202,6 +203,16 @@ impl Reader {
             });
         }
 
+        // Extract key column values BEFORE take_data() consumes them.
+        // These represent the specific parameter values that were affected
+        // (e.g., the exact conversation_id that changed), enabling per-parameter
+        // granular invalidation instead of invalidating the entire parameterized cache.
+        let key_values = if publish && cache_name.is_some() && !self.placeholder_map.is_empty() {
+            self.extract_key_column_values(m)
+        } else {
+            vec![]
+        };
+
         state.add(m.take_data());
 
         if publish {
@@ -210,9 +221,69 @@ impl Reader {
 
             // Tier 1: Notify Redis that this reader's cached data has changed
             if let Some(name) = cache_name {
-                redis_notifier::notify_invalidation(name);
+                redis_notifier::notify_invalidation(name, key_values);
             }
         }
+    }
+
+    /// Extract unique key column values from the packet's data.
+    ///
+    /// For a parameterized query like `WHERE conversation_id = $1`, the placeholder_map
+    /// tells us which column index holds `conversation_id`. We extract those values from
+    /// each record, deduplicate, and return them as pipe-delimited strings (one per unique
+    /// key combination). This enables the Redis bridge to invalidate only the specific
+    /// parameter values that were affected, not the entire parameterized cache.
+    fn extract_key_column_values(&self, packet: &mut Packet) -> Vec<String> {
+        let data = packet.data_mut();
+
+        // Collect key column indices sorted by placeholder index.
+        // For `WHERE a = $1 AND b = $2`, this gives us columns for $1 then $2 in order.
+        let mut key_indices: Vec<(usize, usize)> = Vec::new(); // (placeholder_idx, column_idx)
+        for (placeholder, col_idx) in &self.placeholder_map {
+            match placeholder {
+                ViewPlaceholder::OneToOne(placeholder_idx, _) => {
+                    key_indices.push((*placeholder_idx as usize, *col_idx));
+                }
+                _ => {} // Skip Generated, Between, PageNumber for now
+            }
+        }
+
+        if key_indices.is_empty() {
+            return vec![];
+        }
+
+        key_indices.sort_by_key(|&(pi, _)| pi);
+        let col_indices: Vec<usize> = key_indices.iter().map(|&(_, ci)| ci).collect();
+
+        // Extract unique key value combinations from the records
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut result: Vec<String> = Vec::new();
+
+        for record in data.iter() {
+            let row = record.row();
+            let values: Vec<String> = col_indices
+                .iter()
+                .filter_map(|&i| row.get(i).map(|v| format!("{}", v)))
+                .collect();
+
+            if values.len() == col_indices.len() {
+                let key = values.join("|");
+                if !seen.contains(&key) {
+                    seen.insert(key.clone());
+                    result.push(key);
+                }
+            }
+        }
+
+        if !result.is_empty() {
+            debug!(
+                count = result.len(),
+                sample = ?result.first(),
+                "Extracted key column values for granular invalidation"
+            );
+        }
+
+        result
     }
 
     /// Get a reference to the reader's post lookup.
