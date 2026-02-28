@@ -29,6 +29,13 @@ tracing = { workspace = true, features = ["release_max_level_debug"] }
 triomphe = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
+# Reverb HTTP broadcaster (Pusher-compatible API)
+hex = { workspace = true }
+hmac = { workspace = true }
+md5 = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 test-strategy = { workspace = true }

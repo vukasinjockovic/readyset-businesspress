@@ -26,6 +26,7 @@ pub mod progress;
 pub mod properties;
 pub mod ranges;
 pub mod redacted;
+pub mod reverb_http;
 pub mod shared_cache;
 pub mod shutdown;
 
