@@ -192,8 +192,26 @@ fn get_or_init_row_tx() -> &'static mpsc::UnboundedSender<RowChangeMsg> {
 ///
 /// Uses Redis pipelines to minimize round-trips:
 /// - Phase 1 (read): single SMEMBERS for row deps
-/// - Phase 2 (read): pipeline all SMEMBERS for reverse row deps
-/// - Phase 3 (write): pipeline all DEL + SREM + optional XADD in one round-trip
+/// - Phase 2 (write): DEL cache keys + broadcast in one round-trip
+///
+/// IMPORTANT: row_deps (rs:row_deps:{table}:{pk}) are NOT cleaned up on
+/// invalidation. They persist so that subsequent WAL events for the same row
+/// can still find the dependent cache keys and broadcast invalidation events.
+///
+/// Why: The browser must receive the WebSocket event, re-fetch from the server
+/// (MISS path), and the server must re-register deps — a 200-500ms cycle.
+/// If row_deps are cleaned immediately, ALL WAL events during that gap fire
+/// into empty deps and the browser never gets notified, breaking the
+/// invalidation chain permanently until TTL expiry or page reload.
+///
+/// Stale entries are harmless: they point to cache keys that no longer exist.
+/// DEL on a non-existent key is a Redis no-op. The PHP MISS path overwrites
+/// deps via SADD (idempotent) when it re-registers.
+///
+/// Cleanup happens naturally:
+/// - row_deps have TTL matching the cache TTL (set by PHP)
+/// - key_row_deps are overwritten on each MISS re-registration
+/// - Worker recycling (--max-requests) prevents unbounded accumulation
 async fn handle_row_invalidation(
     conn: &mut redis::aio::MultiplexedConnection,
     row_key: &str,
@@ -218,39 +236,14 @@ async fn handle_row_invalidation(
 
     debug!(row_key, keys = dependent_keys.len(), "Tier 2: invalidating dependent keys");
 
-    // --- Phase 1 (read pipeline): fetch all reverse row deps in one round-trip ---
-    let key_row_deps_keys: Vec<String> = dependent_keys.iter()
-        .map(|k| format!("{}rs:key_row_deps:{}", prefix, k))
-        .collect();
-
-    let mut read_pipe = redis::pipe();
-    for krdk in &key_row_deps_keys {
-        read_pipe.cmd("SMEMBERS").arg(krdk);
-    }
-    let all_row_deps: Vec<Vec<String>> = read_pipe
-        .query_async(conn)
-        .await
-        .unwrap_or_else(|_| vec![Vec::new(); dependent_keys.len()]);
-
-    // --- Phase 2 (write pipeline): DEL + SREM in one round-trip ---
+    // --- Write pipeline: DEL cache keys + broadcast (no dep cleanup) ---
     let mut write_pipe = redis::pipe();
 
-    // 2a. DEL all dependent keys (with prefix)
+    // 2a. DEL all dependent cache keys (with prefix)
     let prefixed_keys: Vec<String> = dependent_keys.iter()
         .map(|k| format!("{}{}", prefix, k))
         .collect();
     write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
-
-    // 2b. Clean up reverse row deps
-    for (i, key) in dependent_keys.iter().enumerate() {
-        let row_deps = all_row_deps.get(i).cloned().unwrap_or_default();
-        for row_dep in &row_deps {
-            let row_dep_set_key = format!("{}rs:row_deps:{}", prefix, row_dep);
-            write_pipe.cmd("SREM").arg(&row_dep_set_key).arg(key).ignore();
-        }
-        // DEL the key_row_deps set itself
-        write_pipe.cmd("DEL").arg(&key_row_deps_keys[i]).ignore();
-    }
 
     // 2c. Centrifugo XADD (only when ws_server is centrifugo)
     let grouped = group_by_auth_hash(&dependent_keys);

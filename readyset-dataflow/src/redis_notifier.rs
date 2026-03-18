@@ -293,64 +293,31 @@ async fn handle_invalidation(
         "Tier 1: invalidating dependent keys"
     );
 
-    // --- Phase 2 (read pipeline): fetch all reverse dep sets in one round-trip ---
-    // For each key, we need: SMEMBERS rs:key_pdeps:{key} and SMEMBERS rs:key_deps:{key}
-    let key_pdeps_keys: Vec<String> = dependent_keys.iter()
-        .map(|k| format!("{}rs:key_pdeps:{}", prefix, k))
-        .collect();
-    let key_deps_keys: Vec<String> = dependent_keys.iter()
-        .map(|k| format!("{}rs:key_deps:{}", prefix, k))
-        .collect();
-
-    let mut read_pipe = redis::pipe();
-    for kpk in &key_pdeps_keys {
-        read_pipe.cmd("SMEMBERS").arg(kpk);
-    }
-    for kdk in &key_deps_keys {
-        read_pipe.cmd("SMEMBERS").arg(kdk);
-    }
-    let n = dependent_keys.len();
-    let all_reverse_deps: Vec<Vec<String>> = read_pipe
-        .query_async(conn)
-        .await
-        .unwrap_or_else(|_| vec![Vec::new(); n * 2]);
-
-    let all_param_deps = &all_reverse_deps[..n];
-    let all_broad_deps = &all_reverse_deps[n..];
-
-    // --- Phase 3 (write pipeline): DEL + SREM in one round-trip ---
+    // --- Write pipeline: DEL cache keys + broadcast (no dep cleanup) ---
+    //
+    // IMPORTANT: Dependency mappings (rs:deps, rs:pdeps, rs:row_deps, rs:key_deps,
+    // rs:key_pdeps, rs:key_row_deps, rs:cache_name, rs:cache_params) are NOT cleaned
+    // up on invalidation. They persist so subsequent WAL events for the same data
+    // can still find dependent cache keys and broadcast invalidation events.
+    //
+    // Why: The browser must receive the WebSocket event → re-fetch from the server
+    // (MISS path) → server re-registers deps. This cycle takes 200-500ms. If deps
+    // are cleaned immediately, ALL WAL events during that gap fire into empty dep
+    // sets, breaking the invalidation chain permanently (browser never gets notified,
+    // never re-fetches, deps never re-registered — stuck until TTL or page reload).
+    //
+    // Stale entries are harmless:
+    // - DEL on a non-existent cache key is a Redis no-op
+    // - SADD on re-registration overwrites stale entries (idempotent)
+    // - TTL on deps (set by PHP) provides natural cleanup
+    // - Worker recycling (--max-requests) prevents unbounded accumulation
     let mut write_pipe = redis::pipe();
 
-    // 3a. DEL all affected RSC cache keys (with prefix)
+    // DEL all affected RSC cache keys (with prefix)
     let prefixed_keys: Vec<String> = dependent_keys.iter()
         .map(|k| format!("{}{}", prefix, k))
         .collect();
     write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
-
-    // 3b. Clean up dependency mappings for each invalidated key
-    for (i, key) in dependent_keys.iter().enumerate() {
-        // Clean up per-param dep sets (rs:pdeps:{cacheName}:{paramKey})
-        let param_deps = all_param_deps.get(i).cloned().unwrap_or_default();
-        for pdep in &param_deps {
-            let pdep_set_key = format!("{}rs:pdeps:{}", prefix, pdep);
-            write_pipe.cmd("SREM").arg(&pdep_set_key).arg(key).ignore();
-        }
-        write_pipe.cmd("DEL").arg(&key_pdeps_keys[i]).ignore();
-
-        // Clean up broad dep sets (rs:deps:{cacheName}) -- backward compat
-        let reverse_deps = all_broad_deps.get(i).cloned().unwrap_or_default();
-        for dep in &reverse_deps {
-            let dep_set_key = format!("{}rs:deps:{}", prefix, dep);
-            write_pipe.cmd("SREM").arg(&dep_set_key).arg(key).ignore();
-        }
-        write_pipe.cmd("DEL").arg(&key_deps_keys[i]).ignore();
-
-        // Clean up cache name/params mappings
-        let cache_name_key = format!("{}rs:cache_name:{}", prefix, key);
-        let cache_params_key = format!("{}rs:cache_params:{}", prefix, key);
-        write_pipe.cmd("DEL").arg(&cache_name_key).ignore();
-        write_pipe.cmd("DEL").arg(&cache_params_key).ignore();
-    }
 
     // 3c. Centrifugo XADD (only when ws_server is centrifugo)
     let grouped = group_by_auth_hash(&dependent_keys);
