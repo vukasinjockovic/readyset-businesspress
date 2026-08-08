@@ -133,6 +133,7 @@ use crate::backend::noria_connector::ExecuteSelectContext;
 use crate::metrics_handle::{MetricsHandle, MetricsSummary};
 use crate::query_handler::SetBehavior;
 use crate::query_status_cache::QueryStatusCache;
+use crate::rsc_admission;
 use crate::status_reporter::ReadySetStatusReporter;
 pub use crate::upstream_database::UpstreamPrepare;
 use crate::utils::{create_dummy_column, time_or_null};
@@ -2440,6 +2441,31 @@ where
     ) -> ReadySetResult<noria_connector::QueryResult<'static>> {
         let deep = deep?;
         let (query_id, name, requested_name) = self.make_name_and_id(name, QueryId::from(&deep));
+
+        // RSC admission gate (twin-cache plan, Phase 1b): flag/refuse shapes
+        // whose dataflow is known to serve reads but never deliver Reader
+        // deltas ("zombie caches"). See crate::rsc_admission for details.
+        match rsc_admission::admission_mode() {
+            rsc_admission::AdmissionMode::Off => {}
+            mode => {
+                if let Some(class) = rsc_admission::classify_zombie_shape(&deep.statement) {
+                    let cache_name = name.display_unquoted().to_string();
+                    warn!(
+                        "RSC admission: cache '{}' has shape '{}' with unreliable delta maintenance",
+                        cache_name, class
+                    );
+                    rsc_admission::mark_suspect(&cache_name, class);
+                    if mode == rsc_admission::AdmissionMode::Enforce {
+                        return Err(ReadySetError::CreateCacheError(format!(
+                            "RSC admission (enforce): cache '{cache_name}' has shape '{class}' \
+                             with unreliable delta maintenance; decorrelate the query \
+                             (e.g. LEFT JOIN + GROUP BY derived table) or set \
+                             READYSET_ADMISSION_MODE=warn"
+                        )));
+                    }
+                }
+            }
+        }
 
         // If we have existing caches with the same query_id or name, drop them first.
         self.drop_caches_on_collision(Some(query_id), requested_name.as_ref())

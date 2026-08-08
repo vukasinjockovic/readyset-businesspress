@@ -39,6 +39,7 @@ crossbeam-skiplist = { workspace = true }
 slab = { workspace = true }
 xxhash-rust = { workspace = true }
 rand = { workspace = true }
+redis = { workspace = true }
 sqlparser = { workspace = true }
 streaming-iterator = { workspace = true }
 
