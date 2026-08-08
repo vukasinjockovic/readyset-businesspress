@@ -59,11 +59,14 @@ impl ReverbConfig {
     }
 }
 
-/// Whether a key segment looks like an RSC authHash: a 32-char hex md5
-/// (PHP: md5("{userId}:{shopId}:{scope}")) or the literal "anon" for guests.
+/// Whether a key segment looks like an RSC authHash: a 32-char lowercase hex
+/// md5 (PHP: md5("{userId}:{shopId}:{scope}")) or the literal "anon" for
+/// guests. Lowercase-only, matching the PHP/JS parsers — PHP md5() output is
+/// always lowercase, so an uppercase segment is never a producer hash.
 fn is_auth_hash_segment(segment: &str) -> bool {
     segment == "anon"
-        || (segment.len() == 32 && segment.bytes().all(|b| b.is_ascii_hexdigit()))
+        || (segment.len() == 32
+            && segment.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 /// Extract authHash from an RSC cache key.
@@ -98,10 +101,13 @@ pub fn extract_auth_hash(key: &str) -> Option<String> {
         "gql" => None,
         "lw" if parts.len() >= 4 => Some(parts[2].to_string()),
         "lw" => None,
-        // Internal bookkeeping keys are never broadcast targets
+        // Internal bookkeeping keys are never broadcast targets. MUST stay in
+        // sync with ReactiveSetCacheService::BOOKKEEPING_PREFIXES (PHP) and
+        // rsc/auth-hash.js (JS) — locked by fixtures/rsc-contract.json.
         "deps" | "pdeps" | "row_deps" | "key_deps" | "key_pdeps" | "key_row_deps"
-        | "tag" | "registered" | "lock" | "meta" | "cache_name" | "cache_names"
-        | "cache_params" | "kill" | "listener" => None,
+        | "cache_row_deps" | "tag" | "registered" | "reval" | "dep_refresh"
+        | "lock" | "meta" | "cache_name" | "cache_names" | "cache_params"
+        | "kill" | "listener" | "lw_throttle" | "t1_unsupported" => None,
         // withDeps value keys (rs:{cacheName}:{paramHash}) — shared channel
         _ => Some("anon".to_string()),
     }
@@ -139,6 +145,16 @@ pub fn group_by_auth_hash(dependent_keys: &[String]) -> HashMap<String, Vec<Stri
     grouped
 }
 
+/// Wire channel name for an authHash: `private-rsc.{authHash}`.
+///
+/// Must match the PHP side exactly — RscKeyInvalidated::broadcastOn() returns
+/// PrivateChannel("rsc.{authHash}") which Laravel prefixes to
+/// "private-rsc.{authHash}", and Echo.private('rsc.{hash}') subscribes to the
+/// same wire name. Locked by fixtures/rsc-contract.json expected_channel.
+pub fn channel_for_auth_hash(auth_hash: &str) -> String {
+    format!("private-rsc.{}", auth_hash)
+}
+
 /// Broadcast invalidation events to Reverb via the Pusher batch_events HTTP API.
 ///
 /// Groups events by authHash into a single batch request. Each authHash maps to
@@ -157,7 +173,7 @@ pub async fn broadcast_to_reverb(
     // Build batch payload — one event per authHash
     let mut batch = Vec::new();
     for (auth_hash, keys) in grouped {
-        let channel = format!("private-rsc.{}", auth_hash);
+        let channel = channel_for_auth_hash(auth_hash);
         // data must be a JSON string (double-encoded per Pusher protocol)
         let data = serde_json::json!({ "keys": keys }).to_string();
 
@@ -336,6 +352,117 @@ mod tests {
             vec!["rs:demo:k:h".to_string(), "rs:demo:k:h:stale".to_string()]
         );
         assert!(expand_keys_for_del("gz:", &[]).is_empty());
+    }
+
+    /// Path to the vendored copy of the cross-layer contract fixture.
+    /// Canonical source lives in the PHP core package:
+    ///   packages/businesspress/core/tests/Fixtures/rsc-contract.json
+    fn vendored_fixture_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fixtures/rsc-contract.json")
+    }
+
+    fn load_fixture() -> serde_json::Value {
+        let raw = std::fs::read_to_string(vendored_fixture_path())
+            .expect("vendored fixtures/rsc-contract.json missing — re-vendor from PHP core");
+        serde_json::from_str(&raw).expect("rsc-contract.json is not valid JSON")
+    }
+
+    /// Contract: identity formula. The Rust bridge never *computes* authHashes
+    /// (PHP is the producer), but the fixture's expected hashes must be exactly
+    /// what md5("{user}:{shop|none}:{scope|customer}") yields, and every
+    /// producible hash must be recognized by the shape-based parser.
+    #[test]
+    fn test_contract_hash_inputs() {
+        let fixture = load_fixture();
+        for row in fixture["hash_inputs"].as_array().expect("hash_inputs") {
+            let expected = row["expected_auth_hash"].as_str().unwrap();
+            match row["user_id"].as_str() {
+                None => assert_eq!(expected, "anon", "anonymous must be literal 'anon'"),
+                Some(user_id) => {
+                    let shop = row["shop_id"].as_str().unwrap_or("none");
+                    let scope = row["scope"].as_str().unwrap_or("customer");
+                    let input = format!("{}:{}:{}", user_id, shop, scope);
+                    let computed = format!("{:x}", md5::compute(input.as_bytes()));
+                    assert_eq!(
+                        computed, expected,
+                        "fixture hash mismatch for input '{input}'"
+                    );
+                }
+            }
+            // Round-trip: any producer hash must parse back out of a gql key
+            let key = format!("rs:gql:dashboard:en:{expected}:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            assert_eq!(
+                extract_auth_hash(&key),
+                Some(expected.to_string()),
+                "producer hash not recognized by extract_auth_hash: {expected}"
+            );
+        }
+    }
+
+    /// Contract: key-shape parsing + channel naming for every fixture key.
+    #[test]
+    fn test_contract_keys() {
+        let fixture = load_fixture();
+        for row in fixture["keys"].as_array().expect("keys") {
+            let key = row["key"].as_str().unwrap();
+            let expected_hash = row["expected_auth_hash"].as_str().map(str::to_string);
+            let got = extract_auth_hash(key);
+            assert_eq!(got, expected_hash, "extract_auth_hash drifted for key: {key:?}");
+
+            let expected_channel = row["expected_channel"].as_str().map(str::to_string);
+            let channel = got.as_deref().map(channel_for_auth_hash);
+            assert_eq!(channel, expected_channel, "channel naming drifted for key: {key:?}");
+        }
+    }
+
+    /// Contract: DEL expansion — value key plus its `:stale` SWR twin.
+    #[test]
+    fn test_contract_del_expansion() {
+        let fixture = load_fixture();
+        for row in fixture["del_expansion"].as_array().expect("del_expansion") {
+            let key = row["key"].as_str().unwrap().to_string();
+            let expected: Vec<String> = row["expected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                expand_keys_for_del("", &[key.clone()]),
+                expected,
+                "expand_keys_for_del drifted for key: {key:?}"
+            );
+            // Prefixing must distribute over both twins
+            let prefixed = expand_keys_for_del("gz:", &[key.clone()]);
+            let want: Vec<String> = expected.iter().map(|k| format!("gz:{k}")).collect();
+            assert_eq!(prefixed, want, "prefixed expansion drifted for key: {key:?}");
+        }
+    }
+
+    /// Sync guard: the vendored fixture must be byte-identical to the
+    /// canonical one in the PHP core package. Skips silently when the
+    /// canonical path does not exist (CI checkout without the PHP repo).
+    /// Override the canonical location with RSC_CONTRACT_CANONICAL.
+    #[test]
+    fn test_contract_fixture_in_sync() {
+        let canonical = std::env::var("RSC_CONTRACT_CANONICAL").unwrap_or_else(|_| {
+            "/var/www/reactive-1.businesspress.dev/packages/businesspress/core/tests/Fixtures/rsc-contract.json"
+                .to_string()
+        });
+        let canonical = std::path::Path::new(&canonical);
+        if !canonical.exists() {
+            return; // canonical repo not present on this machine — skip
+        }
+        let canonical_bytes = std::fs::read(canonical).expect("read canonical fixture");
+        let vendored_bytes = std::fs::read(vendored_fixture_path()).expect("read vendored fixture");
+        assert_eq!(
+            canonical_bytes, vendored_bytes,
+            "fixtures/rsc-contract.json drifted from the canonical PHP copy — \
+             re-vendor: cp {} {}",
+            canonical.display(),
+            vendored_fixture_path().display()
+        );
     }
 
     #[test]

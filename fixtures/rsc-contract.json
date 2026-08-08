@@ -1,0 +1,338 @@
+{
+    "_comment": [
+        "CANONICAL RSC cross-layer contract fixture. Consumed by:",
+        "  PHP  tests/Unit/Rsc/RscContractTest.php (reactive-1 app suite)",
+        "  Rust readyset-util/src/reverb_http.rs #[cfg(test)] (vendored copy at readyset-businesspress/fixtures/)",
+        "  JS   packages/businesspress/core/resources/js/rsc/auth-hash.test.mjs (node --test)",
+        "Identity formula (authoritative: RscGraphQLCache::getAuthContext + core-channels.php rsc.{authHash}):",
+        "  authHash = md5(user_id . \":\" . (shop_id ?? \"none\") . \":\" . scope), scope defaults to \"customer\"; anonymous = literal \"anon\".",
+        "Regenerate ONLY via the generator script and re-vendor the Rust copy (check-rsc-contract-sync.sh)."
+    ],
+    "hash_inputs": [
+        {
+            "user_id": "42",
+            "shop_id": null,
+            "scope": null,
+            "expected_auth_hash": "f5ee91cb8f066325d7e66be95fcd0503",
+            "note": "user without shop, default scope -> md5(\"42:none:customer\") \u2014 the null-shop \"none\" case"
+        },
+        {
+            "user_id": "42",
+            "shop_id": "7",
+            "scope": null,
+            "expected_auth_hash": "faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "note": "user with shop, default scope -> md5(\"42:7:customer\")"
+        },
+        {
+            "user_id": "42",
+            "shop_id": "7",
+            "scope": "vendor",
+            "expected_auth_hash": "c051110f9ca8a9dece4a658cafe0a3ab",
+            "note": "explicit non-default scope"
+        },
+        {
+            "user_id": "0198a111-2222-7333-8444-555566667777",
+            "shop_id": "0198b111-2222-7333-8444-555566667778",
+            "scope": "admin",
+            "expected_auth_hash": "809b679826b8d01e6a7a564194e11274",
+            "note": "uuid ids, admin scope"
+        },
+        {
+            "user_id": "42",
+            "shop_id": null,
+            "scope": "vendor",
+            "expected_auth_hash": "33d686da81a5607ac0dc78fc07ac84c0",
+            "note": "no shop + explicit scope"
+        },
+        {
+            "user_id": null,
+            "shop_id": null,
+            "scope": null,
+            "expected_auth_hash": "anon",
+            "note": "unauthenticated -> literal \"anon\", never hashed"
+        }
+    ],
+    "keys": [
+        {
+            "key": "rs:gql:dashboard:en:faf0aaf988d0a32dadc93dd8c3e9adc7:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": "faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_channel": "private-rsc.faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "note": "current gql format with locale"
+        },
+        {
+            "key": "rs:gql:storefront:en-US:f5ee91cb8f066325d7e66be95fcd0503:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": "f5ee91cb8f066325d7e66be95fcd0503",
+            "expected_channel": "private-rsc.f5ee91cb8f066325d7e66be95fcd0503",
+            "note": "long locale tag must not shift the scan"
+        },
+        {
+            "key": "rs:gql:dashboard:faf0aaf988d0a32dadc93dd8c3e9adc7:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": "faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_channel": "private-rsc.faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "note": "legacy gql format without locale"
+        },
+        {
+            "key": "rs:gql:storefront:en:anon:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": "anon",
+            "expected_channel": "private-rsc.anon",
+            "note": "anonymous gql with locale"
+        },
+        {
+            "key": "rs:gql:storefront:anon:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": "anon",
+            "expected_channel": "private-rsc.anon",
+            "note": "anonymous gql legacy"
+        },
+        {
+            "key": "rs:gql:dashboard:en:faf0aaf988d0a32dadc93dd8c3e9adc7:ff33f1b12213e021c2c4a888141953ba:stale",
+            "expected_auth_hash": "faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_channel": "private-rsc.faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "note": "SWR :stale twin maps to the same hash"
+        },
+        {
+            "key": "rs:gql:storefront:en:anon:ff33f1b12213e021c2c4a888141953ba:stale",
+            "expected_auth_hash": "anon",
+            "expected_channel": "private-rsc.anon",
+            "note": "anon SWR twin"
+        },
+        {
+            "key": "rs:gql:dashboard:sr:c051110f9ca8a9dece4a658cafe0a3ab:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": "c051110f9ca8a9dece4a658cafe0a3ab",
+            "expected_channel": "private-rsc.c051110f9ca8a9dece4a658cafe0a3ab",
+            "note": "2-char locale"
+        },
+        {
+            "key": "rs:gql:c9550d5fad73447fc24ba47f95d1c6b7:en:anon:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": "anon",
+            "expected_channel": "private-rsc.anon",
+            "note": "schema segment that is itself 32-hex is never scanned (scan starts after schema)"
+        },
+        {
+            "key": "rs:gql:dashboard:en:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "pathological: only hash-shaped segment is the trailing queryHash, excluded by the exclusive upper bound -> no broadcast"
+        },
+        {
+            "key": "rs:gql:dashboard:faf0aaf988d0a32dadc93dd8c3e9adc7:c051110f9ca8a9dece4a658cafe0a3ab:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": "faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_channel": "private-rsc.faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "note": "pathological: two hash-shaped middle segments \u2014 first match wins"
+        },
+        {
+            "key": "rs:gql:dashboard:en:FAF0AAF988D0A32DADC93DD8C3E9ADC7:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "uppercase 32-hex is NOT an authHash (md5 output is lowercase) -> no broadcast"
+        },
+        {
+            "key": "rs:gql:short",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "too few segments"
+        },
+        {
+            "key": "rs:lw:faf0aaf988d0a32dadc93dd8c3e9adc7:OrderTable_orders:ec6ef230f1828039ee794566b9c58adc",
+            "expected_auth_hash": "faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_channel": "private-rsc.faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "note": "lw key: authHash at parts[2]"
+        },
+        {
+            "key": "rs:lw:anon:StatsWidget_stats:ec6ef230f1828039ee794566b9c58adc",
+            "expected_auth_hash": "anon",
+            "expected_channel": "private-rsc.anon",
+            "note": "anonymous lw key"
+        },
+        {
+            "key": "rs:lw:faf0aaf988d0a32dadc93dd8c3e9adc7:OrderTable_orders:ec6ef230f1828039ee794566b9c58adc:stale",
+            "expected_auth_hash": "faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_channel": "private-rsc.faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "note": "lw SWR twin"
+        },
+        {
+            "key": "rs:lw:not-a-hash:Comp_q:p1",
+            "expected_auth_hash": "not-a-hash",
+            "expected_channel": "private-rsc.not-a-hash",
+            "note": "lw parses positionally: parts[2] verbatim, shape not enforced (aligned behavior in all layers)"
+        },
+        {
+            "key": "rs:lw:faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "malformed lw key (no component segment) -> no broadcast"
+        },
+        {
+            "key": "rs:demo:top-products:21ffce5b8a6cc8cc6a41448dd69623c9",
+            "expected_auth_hash": "anon",
+            "expected_channel": "private-rsc.anon",
+            "note": "withDeps value key broadcasts on the shared anon channel"
+        },
+        {
+            "key": "rs:gql_dashboard_c9550d5fad73447fc24ba47f95d1c6b7:21ffce5b8a6cc8cc6a41448dd69623c9",
+            "expected_auth_hash": "anon",
+            "expected_channel": "private-rsc.anon",
+            "note": "auto-registered gql cacheName is underscore-joined -> withDeps shape, not rs:gql:"
+        },
+        {
+            "key": "rs:deps:gql_dashboard_x",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:pdeps:gql_dashboard_x",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:row_deps:public.bp_orders:abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:key_deps:somekey",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:key_pdeps:somekey",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:key_row_deps:somekey",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:cache_row_deps:public.bp_orders:abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:tag:user:some-uuid",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:registered:gql_dashboard_x",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:reval:somekey",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:dep_refresh:gql_dashboard_x",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:lock:somekey",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:meta:somekey",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:cache_name:abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:cache_names:abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:cache_params:abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:kill:abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:listener:abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "rs:lw_throttle:component-id",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (lw_throttle is not an lw value key)"
+        },
+        {
+            "key": "rs:t1_unsupported:abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping"
+        },
+        {
+            "key": "not_rs:gql:x:y:z",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "wrong root prefix"
+        },
+        {
+            "key": "rs:demo",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "too few segments for any RSC shape"
+        },
+        {
+            "key": "",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "empty string"
+        }
+    ],
+    "del_expansion": [
+        {
+            "key": "rs:gql:dashboard:en:faf0aaf988d0a32dadc93dd8c3e9adc7:ff33f1b12213e021c2c4a888141953ba",
+            "expected": [
+                "rs:gql:dashboard:en:faf0aaf988d0a32dadc93dd8c3e9adc7:ff33f1b12213e021c2c4a888141953ba",
+                "rs:gql:dashboard:en:faf0aaf988d0a32dadc93dd8c3e9adc7:ff33f1b12213e021c2c4a888141953ba:stale"
+            ]
+        },
+        {
+            "key": "rs:lw:faf0aaf988d0a32dadc93dd8c3e9adc7:OrderTable_orders:ec6ef230f1828039ee794566b9c58adc",
+            "expected": [
+                "rs:lw:faf0aaf988d0a32dadc93dd8c3e9adc7:OrderTable_orders:ec6ef230f1828039ee794566b9c58adc",
+                "rs:lw:faf0aaf988d0a32dadc93dd8c3e9adc7:OrderTable_orders:ec6ef230f1828039ee794566b9c58adc:stale"
+            ]
+        },
+        {
+            "key": "rs:demo:top-products:21ffce5b8a6cc8cc6a41448dd69623c9",
+            "expected": [
+                "rs:demo:top-products:21ffce5b8a6cc8cc6a41448dd69623c9",
+                "rs:demo:top-products:21ffce5b8a6cc8cc6a41448dd69623c9:stale"
+            ]
+        }
+    ]
+}
