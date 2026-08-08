@@ -201,6 +201,60 @@ fn get_or_init_tx() -> &'static mpsc::UnboundedSender<InvalidationMsg> {
     })
 }
 
+/// Append delta-liveness telemetry commands to an existing pipeline so they
+/// ride an already-scheduled round trip (zero extra round trips).
+///
+/// Written on EVERY delivered Reader delta, whether or not any dependent keys
+/// are registered — "CREATE CACHE succeeded" does not guarantee delta delivery
+/// (e.g. correlated-subselect dataflows serve reads but never notify).
+/// Debounced/dedup'd batches call handle_invalidation once per unique
+/// cache_name per flush, so this is set once per dedup'd cache_name.
+///
+/// - `rs:t1_seen:{cache_name}`  — legacy audit key (kept for existing tooling)
+/// - `rs:t1_live:{cache_name}`  — ground-truth delta-liveness registry; the
+///   Phase-2 twin eligibility gate consumes this ("this cache's delta path is
+///   alive"). Value = unix timestamp of the last delivered delta, TTL 7 days.
+fn add_liveness_cmds(pipe: &mut redis::Pipeline, prefix: &str, cache_name: &str) {
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    pipe.cmd("SET")
+        .arg(format!("{}rs:t1_seen:{}", prefix, cache_name))
+        .arg(now_ts)
+        .arg("EX")
+        .arg(7 * 86400)
+        .ignore();
+    pipe.cmd("SETEX")
+        .arg(format!("{}rs:t1_live:{}", prefix, cache_name))
+        .arg(7 * 86400)
+        .arg(now_ts)
+        .ignore();
+}
+
+/// Unprefixed hydrated-twin value key for a `(cache_name, param_key)` pair.
+///
+/// Contract-locked (`twin_identities` in fixtures/rsc-contract.json; PHP twin:
+/// `RscTwinIdentity::twinKey`): `rs:hyd:{cache_name}:{param_key}`, and the
+/// literal `_` segment when `param_key` is empty (non-parameterized cache).
+/// `param_key` itself is the pipe-joined, placeholder-ordered DfValue Display
+/// encoding produced by reader.rs (extract_key_column_values /
+/// eviction_key_values) — PHP normalizes TO that encoding.
+pub(crate) fn twin_key(cache_name: &str, param_key: &str) -> String {
+    if param_key.is_empty() {
+        format!("rs:hyd:{cache_name}:_")
+    } else {
+        format!("rs:hyd:{cache_name}:{param_key}")
+    }
+}
+
+/// Unprefixed per-cache index SET of twin keys PHP has stored (SADDed by
+/// TwinStore at store time, 7d TTL). Broad invalidation drains this set
+/// instead of SCANning the keyspace in the hot path.
+pub(crate) fn twin_idx_key(cache_name: &str) -> String {
+    format!("rs:hyd_idx:{cache_name}")
+}
+
 /// Handle the full invalidation cycle for a cache name.
 ///
 /// For parameterized queries, `key_values` contains the specific parameter values
@@ -211,8 +265,19 @@ fn get_or_init_tx() -> &'static mpsc::UnboundedSender<InvalidationMsg> {
 /// For non-parameterized queries, `key_values` is empty and we always use the
 /// broad dep key.
 ///
+/// Hydrated twins (`rs:hyd:{cache_name}:{param_key}`) are dropped alongside,
+/// UNCONDITIONALLY (they exist independently of any registered payload deps):
+/// - granular: one DEL per affected param_key, plus the `_` (empty-params) twin
+/// - broad: the `_` twin plus every member of `rs:hyd_idx:{cache_name}` (the
+///   per-cache index SET maintained by PHP at store time), then the index itself
+/// Every dropped twin also gets a 3s `rs:reval:{twin_key}` marker so the PHP
+/// refill inside the replication-lag window routes to direct Postgres and does
+/// NOT store (same guard as the payload keys). Twin keys are server-side only
+/// and are never broadcast.
+///
 /// Uses Redis pipelines to minimize round-trips:
-/// - Phase 1 (read): pipeline SMEMBERS for dep resolution (pdeps or broad deps)
+/// - Phase 1 (read): pipeline SMEMBERS for dep resolution (pdeps or broad deps
+///   + hyd_idx on the broad path)
 /// - Phase 2 (read): pipeline SMEMBERS for key_pdeps + key_deps reverse lookups
 /// - Phase 3 (write): pipeline all DEL + SREM + broadcast in one round-trip
 async fn handle_invalidation(
@@ -226,11 +291,17 @@ async fn handle_invalidation(
     http_client: Option<&reqwest::Client>,
 ) -> Result<(), redis::RedisError> {
     let dependent_keys: Vec<String>;
+    // Unprefixed twin keys to drop in the write pipeline (+ whether the
+    // per-cache twin index set itself must be dropped — broad path only).
+    let mut twin_dels: Vec<String>;
+    let mut drop_twin_idx = false;
 
     if !key_values.is_empty() {
         // Parameterized query — pipeline all per-param dep lookups
+        // (plus the delta-liveness telemetry, piggybacked on the same round trip)
         let mut pdep_keys: Vec<String> = Vec::new();
         let mut read_pipe = redis::pipe();
+        add_liveness_cmds(&mut read_pipe, prefix, cache_name);
         for param_key in key_values {
             let pdep_key = format!("{}rs:pdeps:{}:{}", prefix, cache_name, param_key);
             read_pipe.cmd("SMEMBERS").arg(&pdep_key);
@@ -240,6 +311,15 @@ async fn handle_invalidation(
             .query_async(conn)
             .await
             .unwrap_or_else(|_| vec![Vec::new(); key_values.len()]);
+
+        // Granular twin drop: the exact affected param twins + the `_` twin
+        // (a non-parameterized composition over the same cache would be keyed
+        // `_`; cheap DEL no-op when absent).
+        twin_dels = key_values
+            .iter()
+            .map(|pk| twin_key(cache_name, pk))
+            .collect();
+        twin_dels.push(twin_key(cache_name, ""));
 
         let mut all_keys: Vec<String> = Vec::new();
         for (i, keys) in pdep_results.iter().enumerate() {
@@ -267,46 +347,49 @@ async fn handle_invalidation(
             dependent_keys = all_keys;
         }
     } else {
-        // Non-parameterized query — use broad dep key (existing behavior)
+        // Non-parameterized (broad) invalidation — broad dep key + the twin
+        // index SET, all on the same round trip as the liveness telemetry.
         let dep_key = format!("{}rs:deps:{}", prefix, cache_name);
-        dependent_keys = match redis::cmd("SMEMBERS")
-            .arg(&dep_key)
-            .query_async(conn)
-            .await
-        {
-            Ok(keys) => keys,
-            Err(e) => {
-                warn!(%e, %cache_name, "Tier 1: SMEMBERS failed");
-                return Ok(());
-            }
-        };
+        let idx_key = format!("{}{}", prefix, twin_idx_key(cache_name));
+        let mut read_pipe = redis::pipe();
+        add_liveness_cmds(&mut read_pipe, prefix, cache_name);
+        read_pipe.cmd("SMEMBERS").arg(&dep_key);
+        read_pipe.cmd("SMEMBERS").arg(&idx_key);
+        let idx_members: Vec<String>;
+        (dependent_keys, idx_members) =
+            match read_pipe.query_async::<(Vec<String>, Vec<String>)>(conn).await {
+                Ok((keys, idx)) => (keys, idx),
+                Err(e) => {
+                    warn!(%e, %cache_name, "Tier 1: SMEMBERS failed");
+                    return Ok(());
+                }
+            };
+
+        // Broad twin drop: SCAN in the hot path is unacceptable, so PHP
+        // maintains rs:hyd_idx:{cache_name} — drain it, plus the `_` twin
+        // (self-healing if the index lapsed before the twin), plus the index
+        // itself so a stale index never masks future broad drops.
+        twin_dels = idx_members;
+        let underscore = twin_key(cache_name, "");
+        if !twin_dels.contains(&underscore) {
+            twin_dels.push(underscore);
+        }
+        drop_twin_idx = true;
     }
 
-    // Liveness telemetry: record that this Reader emitted a notification,
-    // whether or not any dependent keys were registered. Lets the PHP side
-    // (and humans battle-testing) audit which caches actually produce Tier 1
-    // signals — "CREATE CACHE succeeded" does not guarantee delta delivery
-    // (e.g. correlated-subselect dataflows serve reads but never notify).
-    let _: Result<(), _> = redis::cmd("SET")
-        .arg(format!("{}rs:t1_seen:{}", prefix, cache_name))
-        .arg(format!("{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)))
-        .arg("EX")
-        .arg(7 * 86400)
-        .query_async(conn)
-        .await;
-
-    if dependent_keys.is_empty() {
+    // Twin drops proceed even with zero registered payload deps — twins exist
+    // independently of rs:gql/rs:lw registrations. (twin_dels is never empty:
+    // the `_` twin is always included; DEL on absent keys is a no-op.)
+    if dependent_keys.is_empty() && twin_dels.is_empty() {
         return Ok(());
     }
 
     debug!(
         cache_name,
         keys = dependent_keys.len(),
+        twins = twin_dels.len(),
         granular = !key_values.is_empty(),
-        "Tier 1: invalidating dependent keys"
+        "Tier 1: invalidating dependent keys + twins"
     );
 
     // --- Write pipeline: DEL cache keys + broadcast (no dep cleanup) ---
@@ -329,24 +412,50 @@ async fn handle_invalidation(
     // - Worker recycling (--max-requests) prevents unbounded accumulation
     let mut write_pipe = redis::pipe();
 
-    // DEL all affected RSC cache keys (with prefix), PLUS their
-    // stale-while-revalidate twins ("{key}:stale", kept by PHP at ~3x TTL).
-    // SWR exists to smooth TTL expiry, not to serve known-stale data: without
-    // this, concurrent clients could be served pre-change data from :stale
-    // for up to the extended TTL if the rebuild fails.
-    let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
-    write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
+    if !dependent_keys.is_empty() {
+        // DEL all affected RSC cache keys (with prefix), PLUS their
+        // stale-while-revalidate twins ("{key}:stale", kept by PHP at ~3x TTL).
+        // SWR exists to smooth TTL expiry, not to serve known-stale data: without
+        // this, concurrent clients could be served pre-change data from :stale
+        // for up to the extended TTL if the rebuild fails.
+        let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
+        write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
 
-    // Revalidation markers: the PHP MISS path checks rs:reval:{key} and, when
-    // present, routes the rebuild's reads to the direct Postgres write
-    // connection instead of ReadySet — closing the window where a refetch
-    // races the dataflow's replication lag and re-caches pre-change data.
-    // 3s TTL: well above typical replication lag, well below cache TTL.
-    for k in &dependent_keys {
-        write_pipe.cmd("SETEX")
-            .arg(format!("{}rs:reval:{}", prefix, k))
-            .arg(3)
-            .arg("1")
+        // Revalidation markers: the PHP MISS path checks rs:reval:{key} and, when
+        // present, routes the rebuild's reads to the direct Postgres write
+        // connection instead of ReadySet — closing the window where a refetch
+        // races the dataflow's replication lag and re-caches pre-change data.
+        // 3s TTL: well above typical replication lag, well below cache TTL.
+        for k in &dependent_keys {
+            write_pipe.cmd("SETEX")
+                .arg(format!("{}rs:reval:{}", prefix, k))
+                .arg(3)
+                .arg("1")
+                .ignore();
+        }
+    }
+
+    // Hydrated twins: DEL each affected twin (no `:stale` companions — twins
+    // have none) + the same 3s rs:reval marker so a TwinStore refill inside
+    // the replication-lag window reads direct Postgres and skips storing.
+    // Twin keys are server-side only: intentionally NOT broadcast.
+    if !twin_dels.is_empty() {
+        let twin_prefixed: Vec<String> = twin_dels
+            .iter()
+            .map(|k| format!("{}{}", prefix, k))
+            .collect();
+        write_pipe.cmd("DEL").arg(&twin_prefixed).ignore();
+        for k in &twin_dels {
+            write_pipe.cmd("SETEX")
+                .arg(format!("{}rs:reval:{}", prefix, k))
+                .arg(3)
+                .arg("1")
+                .ignore();
+        }
+    }
+    if drop_twin_idx {
+        write_pipe.cmd("DEL")
+            .arg(format!("{}{}", prefix, twin_idx_key(cache_name)))
             .ignore();
     }
 
@@ -409,4 +518,94 @@ pub fn notify_invalidation(cache_name: &str, key_values: Vec<String>) {
         cache_name: cache_name.to_string(),
         key_values,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use readyset_data::DfValue;
+
+    use super::*;
+
+    /// Vendored copy of the cross-layer contract fixture (canonical source:
+    /// packages/businesspress/core/tests/Fixtures/rsc-contract.json — byte
+    /// sync is guarded by reverb_http.rs test_contract_fixture_in_sync).
+    fn load_fixture() -> serde_json::Value {
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../fixtures/rsc-contract.json"),
+        )
+        .expect("vendored fixtures/rsc-contract.json missing — re-vendor from PHP core");
+        serde_json::from_str(&raw).expect("rsc-contract.json is not valid JSON")
+    }
+
+    /// Map a typed JSON fixture param onto the DfValue the dataflow would
+    /// carry for it (PG bool replicates as 0/1, JSON null as DfValue::None).
+    fn df_from_json(v: &serde_json::Value) -> DfValue {
+        match v {
+            serde_json::Value::Null => DfValue::None,
+            serde_json::Value::Bool(b) => DfValue::from(*b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    DfValue::Int(i)
+                } else {
+                    DfValue::Double(n.as_f64().expect("numeric fixture param"))
+                }
+            }
+            serde_json::Value::String(s) => DfValue::from(s.as_str()),
+            other => panic!("unsupported twin_identities param type: {other:?}"),
+        }
+    }
+
+    /// Contract: the param_key the Reader paths emit (DfValue Display joined
+    /// with '|' in placeholder order — reader.rs extract_key_column_values and
+    /// eviction_key_values both use `format!("{}", v)` + `join("|")`) must
+    /// match the fixture byte-for-byte. PHP normalizes TO this encoding.
+    #[test]
+    fn twin_identities_param_encoding_matches_fixture() {
+        let fixture = load_fixture();
+        for row in fixture["twin_identities"].as_array().expect("twin_identities") {
+            let params = row["params"].as_array().unwrap();
+            let encoded: String = params
+                .iter()
+                .map(|p| format!("{}", df_from_json(p)))
+                .collect::<Vec<_>>()
+                .join("|");
+            let expected = row["expected_param_key"].as_str().unwrap();
+            assert_eq!(
+                encoded, expected,
+                "DfValue Display param encoding drifted for params {params:?}"
+            );
+        }
+    }
+
+    /// Contract: twin key construction (incl. the `_` empty-params form) and
+    /// the per-cache index key.
+    #[test]
+    fn twin_identities_key_building_matches_fixture() {
+        let fixture = load_fixture();
+        for row in fixture["twin_identities"].as_array().expect("twin_identities") {
+            let cache_name = row["cache_name"].as_str().unwrap();
+            let param_key = row["expected_param_key"].as_str().unwrap();
+            let expected_twin = row["expected_twin_key"].as_str().unwrap();
+            assert_eq!(
+                twin_key(cache_name, param_key),
+                expected_twin,
+                "twin_key drifted for cache {cache_name:?} param_key {param_key:?}"
+            );
+            if let Some(expected_idx) = row["expected_idx_key"].as_str() {
+                assert_eq!(
+                    twin_idx_key(cache_name),
+                    expected_idx,
+                    "twin_idx_key drifted for cache {cache_name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn twin_key_empty_param_uses_underscore_placeholder() {
+        assert_eq!(twin_key("c", ""), "rs:hyd:c:_");
+        assert_eq!(twin_key("c", "a|0"), "rs:hyd:c:a|0");
+        assert_eq!(twin_idx_key("c"), "rs:hyd_idx:c");
+    }
 }

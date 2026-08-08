@@ -5,7 +5,7 @@ use dataflow_expression::ReaderProcessing;
 use failpoint_macros::failpoint;
 use metrics::histogram;
 use readyset_client::metrics::recorded;
-use readyset_client::{KeyColumnIdx, ViewPlaceholder};
+use readyset_client::{KeyColumnIdx, KeyComparison, ViewPlaceholder};
 #[cfg(feature = "failure_injection")]
 use readyset_util::failpoints;
 use serde::{Deserialize, Serialize};
@@ -286,8 +286,142 @@ impl Reader {
         result
     }
 
+    /// Map evicted reader keys into the same pipe-delimited, placeholder-ordered
+    /// strings that [`Self::extract_key_column_values`] produces for the Update
+    /// path, so eviction-sourced invalidations hit the same per-param dep sets
+    /// (`rs:pdeps:{cache}:{param_key}`).
+    ///
+    /// `key_columns` is the reader's partial index columns (the order in which
+    /// values appear inside each `KeyComparison`). Any shape we cannot map
+    /// faithfully (range evictions, non-OneToOne placeholders, column
+    /// mismatches) returns an empty vec, which the notifier treats as a broad
+    /// (whole-cache) invalidation — strictly safe, just less granular.
+    pub(in crate::node) fn eviction_key_values(
+        &self,
+        key_columns: &[usize],
+        keys: &[KeyComparison],
+    ) -> Vec<String> {
+        // (placeholder_idx, position of the value inside the key tuple)
+        let mut mapped: Vec<(usize, usize)> = Vec::new();
+        for (placeholder, col_idx) in &self.placeholder_map {
+            match placeholder {
+                ViewPlaceholder::OneToOne(placeholder_idx, _) => {
+                    match key_columns.iter().position(|c| c == col_idx) {
+                        Some(pos) => mapped.push((*placeholder_idx as usize, pos)),
+                        None => return vec![],
+                    }
+                }
+                _ => return vec![], // Generated, Between, PageNumber -> broad
+            }
+        }
+        if mapped.is_empty() {
+            return vec![];
+        }
+        mapped.sort_by_key(|&(pi, _)| pi);
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut result: Vec<String> = Vec::new();
+        for key in keys {
+            match key {
+                KeyComparison::Equal(values) => {
+                    let vs: Vec<String> = mapped
+                        .iter()
+                        .filter_map(|&(_, pos)| values.get(pos).map(|v| format!("{}", v)))
+                        .collect();
+                    if vs.len() != mapped.len() {
+                        return vec![];
+                    }
+                    let joined = vs.join("|");
+                    if seen.insert(joined.clone()) {
+                        result.push(joined);
+                    }
+                }
+                KeyComparison::Range(_) => return vec![],
+            }
+        }
+        result
+    }
+
     /// Get a reference to the reader's post lookup.
     pub fn reader_processing(&self) -> &ReaderProcessing {
         &self.reader_processing
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use readyset_sql::ast::BinaryOperator;
+    use vec1::vec1;
+
+    use super::*;
+
+    fn reader_with_mapping(mapping: Vec<(ViewPlaceholder, KeyColumnIdx)>) -> Reader {
+        let mut r = Reader::new(NodeIndex::new(0), ReaderProcessing::default());
+        r.set_mapping(mapping);
+        r
+    }
+
+    #[test]
+    fn eviction_key_values_single_column() {
+        let r = reader_with_mapping(vec![(ViewPlaceholder::OneToOne(1, BinaryOperator::Equal), 3)]);
+        let keys = [KeyComparison::Equal(vec1![DfValue::from("abc")])];
+        assert_eq!(r.eviction_key_values(&[3], &keys), vec!["abc".to_string()]);
+    }
+
+    #[test]
+    fn eviction_key_values_composite_reordered() {
+        // $1 -> row col 7, $2 -> row col 2; reader index columns are [2, 7],
+        // so key tuples arrive as (col2_val, col7_val) and must be emitted in
+        // placeholder order "col7_val|col2_val".
+        let r = reader_with_mapping(vec![
+            (ViewPlaceholder::OneToOne(1, BinaryOperator::Equal), 7),
+            (ViewPlaceholder::OneToOne(2, BinaryOperator::Equal), 2),
+        ]);
+        let keys = [KeyComparison::Equal(vec1![
+            DfValue::from(0),
+            DfValue::from("not_sent")
+        ])];
+        assert_eq!(
+            r.eviction_key_values(&[2, 7], &keys),
+            vec!["not_sent|0".to_string()]
+        );
+    }
+
+    #[test]
+    fn eviction_key_values_dedups() {
+        let r = reader_with_mapping(vec![(ViewPlaceholder::OneToOne(1, BinaryOperator::Equal), 0)]);
+        let keys = [
+            KeyComparison::Equal(vec1![DfValue::from("x")]),
+            KeyComparison::Equal(vec1![DfValue::from("x")]),
+            KeyComparison::Equal(vec1![DfValue::from("y")]),
+        ];
+        assert_eq!(
+            r.eviction_key_values(&[0], &keys),
+            vec!["x".to_string(), "y".to_string()]
+        );
+    }
+
+    #[test]
+    fn eviction_key_values_range_falls_back_to_broad() {
+        let r = reader_with_mapping(vec![(ViewPlaceholder::OneToOne(1, BinaryOperator::Equal), 0)]);
+        let keys = [KeyComparison::from_range(
+            &(vec1![DfValue::from(1)]..=vec1![DfValue::from(5)]),
+        )];
+        assert!(r.eviction_key_values(&[0], &keys).is_empty());
+    }
+
+    #[test]
+    fn eviction_key_values_unmappable_column_falls_back_to_broad() {
+        // Placeholder maps to a column that is not part of the evicted index.
+        let r = reader_with_mapping(vec![(ViewPlaceholder::OneToOne(1, BinaryOperator::Equal), 9)]);
+        let keys = [KeyComparison::Equal(vec1![DfValue::from("abc")])];
+        assert!(r.eviction_key_values(&[3], &keys).is_empty());
+    }
+
+    #[test]
+    fn eviction_key_values_no_placeholders_is_broad() {
+        let r = reader_with_mapping(vec![]);
+        let keys = [KeyComparison::Equal(vec1![DfValue::from("abc")])];
+        assert!(r.eviction_key_values(&[0], &keys).is_empty());
     }
 }

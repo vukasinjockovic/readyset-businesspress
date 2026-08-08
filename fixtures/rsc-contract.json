@@ -6,7 +6,92 @@
         "  JS   packages/businesspress/core/resources/js/rsc/auth-hash.test.mjs (node --test)",
         "Identity formula (authoritative: RscGraphQLCache::getAuthContext + core-channels.php rsc.{authHash}):",
         "  authHash = md5(user_id . \":\" . (shop_id ?? \"none\") . \":\" . scope), scope defaults to \"customer\"; anonymous = literal \"anon\".",
+        "twin_identities: canonical (cache_name, param_key) -> rs:hyd twin key encoding.",
+        "  Producers: PHP RscTwinIdentity::paramKey/twinKey (pdeps registration + TwinStore)",
+        "             Rust DfValue Display join('|') (reader.rs extract_key_column_values +",
+        "             eviction_key_values) + redis_notifier.rs twin_key().",
+        "  param_key = per-binding canonical strings joined with '|' in PLACEHOLDER order.",
+        "  Value encoding is DfValue-Display-canonical: NULL->\"NULL\", false->\"0\", true->\"1\",",
+        "  numbers -> decimal string, strings verbatim (NO escaping: a literal '|' in a value",
+        "  is structurally ambiguous but both sides join identically so keys still match;",
+        "  a lone value \"_\" collides with the empty-params form; timestamp params may",
+        "  mismatch the engine's TimestampTz Display - all documented, accepted).",
+        "  Empty params -> param_key \"\" -> twin key rs:hyd:{cache_name}:_",
         "Regenerate ONLY via the generator script and re-vendor the Rust copy (check-rsc-contract-sync.sh)."
+    ],
+    "twin_identities": [
+        {
+            "cache_name": "gql_dashboard_d0195ae043d81898e1f5f08bb1c5ed73",
+            "params": ["not_sent", false],
+            "expected_param_key": "not_sent|0",
+            "expected_twin_key": "rs:hyd:gql_dashboard_d0195ae043d81898e1f5f08bb1c5ed73:not_sent|0",
+            "expected_idx_key": "rs:hyd_idx:gql_dashboard_d0195ae043d81898e1f5f08bb1c5ed73",
+            "note": "THE historical mismatch: strval(false) was \"\" (PHP registered \"not_sent|\"), engine emits Int 0 -> \"not_sent|0\". PHP was the fixed side."
+        },
+        {
+            "cache_name": "gql_dashboard_d0195ae043d81898e1f5f08bb1c5ed73",
+            "params": ["sent", true],
+            "expected_param_key": "sent|1",
+            "expected_twin_key": "rs:hyd:gql_dashboard_d0195ae043d81898e1f5f08bb1c5ed73:sent|1",
+            "note": "boolean true -> \"1\" (matched before by accident: strval(true) is also \"1\")"
+        },
+        {
+            "cache_name": "gql_dashboard_5bbe3a1a69a166f9b5ef251925b2d14a",
+            "params": ["1ef9e7ee-12ad-4d1a-9568-230852a1f050"],
+            "expected_param_key": "1ef9e7ee-12ad-4d1a-9568-230852a1f050",
+            "expected_twin_key": "rs:hyd:gql_dashboard_5bbe3a1a69a166f9b5ef251925b2d14a:1ef9e7ee-12ad-4d1a-9568-230852a1f050",
+            "note": "single uuid string param (chat conversation cache), verbatim"
+        },
+        {
+            "cache_name": "gql_dashboard_x",
+            "params": [null],
+            "expected_param_key": "NULL",
+            "expected_twin_key": "rs:hyd:gql_dashboard_x:NULL",
+            "note": "NULL binding -> literal \"NULL\" (DfValue::None Display); collides with the string \"NULL\" (next case) - documented"
+        },
+        {
+            "cache_name": "gql_dashboard_x",
+            "params": ["NULL"],
+            "expected_param_key": "NULL",
+            "expected_twin_key": "rs:hyd:gql_dashboard_x:NULL",
+            "note": "string \"NULL\" is indistinguishable from a NULL binding - accepted collision"
+        },
+        {
+            "cache_name": "gql_dashboard_x",
+            "params": [42, -7],
+            "expected_param_key": "42|-7",
+            "expected_twin_key": "rs:hyd:gql_dashboard_x:42|-7",
+            "note": "integers, decimal string, placeholder order preserved"
+        },
+        {
+            "cache_name": "gql_dashboard_x",
+            "params": [1.5],
+            "expected_param_key": "1.5",
+            "expected_twin_key": "rs:hyd:gql_dashboard_x:1.5",
+            "note": "float -> shortest decimal form on both sides"
+        },
+        {
+            "cache_name": "gql_dashboard_x",
+            "params": ["a|b", "c"],
+            "expected_param_key": "a|b|c",
+            "expected_twin_key": "rs:hyd:gql_dashboard_x:a|b|c",
+            "note": "literal pipe in a value: NO escaping on either side - joined strings still match byte-for-byte, structural ambiguity accepted"
+        },
+        {
+            "cache_name": "gql_dashboard_x",
+            "params": ["val:with:colons"],
+            "expected_param_key": "val:with:colons",
+            "expected_twin_key": "rs:hyd:gql_dashboard_x:val:with:colons",
+            "note": "colons pass through verbatim (twin key parsing is prefix-anchored, never split-based)"
+        },
+        {
+            "cache_name": "gql_dashboard_nonparam",
+            "params": [],
+            "expected_param_key": "",
+            "expected_twin_key": "rs:hyd:gql_dashboard_nonparam:_",
+            "expected_idx_key": "rs:hyd_idx:gql_dashboard_nonparam",
+            "note": "non-parameterized cache: empty param_key -> `_` placeholder segment"
+        }
     ],
     "hash_inputs": [
         {

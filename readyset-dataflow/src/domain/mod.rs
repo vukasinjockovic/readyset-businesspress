@@ -1349,6 +1349,12 @@ impl Domain {
 
         if let Some(evictions) = evictions {
             // now send evictions for all the (tag, [key]) things in evictions
+            trace!(
+                %src,
+                node = %me,
+                n_tags = evictions.len(),
+                "join-miss during regular update -> downstream evictions (dispatch)"
+            );
             for (tag, keys) in evictions {
                 self.handle_eviction(
                     Eviction::Keys {
@@ -4418,6 +4424,11 @@ impl Domain {
                 freed += bytes;
                 state.publish();
                 state.notify_readers_of_eviction()?;
+                trace!(
+                    %node,
+                    bytes,
+                    "reader memory-pressure eviction (evict_bytes, NOT Tier-1 notified)"
+                );
 
                 if let Some(addrs) = self.trigger_addresses.get(node) {
                     if self.unquery_after_eviction {
@@ -4485,6 +4496,12 @@ impl Domain {
             return Ok(None);
         };
 
+        trace!(
+            %dst,
+            ?tag,
+            n_keys = keys.len(),
+            "handle_eviction_keys walking replay path"
+        );
         let i = path
             .iter()
             .position(|ps| ps.node == dst)
@@ -4594,6 +4611,11 @@ impl Domain {
                     };
                     state.publish();
                     state.notify_readers_of_eviction()?;
+                    trace!(
+                        %destination,
+                        bytes_freed,
+                        "reader single-key eviction (SingleKey, NOT Tier-1 notified)"
+                    );
                     (bytes_freed, eviction)
                 } else {
                     let eviction = match key {

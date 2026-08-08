@@ -6,14 +6,14 @@ use dataflow_state::{MaterializedNodeState, SnapshotMode};
 use readyset_client::{KeyComparison, PacketData};
 use readyset_errors::ReadySetResult;
 use replication_offset::ReplicationOffset;
-use tracing::{debug_span, trace};
+use tracing::{debug, debug_span, trace};
 
 use crate::node::special::base::{BaseWrite, SetSnapshotMode};
 use crate::node::NodeType;
 use crate::payload::Eviction;
 use crate::prelude::*;
 use crate::processing::{MissLookupKey, MissReplayKey};
-use crate::{backlog, payload};
+use crate::{backlog, payload, redis_notifier};
 
 /// The results of running a forward pass on a node
 #[derive(Debug, PartialEq, Eq, Default)]
@@ -497,7 +497,7 @@ impl Node {
             NodeType::Internal(ref mut i) => {
                 i.on_eviction(from, tag, keys, auxiliary_node_states);
             }
-            NodeType::Reader(_) => {
+            NodeType::Reader(ref r) => {
                 if let Some(state) = reader_write_handles.get_mut(addr) {
                     trace!(
                         local = %self.local_addr(),
@@ -510,6 +510,33 @@ impl Node {
                     }
                     state.publish();
                     state.notify_readers_of_eviction()?;
+
+                    // Tier 1 bridge (eviction-sourced): partial-state shapes
+                    // (joins over grouped derived tables, decorrelated
+                    // subselects, ...) are maintained by evicting the affected
+                    // reader keys and upquerying on the next read instead of
+                    // delivering a precise delta to the Reader. Those shapes
+                    // never hit `Reader::process`'s notify call, so without
+                    // this the cached answer changes silently. Emit the same
+                    // invalidation the Update path would have emitted.
+                    //
+                    // Memory-pressure evictions that target the reader
+                    // directly (evict_bytes / evict_random in the domain) do
+                    // NOT route through process_eviction, so they stay
+                    // unnotified. Upstream *state* memory evictions that
+                    // propagate downstream do reach this point and will
+                    // over-notify — that is safe (it just DELs a Redis key
+                    // early; the next read re-caches).
+                    let cache_name = self.name.display_unquoted().to_string();
+                    let key_values = r.eviction_key_values(key_columns, keys);
+                    debug!(
+                        cache_name = %cache_name,
+                        ?keys,
+                        ?tag,
+                        n_key_values = key_values.len(),
+                        "Tier 1: reader eviction -> notify_invalidation"
+                    );
+                    redis_notifier::notify_invalidation(&cache_name, key_values);
                 }
             }
             NodeType::Ingress => {}
