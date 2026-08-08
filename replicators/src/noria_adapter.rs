@@ -638,7 +638,14 @@ impl<'a> NoriaAdapter<'a> {
 
                 Some(
                     connector
-                        .create_replication_slot(&repl_slot_name, true)
+                        // PERSISTENT (temporary=false): this is the PRIMARY slot.
+                        // Creating it TEMPORARY made it vanish on every process
+                        // exit, forcing a full resnapshot on every restart —
+                        // the slot must outlive the session so subsequent
+                        // starts resume from the committed LSN. Temporary slots
+                        // are only for the resnapshot slot (see doc comment on
+                        // create_replication_slot).
+                        .create_replication_slot(&repl_slot_name, false)
                         .await?,
                 )
             }

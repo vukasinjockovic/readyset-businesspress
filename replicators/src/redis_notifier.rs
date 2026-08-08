@@ -239,11 +239,26 @@ async fn handle_row_invalidation(
     // --- Write pipeline: DEL cache keys + broadcast (no dep cleanup) ---
     let mut write_pipe = redis::pipe();
 
-    // 2a. DEL all dependent cache keys (with prefix)
-    let prefixed_keys: Vec<String> = dependent_keys.iter()
-        .map(|k| format!("{}{}", prefix, k))
-        .collect();
+    // 2a. DEL all dependent cache keys (with prefix), PLUS their
+    // stale-while-revalidate twins ("{key}:stale", kept by PHP at ~3x TTL).
+    // SWR exists to smooth TTL expiry, not to serve known-stale data: without
+    // this, concurrent clients could be served pre-change data from :stale
+    // for up to the extended TTL if the rebuild fails.
+    let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
     write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
+
+    // 2b. Revalidation markers: the PHP MISS path checks rs:reval:{key} and,
+    // when present, routes the rebuild's reads to the direct Postgres write
+    // connection instead of ReadySet — closing the window where a refetch
+    // races the dataflow's replication lag and re-caches pre-change data.
+    // 3s TTL: well above typical replication lag, well below cache TTL.
+    for k in &dependent_keys {
+        write_pipe.cmd("SETEX")
+            .arg(format!("{}rs:reval:{}", prefix, k))
+            .arg(3)
+            .arg("1")
+            .ignore();
+    }
 
     // 2c. Centrifugo XADD (only when ws_server is centrifugo)
     let grouped = group_by_auth_hash(&dependent_keys);
@@ -263,6 +278,9 @@ async fn handle_row_invalidation(
 
             write_pipe.cmd("XADD")
                 .arg(centrifugo_stream)
+                .arg("MAXLEN")
+                .arg("~")
+                .arg("10000")
                 .arg("*")
                 .arg("method")
                 .arg("publish")
@@ -287,6 +305,43 @@ async fn handle_row_invalidation(
     Ok(())
 }
 
+/// WAL ops for which Tier 3 (table-level declared deps) fires.
+///
+/// Default: INSERT only. UPDATEs/DELETEs of rows that are actually displayed
+/// somewhere are already precisely covered by Tier 2 row_deps
+/// (rs:row_deps:{schema}.{table}:{pk}), so firing Tier 3 for them is pure
+/// over-invalidation: on a hot table every UPDATE would flush every declared
+/// listing cache for all users (cache-hit collapse + broadcast storm) with no
+/// correctness gain. Tier 3's irreplaceable job is the INSERT phantom: a
+/// brand-new row that should appear in a cached listing has no row_dep yet,
+/// so only the table-level declared dep can catch it.
+///
+/// Override with READYSET_TIER3_OPS (comma-separated, case-insensitive, e.g.
+/// "INSERT,DELETE"). Setting it to an empty/blank value disables Tier 3
+/// entirely. Parsed once on first row event.
+static TIER3_OPS: OnceLock<Vec<String>> = OnceLock::new();
+
+fn tier3_ops() -> &'static [String] {
+    TIER3_OPS.get_or_init(|| {
+        let ops = parse_tier3_ops(env::var("READYSET_TIER3_OPS").ok().as_deref());
+        info!(?ops, "Tier 3 declared-dep invalidation fires for ops");
+        ops
+    })
+}
+
+/// Parse the READYSET_TIER3_OPS value. `None` (unset) defaults to INSERT-only;
+/// an explicitly set empty/blank value yields an empty set (Tier 3 disabled).
+fn parse_tier3_ops(raw: Option<&str>) -> Vec<String> {
+    match raw {
+        None => vec!["INSERT".to_string()],
+        Some(s) => s
+            .split(',')
+            .map(|op| op.trim().to_ascii_uppercase())
+            .filter(|op| !op.is_empty())
+            .collect(),
+    }
+}
+
 /// Notify that a specific row has been modified via WAL replication.
 pub fn notify_row_change(schema: &str, table: &str, pk: &str, op: &str) {
     let json = serde_json::json!({
@@ -297,4 +352,265 @@ pub fn notify_row_change(schema: &str, table: &str, pk: &str, op: &str) {
     .to_string();
     let row_key = format!("{}.{}:{}", schema, table, pk);
     let _ = get_or_init_row_tx().send(RowChangeMsg { json, row_key });
+
+    // Tier 3: table-level declared deps. PHP's withDeps($cacheName, $deps, ...)
+    // registers cache keys under rs:deps:{dep} where {dep} is a table name the
+    // caller declared (bare or schema-qualified). This tier was originally
+    // consumed by the PHP `readyset:listen` daemon; when broadcasting moved
+    // into this bridge (d36ae9945) the table-level lookup was dropped and the
+    // declared-dep API silently went dead. Re-enqueue here — the debounce loop
+    // dedups per table per window, and SMEMBERS on a non-existent dep key is a
+    // sub-ms no-op, so tables without declared deps cost effectively nothing.
+    //
+    // Op-gated (default INSERT-only, see TIER3_OPS): updates/deletes of
+    // displayed rows are already precisely invalidated by Tier 2 row_deps
+    // above; inserts are the phantom case Tier 2 cannot see.
+    if tier3_ops().iter().any(|o| o.eq_ignore_ascii_case(op)) {
+        notify_table_change(schema, table);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3: table-level declared-dep invalidation
+// ---------------------------------------------------------------------------
+
+/// Message type for the table-level change notifier (Tier 3).
+struct TableChangeMsg {
+    /// Bare table name, e.g. "bp_messages"
+    table: String,
+    /// Schema-qualified name, e.g. "public.bp_messages"
+    qualified: String,
+}
+
+static TABLE_CHANGE_TX: OnceLock<mpsc::UnboundedSender<TableChangeMsg>> = OnceLock::new();
+
+fn get_or_init_table_tx() -> &'static mpsc::UnboundedSender<TableChangeMsg> {
+    TABLE_CHANGE_TX.get_or_init(|| {
+        let (tx, mut rx) = mpsc::unbounded_channel::<TableChangeMsg>();
+
+        tokio::spawn(async move {
+            let redis_url = env::var("READYSET_REDIS_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+            let prefix = env::var("READYSET_REDIS_PREFIX")
+                .unwrap_or_default();
+            let ws_server = env::var("READYSET_WEBSOCKET_SERVER")
+                .unwrap_or_else(|_| "centrifugo".to_string());
+            let centrifugo_stream = env::var("READYSET_CENTRIFUGO_STREAM")
+                .unwrap_or_else(|_| "centrifugo:rsc".to_string());
+            let debounce_ms: u64 = env::var("READYSET_DEBOUNCE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+
+            let reverb_config = if ws_server == "reverb" {
+                ReverbConfig::from_env()
+            } else {
+                None
+            };
+            let http_client = reverb_config.as_ref().map(|_| {
+                reqwest::Client::builder()
+                    .timeout(Duration::from_millis(500))
+                    .build()
+                    .expect("Failed to build HTTP client for Reverb")
+            });
+
+            let client = match redis::Client::open(redis_url.as_str()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(%e, "Failed to create Redis client for table change notifier");
+                    while rx.recv().await.is_some() {}
+                    return;
+                }
+            };
+
+            let mut conn = match client.get_multiplexed_async_connection().await {
+                Ok(c) => {
+                    info!(url = %redis_url, ws_server = %ws_server,
+                          "Redis table change notifier connected (Tier 3 — declared deps)");
+                    c
+                }
+                Err(e) => {
+                    error!(%e, "Failed to connect to Redis for table change notifier");
+                    while rx.recv().await.is_some() {}
+                    return;
+                }
+            };
+
+            // Table-level events arrive once per WAL row event, so the
+            // debounce window is essential here: dedup by qualified name.
+            let debounce_duration = Duration::from_millis(debounce_ms.max(10));
+
+            loop {
+                let first = match rx.recv().await {
+                    Some(msg) => msg,
+                    None => break,
+                };
+
+                let mut dedup: HashMap<String, TableChangeMsg> = HashMap::new();
+                dedup.insert(first.qualified.clone(), first);
+
+                let deadline = tokio::time::Instant::now() + debounce_duration;
+                loop {
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                        Ok(Some(msg)) => {
+                            dedup.insert(msg.qualified.clone(), msg);
+                        }
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+
+                for (_qualified, msg) in dedup {
+                    if let Err(e) = handle_table_invalidation(
+                        &mut conn,
+                        &msg.table,
+                        &msg.qualified,
+                        &prefix,
+                        &ws_server,
+                        &centrifugo_stream,
+                        reverb_config.as_ref(),
+                        http_client.as_ref(),
+                    ).await {
+                        warn!(%e, table = %msg.qualified, "Tier 3: table invalidation failed");
+                    }
+                }
+            }
+        });
+
+        tx
+    })
+}
+
+/// Handle the invalidation cycle for declared table-level deps.
+///
+/// Looks up BOTH `rs:deps:{table}` (bare) and `rs:deps:{schema}.{table}`
+/// (qualified) — PHP callers have historically declared deps in either form.
+///
+/// Same policy as Tiers 1/2: cache VALUES are deleted, dep mappings persist
+/// (see handle_row_invalidation for the re-registration race rationale).
+async fn handle_table_invalidation(
+    conn: &mut redis::aio::MultiplexedConnection,
+    table: &str,
+    qualified: &str,
+    prefix: &str,
+    ws_server: &str,
+    centrifugo_stream: &str,
+    reverb_config: Option<&ReverbConfig>,
+    http_client: Option<&reqwest::Client>,
+) -> Result<(), redis::RedisError> {
+    let mut read_pipe = redis::pipe();
+    read_pipe.cmd("SMEMBERS").arg(format!("{}rs:deps:{}", prefix, table));
+    read_pipe.cmd("SMEMBERS").arg(format!("{}rs:deps:{}", prefix, qualified));
+    let (bare_keys, qualified_keys): (Vec<String>, Vec<String>) =
+        read_pipe.query_async(conn).await.unwrap_or_default();
+
+    let mut dependent_keys = bare_keys;
+    for key in qualified_keys {
+        if !dependent_keys.contains(&key) {
+            dependent_keys.push(key);
+        }
+    }
+
+    if dependent_keys.is_empty() {
+        return Ok(());
+    }
+
+    debug!(table = %qualified, keys = dependent_keys.len(), "Tier 3: invalidating declared-dep keys");
+
+    let mut write_pipe = redis::pipe();
+    // DEL values AND their ":stale" SWR twins — see handle_row_invalidation.
+    let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
+    write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
+
+    // Revalidation markers (rs:reval:{key}, 3s TTL): tell the PHP MISS path
+    // to rebuild from the direct Postgres connection instead of ReadySet,
+    // closing the replication-lag re-cache race — see handle_row_invalidation.
+    for k in &dependent_keys {
+        write_pipe.cmd("SETEX")
+            .arg(format!("{}rs:reval:{}", prefix, k))
+            .arg(3)
+            .arg("1")
+            .ignore();
+    }
+
+    let grouped = group_by_auth_hash(&dependent_keys);
+
+    if ws_server == "centrifugo" {
+        for (auth_hash, keys) in &grouped {
+            let channel = if auth_hash == "anon" {
+                "rsc:anon".to_string()
+            } else {
+                format!("rsc:{}", auth_hash)
+            };
+
+            let payload = serde_json::json!({
+                "channel": channel,
+                "data": { "keys": keys }
+            });
+
+            write_pipe.cmd("XADD")
+                .arg(centrifugo_stream)
+                .arg("MAXLEN")
+                .arg("~")
+                .arg("10000")
+                .arg("*")
+                .arg("method")
+                .arg("publish")
+                .arg("payload")
+                .arg(payload.to_string())
+                .ignore();
+        }
+    }
+
+    write_pipe.query_async::<()>(conn).await.ok();
+
+    if ws_server == "reverb" {
+        if let (Some(cfg), Some(client)) = (reverb_config, http_client) {
+            reverb_http::broadcast_to_reverb(cfg, client, &grouped).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Notify that some row in a table changed (Tier 3 declared-dep fan-out).
+/// Called from notify_row_change for ops in TIER3_OPS (default INSERT-only)
+/// — deduped per debounce window downstream.
+pub fn notify_table_change(schema: &str, table: &str) {
+    let _ = get_or_init_table_tx().send(TableChangeMsg {
+        table: table.to_string(),
+        qualified: format!("{}.{}", schema, table),
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tier3_ops_default_is_insert_only() {
+        assert_eq!(parse_tier3_ops(None), vec!["INSERT".to_string()]);
+    }
+
+    #[test]
+    fn test_tier3_ops_custom_list_normalized() {
+        assert_eq!(
+            parse_tier3_ops(Some("insert, Delete")),
+            vec!["INSERT".to_string(), "DELETE".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_tier3_ops_explicit_empty_disables_tier3() {
+        assert!(parse_tier3_ops(Some("")).is_empty());
+        assert!(parse_tier3_ops(Some(" , ")).is_empty());
+    }
+
+    #[test]
+    fn test_tier3_ops_matching_is_case_insensitive() {
+        let ops = parse_tier3_ops(Some("INSERT"));
+        assert!(ops.iter().any(|o| o.eq_ignore_ascii_case("insert")));
+        assert!(!ops.iter().any(|o| o.eq_ignore_ascii_case("UPDATE")));
+        assert!(!ops.iter().any(|o| o.eq_ignore_ascii_case("DELETE")));
+    }
 }

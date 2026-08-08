@@ -282,6 +282,22 @@ async fn handle_invalidation(
         };
     }
 
+    // Liveness telemetry: record that this Reader emitted a notification,
+    // whether or not any dependent keys were registered. Lets the PHP side
+    // (and humans battle-testing) audit which caches actually produce Tier 1
+    // signals — "CREATE CACHE succeeded" does not guarantee delta delivery
+    // (e.g. correlated-subselect dataflows serve reads but never notify).
+    let _: Result<(), _> = redis::cmd("SET")
+        .arg(format!("{}rs:t1_seen:{}", prefix, cache_name))
+        .arg(format!("{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)))
+        .arg("EX")
+        .arg(7 * 86400)
+        .query_async(conn)
+        .await;
+
     if dependent_keys.is_empty() {
         return Ok(());
     }
@@ -313,11 +329,26 @@ async fn handle_invalidation(
     // - Worker recycling (--max-requests) prevents unbounded accumulation
     let mut write_pipe = redis::pipe();
 
-    // DEL all affected RSC cache keys (with prefix)
-    let prefixed_keys: Vec<String> = dependent_keys.iter()
-        .map(|k| format!("{}{}", prefix, k))
-        .collect();
+    // DEL all affected RSC cache keys (with prefix), PLUS their
+    // stale-while-revalidate twins ("{key}:stale", kept by PHP at ~3x TTL).
+    // SWR exists to smooth TTL expiry, not to serve known-stale data: without
+    // this, concurrent clients could be served pre-change data from :stale
+    // for up to the extended TTL if the rebuild fails.
+    let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
     write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
+
+    // Revalidation markers: the PHP MISS path checks rs:reval:{key} and, when
+    // present, routes the rebuild's reads to the direct Postgres write
+    // connection instead of ReadySet — closing the window where a refetch
+    // races the dataflow's replication lag and re-caches pre-change data.
+    // 3s TTL: well above typical replication lag, well below cache TTL.
+    for k in &dependent_keys {
+        write_pipe.cmd("SETEX")
+            .arg(format!("{}rs:reval:{}", prefix, k))
+            .arg(3)
+            .arg("1")
+            .ignore();
+    }
 
     // 3c. Centrifugo XADD (only when ws_server is centrifugo)
     let grouped = group_by_auth_hash(&dependent_keys);

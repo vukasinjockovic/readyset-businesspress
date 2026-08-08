@@ -59,23 +59,71 @@ impl ReverbConfig {
     }
 }
 
+/// Whether a key segment looks like an RSC authHash: a 32-char hex md5
+/// (PHP: md5("{userId}:{shopId}:{scope}")) or the literal "anon" for guests.
+fn is_auth_hash_segment(segment: &str) -> bool {
+    segment == "anon"
+        || (segment.len() == 32 && segment.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// Extract authHash from an RSC cache key.
 ///
-/// Supports two key formats:
-///   - GraphQL:  rs:gql:{schema}:{authHash}:{queryHash}  → authHash at parts[3]
-///   - Livewire: rs:lw:{authHash}:{Component}_{name}:{paramHash} → authHash at parts[2]
+/// Supported key formats:
+///   - GraphQL (current): rs:gql:{schema}:{locale}:{authHash}:{queryHash}
+///   - GraphQL (legacy):  rs:gql:{schema}:{authHash}:{queryHash}
+///   - Livewire:          rs:lw:{authHash}:{Component}_{name}:{paramHash}
+///   - withDeps:          rs:{cacheName}:{paramHash} — no auth segment
 ///
-/// Returns None for keys that don't match either format.
+/// For gql keys the authHash position depends on whether a locale segment is
+/// present, so we find the first segment after the schema that *looks like*
+/// an authHash (32-hex or "anon"), excluding the trailing queryHash — which
+/// is also 32-hex, hence the exclusive upper bound.
+///
+/// withDeps keys carry no auth context: those broadcast on the shared "anon"
+/// channel, which every RSC client (guest or authenticated) is authorized to
+/// join — see Broadcast::channel('rsc.{authHash}') in core-channels.php and
+/// the echo.js adapter's anon-channel subscription.
+///
+/// Returns None only for keys that are not RSC cache keys at all.
 pub fn extract_auth_hash(key: &str) -> Option<String> {
     let parts: Vec<&str> = key.split(':').collect();
     if parts.len() < 3 || parts[0] != "rs" {
         return None;
     }
     match parts[1] {
-        "gql" if parts.len() >= 5 => Some(parts[3].to_string()),
+        "gql" if parts.len() >= 5 => parts[3..parts.len() - 1]
+            .iter()
+            .find(|p| is_auth_hash_segment(p))
+            .map(|p| (*p).to_string()),
+        "gql" => None,
         "lw" if parts.len() >= 4 => Some(parts[2].to_string()),
-        _ => None,
+        "lw" => None,
+        // Internal bookkeeping keys are never broadcast targets
+        "deps" | "pdeps" | "row_deps" | "key_deps" | "key_pdeps" | "key_row_deps"
+        | "tag" | "registered" | "lock" | "meta" | "cache_name" | "cache_names"
+        | "cache_params" | "kill" | "listener" => None,
+        // withDeps value keys (rs:{cacheName}:{paramHash}) — shared channel
+        _ => Some("anon".to_string()),
     }
+}
+
+/// Expand dependent cache keys into the full list to DEL on invalidation:
+/// for each key, the prefixed value key PLUS its stale-while-revalidate twin
+/// `{key}:stale`.
+///
+/// The PHP layer keeps an SWR copy of every RSC value at `{key}:stale` with
+/// ~3x the primary TTL. SWR exists to smooth TTL expiry, not to serve
+/// known-stale data: if a data-change invalidation only DELs the value key,
+/// concurrent clients can be served pre-change data from `:stale` for up to
+/// the extended TTL when the rebuild fails. Shared by all three notifier
+/// tiers (Tier 1 query-level, Tier 2 row-level, Tier 3 table-level).
+pub fn expand_keys_for_del(prefix: &str, dependent_keys: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(dependent_keys.len() * 2);
+    for k in dependent_keys {
+        out.push(format!("{}{}", prefix, k));
+        out.push(format!("{}{}:stale", prefix, k));
+    }
+    out
 }
 
 /// Group dependent cache keys by authHash for per-user channel broadcasting.
@@ -194,42 +242,117 @@ pub async fn broadcast_to_reverb(
 mod tests {
     use super::*;
 
+    const HASH_A: &str = "0c2259fa3fd90640b5b2a10e8075544e";
+    const HASH_B: &str = "a3f1c2d4e5b6978811223344556677aa";
+    const QHASH: &str = "54dd078ed77c1e68b6129838a3a398fc";
+
     #[test]
-    fn test_extract_auth_hash_gql() {
+    fn test_extract_auth_hash_gql_legacy_no_locale() {
+        // rs:gql:{schema}:{authHash}:{queryHash}
         assert_eq!(
-            extract_auth_hash("rs:gql:dashboard:abc123:q1"),
-            Some("abc123".to_string())
+            extract_auth_hash(&format!("rs:gql:dashboard:{HASH_A}:{QHASH}")),
+            Some(HASH_A.to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_auth_hash_gql_with_locale() {
+        // rs:gql:{schema}:{locale}:{authHash}:{queryHash} — current core format
+        assert_eq!(
+            extract_auth_hash(&format!("rs:gql:dashboard:en:{HASH_A}:{QHASH}")),
+            Some(HASH_A.to_string())
+        );
+        // longer locale tags must not be mistaken for the hash either
+        assert_eq!(
+            extract_auth_hash(&format!("rs:gql:storefront:en-US:{HASH_A}:{QHASH}")),
+            Some(HASH_A.to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_auth_hash_gql_anon() {
+        assert_eq!(
+            extract_auth_hash(&format!("rs:gql:storefront:en:anon:{QHASH}")),
+            Some("anon".to_string())
+        );
+        assert_eq!(
+            extract_auth_hash(&format!("rs:gql:storefront:anon:{QHASH}")),
+            Some("anon".to_string())
         );
     }
 
     #[test]
     fn test_extract_auth_hash_lw() {
         assert_eq!(
-            extract_auth_hash("rs:lw:abc123:OrderTable_orders:def456"),
-            Some("abc123".to_string())
+            extract_auth_hash(&format!("rs:lw:{HASH_A}:OrderTable_orders:def456")),
+            Some(HASH_A.to_string())
         );
     }
 
     #[test]
     fn test_extract_auth_hash_unknown() {
-        assert_eq!(extract_auth_hash("rs:unknown:foo:bar"), None);
         assert_eq!(extract_auth_hash("not_rs:gql:x:y:z"), None);
         assert_eq!(extract_auth_hash("rs:gql:short"), None);
+        // gql key whose middle segments contain no hash-shaped part
+        assert_eq!(extract_auth_hash(&format!("rs:gql:dashboard:en:{QHASH}")), None);
+    }
+
+    #[test]
+    fn test_extract_auth_hash_withdeps_anon_fallback() {
+        // withDeps value keys have no auth segment — shared "anon" channel
+        assert_eq!(
+            extract_auth_hash("rs:demo:top-products:40cd750bba9870f18aada2478b24840a"),
+            Some("anon".to_string())
+        );
+        // Internal bookkeeping keys must never become broadcast targets
+        assert_eq!(extract_auth_hash("rs:deps:demo_top_products_mv"), None);
+        assert_eq!(extract_auth_hash("rs:row_deps:public.bp_orders:abc"), None);
+        assert_eq!(extract_auth_hash("rs:tag:user:some-uuid"), None);
+        assert_eq!(extract_auth_hash("rs:registered:gql_dashboard_x"), None);
+    }
+
+    #[test]
+    fn test_expand_keys_for_del_adds_stale_twins() {
+        let keys = vec![
+            format!("rs:gql:dashboard:en:{HASH_A}:{QHASH}"),
+            "rs:lw:anon:Comp_x:p1".to_string(),
+        ];
+        assert_eq!(
+            expand_keys_for_del("gz:", &keys),
+            vec![
+                format!("gz:rs:gql:dashboard:en:{HASH_A}:{QHASH}"),
+                format!("gz:rs:gql:dashboard:en:{HASH_A}:{QHASH}:stale"),
+                "gz:rs:lw:anon:Comp_x:p1".to_string(),
+                "gz:rs:lw:anon:Comp_x:p1:stale".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expand_keys_for_del_empty_prefix_and_keys() {
+        let keys = vec!["rs:demo:k:h".to_string()];
+        assert_eq!(
+            expand_keys_for_del("", &keys),
+            vec!["rs:demo:k:h".to_string(), "rs:demo:k:h:stale".to_string()]
+        );
+        assert!(expand_keys_for_del("gz:", &[]).is_empty());
     }
 
     #[test]
     fn test_group_by_auth_hash_mixed() {
         let keys = vec![
-            "rs:gql:dashboard:user1:q1".to_string(),
-            "rs:gql:dashboard:user1:q2".to_string(),
-            "rs:lw:user1:OrderTable_orders:p1".to_string(),
-            "rs:gql:dashboard:user2:q3".to_string(),
-            "rs:lw:user2:StatsTable_stats:p2".to_string(),
-            "rs:unknown:ignored".to_string(),
+            format!("rs:gql:dashboard:en:{HASH_A}:q1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            format!("rs:gql:dashboard:{HASH_A}:q2bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            format!("rs:lw:{HASH_A}:OrderTable_orders:p1"),
+            format!("rs:gql:dashboard:sr:{HASH_B}:q3cccccccccccccccccccccccccccccc"),
+            format!("rs:lw:{HASH_B}:StatsTable_stats:p2"),
+            "rs:demo:top-products:40cd750bba9870f18aada2478b24840a".to_string(),
+            "rs:deps:demo_top_products_mv".to_string(), // bookkeeping — skipped
         ];
         let grouped = group_by_auth_hash(&keys);
-        assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped["user1"].len(), 3); // 2 gql + 1 lw
-        assert_eq!(grouped["user2"].len(), 2); // 1 gql + 1 lw
+        assert_eq!(grouped.len(), 3);
+        assert_eq!(grouped[HASH_A].len(), 3); // 2 gql (both formats) + 1 lw
+        assert_eq!(grouped[HASH_B].len(), 2); // 1 gql + 1 lw
+        assert_eq!(grouped["anon"].len(), 1); // withDeps key → shared channel
     }
 }
