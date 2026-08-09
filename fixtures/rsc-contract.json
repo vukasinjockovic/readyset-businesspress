@@ -25,6 +25,7 @@
             "params": ["not_sent", false],
             "expected_param_key": "not_sent|0",
             "expected_twin_key": "rs:hyd:gql_dashboard_d0195ae043d81898e1f5f08bb1c5ed73:not_sent|0",
+            "expected_hyd_deps_key": "rs:hyd_deps:gql_dashboard_d0195ae043d81898e1f5f08bb1c5ed73:not_sent|0",
             "expected_idx_key": "rs:hyd_idx:gql_dashboard_d0195ae043d81898e1f5f08bb1c5ed73",
             "note": "THE historical mismatch: strval(false) was \"\" (PHP registered \"not_sent|\"), engine emits Int 0 -> \"not_sent|0\". PHP was the fixed side."
         },
@@ -33,6 +34,7 @@
             "params": ["sent", true],
             "expected_param_key": "sent|1",
             "expected_twin_key": "rs:hyd:gql_dashboard_d0195ae043d81898e1f5f08bb1c5ed73:sent|1",
+            "expected_hyd_deps_key": "rs:hyd_deps:gql_dashboard_d0195ae043d81898e1f5f08bb1c5ed73:sent|1",
             "note": "boolean true -> \"1\" (matched before by accident: strval(true) is also \"1\")"
         },
         {
@@ -40,6 +42,7 @@
             "params": ["1ef9e7ee-12ad-4d1a-9568-230852a1f050"],
             "expected_param_key": "1ef9e7ee-12ad-4d1a-9568-230852a1f050",
             "expected_twin_key": "rs:hyd:gql_dashboard_5bbe3a1a69a166f9b5ef251925b2d14a:1ef9e7ee-12ad-4d1a-9568-230852a1f050",
+            "expected_hyd_deps_key": "rs:hyd_deps:gql_dashboard_5bbe3a1a69a166f9b5ef251925b2d14a:1ef9e7ee-12ad-4d1a-9568-230852a1f050",
             "note": "single uuid string param (chat conversation cache), verbatim"
         },
         {
@@ -47,6 +50,7 @@
             "params": [null],
             "expected_param_key": "NULL",
             "expected_twin_key": "rs:hyd:gql_dashboard_x:NULL",
+            "expected_hyd_deps_key": "rs:hyd_deps:gql_dashboard_x:NULL",
             "note": "NULL binding -> literal \"NULL\" (DfValue::None Display); collides with the string \"NULL\" (next case) - documented"
         },
         {
@@ -54,6 +58,7 @@
             "params": ["NULL"],
             "expected_param_key": "NULL",
             "expected_twin_key": "rs:hyd:gql_dashboard_x:NULL",
+            "expected_hyd_deps_key": "rs:hyd_deps:gql_dashboard_x:NULL",
             "note": "string \"NULL\" is indistinguishable from a NULL binding - accepted collision"
         },
         {
@@ -61,6 +66,7 @@
             "params": [42, -7],
             "expected_param_key": "42|-7",
             "expected_twin_key": "rs:hyd:gql_dashboard_x:42|-7",
+            "expected_hyd_deps_key": "rs:hyd_deps:gql_dashboard_x:42|-7",
             "note": "integers, decimal string, placeholder order preserved"
         },
         {
@@ -68,6 +74,7 @@
             "params": [1.5],
             "expected_param_key": "1.5",
             "expected_twin_key": "rs:hyd:gql_dashboard_x:1.5",
+            "expected_hyd_deps_key": "rs:hyd_deps:gql_dashboard_x:1.5",
             "note": "float -> shortest decimal form on both sides"
         },
         {
@@ -75,6 +82,7 @@
             "params": ["a|b", "c"],
             "expected_param_key": "a|b|c",
             "expected_twin_key": "rs:hyd:gql_dashboard_x:a|b|c",
+            "expected_hyd_deps_key": "rs:hyd_deps:gql_dashboard_x:a|b|c",
             "note": "literal pipe in a value: NO escaping on either side - joined strings still match byte-for-byte, structural ambiguity accepted"
         },
         {
@@ -82,6 +90,7 @@
             "params": ["val:with:colons"],
             "expected_param_key": "val:with:colons",
             "expected_twin_key": "rs:hyd:gql_dashboard_x:val:with:colons",
+            "expected_hyd_deps_key": "rs:hyd_deps:gql_dashboard_x:val:with:colons",
             "note": "colons pass through verbatim (twin key parsing is prefix-anchored, never split-based)"
         },
         {
@@ -89,6 +98,7 @@
             "params": [],
             "expected_param_key": "",
             "expected_twin_key": "rs:hyd:gql_dashboard_nonparam:_",
+            "expected_hyd_deps_key": "rs:hyd_deps:gql_dashboard_nonparam:_",
             "expected_idx_key": "rs:hyd_idx:gql_dashboard_nonparam",
             "note": "non-parameterized cache: empty param_key -> `_` placeholder segment"
         }

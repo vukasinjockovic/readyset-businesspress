@@ -255,6 +255,43 @@ pub(crate) fn twin_idx_key(cache_name: &str) -> String {
     format!("rs:hyd_idx:{cache_name}")
 }
 
+/// Phase 3 — unprefixed read-set dependents SET for one twin identity:
+/// `rs:hyd_deps:{cache_name}:{param_key}` (the `_` placeholder mirrors
+/// `twin_key()` for the empty/non-parameterized form).
+///
+/// Contract-locked (`expected_hyd_deps_key` in fixtures/rsc-contract.json;
+/// PHP twin: `RscTwinIdentity::hydDepsKey`). Members are composed-payload
+/// cache keys (rs:gql:*) whose MISS composition read EXACTLY this identity
+/// while its whole read set was twin-promoted; PHP registers them with
+/// SADD + 7d EXPIRE and re-registers on every re-composition.
+pub(crate) fn hyd_deps_key(cache_name: &str, param_key: &str) -> String {
+    if param_key.is_empty() {
+        format!("rs:hyd_deps:{cache_name}:_")
+    } else {
+        format!("rs:hyd_deps:{cache_name}:{param_key}")
+    }
+}
+
+/// Map a twin VALUE key (`rs:hyd:{cache_name}:{param_key}`, `_` form
+/// included) to its read-set dependents SET key. Returns None for non-twin
+/// input (defensive — twin_dels only ever contains twin keys).
+pub(crate) fn hyd_deps_key_for_twin(twin_key: &str) -> Option<String> {
+    twin_key
+        .strip_prefix("rs:hyd:")
+        .map(|identity| format!("rs:hyd_deps:{identity}"))
+}
+
+/// Merge `extra` into `dest`, skipping duplicates (payload keys may be found
+/// both via pdeps/deps AND via a hyd_deps cascade — they must be DELed and
+/// broadcast exactly once).
+pub(crate) fn merge_unique(dest: &mut Vec<String>, extra: impl IntoIterator<Item = String>) {
+    for k in extra {
+        if !dest.contains(&k) {
+            dest.push(k);
+        }
+    }
+}
+
 /// Handle the full invalidation cycle for a cache name.
 ///
 /// For parameterized queries, `key_values` contains the specific parameter values
@@ -290,7 +327,7 @@ async fn handle_invalidation(
     reverb_config: Option<&ReverbConfig>,
     http_client: Option<&reqwest::Client>,
 ) -> Result<(), redis::RedisError> {
-    let dependent_keys: Vec<String>;
+    let mut dependent_keys: Vec<String>;
     // Unprefixed twin keys to drop in the write pipeline (+ whether the
     // per-cache twin index set itself must be dropped — broad path only).
     let mut twin_dels: Vec<String>;
@@ -377,6 +414,48 @@ async fn handle_invalidation(
         drop_twin_idx = true;
     }
 
+    // --- Phase 3: read-set cascade -----------------------------------------
+    // Every dropped twin may carry a `rs:hyd_deps:{cache}:{param_key}` SET of
+    // composed-payload keys whose MISS composition read exactly that identity
+    // (PHP registers them ONLY when the payload's whole read set was
+    // twin-promoted — see RscGraphQLCache::registerHydDeps). Drain them in one
+    // pipelined SMEMBERS round trip, merge the members into dependent_keys —
+    // they then ride the EXISTING write pipeline (DEL key + :stale expansion,
+    // rs:reval marker) and the EXISTING broadcast grouping (authHash
+    // extraction) exactly like pdeps-resolved keys — and DEL the sets
+    // themselves in the write pipeline (payloads re-register on their next
+    // composition). Applies uniformly to granular twins, the `_` twin, and
+    // broad idx-drain twins, and rides the same debounce batching.
+    let hyd_deps_keys: Vec<String> = twin_dels
+        .iter()
+        .filter_map(|t| hyd_deps_key_for_twin(t))
+        .collect();
+    if !hyd_deps_keys.is_empty() {
+        let mut cascade_pipe = redis::pipe();
+        for k in &hyd_deps_keys {
+            cascade_pipe.cmd("SMEMBERS").arg(format!("{}{}", prefix, k));
+        }
+        match cascade_pipe.query_async::<Vec<Vec<String>>>(conn).await {
+            Ok(member_sets) => {
+                let n: usize = member_sets.iter().map(|m| m.len()).sum();
+                if n > 0 {
+                    debug!(
+                        cache_name,
+                        payload_keys = n,
+                        hyd_deps_sets = hyd_deps_keys.len(),
+                        "Phase 3: read-set cascade — twin drop fans out to composed payloads"
+                    );
+                }
+                for members in member_sets {
+                    merge_unique(&mut dependent_keys, members);
+                }
+            }
+            Err(e) => {
+                warn!(%e, cache_name, "Phase 3: hyd_deps SMEMBERS failed — cascade skipped this round");
+            }
+        }
+    }
+
     // Twin drops proceed even with zero registered payload deps — twins exist
     // independently of rs:gql/rs:lw registrations. (twin_dels is never empty:
     // the `_` twin is always included; DEL on absent keys is a no-op.)
@@ -457,6 +536,18 @@ async fn handle_invalidation(
         write_pipe.cmd("DEL")
             .arg(format!("{}{}", prefix, twin_idx_key(cache_name)))
             .ignore();
+    }
+
+    // Phase 3: DEL the drained hyd_deps sets — their member payloads were
+    // just DELed above, and each payload re-registers its (possibly changed)
+    // read set on its next MISS composition. A stale set surviving here would
+    // re-DEL already-recomposed payloads on the next delta.
+    if !hyd_deps_keys.is_empty() {
+        let prefixed: Vec<String> = hyd_deps_keys
+            .iter()
+            .map(|k| format!("{}{}", prefix, k))
+            .collect();
+        write_pipe.cmd("DEL").arg(&prefixed).ignore();
     }
 
     // 3c. Centrifugo XADD (only when ws_server is centrifugo)
@@ -599,6 +690,23 @@ mod tests {
                     "twin_idx_key drifted for cache {cache_name:?}"
                 );
             }
+
+            // Phase 3: the read-set dependents SET key mirrors the twin key
+            // (rs:hyd_deps:{cache}:{param_key}, `_` for empty params), both
+            // when built from the identity AND when mapped from the twin key
+            // (the broad idx-drain path only has twin keys in hand).
+            if let Some(expected_hyd_deps) = row["expected_hyd_deps_key"].as_str() {
+                assert_eq!(
+                    hyd_deps_key(cache_name, param_key),
+                    expected_hyd_deps,
+                    "hyd_deps_key drifted for cache {cache_name:?} param_key {param_key:?}"
+                );
+                assert_eq!(
+                    hyd_deps_key_for_twin(expected_twin).as_deref(),
+                    Some(expected_hyd_deps),
+                    "hyd_deps_key_for_twin drifted for twin {expected_twin:?}"
+                );
+            }
         }
     }
 
@@ -607,5 +715,58 @@ mod tests {
         assert_eq!(twin_key("c", ""), "rs:hyd:c:_");
         assert_eq!(twin_key("c", "a|0"), "rs:hyd:c:a|0");
         assert_eq!(twin_idx_key("c"), "rs:hyd_idx:c");
+        assert_eq!(hyd_deps_key("c", ""), "rs:hyd_deps:c:_");
+        assert_eq!(hyd_deps_key("c", "a|0"), "rs:hyd_deps:c:a|0");
+    }
+
+    /// Phase 3: twin-key → hyd_deps-key mapping is prefix-anchored (param
+    /// keys may contain `:` and `|` freely) and rejects non-twin input.
+    #[test]
+    fn hyd_deps_key_for_twin_maps_and_rejects() {
+        assert_eq!(
+            hyd_deps_key_for_twin("rs:hyd:gql_dashboard_abc:not_sent|0").as_deref(),
+            Some("rs:hyd_deps:gql_dashboard_abc:not_sent|0")
+        );
+        // `_` (non-parameterized) form maps to the `_` deps set
+        assert_eq!(
+            hyd_deps_key_for_twin("rs:hyd:gql_dashboard_abc:_").as_deref(),
+            Some("rs:hyd_deps:gql_dashboard_abc:_")
+        );
+        // colons inside the param segment pass through verbatim
+        assert_eq!(
+            hyd_deps_key_for_twin("rs:hyd:c:val:with:colons").as_deref(),
+            Some("rs:hyd_deps:c:val:with:colons")
+        );
+        // non-twin keys are rejected (incl. the idx and deps namespaces)
+        assert_eq!(hyd_deps_key_for_twin("rs:hyd_idx:c"), None);
+        assert_eq!(hyd_deps_key_for_twin("rs:gql:dashboard:en:a:b"), None);
+        assert_eq!(hyd_deps_key_for_twin("rs:hyd_deps:c:x"), None);
+    }
+
+    /// Phase 3: cascade members merge into dependent_keys without duplicates
+    /// (a payload found via pdeps AND via a hyd_deps set must be DELed and
+    /// broadcast exactly once).
+    #[test]
+    fn merge_unique_dedups_cascade_members() {
+        let mut deps = vec![
+            "rs:gql:dashboard:en:h1:q1".to_string(),
+            "rs:gql:dashboard:en:h1:q2".to_string(),
+        ];
+        merge_unique(
+            &mut deps,
+            vec![
+                "rs:gql:dashboard:en:h1:q2".to_string(), // dup with existing
+                "rs:gql:dashboard:en:h2:q3".to_string(),
+                "rs:gql:dashboard:en:h2:q3".to_string(), // dup within cascade
+            ],
+        );
+        assert_eq!(
+            deps,
+            vec![
+                "rs:gql:dashboard:en:h1:q1".to_string(),
+                "rs:gql:dashboard:en:h1:q2".to_string(),
+                "rs:gql:dashboard:en:h2:q3".to_string(),
+            ]
+        );
     }
 }
