@@ -239,19 +239,15 @@ async fn handle_row_invalidation(
     // --- Write pipeline: DEL cache keys + broadcast (no dep cleanup) ---
     let mut write_pipe = redis::pipe();
 
-    // 2a. DEL all dependent cache keys (with prefix), PLUS their
-    // stale-while-revalidate twins ("{key}:stale", kept by PHP at ~3x TTL).
-    // SWR exists to smooth TTL expiry, not to serve known-stale data: without
-    // this, concurrent clients could be served pre-change data from :stale
-    // for up to the extended TTL if the rebuild fails.
-    let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
-    write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
-
-    // 2b. Revalidation markers: the PHP MISS path checks rs:reval:{key} and,
+    // 2a. Revalidation markers: the PHP MISS path checks rs:reval:{key} and,
     // when present, routes the rebuild's reads to the direct Postgres write
     // connection instead of ReadySet — closing the window where a refetch
     // races the dataflow's replication lag and re-caches pre-change data.
     // 3s TTL: well above typical replication lag, well below cache TTL.
+    //
+    // Phase 5B ORDER CONTRACT: markers BEFORE the DELs, so marker visibility
+    // >= deletion visibility for every concurrent observer (the PHP
+    // post-store guard and the GET-nil/EXISTS MISS path both rely on it).
     for k in &dependent_keys {
         write_pipe.cmd("SETEX")
             .arg(format!("{}rs:reval:{}", prefix, k))
@@ -259,6 +255,14 @@ async fn handle_row_invalidation(
             .arg("1")
             .ignore();
     }
+
+    // 2b. DEL all dependent cache keys (with prefix), PLUS their
+    // stale-while-revalidate twins ("{key}:stale", kept by PHP at ~3x TTL).
+    // SWR exists to smooth TTL expiry, not to serve known-stale data: without
+    // this, concurrent clients could be served pre-change data from :stale
+    // for up to the extended TTL if the rebuild fails.
+    let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
+    write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
 
     // 2c. Centrifugo XADD (only when ws_server is centrifugo)
     let grouped = group_by_auth_hash(&dependent_keys);
@@ -518,13 +522,10 @@ async fn handle_table_invalidation(
     debug!(table = %qualified, keys = dependent_keys.len(), "Tier 3: invalidating declared-dep keys");
 
     let mut write_pipe = redis::pipe();
-    // DEL values AND their ":stale" SWR twins — see handle_row_invalidation.
-    let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
-    write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
-
     // Revalidation markers (rs:reval:{key}, 3s TTL): tell the PHP MISS path
     // to rebuild from the direct Postgres connection instead of ReadySet,
     // closing the replication-lag re-cache race — see handle_row_invalidation.
+    // Phase 5B order contract: markers BEFORE the DELs (see 2a there).
     for k in &dependent_keys {
         write_pipe.cmd("SETEX")
             .arg(format!("{}rs:reval:{}", prefix, k))
@@ -532,6 +533,10 @@ async fn handle_table_invalidation(
             .arg("1")
             .ignore();
     }
+
+    // DEL values AND their ":stale" SWR twins — see handle_row_invalidation.
+    let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
+    write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
 
     let grouped = group_by_auth_hash(&dependent_keys);
 
@@ -581,6 +586,147 @@ pub fn notify_table_change(schema: &str, table: &str) {
         table: table.to_string(),
         qualified: format!("{}.{}", schema, table),
     });
+}
+
+/// Phase 5B: one-shot cold-start flush of the twin layer, fired when
+/// streaming replication (re)starts.
+///
+/// Tier-1 invalidation is EVICTION-sourced. A process restart clears all
+/// materialized reader state; a warm `rs:hyd` twin then short-circuits the
+/// PHP read path (no SQL executes), the reader never re-materializes, and no
+/// delta ever drops that twin again — writes go dark for every warm
+/// twin-mode surface until its TTL (proven live in the Phase 5B battery:
+/// post-restart sentinel writes produced ZERO twin invalidation while the
+/// pilot kept serving HITs). Read-set (HYD) payloads are worse off: they
+/// skipped Tier-2 row_deps by design, so their ONLY invalidation source is
+/// the twin-drop cascade that just went silent.
+///
+/// The flush deletes all twins, twin indexes and hyd_deps sets, plus the
+/// payloads those sets reference (rs:reval markers first — same order
+/// contract as live invalidation), then broadcasts the dropped payload keys
+/// so live browsers refetch. The next read of each surface MISSes ->
+/// re-executes SQL -> re-materializes its reader -> Tier-1 is alive again.
+pub fn startup_twin_flush() {
+    tokio::spawn(async move {
+        if let Err(e) = run_startup_twin_flush().await {
+            warn!(%e, "Startup twin flush failed (twin-mode surfaces may serve stale reads until TTL)");
+        }
+    });
+}
+
+async fn run_startup_twin_flush() -> Result<(), redis::RedisError> {
+    let redis_url = env::var("READYSET_REDIS_URL")
+        .unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+    let prefix = env::var("READYSET_REDIS_PREFIX").unwrap_or_default();
+    let ws_server = env::var("READYSET_WEBSOCKET_SERVER")
+        .unwrap_or_else(|_| "centrifugo".to_string());
+
+    let client = redis::Client::open(redis_url.as_str())?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    // NOTE "rs:hyd:*" does not glob-match "rs:hyd_idx:*"/"rs:hyd_deps:*".
+    let twins = scan_keys(&mut conn, &format!("{}rs:hyd:*", prefix)).await?;
+    let idx_sets = scan_keys(&mut conn, &format!("{}rs:hyd_idx:*", prefix)).await?;
+    let dep_sets = scan_keys(&mut conn, &format!("{}rs:hyd_deps:*", prefix)).await?;
+
+    // Collect the (unprefixed) payload keys the hyd_deps sets reference.
+    let mut payloads: Vec<String> = Vec::new();
+    if !dep_sets.is_empty() {
+        let mut read_pipe = redis::pipe();
+        for s in &dep_sets {
+            read_pipe.cmd("SMEMBERS").arg(s);
+        }
+        let results: Vec<Vec<String>> = read_pipe.query_async(&mut conn).await?;
+        for members in results {
+            for m in members {
+                if !payloads.contains(&m) {
+                    payloads.push(m);
+                }
+            }
+        }
+    }
+
+    if twins.is_empty() && idx_sets.is_empty() && dep_sets.is_empty() {
+        info!("Startup twin flush: twin layer already cold, nothing to do");
+        return Ok(());
+    }
+
+    let mut write_pipe = redis::pipe();
+    // Order contract: rs:reval markers BEFORE the DELs.
+    for t in &twins {
+        let unprefixed = t.strip_prefix(prefix.as_str()).unwrap_or(t);
+        write_pipe.cmd("SETEX")
+            .arg(format!("{}rs:reval:{}", prefix, unprefixed))
+            .arg(3)
+            .arg("1")
+            .ignore();
+    }
+    for p in &payloads {
+        write_pipe.cmd("SETEX")
+            .arg(format!("{}rs:reval:{}", prefix, p))
+            .arg(3)
+            .arg("1")
+            .ignore();
+    }
+    if !twins.is_empty() {
+        write_pipe.cmd("DEL").arg(&twins).ignore();
+    }
+    if !payloads.is_empty() {
+        // expand_keys_for_del adds the prefix AND the ":stale" companions.
+        let prefixed = reverb_http::expand_keys_for_del(&prefix, &payloads);
+        write_pipe.cmd("DEL").arg(&prefixed).ignore();
+    }
+    if !idx_sets.is_empty() {
+        write_pipe.cmd("DEL").arg(&idx_sets).ignore();
+    }
+    if !dep_sets.is_empty() {
+        write_pipe.cmd("DEL").arg(&dep_sets).ignore();
+    }
+    write_pipe.query_async::<()>(&mut conn).await?;
+
+    info!(twins = twins.len(), idx_sets = idx_sets.len(),
+          hyd_deps_sets = dep_sets.len(), payloads = payloads.len(),
+          "Startup twin flush: cold-start twin layer cleared (Tier-1 is eviction-sourced; readers must re-materialize)");
+
+    // Broadcast the dropped payload keys so live browsers refetch.
+    if ws_server == "reverb" && !payloads.is_empty() {
+        if let Some(cfg) = ReverbConfig::from_env() {
+            if let Ok(http) = reqwest::Client::builder()
+                .timeout(Duration::from_millis(500))
+                .build()
+            {
+                let grouped = group_by_auth_hash(&payloads);
+                reverb_http::broadcast_to_reverb(&cfg, &http, &grouped).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Full incremental SCAN (never KEYS) for a match pattern.
+async fn scan_keys(
+    conn: &mut redis::aio::MultiplexedConnection,
+    pattern: &str,
+) -> Result<Vec<String>, redis::RedisError> {
+    let mut keys = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(500)
+            .query_async(conn)
+            .await?;
+        keys.extend(batch);
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
+    Ok(keys)
 }
 
 #[cfg(test)]

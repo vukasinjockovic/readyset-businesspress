@@ -496,6 +496,10 @@ impl<'a> NoriaAdapter<'a> {
         let _ = controller_tx.send(ControllerMessage::SnapshotDone);
 
         info!(position = %current_pos, "Streaming replication started");
+        // Phase 5B: Tier-1 is eviction-sourced and reader state did not
+        // survive the restart — flush the twin layer so warm twins cannot
+        // serve permanently-stale HITs (see redis_notifier::startup_twin_flush).
+        crate::redis_notifier::startup_twin_flush();
         if let Err(err) = adapter
             .main_loop(&mut current_pos, None, controller_tx, replicator_rx)
             .await
@@ -777,6 +781,8 @@ impl<'a> NoriaAdapter<'a> {
         let _ = controller_tx.send(ControllerMessage::SnapshotDone);
 
         info!(position = %min_pos, "Streaming replication started");
+        // Phase 5B: see the matching call above — cold-start twin flush.
+        crate::redis_notifier::startup_twin_flush();
         if let Err(err) = adapter
             .main_loop(&mut min_pos, None, controller_tx, replicator_rx)
             .await

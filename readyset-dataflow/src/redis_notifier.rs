@@ -26,7 +26,7 @@ use tracing::{error, info, warn, debug};
 /// Invalidation message: cache name + optional per-parameter key values.
 /// When key_values is non-empty, only the specific parameter values are invalidated.
 /// When empty, the entire cache (all parameter values) is invalidated.
-struct InvalidationMsg {
+pub(crate) struct InvalidationMsg {
     cache_name: String,
     key_values: Vec<String>,
 }
@@ -152,16 +152,10 @@ fn get_or_init_tx() -> &'static mpsc::UnboundedSender<InvalidationMsg> {
                         }
                     }
 
-                    // Deduplicate by cache_name — merge key_values across messages
-                    let mut dedup: HashMap<String, Vec<String>> = HashMap::new();
-                    for msg in &batch {
-                        let entry = dedup.entry(msg.cache_name.clone()).or_default();
-                        for kv in &msg.key_values {
-                            if !entry.contains(kv) {
-                                entry.push(kv.clone());
-                            }
-                        }
-                    }
+                    // Deduplicate by cache_name — merge key_values across messages.
+                    // Broad (empty key_values) is ABSORBING per cache_name: see
+                    // merge_debounce_batch.
+                    let dedup = merge_debounce_batch(&batch);
 
                     debug!(debounce_ms, batch_size = batch.len(), unique = dedup.len(), "Debounce: batched Tier 1 messages");
 
@@ -279,6 +273,43 @@ pub(crate) fn hyd_deps_key_for_twin(twin_key: &str) -> Option<String> {
     twin_key
         .strip_prefix("rs:hyd:")
         .map(|identity| format!("rs:hyd_deps:{identity}"))
+}
+
+/// Merge one debounce window's messages per cache_name into the key_values
+/// list handle_invalidation consumes (empty = broad, whole-cache).
+///
+/// Broad is ABSORBING: one broad message (empty key_values) makes the merged
+/// entry broad, regardless of what granular messages share the window. The
+/// pre-fix code merged by appending key_values only, so a broad message
+/// merged with granular ones for the SAME cache_name was silently demoted to
+/// granular — the idx drain (`rs:hyd_idx` members for params outside the
+/// window), the broad `rs:deps` lookup and the hyd_deps sets of un-named
+/// param twins were all SKIPPED for that window, and nothing ever replayed
+/// them (a "delayed" broad drop only happens if a later window is broad-only).
+/// Broad ⊇ granular for every artifact class (PHP always registers
+/// `rs:deps:{cache}` alongside pdeps — RscGraphQLCache::registerDeps — and
+/// `rs:hyd_idx` indexes every stored twin), so absorbing into broad can only
+/// over-invalidate, never under-invalidate.
+pub(crate) fn merge_debounce_batch(batch: &[InvalidationMsg]) -> HashMap<String, Vec<String>> {
+    let mut dedup: HashMap<String, (bool, Vec<String>)> = HashMap::new();
+    for msg in batch {
+        let entry = dedup
+            .entry(msg.cache_name.clone())
+            .or_insert_with(|| (false, Vec::new()));
+        if msg.key_values.is_empty() {
+            // Broad message — absorb: drop any granular keys already merged
+            // and ignore any that follow in this window.
+            entry.0 = true;
+            entry.1.clear();
+        } else if !entry.0 {
+            for kv in &msg.key_values {
+                if !entry.1.contains(kv) {
+                    entry.1.push(kv.clone());
+                }
+            }
+        }
+    }
+    dedup.into_iter().map(|(name, (_, kvs))| (name, kvs)).collect()
 }
 
 /// Merge `extra` into `dest`, skipping duplicates (payload keys may be found
@@ -498,13 +529,19 @@ async fn handle_invalidation(
         // this, concurrent clients could be served pre-change data from :stale
         // for up to the extended TTL if the rebuild fails.
         let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
-        write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
 
         // Revalidation markers: the PHP MISS path checks rs:reval:{key} and, when
         // present, routes the rebuild's reads to the direct Postgres write
         // connection instead of ReadySet — closing the window where a refetch
         // races the dataflow's replication lag and re-caches pre-change data.
         // 3s TTL: well above typical replication lag, well below cache TTL.
+        //
+        // Phase 5B ORDER CONTRACT: markers are SETEXed BEFORE the DELs so that
+        // marker visibility >= deletion visibility for every concurrent
+        // observer. Pipelined commands are not atomic — with DEL first, a PHP
+        // reader could observe the deletion (GET nil / its post-store re-check)
+        // while EXISTS rs:reval still returns 0, and rebuild-or-keep a
+        // pre-delta value that nothing ever invalidates again.
         for k in &dependent_keys {
             write_pipe.cmd("SETEX")
                 .arg(format!("{}rs:reval:{}", prefix, k))
@@ -512,6 +549,7 @@ async fn handle_invalidation(
                 .arg("1")
                 .ignore();
         }
+        write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
     }
 
     // Hydrated twins: DEL each affected twin (no `:stale` companions — twins
@@ -523,7 +561,7 @@ async fn handle_invalidation(
             .iter()
             .map(|k| format!("{}{}", prefix, k))
             .collect();
-        write_pipe.cmd("DEL").arg(&twin_prefixed).ignore();
+        // Same Phase 5B order contract as above: marker before DEL.
         for k in &twin_dels {
             write_pipe.cmd("SETEX")
                 .arg(format!("{}rs:reval:{}", prefix, k))
@@ -531,6 +569,7 @@ async fn handle_invalidation(
                 .arg("1")
                 .ignore();
         }
+        write_pipe.cmd("DEL").arg(&twin_prefixed).ignore();
     }
     if drop_twin_idx {
         write_pipe.cmd("DEL")
@@ -741,6 +780,57 @@ mod tests {
         assert_eq!(hyd_deps_key_for_twin("rs:hyd_idx:c"), None);
         assert_eq!(hyd_deps_key_for_twin("rs:gql:dashboard:en:a:b"), None);
         assert_eq!(hyd_deps_key_for_twin("rs:hyd_deps:c:x"), None);
+    }
+
+    fn msg(cache: &str, kvs: &[&str]) -> InvalidationMsg {
+        InvalidationMsg {
+            cache_name: cache.to_string(),
+            key_values: kvs.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Phase 5A fix: a broad message (empty key_values) in a debounce window
+    /// must make the merged entry for that cache_name broad — in EITHER
+    /// arrival order. The pre-fix append-only merge demoted broad to granular,
+    /// skipping the idx drain / broad deps for that window with no replay.
+    #[test]
+    fn debounce_merge_broad_absorbs_granular() {
+        // granular then broad
+        let merged = merge_debounce_batch(&[
+            msg("c1", &["a|0"]),
+            msg("c1", &[]),
+        ]);
+        assert_eq!(merged["c1"], Vec::<String>::new(), "broad after granular must stay broad");
+
+        // broad then granular
+        let merged = merge_debounce_batch(&[
+            msg("c1", &[]),
+            msg("c1", &["a|0", "b|1"]),
+        ]);
+        assert_eq!(merged["c1"], Vec::<String>::new(), "granular after broad must not resurrect granular");
+
+        // granular sandwiched by broad, plus an unrelated granular cache
+        let merged = merge_debounce_batch(&[
+            msg("c1", &["a|0"]),
+            msg("c2", &["x"]),
+            msg("c1", &[]),
+            msg("c1", &["b|1"]),
+        ]);
+        assert_eq!(merged["c1"], Vec::<String>::new());
+        assert_eq!(merged["c2"], vec!["x".to_string()], "other caches keep their granular keys");
+    }
+
+    /// Granular-only windows keep the original dedup'd merge semantics.
+    #[test]
+    fn debounce_merge_granular_dedups_and_broad_only_stays_broad() {
+        let merged = merge_debounce_batch(&[
+            msg("c1", &["a|0"]),
+            msg("c1", &["a|0", "b|1"]),
+        ]);
+        assert_eq!(merged["c1"], vec!["a|0".to_string(), "b|1".to_string()]);
+
+        let merged = merge_debounce_batch(&[msg("c3", &[]), msg("c3", &[])]);
+        assert_eq!(merged["c3"], Vec::<String>::new());
     }
 
     /// Phase 3: cascade members merge into dependent_keys without duplicates
