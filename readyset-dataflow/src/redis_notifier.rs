@@ -208,7 +208,20 @@ fn get_or_init_tx() -> &'static mpsc::UnboundedSender<InvalidationMsg> {
 /// - `rs:t1_live:{cache_name}`  — ground-truth delta-liveness registry; the
 ///   Phase-2 twin eligibility gate consumes this ("this cache's delta path is
 ///   alive"). Value = unix timestamp of the last delivered delta, TTL 7 days.
-fn add_liveness_cmds(pipe: &mut redis::Pipeline, prefix: &str, cache_name: &str) {
+/// - `rs:t1_echo:{cache_name}`  — identity echo (Phase-5 condition C1): a
+///   sample of the param_key THIS ENGINE actually emits for the cache, written
+///   on GRANULAR deltas only (`echo_sample = Some(...)`). PHP's promotion gate
+///   compares its own binding arity against the echoed arity before granting
+///   `rs:twin_on` — a shape whose PHP param encoding disagrees with the
+///   engine's emission (inlined-literal params, multi-value collapsed-IN
+///   reads) must never store twins the engine cannot drop. Broad deltas carry
+///   no param_key and write no echo.
+fn add_liveness_cmds(
+    pipe: &mut redis::Pipeline,
+    prefix: &str,
+    cache_name: &str,
+    echo_sample: Option<&str>,
+) {
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -224,6 +237,20 @@ fn add_liveness_cmds(pipe: &mut redis::Pipeline, prefix: &str, cache_name: &str)
         .arg(7 * 86400)
         .arg(now_ts)
         .ignore();
+    if let Some(sample) = echo_sample {
+        pipe.cmd("SETEX")
+            .arg(format!("{}{}", prefix, t1_echo_key(cache_name)))
+            .arg(7 * 86400)
+            .arg(sample)
+            .ignore();
+    }
+}
+
+/// Unprefixed identity-echo key (see `add_liveness_cmds`). PHP twin:
+/// `RscTwinIdentity::echoKey` — the promotion gate GETs this and compares
+/// arity (`substr_count('|') + 1`) against its own binding count.
+pub(crate) fn t1_echo_key(cache_name: &str) -> String {
+    format!("rs:t1_echo:{cache_name}")
 }
 
 /// Unprefixed hydrated-twin value key for a `(cache_name, param_key)` pair.
@@ -369,7 +396,9 @@ async fn handle_invalidation(
         // (plus the delta-liveness telemetry, piggybacked on the same round trip)
         let mut pdep_keys: Vec<String> = Vec::new();
         let mut read_pipe = redis::pipe();
-        add_liveness_cmds(&mut read_pipe, prefix, cache_name);
+        // Granular delta — echo a sample emitted param_key (all emissions for
+        // one cache share the reader's key-column arity, so any sample works).
+        add_liveness_cmds(&mut read_pipe, prefix, cache_name, Some(&key_values[0]));
         for param_key in key_values {
             let pdep_key = format!("{}rs:pdeps:{}:{}", prefix, cache_name, param_key);
             read_pipe.cmd("SMEMBERS").arg(&pdep_key);
@@ -420,7 +449,8 @@ async fn handle_invalidation(
         let dep_key = format!("{}rs:deps:{}", prefix, cache_name);
         let idx_key = format!("{}{}", prefix, twin_idx_key(cache_name));
         let mut read_pipe = redis::pipe();
-        add_liveness_cmds(&mut read_pipe, prefix, cache_name);
+        // Broad delta — no param_key exists, so no identity echo is written.
+        add_liveness_cmds(&mut read_pipe, prefix, cache_name, None);
         read_pipe.cmd("SMEMBERS").arg(&dep_key);
         read_pipe.cmd("SMEMBERS").arg(&idx_key);
         let idx_members: Vec<String>;
@@ -756,6 +786,26 @@ mod tests {
         assert_eq!(twin_idx_key("c"), "rs:hyd_idx:c");
         assert_eq!(hyd_deps_key("c", ""), "rs:hyd_deps:c:_");
         assert_eq!(hyd_deps_key("c", "a|0"), "rs:hyd_deps:c:a|0");
+        assert_eq!(t1_echo_key("c"), "rs:t1_echo:c");
+    }
+
+    /// C1 identity-echo gate: granular deltas write the echo (a sample
+    /// emitted param_key), broad deltas do not — the echo's ABSENCE is what
+    /// keeps never-granular parameterized shapes unpromotable on the PHP side.
+    #[test]
+    fn liveness_cmds_echo_only_on_granular() {
+        let mut granular = redis::pipe();
+        add_liveness_cmds(&mut granular, "pfx-", "c1", Some("not_sent|0"));
+        let packed = String::from_utf8_lossy(&granular.get_packed_pipeline()).into_owned();
+        assert!(packed.contains("pfx-rs:t1_echo:c1"), "granular must write the echo key");
+        assert!(packed.contains("not_sent|0"), "echo value must be the emitted param_key sample");
+        assert!(packed.contains("pfx-rs:t1_live:c1"));
+
+        let mut broad = redis::pipe();
+        add_liveness_cmds(&mut broad, "pfx-", "c1", None);
+        let packed = String::from_utf8_lossy(&broad.get_packed_pipeline()).into_owned();
+        assert!(!packed.contains("rs:t1_echo"), "broad must NOT write an echo");
+        assert!(packed.contains("pfx-rs:t1_live:c1"));
     }
 
     /// Phase 3: twin-key → hyd_deps-key mapping is prefix-anchored (param
