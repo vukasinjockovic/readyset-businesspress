@@ -31,6 +31,43 @@ static ROW_CHANGE_TX: OnceLock<mpsc::UnboundedSender<RowChangeMsg>> = OnceLock::
 
 const ROW_CHANGES_CHANNEL: &str = "readyset:row_changes";
 
+/// TTL in milliseconds for `rs:reval:{key}` revalidation markers
+/// (READYSET_REVAL_TTL_MS, default 3000). The 3s legacy size predates the
+/// latency work — write→invalidation is measured at p50 11.4ms / max 16.9ms,
+/// so deployments size this down (250ms ≈ 15x the measured max) to stop the
+/// reval window from destroying the HIT rate under write churn. Parsed once.
+static REVAL_TTL_MS: OnceLock<u64> = OnceLock::new();
+
+fn reval_ttl_ms() -> u64 {
+    *REVAL_TTL_MS.get_or_init(|| {
+        let ttl = parse_reval_ttl_ms(env::var("READYSET_REVAL_TTL_MS").ok().as_deref());
+        info!(reval_ttl_ms = ttl, "rs:reval marker TTL: {}ms", ttl);
+        ttl
+    })
+}
+
+/// Parse the READYSET_REVAL_TTL_MS value. Unset, unparsable or zero all fall
+/// back to the legacy 3000ms default (a 0ms marker would expire before any
+/// concurrent observer could see it, silently voiding the reval guard).
+fn parse_reval_ttl_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(3000)
+}
+
+/// Queue a `SET {prefix}rs:reval:{key} 1 PX {ttl_ms}` marker on `pipe`.
+/// PX (millisecond expiry) replaces the old `SETEX <key> 3 1` — SETEX cannot
+/// express sub-second TTLs. Phase 5B ORDER CONTRACT unchanged: callers must
+/// queue markers BEFORE the DELs in the same pipeline.
+fn add_reval_marker(pipe: &mut redis::Pipeline, prefix: &str, key: &str, ttl_ms: u64) {
+    pipe.cmd("SET")
+        .arg(format!("{}rs:reval:{}", prefix, key))
+        .arg("1")
+        .arg("PX")
+        .arg(ttl_ms)
+        .ignore();
+}
+
 fn get_or_init_row_tx() -> &'static mpsc::UnboundedSender<RowChangeMsg> {
     ROW_CHANGE_TX.get_or_init(|| {
         let (tx, mut rx) = mpsc::unbounded_channel::<RowChangeMsg>();
@@ -243,17 +280,15 @@ async fn handle_row_invalidation(
     // when present, routes the rebuild's reads to the direct Postgres write
     // connection instead of ReadySet — closing the window where a refetch
     // races the dataflow's replication lag and re-caches pre-change data.
-    // 3s TTL: well above typical replication lag, well below cache TTL.
+    // TTL = READYSET_REVAL_TTL_MS (default 3000ms): well above replication
+    // lag (measured max 16.9ms), well below cache TTL.
     //
     // Phase 5B ORDER CONTRACT: markers BEFORE the DELs, so marker visibility
     // >= deletion visibility for every concurrent observer (the PHP
     // post-store guard and the GET-nil/EXISTS MISS path both rely on it).
+    let reval_ttl = reval_ttl_ms();
     for k in &dependent_keys {
-        write_pipe.cmd("SETEX")
-            .arg(format!("{}rs:reval:{}", prefix, k))
-            .arg(3)
-            .arg("1")
-            .ignore();
+        add_reval_marker(&mut write_pipe, prefix, k, reval_ttl);
     }
 
     // 2b. DEL all dependent cache keys (with prefix), PLUS their
@@ -522,16 +557,14 @@ async fn handle_table_invalidation(
     debug!(table = %qualified, keys = dependent_keys.len(), "Tier 3: invalidating declared-dep keys");
 
     let mut write_pipe = redis::pipe();
-    // Revalidation markers (rs:reval:{key}, 3s TTL): tell the PHP MISS path
-    // to rebuild from the direct Postgres connection instead of ReadySet,
-    // closing the replication-lag re-cache race — see handle_row_invalidation.
+    // Revalidation markers (rs:reval:{key}, TTL READYSET_REVAL_TTL_MS,
+    // default 3000ms): tell the PHP MISS path to rebuild from the direct
+    // Postgres connection instead of ReadySet, closing the replication-lag
+    // re-cache race — see handle_row_invalidation.
     // Phase 5B order contract: markers BEFORE the DELs (see 2a there).
+    let reval_ttl = reval_ttl_ms();
     for k in &dependent_keys {
-        write_pipe.cmd("SETEX")
-            .arg(format!("{}rs:reval:{}", prefix, k))
-            .arg(3)
-            .arg("1")
-            .ignore();
+        add_reval_marker(&mut write_pipe, prefix, k, reval_ttl);
     }
 
     // DEL values AND their ":stale" SWR twins — see handle_row_invalidation.
@@ -672,20 +705,13 @@ async fn run_startup_twin_flush() -> Result<(), redis::RedisError> {
 
     let mut write_pipe = redis::pipe();
     // Order contract: rs:reval markers BEFORE the DELs.
+    let reval_ttl = reval_ttl_ms();
     for t in &twins {
         let unprefixed = t.strip_prefix(prefix.as_str()).unwrap_or(t);
-        write_pipe.cmd("SETEX")
-            .arg(format!("{}rs:reval:{}", prefix, unprefixed))
-            .arg(3)
-            .arg("1")
-            .ignore();
+        add_reval_marker(&mut write_pipe, &prefix, unprefixed, reval_ttl);
     }
     for p in &payloads {
-        write_pipe.cmd("SETEX")
-            .arg(format!("{}rs:reval:{}", prefix, p))
-            .arg(3)
-            .arg("1")
-            .ignore();
+        add_reval_marker(&mut write_pipe, &prefix, p, reval_ttl);
     }
     if !twins.is_empty() {
         write_pipe.cmd("DEL").arg(&twins).ignore();
@@ -784,5 +810,31 @@ mod tests {
         assert!(ops.iter().any(|o| o.eq_ignore_ascii_case("insert")));
         assert!(!ops.iter().any(|o| o.eq_ignore_ascii_case("UPDATE")));
         assert!(!ops.iter().any(|o| o.eq_ignore_ascii_case("DELETE")));
+    }
+
+    /// READYSET_REVAL_TTL_MS parsing: unset/garbage/zero fall back to the
+    /// legacy 3000ms default; a set value is honored (deployment: 250).
+    #[test]
+    fn test_reval_ttl_ms_parses_env_with_3000_default() {
+        assert_eq!(parse_reval_ttl_ms(None), 3000);
+        assert_eq!(parse_reval_ttl_ms(Some("250")), 250);
+        assert_eq!(parse_reval_ttl_ms(Some("")), 3000);
+        assert_eq!(parse_reval_ttl_ms(Some("abc")), 3000);
+        assert_eq!(parse_reval_ttl_ms(Some("0")), 3000);
+    }
+
+    /// The marker command is `SET {prefix}rs:reval:{key} 1 PX {ttl_ms}` —
+    /// PX millisecond expiry (SETEX cannot express sub-second TTLs), value
+    /// and key name unchanged from the legacy SETEX shape.
+    #[test]
+    fn test_reval_marker_emits_set_px_with_configured_ttl() {
+        let mut pipe = redis::pipe();
+        add_reval_marker(&mut pipe, "pfx-", "rs:gql:dashboard:en:anon:q1", parse_reval_ttl_ms(Some("250")));
+        let packed = String::from_utf8_lossy(&pipe.get_packed_pipeline()).into_owned();
+        assert!(packed.contains("SET"), "must use SET (not SETEX)");
+        assert!(!packed.contains("SETEX"), "SETEX cannot express sub-second TTLs");
+        assert!(packed.contains("pfx-rs:reval:rs:gql:dashboard:en:anon:q1"), "marker key unchanged");
+        assert!(packed.contains("PX"), "must use PX millisecond expiry");
+        assert!(packed.contains("250"), "configured TTL must be emitted");
     }
 }

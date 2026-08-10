@@ -37,6 +37,48 @@ static INVALIDATION_TX: OnceLock<mpsc::UnboundedSender<InvalidationMsg>> = OnceL
 /// The Redis channel name for query-level invalidations (Tier 1).
 const INVALIDATION_CHANNEL: &str = "readyset:invalidations";
 
+/// TTL in milliseconds for `rs:reval:{key}` revalidation markers
+/// (READYSET_REVAL_TTL_MS, default 3000). The 3s legacy size predates the
+/// latency work — write→invalidation is measured at p50 11.4ms / max 16.9ms,
+/// so deployments size this down (250ms ≈ 15x the measured max) to stop the
+/// reval window from destroying the HIT rate under write churn. Parsed once.
+static REVAL_TTL_MS: OnceLock<u64> = OnceLock::new();
+
+fn reval_ttl_ms() -> u64 {
+    *REVAL_TTL_MS.get_or_init(|| {
+        let ttl = parse_reval_ttl_ms(env::var("READYSET_REVAL_TTL_MS").ok().as_deref());
+        info!(reval_ttl_ms = ttl, "rs:reval marker TTL: {}ms", ttl);
+        ttl
+    })
+}
+
+/// Parse the READYSET_REVAL_TTL_MS value. Unset, unparsable or zero all fall
+/// back to the legacy 3000ms default (a 0ms marker would expire before any
+/// concurrent observer could see it, silently voiding the reval guard).
+pub(crate) fn parse_reval_ttl_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(3000)
+}
+
+/// Queue a `SET {prefix}rs:reval:{key} 1 PX {ttl_ms}` marker on `pipe`.
+/// PX (millisecond expiry) replaces the old `SETEX <key> 3 1` — SETEX cannot
+/// express sub-second TTLs. Phase 5B ORDER CONTRACT unchanged: callers must
+/// queue markers BEFORE the DELs in the same pipeline.
+pub(crate) fn add_reval_marker(
+    pipe: &mut redis::Pipeline,
+    prefix: &str,
+    key: &str,
+    ttl_ms: u64,
+) {
+    pipe.cmd("SET")
+        .arg(format!("{}rs:reval:{}", prefix, key))
+        .arg("1")
+        .arg("PX")
+        .arg(ttl_ms)
+        .ignore();
+}
+
 /// Lazily initialize the background Redis publisher task.
 fn get_or_init_tx() -> &'static mpsc::UnboundedSender<InvalidationMsg> {
     INVALIDATION_TX.get_or_init(|| {
@@ -365,10 +407,11 @@ pub(crate) fn merge_unique(dest: &mut Vec<String>, extra: impl IntoIterator<Item
 /// - granular: one DEL per affected param_key, plus the `_` (empty-params) twin
 /// - broad: the `_` twin plus every member of `rs:hyd_idx:{cache_name}` (the
 ///   per-cache index SET maintained by PHP at store time), then the index itself
-/// Every dropped twin also gets a 3s `rs:reval:{twin_key}` marker so the PHP
-/// refill inside the replication-lag window routes to direct Postgres and does
-/// NOT store (same guard as the payload keys). Twin keys are server-side only
-/// and are never broadcast.
+/// Every dropped twin also gets a `rs:reval:{twin_key}` marker (TTL
+/// READYSET_REVAL_TTL_MS, default 3000ms) so the PHP refill inside the
+/// replication-lag window routes to direct Postgres and does NOT store (same
+/// guard as the payload keys). Twin keys are server-side only and are never
+/// broadcast.
 ///
 /// Uses Redis pipelines to minimize round-trips:
 /// - Phase 1 (read): pipeline SMEMBERS for dep resolution (pdeps or broad deps
@@ -551,6 +594,7 @@ async fn handle_invalidation(
     // - TTL on deps (set by PHP) provides natural cleanup
     // - Worker recycling (--max-requests) prevents unbounded accumulation
     let mut write_pipe = redis::pipe();
+    let reval_ttl = reval_ttl_ms();
 
     if !dependent_keys.is_empty() {
         // DEL all affected RSC cache keys (with prefix), PLUS their
@@ -564,26 +608,23 @@ async fn handle_invalidation(
         // present, routes the rebuild's reads to the direct Postgres write
         // connection instead of ReadySet — closing the window where a refetch
         // races the dataflow's replication lag and re-caches pre-change data.
-        // 3s TTL: well above typical replication lag, well below cache TTL.
+        // TTL = READYSET_REVAL_TTL_MS (default 3000ms): well above replication
+        // lag (measured max 16.9ms), well below cache TTL.
         //
-        // Phase 5B ORDER CONTRACT: markers are SETEXed BEFORE the DELs so that
+        // Phase 5B ORDER CONTRACT: markers are queued BEFORE the DELs so that
         // marker visibility >= deletion visibility for every concurrent
         // observer. Pipelined commands are not atomic — with DEL first, a PHP
         // reader could observe the deletion (GET nil / its post-store re-check)
         // while EXISTS rs:reval still returns 0, and rebuild-or-keep a
         // pre-delta value that nothing ever invalidates again.
         for k in &dependent_keys {
-            write_pipe.cmd("SETEX")
-                .arg(format!("{}rs:reval:{}", prefix, k))
-                .arg(3)
-                .arg("1")
-                .ignore();
+            add_reval_marker(&mut write_pipe, prefix, k, reval_ttl);
         }
         write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
     }
 
     // Hydrated twins: DEL each affected twin (no `:stale` companions — twins
-    // have none) + the same 3s rs:reval marker so a TwinStore refill inside
+    // have none) + the same rs:reval marker so a TwinStore refill inside
     // the replication-lag window reads direct Postgres and skips storing.
     // Twin keys are server-side only: intentionally NOT broadcast.
     if !twin_dels.is_empty() {
@@ -593,11 +634,7 @@ async fn handle_invalidation(
             .collect();
         // Same Phase 5B order contract as above: marker before DEL.
         for k in &twin_dels {
-            write_pipe.cmd("SETEX")
-                .arg(format!("{}rs:reval:{}", prefix, k))
-                .arg(3)
-                .arg("1")
-                .ignore();
+            add_reval_marker(&mut write_pipe, prefix, k, reval_ttl);
         }
         write_pipe.cmd("DEL").arg(&twin_prefixed).ignore();
     }
@@ -806,6 +843,36 @@ mod tests {
         let packed = String::from_utf8_lossy(&broad.get_packed_pipeline()).into_owned();
         assert!(!packed.contains("rs:t1_echo"), "broad must NOT write an echo");
         assert!(packed.contains("pfx-rs:t1_live:c1"));
+    }
+
+    /// READYSET_REVAL_TTL_MS parsing: unset/garbage/zero fall back to the
+    /// legacy 3000ms default; a set value is honored (deployment: 250).
+    #[test]
+    fn reval_ttl_ms_parses_env_with_3000_default() {
+        assert_eq!(parse_reval_ttl_ms(None), 3000);
+        assert_eq!(parse_reval_ttl_ms(Some("250")), 250);
+        assert_eq!(parse_reval_ttl_ms(Some(" 250 ")), 250);
+        assert_eq!(parse_reval_ttl_ms(Some("3000")), 3000);
+        assert_eq!(parse_reval_ttl_ms(Some("")), 3000);
+        assert_eq!(parse_reval_ttl_ms(Some("abc")), 3000);
+        assert_eq!(parse_reval_ttl_ms(Some("-1")), 3000);
+        // 0 would expire before any observer sees the marker — rejected
+        assert_eq!(parse_reval_ttl_ms(Some("0")), 3000);
+    }
+
+    /// The marker command is `SET {prefix}rs:reval:{key} 1 PX {ttl_ms}` —
+    /// PX millisecond expiry (SETEX cannot express sub-second TTLs), value
+    /// and key name unchanged from the legacy SETEX shape.
+    #[test]
+    fn reval_marker_emits_set_px_with_configured_ttl() {
+        let mut pipe = redis::pipe();
+        add_reval_marker(&mut pipe, "pfx-", "rs:hyd:c1:a|0", parse_reval_ttl_ms(Some("250")));
+        let packed = String::from_utf8_lossy(&pipe.get_packed_pipeline()).into_owned();
+        assert!(packed.contains("SET"), "must use SET (not SETEX)");
+        assert!(!packed.contains("SETEX"), "SETEX cannot express sub-second TTLs");
+        assert!(packed.contains("pfx-rs:reval:rs:hyd:c1:a|0"), "marker key unchanged");
+        assert!(packed.contains("PX"), "must use PX millisecond expiry");
+        assert!(packed.contains("250"), "configured TTL must be emitted");
     }
 
     /// Phase 3: twin-key → hyd_deps-key mapping is prefix-anchored (param
