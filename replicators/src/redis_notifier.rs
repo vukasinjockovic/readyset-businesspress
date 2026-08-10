@@ -629,6 +629,19 @@ async fn run_startup_twin_flush() -> Result<(), redis::RedisError> {
     let idx_sets = scan_keys(&mut conn, &format!("{}rs:hyd_idx:*", prefix)).await?;
     let dep_sets = scan_keys(&mut conn, &format!("{}rs:hyd_deps:*", prefix)).await?;
 
+    // Liveness / echo / promotion flags must be RE-PROVEN after a restart,
+    // not carried over: restart clears reader state, and a cache may not
+    // even exist in the rebuilt engine (upstream-sync 2026-08-10 finding:
+    // after a restore failure the stale rs:twin_on + rs:t1_live let
+    // TwinStore keep twin-serving a reader-less cache — reads were rebuilt
+    // from proxied SQL, twins re-stored, and Tier-1 stayed permanently
+    // dark). Dropping the flags forces every surface back through observed
+    // delta-liveness before it can promote again; rs:twin_off (operator
+    // demotion) is deliberately kept.
+    let live_flags = scan_keys(&mut conn, &format!("{}rs:t1_live:*", prefix)).await?;
+    let echo_flags = scan_keys(&mut conn, &format!("{}rs:t1_echo:*", prefix)).await?;
+    let promo_flags = scan_keys(&mut conn, &format!("{}rs:twin_on:*", prefix)).await?;
+
     // Collect the (unprefixed) payload keys the hyd_deps sets reference.
     let mut payloads: Vec<String> = Vec::new();
     if !dep_sets.is_empty() {
@@ -646,7 +659,13 @@ async fn run_startup_twin_flush() -> Result<(), redis::RedisError> {
         }
     }
 
-    if twins.is_empty() && idx_sets.is_empty() && dep_sets.is_empty() {
+    if twins.is_empty()
+        && idx_sets.is_empty()
+        && dep_sets.is_empty()
+        && live_flags.is_empty()
+        && echo_flags.is_empty()
+        && promo_flags.is_empty()
+    {
         info!("Startup twin flush: twin layer already cold, nothing to do");
         return Ok(());
     }
@@ -682,11 +701,18 @@ async fn run_startup_twin_flush() -> Result<(), redis::RedisError> {
     if !dep_sets.is_empty() {
         write_pipe.cmd("DEL").arg(&dep_sets).ignore();
     }
+    for flags in [&live_flags, &echo_flags, &promo_flags] {
+        if !flags.is_empty() {
+            write_pipe.cmd("DEL").arg(flags.as_slice()).ignore();
+        }
+    }
     write_pipe.query_async::<()>(&mut conn).await?;
 
     info!(twins = twins.len(), idx_sets = idx_sets.len(),
           hyd_deps_sets = dep_sets.len(), payloads = payloads.len(),
-          "Startup twin flush: cold-start twin layer cleared (Tier-1 is eviction-sourced; readers must re-materialize)");
+          live_flags = live_flags.len(), echo_flags = echo_flags.len(),
+          promo_flags = promo_flags.len(),
+          "Startup twin flush: cold-start twin layer cleared (Tier-1 is eviction-sourced; readers must re-materialize and liveness must be re-proven)");
 
     // Broadcast the dropped payload keys so live browsers refetch.
     if ws_server == "reverb" && !payloads.is_empty() {
