@@ -1120,6 +1120,27 @@ where
             )
         }
 
+        // RSC deep-mode startup assertion (upstream-sync ruling, 2026-08-10):
+        // the RSC Redis bridge is delta/eviction-sourced and depends on deep
+        // (dataflow) caches with partial materialization. Upstream's default
+        // cache mode is now Shallow, which has no dataflow deltas — running
+        // the bridge under a non-deep default would let plain CREATE CACHE
+        // statements silently create caches Tier-1 can never see. Refuse the
+        // combination outright; explicit `CREATE SHALLOW CACHE` remains
+        // possible and is marked rs:t1_suspect at creation.
+        if std::env::var("READYSET_REDIS_URL").is_ok()
+            && options.cache_mode != CacheMode::Deep
+            && std::env::var("READYSET_RSC_ALLOW_NON_DEEP_MODE").map_or(true, |v| v != "1")
+        {
+            bail!(
+                "RSC bridge is enabled (READYSET_REDIS_URL is set) but --cache-mode is '{}'. \
+                 RSC requires deep caches (standard partial materialization); shallow caches \
+                 deliver no dataflow deltas and would silently break Tier-1 invalidation. \
+                 Set CACHE_MODE=deep (or READYSET_RSC_ALLOW_NON_DEEP_MODE=1 to override).",
+                options.cache_mode
+            );
+        }
+
         let listen_addresses: &[SocketAddr] = if options.address.is_empty() {
             &self.default_addresses
         } else {

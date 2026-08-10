@@ -123,6 +123,9 @@ fn table_expr_subquery(te: &TableExpr) -> Option<&SelectStatement> {
     match &te.inner {
         TableExprInner::Subquery(sq) => Some(sq.as_ref()),
         TableExprInner::Table(_) => None,
+        // VALUES lists (upstream addition, stable-2604xx): literal row
+        // constructors — no nested SELECT to descend into, cannot correlate.
+        TableExprInner::Values { .. } => None,
     }
 }
 
