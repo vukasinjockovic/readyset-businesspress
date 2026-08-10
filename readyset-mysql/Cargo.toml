@@ -15,9 +15,10 @@ test-discovery = { path = "../test-discovery" }
 
 [dependencies]
 anyhow = { workspace = true }
-assert_matches = { workspace = true }
 async-trait = { workspace = true }
 bincode = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
 fail = { workspace = true }
 futures-util = { workspace = true }
 itertools = { workspace = true }
@@ -34,19 +35,20 @@ tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true, features = ["release_max_level_debug"] }
 
 database-utils = { path = "../database-utils" }
+metric = { path = "../metric" }
 readyset-adapter = { path = "../readyset-adapter" }
 readyset-adapter-types = { path = "../readyset-adapter-types" }
 readyset-client = { path = "../readyset-client" }
 readyset-client-metrics = { path = "../readyset-client-metrics" }
 readyset-data = { path = "../readyset-data" }
 readyset-errors = { path = "../readyset-errors" }
+readyset-schema = { path = "../readyset-schema" }
 readyset-sql = { path = "../readyset-sql" }
 readyset-sql-passes = { path = "../readyset-sql-passes" }
 readyset-shallow = { path = "../readyset-shallow" }
 readyset-util = { path = "../readyset-util" }
 
 [dev-dependencies]
-chrono = { workspace = true }
 futures = { workspace = true }
 paste = { workspace = true }
 proptest = { workspace = true }

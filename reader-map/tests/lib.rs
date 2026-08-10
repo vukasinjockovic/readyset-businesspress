@@ -11,7 +11,7 @@ use reader_map::{DefaultInsertionOrder, EvictionQuantity, Options};
 use readyset_util::ranges::Bound;
 
 macro_rules! assert_match {
-    ($x:expr, $p:pat) => {
+    ($x:expr_2021, $p:pat) => {
         if let $p = $x {
         } else {
             panic!(concat!(stringify!($x), " did not match ", stringify!($p)));
@@ -42,9 +42,6 @@ fn it_works() {
     let x = ('x', 42);
 
     let (mut w, r) = reader_map::new();
-
-    // the map is uninitialized, so all lookups should return Err(NotPublished)
-    assert_match!(r.get(&x.0), Err(NotPublished));
 
     w.publish();
 
@@ -104,12 +101,6 @@ fn mapref() {
     let x = ('x', 42);
 
     let (mut w, r) = reader_map::new();
-
-    // get a read ref to the map
-    // scope to ensure it gets dropped and doesn't stall refresh
-    {
-        assert_match!(r.enter(), Err(NotPublished));
-    }
 
     w.publish();
 
@@ -359,8 +350,6 @@ fn clear_vs_empty() {
 fn non_copy_values() {
     let (mut w, r) = reader_map::new();
     w.insert(1, "a".to_string());
-    assert_match!(r.get(&1), Err(NotPublished));
-
     w.publish();
 
     assert_eq!(r.get(&1).unwrap().map(|rs| rs.len()), Some(1));
@@ -530,10 +519,6 @@ fn clear() {
 #[test]
 fn test_with_meta() {
     let (mut w, r) = with_meta::<usize, usize, usize>(42);
-    assert_eq!(
-        r.meta_get(&1).map(|(rs, m)| (rs.map(|rs| rs.len()), m)),
-        Err(NotPublished)
-    );
     w.publish();
     assert_eq!(
         r.meta_get(&1).map(|(rs, m)| (rs.map(|rs| rs.len()), m)),
@@ -714,22 +699,6 @@ fn foreach() {
             _ => unreachable!(),
         }
     }
-}
-
-#[test]
-fn first() {
-    let x = ('x', 42);
-
-    let (mut w, r) = reader_map::new();
-
-    w.insert(x.0, x);
-    w.insert(x.0, x);
-
-    assert_match!(r.first(&x.0), Err(NotPublished));
-
-    w.publish();
-
-    assert_match!(r.first(&x.0).unwrap().as_deref(), Some(('x', 42)));
 }
 
 #[test]

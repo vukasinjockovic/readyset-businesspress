@@ -9,8 +9,9 @@ use std::borrow::Cow;
 use std::fmt::{self, Debug};
 use std::hash::Hash;
 use std::iter::FromIterator;
+use std::mem::size_of;
 use std::ops::Deref;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::vec;
 
 use ahash::RandomState;
@@ -37,8 +38,9 @@ static STATE: OnceLock<RandomState> = OnceLock::new();
 pub use crate::key::{PointKey, RangeKey};
 pub use crate::memory_state::MemoryState;
 pub use crate::persistent_state::{
-    clean_working_dir, DurabilityMode, PersistenceParameters, PersistenceType, PersistentState,
-    PersistentStateHandle, SnapshotMode,
+    clean_working_dir, example_serialized_keys, example_serialized_metas, example_serialized_row,
+    DurabilityMode, IndexBuildContext, IndexBuildStatus, PersistenceParameters, PersistenceType,
+    PersistentState, PersistentStateHandle, SnapshotMode,
 };
 
 pub fn init_parallel_row_pool() {
@@ -79,6 +81,7 @@ pub struct EvictRandomResult<'a> {
 }
 
 /// The state of an individual, non-reader node in the graph
+#[allow(clippy::large_enum_variant)]
 pub enum MaterializedNodeState {
     /// The state that stores all the materialized rows in-memory.
     Memory(MemoryState),
@@ -140,6 +143,12 @@ pub trait State: SizeOf + Send {
             self.add_weak_index(index);
         }
     }
+
+    /// Returns the current status of any background index build.
+    ///
+    /// For memory state, always returns `Succeeded` (no async builds).
+    /// For persistent state, checks the atomic status flag.
+    fn index_build_status(&self) -> IndexBuildStatus;
 
     /// Returns whether this state is currently indexed on anything. If not, then it cannot store
     /// any information and is thus "not useful".
@@ -314,11 +323,11 @@ impl SizeOf for MaterializedNodeState {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         match self {
-            MaterializedNodeState::Memory(ms) => ms.is_empty(),
-            MaterializedNodeState::Persistent(ps) => ps.is_empty(),
-            MaterializedNodeState::PersistentReadHandle(rh) => rh.is_empty(),
+            MaterializedNodeState::Memory(ms) => ms.size_is_empty(),
+            MaterializedNodeState::Persistent(ps) => ps.size_is_empty(),
+            MaterializedNodeState::PersistentReadHandle(rh) => rh.size_is_empty(),
         }
     }
 }
@@ -345,6 +354,14 @@ impl State for MaterializedNodeState {
             MaterializedNodeState::Memory(ms) => ms.add_index_multi(strict, weak),
             MaterializedNodeState::Persistent(ps) => ps.add_index_multi(strict, weak),
             MaterializedNodeState::PersistentReadHandle(rh) => rh.add_index_multi(strict, weak),
+        }
+    }
+
+    fn index_build_status(&self) -> IndexBuildStatus {
+        match self {
+            MaterializedNodeState::Memory(ms) => ms.index_build_status(),
+            MaterializedNodeState::Persistent(ps) => ps.index_build_status(),
+            MaterializedNodeState::PersistentReadHandle(rh) => rh.index_build_status(),
         }
     }
 
@@ -608,17 +625,14 @@ impl std::hash::BuildHasher for GlobalRandomState {
 /// The hash is computed once when the Row is created using a global RandomState,
 /// and reused for all subsequent operations. This is especially beneficial when
 /// rows are inserted into multiple indices.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
-    data: Rc<Vec<DfValue>>,
+    data: Arc<Vec<DfValue>>,
     cached_hash: u64,
+    cached_size: usize,
 }
 
 pub type Rows = HashBag<Row, GlobalRandomState>;
-
-// SAFETY: All references to the same row always belong to the same `State`, so won't be cloned
-// across threads (which would be UB). See [`Row:clone`].
-unsafe impl Send for Row {}
 
 impl Hash for Row {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -635,12 +649,19 @@ impl PartialEq<[DfValue]> for Row {
 }
 
 impl Row {
+    /// Compute the cached size for a row's data.
+    fn compute_size(data: &Vec<DfValue>) -> usize {
+        size_of::<u64>() + size_of::<usize>() + data.deep_size_of()
+    }
+
     /// Create a new Row with computed hash
     fn new(data: Vec<DfValue>) -> Self {
         let cached_hash = global_random_state().hash_one(&data);
+        let cached_size = Self::compute_size(&data);
         Row {
-            data: Rc::new(data),
+            data: Arc::new(data),
             cached_hash,
+            cached_size,
         }
     }
 
@@ -648,21 +669,6 @@ impl Row {
     /// Uses rayon to parallelize hash computation across all available CPU cores.
     pub(crate) fn batch_new_parallel(data_vec: Vec<Vec<DfValue>>) -> Vec<Self> {
         data_vec.into_par_iter().map(Self::new).collect()
-    }
-
-    /// Clone a row with a `State` and its original thread.
-    ///
-    /// # Safety
-    ///
-    /// This is very unsafe. Since `Row` unsafely implements `Send`, one can clone a row
-    /// and have two `Row`s with an inner Rc being sent to two different threads leading
-    /// to undefined behaviour. In the context of `State` it is only safe because all references
-    /// to the same row always belong to the same state, which lives on a single thread.
-    pub(crate) unsafe fn clone(&self) -> Self {
-        Row {
-            data: Rc::clone(&self.data),
-            cached_hash: self.cached_hash,
-        }
     }
 }
 
@@ -672,12 +678,14 @@ impl From<Vec<DfValue>> for Row {
     }
 }
 
-impl From<Rc<Vec<DfValue>>> for Row {
-    fn from(r: Rc<Vec<DfValue>>) -> Self {
+impl From<Arc<Vec<DfValue>>> for Row {
+    fn from(r: Arc<Vec<DfValue>>) -> Self {
         let cached_hash = global_random_state().hash_one(&*r);
+        let cached_size = Self::compute_size(&r);
         Row {
             data: r,
             cached_hash,
+            cached_size,
         }
     }
 }
@@ -704,11 +712,10 @@ impl Deref for Row {
 
 impl SizeOf for Row {
     fn deep_size_of(&self) -> usize {
-        // Include the size of cached_hash (8 bytes) + data
-        std::mem::size_of::<u64>() + (*self.data).deep_size_of()
+        self.cached_size
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         false
     }
 }

@@ -1,8 +1,10 @@
 use std::env;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use database_utils::TlsMode;
+use mysql_srv::{AuthCache, AuthPlugin};
 use readyset_adapter::backend::{QueryDestination, QueryInfo};
 use readyset_adapter::upstream_database::LazyUpstream;
 use readyset_adapter::Backend;
@@ -103,7 +105,12 @@ impl Adapter for PostgreSQLAdapter {
         .expect("Failed to cleanly drop and recreate database after");
     }
 
-    async fn run_backend(backend: Backend<Self::Upstream, Self::Handler>, s: TcpStream) {
+    async fn run_backend(
+        backend: Backend<Self::Upstream, Self::Handler>,
+        s: TcpStream,
+        _auth_plugin: AuthPlugin,
+        _auth_cache: Arc<AuthCache>,
+    ) {
         psql_srv::run_backend(
             readyset_psql::Backend::new(backend),
             s,
@@ -130,10 +137,10 @@ pub async fn last_query_info(conn: &Client) -> QueryInfo {
     };
 
     let destination = QueryDestination::try_from(row.get("Query_destination").unwrap()).unwrap();
-    let noria_error = row.get("Readyset_error").unwrap().to_owned();
+    let reason = row.get("Readyset_reason").unwrap().to_owned();
 
     QueryInfo {
         destination,
-        noria_error,
+        reason,
     }
 }

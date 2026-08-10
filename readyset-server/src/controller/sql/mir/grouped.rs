@@ -4,8 +4,8 @@ use dataflow::{PostLookupAggregate, PostLookupAggregateFunction, PostLookupAggre
 use mir::node::node_inner::MirNodeInner;
 use mir::node::ProjectExpr;
 use mir::{Column, NodeIndex};
-use readyset_errors::{unsupported, ReadySetError, ReadySetResult};
-use readyset_sql::ast::{self, Expr, FieldDefinitionExpr, FunctionExpr, Relation, SqlIdentifier};
+use readyset_errors::{internal, unsupported, ReadySetError, ReadySetResult};
+use readyset_sql::ast::{self, Expr, FunctionExpr, Relation, SqlIdentifier};
 use readyset_sql::{
     analysis::{is_aggregate, ReferredColumns},
     DialectDisplay,
@@ -109,26 +109,26 @@ pub(super) fn make_expressions_above_grouped(
                 )),
             }
         }))
-        .chain(qg.aggregates.keys().filter_map(|f| {
-            match f {
-                FunctionExpr::JsonObjectAgg {
-                    key,
-                    value,
-                    allow_duplicate_keys,
-                } => Some((
-                    SqlIdentifier::from("__json_objects__".to_string()),
-                    Expr::Call(FunctionExpr::Call {
-                        name: if *allow_duplicate_keys {
-                            "json_build_object"
-                        } else {
-                            "jsonb_build_object"
-                        }
-                        .into(),
-                        arguments: Some(vec![*key.clone(), *value.clone()]),
-                    }),
-                )),
-                _ => None,
-            }
+        .chain(qg.aggregates.keys().filter_map(|f| match f {
+            FunctionExpr::JsonObjectAgg {
+                key,
+                value,
+                allow_duplicate_keys,
+            } => Some((
+                SqlIdentifier::from("__json_objects__".to_string()),
+                if *allow_duplicate_keys {
+                    Expr::Call(FunctionExpr::JsonBuildObject(vec![
+                        *key.clone(),
+                        *value.clone(),
+                    ]))
+                } else {
+                    Expr::Call(FunctionExpr::JsonbBuildObject(vec![
+                        *key.clone(),
+                        *value.clone(),
+                    ]))
+                },
+            )),
+            _ => None,
         }))
         .collect();
 
@@ -210,7 +210,7 @@ pub(super) fn make_grouped(
             .collect();
         let gb_and_param_cols = dedup_gb_cols
             .into_iter()
-            .chain(param_cols.into_iter())
+            .chain(param_cols)
             .map(Column::from);
 
         let mut have_parent_cols = HashSet::new();
@@ -257,8 +257,25 @@ pub(super) fn make_grouped(
     let joinable_agg_nodes = joinable_aggregate_nodes(mir_converter, &agg_nodes);
 
     if joinable_agg_nodes.len() >= 2 {
-        let join_nodes =
-            make_joins_for_aggregates(mir_converter, query_name, &name.name, &joinable_agg_nodes)?;
+        // The joinable aggregates all share the same group columns: the GROUP BY columns plus
+        // any parameter columns folded in by `group_cols` above. Use those as the JoinAggregates
+        // join keys so that aggregate output columns which happen to share a name (e.g.
+        // `max(a.x)` and `max(b.x)`) are not mistaken for shared group columns and collapsed.
+        let group_by = match &mir_converter.get_node(joinable_agg_nodes[0]).unwrap().inner {
+            MirNodeInner::Aggregation { group_by, .. }
+            | MirNodeInner::Extremum { group_by, .. }
+            | MirNodeInner::Accumulator { group_by, .. } => group_by.clone(),
+            other => {
+                internal!("joinable_aggregate_nodes returned non-aggregate MIR node: {other:?}")
+            }
+        };
+        let join_nodes = make_joins_for_aggregates(
+            mir_converter,
+            query_name,
+            &name.name,
+            &joinable_agg_nodes,
+            &group_by,
+        )?;
         agg_nodes.extend(join_nodes);
     }
 
@@ -356,11 +373,11 @@ fn record_reachable(function: &FunctionExpr) {
         JsonObjectAgg { .. } => record_reachable!(
             r#"{"id":"Post-lookup aggregate","sub":"JsonObjectAgg","tags":["exclude-nightly"]}"#
         ),
-        Call { .. } => record_reachable!(
-            r#"{"id":"Post-lookup aggregate","sub":"Call","tags":["exclude-nightly"]}"#
-        ),
         Udf { .. } => record_reachable!(
             r#"{"id":"Post-lookup aggregate","sub":"Udf","tags":["exclude-nightly"]}"#
+        ),
+        _ => record_reachable!(
+            r#"{"id":"Post-lookup aggregate","sub":"Other","tags":["exclude-nightly"]}"#
         ),
     }
 }
@@ -376,33 +393,8 @@ pub(super) fn post_lookup_aggregates(
     query_name: &Relation,
     dialect: readyset_data::Dialect,
 ) -> ReadySetResult<Option<PostLookupAggregates<Column>>> {
-    if query_graph.distinct {
-        // DISTINCT is the equivalent of grouping by all projected columns but not actually doing
-        // any aggregation function
-        return Ok(Some(PostLookupAggregates {
-            group_by: query_graph
-                .fields
-                .iter()
-                .filter_map(|expr| match expr {
-                    FieldDefinitionExpr::Expr {
-                        alias: Some(alias), ..
-                    } => Some(Column::named(alias.clone()).aliased_as_table(query_name.clone())),
-                    FieldDefinitionExpr::Expr {
-                        expr: Expr::Column(col),
-                        ..
-                    } => Some(Column::from(col).aliased_as_table(query_name.clone())),
-                    FieldDefinitionExpr::Expr { expr, .. } => Some(
-                        Column::named(expr.display(dialect.into()).to_string())
-                            .aliased_as_table(query_name.clone()),
-                    ),
-                    _ => None,
-                })
-                .collect(),
-            aggregates: vec![],
-        }));
-    }
-
     if query_graph.aggregates.is_empty() {
+        // No aggregates — DISTINCT (if any) is handled by PostLookup.distinct
         return Ok(None);
     }
 
@@ -415,8 +407,14 @@ pub(super) fn post_lookup_aggregates(
                 ArrayAgg { .. } => PostLookupAggregateFunction::ArrayAgg {
                     op: function.try_into()?,
                 },
+                Avg { distinct: true, .. } => {
+                    unsupported!("AVG(DISTINCT ...) is not supported as a post-lookup aggregate")
+                }
                 Avg { .. } => {
-                    unsupported!("Average is not supported as a post-lookup aggregate")
+                    unsupported!(
+                        "AVG is not supported as a post-lookup aggregate in this context \
+                         (e.g. nested in expressions, HAVING, ORDER BY, or subqueries)"
+                    )
                 }
                 Count { distinct, .. } if *distinct => {
                     // TODO(REA-4289)
@@ -438,20 +436,20 @@ pub(super) fn post_lookup_aggregates(
                     op: function.try_into()?,
                 },
                 Extract { .. }
-                | Call { .. }
                 | Udf { .. }
                 | Substring { .. }
                 | Lower { .. }
                 | Upper { .. }
                 | Bucket { .. } => continue,
-                // TODO: should this be supported given the projection workaround we have?
                 JsonObjectAgg { .. } => PostLookupAggregateFunction::JsonObjectAgg {
                     op: function.try_into()?,
                 },
                 StringAgg { .. } => PostLookupAggregateFunction::StringAgg {
                     op: function.try_into()?,
                 },
+                _ => continue,
             },
+            raw_values: false,
         });
     }
 

@@ -117,12 +117,20 @@ check_all_dependencies() {
 
 download_demo_compose_file() {
   echo -e "${BLUE}${WHALE}Downloading the Readyset Docker Compose file... ${NOCOLOR}"
-  curl -Ls -o readyset.compose.yml "https://raw.githubusercontent.com/readysettech/readyset/current/quickstart/compose.postgres.yml"
+  if ! curl -fsSL --retry 3 --connect-timeout 30 -o readyset.compose.yml "https://raw.githubusercontent.com/readysettech/readyset/current/quickstart/compose.postgres.yml"; then
+    echo -e "${RED}Failed to download the Readyset Docker Compose file.${NOCOLOR}"
+    rm -f readyset.compose.yml
+    exit 1
+  fi
 }
 
 download_byo_compose_file() {
   echo -e "${BLUE}${WHALE}Downloading the Readyset Docker Compose file... ${NOCOLOR}"
-  curl -Ls -o /tmp/readyset.compose.yml "https://raw.githubusercontent.com/readysettech/readyset/current/quickstart/compose.yml"
+  if ! curl -fsSL --retry 3 --connect-timeout 30 -o /tmp/readyset.compose.yml "https://raw.githubusercontent.com/readysettech/readyset/current/quickstart/compose.yml"; then
+    echo -e "${RED}Failed to download the Readyset Docker Compose file.${NOCOLOR}"
+    rm -f /tmp/readyset.compose.yml
+    exit 1
+  fi
 }
 
 run_docker_compose() {
@@ -131,7 +139,16 @@ run_docker_compose() {
     echo -e "${RED}${ROTATING_LIGHT}Unable to pull Readyset images.${NOCOLOR}"
     exit 1
   fi
-  if ! docker compose -f readyset.compose.yml up -d --wait; then
+
+  # Add additional Readyset configuration.
+  cat << EOF > readyset.compose.override.yml
+services:
+  cache:
+    environment:
+      CACHE_MODE: deep
+EOF
+
+  if ! docker compose -f readyset.compose.yml -f readyset.compose.override.yml up -d --wait; then
     echo -e "${RED}${ROTATING_LIGHT}Docker compose setup failed.${NOCOLOR}"
     exit 1
   fi
@@ -180,27 +197,39 @@ import_data() {
   if [[ $import_choice == "y" ]]; then
     if [ ! -f imdb-postgres.sql ]; then
       echo -e "${BLUE}${ELEPHANT}Downloading IMDB sample data to imdb-postgres.sql...${NOCOLOR}"
-      curl -L "https://readyset.io/quickstart/imdb-postgres.sql" -o imdb-postgres.sql
+      if ! curl -fL --retry 3 --connect-timeout 30 "https://readyset.io/quickstart/imdb-postgres.sql" -o imdb-postgres.sql; then
+        echo -e "${RED}Failed to download sample data from https://readyset.io/quickstart/imdb-postgres.sql${NOCOLOR}"
+        rm -f imdb-postgres.sql
+        exit 1
+      fi
     else
       echo "Sample data found."
     fi
 
     echo -e "${BLUE}${ELEPHANT}Importing sample data...${NOCOLOR}"
+    local import_status=0
+    local import_errors
+    import_errors=$(mktemp)
+    # ON_ERROR_STOP makes psql exit non-zero on the first bad statement, so a
+    # truncated or non-SQL file (e.g. an HTML error page) fails loudly here.
     if command -v pv &>/dev/null; then
-      pv -w 80 imdb-postgres.sql | psql $CONNECTION_STRING >/dev/null 2>&1
+      pv -w 80 imdb-postgres.sql | psql -v ON_ERROR_STOP=1 $CONNECTION_STRING >/dev/null 2>"$import_errors" \
+        || import_status=$?
     else
       echo -e "This may take a few minutes. Install \`pv\` if you would like to see a progress bar for this step."
-      psql $CONNECTION_STRING < imdb-postgres.sql >/dev/null 2>&1
+      psql -v ON_ERROR_STOP=1 $CONNECTION_STRING < imdb-postgres.sql >/dev/null 2>"$import_errors" \
+        || import_status=$?
     fi
 
-    echo -e "${GREEN}${GREEN_CHECK}Sample data imported successfully!${NOCOLOR}"
-  fi
-}
+    if [[ $import_status -ne 0 ]]; then
+      echo -e "${RED}Failed to import sample data. The downloaded file may be incomplete or invalid.${NOCOLOR}"
+      head -n 5 "$import_errors" >&2
+      rm -f "$import_errors"
+      exit 1
+    fi
+    rm -f "$import_errors"
 
-display_arm_warning() {
-  if [[ $(uname -m) == "arm64" ]]; then
-    echo -e "${YELLOW}${WARNING}You are running on an ARM-based Machine, but Readyset is currently built for x86_64."
-    echo -e "   Query performance will be slower due to virtualization overhead.${NOCOLOR}"
+    echo -e "${GREEN}${GREEN_CHECK}Sample data imported successfully!${NOCOLOR}"
   fi
 }
 
@@ -429,7 +458,7 @@ free_form_connect() {
 
 print_exit_message() {
   echo ""
-  echo -e "${BLUE}See ${NOCOLOR}https://docs.readyset.io/demo${BLUE} for more fun things to try.${NOCOLOR}"
+  echo -e "${BLUE}See ${NOCOLOR}https://readyset.io/docs/${BLUE} for more fun things to try.${NOCOLOR}"
   echo ""
   echo -e "${BLUE}Join us on slack:${NOCOLOR}"
   echo "https://join.slack.com/t/readysetcommunity/shared_invite/zt-2272gtiz4-0024xeRJUPGWlRETQrGkFw"
@@ -516,7 +545,7 @@ wait_for_snapshot() {
       if [ $error_count -ge 5 ]; then
         echo "${RED}Error detected in replication:${NOCOLOR}"
         docker logs readyset-cache-1 | grep "ERROR" | tail -n 1
-        echo "See https://docs.readyset.io/get-started for troubleshooting, or reach out on slack."
+        echo "See https://readyset.io/docs/cache/install-rs for troubleshooting, or reach out on slack."
 
         exit 1
       fi
@@ -621,7 +650,6 @@ check_localhost_alternatives() {
 
 
 run_after_connection() {
-  display_arm_warning
   wait_for_snapshot "$1"
   explore_connection
   free_form_connect "$1"
@@ -663,7 +691,6 @@ run_demo() {
   check_sample_data
   prompt_for_import
   import_data
-  display_arm_warning
   explore_data
   free_form_connect "psql"
   print_exit_message "psql"

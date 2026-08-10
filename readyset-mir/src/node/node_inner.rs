@@ -10,6 +10,7 @@ use dataflow_expression::grouped::accumulator::AccumulationOp;
 use derive_more::From;
 use itertools::Itertools;
 use readyset_client::{PlaceholderIdx, ViewPlaceholder};
+use readyset_data::DfType;
 use readyset_errors::{internal, ReadySetResult};
 use readyset_sql::ast::{
     BinaryOperator, ColumnSpecification, Expr, NullOrder, OrderType, Relation, SqlIdentifier,
@@ -89,6 +90,11 @@ pub enum MirNodeInner {
         output_column: Column,
         /// Which accumulation function we are computing
         kind: AccumulationOp,
+        /// When true, the accumulator emits raw arrays instead of finalized values,
+        /// deferring finalization to the post-lookup phase for lossless merging.
+        // serde(default): backward compat with serialized MIR graphs predating this field
+        #[serde(default)]
+        skip_finalization: bool,
     },
     /// Node that computes an aggregate function on a column grouped by another set of columns,
     /// outputting its result as an additional column.
@@ -117,6 +123,19 @@ pub enum MirNodeInner {
         column_specs: Vec<ColumnSpecification>,
         primary_key: Option<Box<[Column]>>,
         unique_keys: Box<[Box<[Column]>]>,
+    },
+    /// Constant table node from a VALUES clause.
+    ///
+    /// Converted to [`Constant`] when lowering to dataflow.
+    ///
+    /// [`Constant`]: dataflow::node::special::constant::Constant
+    Constant {
+        /// The constant rows
+        rows: Vec<Vec<DfValue>>,
+        /// Column names for the values
+        column_names: Vec<SqlIdentifier>,
+        /// Column types inferred from the data
+        column_types: Vec<DfType>,
     },
     /// Node that evaluates Window Functions over a window.
     /// PARTITIONS and ORDER BY can be expressions, but should
@@ -189,7 +208,17 @@ pub enum MirNodeInner {
     /// group_by columns which are deduplicated at every join, so by the end we have every
     /// unique column (the actual aggregate columns) from each aggregate node, and a single
     /// version of each group_by column in the final join.
-    JoinAggregates,
+    ///
+    /// The `group_by` field stores the group columns shared by all joined aggregates: the query's
+    /// GROUP BY columns plus any parameter columns. It is used during dataflow lowering to
+    /// determine which columns are join keys (group columns) vs. aggregate output columns. Without
+    /// it, the lowering code would infer join keys from column name matching, which fails when two
+    /// different aggregates produce the same alias (e.g., `MAX(a.col)` and `MAX(b.col)` both alias
+    /// to `max(col)`).
+    JoinAggregates {
+        /// The group columns shared by all aggregates being joined.
+        group_by: Vec<Column>,
+    },
     /// Node which computes a *left* join on its two parents by finding all rows in the right where
     /// the values in `on_right` are equal to the values of `on_left` on the left
     ///
@@ -203,6 +232,10 @@ pub enum MirNodeInner {
         on: Vec<(Column, Column)>,
         /// Columns (from both parents) to project in the output.
         project: Vec<Column>,
+        /// Predicates from the ON clause that reference only the left side of the join.
+        /// These must be evaluated as part of the join semantics (not as pre-filters)
+        /// to preserve correct LEFT JOIN NULL-extension behavior.
+        left_local_preds: Vec<Expr>,
     },
     /// Join where nodes in the right-hand side depend on columns in the left-hand side
     /// (referencing tables in `dependent_tables`). These are created during compilation for
@@ -237,6 +270,9 @@ pub enum MirNodeInner {
         on: Vec<(Column, Column)>,
         /// Columns (from both parents) to project in the output.
         project: Vec<Column>,
+        /// Predicates from the ON clause that reference only the left side of the join.
+        /// Carried through decorrelation into the resulting LeftJoin node.
+        left_local_preds: Vec<Expr>,
     },
     /// Represents view key placeholders in a query that have not yet been added to the [`Leaf`][]
     /// node of the query.
@@ -305,6 +341,15 @@ pub enum MirNodeInner {
         /// Numeric literal that determines the number of results stored per group. Taken from the
         /// LIMIT clause
         limit: usize,
+        /// Optional multiplier for the dataflow TopK operator's buffer size (`buffered = k *
+        /// multiplier`). `None` preserves the legacy default of `buffered = k`. Set via
+        /// `CREATE CACHE WITH (TOPK_BUFFER_MULTIPLIER = N)`.
+        #[serde(default)]
+        topk_buffer_multiplier: Option<usize>,
+        /// Name of the cache this TopK belongs to, propagated to the dataflow operator so its
+        /// backfill counter (`readyset_domain.topk_backfill_requests`) can be labeled with an
+        /// identifier the user also sees in `SHOW CACHES`.
+        query_name: Relation,
     },
     /// Node which emits only distinct rows per some group.
     ///
@@ -343,6 +388,8 @@ pub enum MirNodeInner {
         default_row: Option<Vec<DfValue>>,
         /// Aggregates to perform in the reader on result sets for keys after performing the lookup
         aggregates: Option<PostLookupAggregates<Column>>,
+        /// Whether to deduplicate result rows after aggregation (SELECT DISTINCT with post-lookup)
+        distinct: bool,
     },
 }
 
@@ -359,6 +406,7 @@ impl MirNodeInner {
             returned_cols: None,
             default_row: None,
             aggregates: None,
+            distinct: false,
         }
     }
 
@@ -413,9 +461,12 @@ impl MirNodeInner {
                 group_by.push(c);
                 Ok(true)
             }
-            MirNodeInner::TopK { group_by, .. } => {
-                group_by.push(c);
-                Ok(true)
+            MirNodeInner::TopK { .. } => {
+                // TopK is transparent: its output columns are its parent's columns.
+                // Adding a column here would incorrectly push it into group_by,
+                // changing the grouping semantics. Return false so the column
+                // is pulled through the parent instead.
+                Ok(false)
             }
             _ => Ok(false),
         }
@@ -594,7 +645,7 @@ impl MirNodeInner {
                     jc
                 )
             }
-            MirNodeInner::JoinAggregates => "AGG ⋈".to_string(),
+            MirNodeInner::JoinAggregates { .. } => "AGG ⋈".to_string(),
             MirNodeInner::Leaf { ref keys, .. } => {
                 let key_cols = keys
                     .iter()
@@ -606,21 +657,34 @@ impl MirNodeInner {
             MirNodeInner::LeftJoin {
                 ref on,
                 ref project,
-                ..
+                ref left_local_preds,
             } => {
                 let jc = on
                     .iter()
                     .map(|(l, r)| format!("{}:{}", l.name, r.name))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let filter_str = if left_local_preds.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " where_left: {}",
+                        left_local_preds
+                            .iter()
+                            .map(|p| p.display(readyset_sql::Dialect::MySQL).to_string())
+                            .collect::<Vec<_>>()
+                            .join(" AND ")
+                    )
+                };
                 format!(
-                    "⟕ [{} on {}]",
+                    "⟕ [{} on {}{}]",
                     project
                         .iter()
                         .map(|c| c.name.as_str())
                         .collect::<Vec<_>>()
                         .join(", "),
-                    jc
+                    jc,
+                    filter_str
                 )
             }
             MirNodeInner::DependentJoin {
@@ -668,10 +732,12 @@ impl MirNodeInner {
             MirNodeInner::TopK {
                 ref order,
                 ref limit,
+                ref topk_buffer_multiplier,
                 ..
-            } => {
-                format!("TopK [k: {limit}, {order:?}]")
-            }
+            } => match topk_buffer_multiplier {
+                Some(m) => format!("TopK [k: {limit}, buf×{m}, {order:?}]"),
+                None => format!("TopK [k: {limit}, {order:?}]"),
+            },
             MirNodeInner::Union {
                 ref emit,
                 ref duplicate_mode,
@@ -691,6 +757,17 @@ impl MirNodeInner {
             }
             MirNodeInner::AliasTable { ref table } => {
                 format!("AliasTable [{}]", table.display_unquoted())
+            }
+            MirNodeInner::Constant {
+                ref rows,
+                ref column_names,
+                ..
+            } => {
+                format!(
+                    "C [{}; {} rows]",
+                    column_names.iter().join(", "),
+                    rows.len()
+                )
             }
         }
     }

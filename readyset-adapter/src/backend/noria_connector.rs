@@ -6,13 +6,13 @@ use std::time::Instant;
 
 use itertools::Itertools;
 use readyset_client::internal::LocalNodeIndex;
+use readyset_client::post_processing::{ResultIterator, Results};
 use readyset_client::query::QueryId;
 use readyset_client::recipe::CacheExpr;
 use readyset_client::recipe::changelist::{Change, ChangeList, IntoChanges};
-use readyset_client::results::{ResultIterator, Results};
+use readyset_client::schema::{ColumnSchema, SchemaType, SelectSchema};
 use readyset_client::{
-    ColumnSchema, GraphvizOptions, ReadQuery, ReaderAddress, ReaderHandle, ReadySetHandle,
-    SchemaType, Table, TableOperation, View, ViewCreateRequest, ViewQuery,
+    GraphvizOptions, ReadySetHandle, Table, TableOperation, View, ViewCreateRequest,
 };
 use readyset_client_metrics::QueryDestination;
 use readyset_data::encoding::Encoding;
@@ -21,11 +21,11 @@ use readyset_errors::{
     ReadySetError, ReadySetResult, internal_err, invariant_eq, table_err, unsupported,
     unsupported_err,
 };
-use readyset_server::worker::readers::{CallResult, ReadRequestHandler};
+use readyset_server::worker::readers::ReadRequestHandler;
 use readyset_sql::ast::{
     self, ColumnConstraint, CreateViewStatement, DeleteStatement, Expr, InsertStatement, Relation,
-    SelectStatement, SetStatement, SqlIdentifier, SqlQuery, TruncateStatement, UnaryOperator,
-    UpdateStatement,
+    SelectStatement, SetStatement, SqlIdentifier, SqlQuery, TruncateStatement, TrxCachePolicy,
+    UnaryOperator, UpdateStatement,
 };
 use readyset_sql::{DialectDisplay, TryFromDialect as _, TryIntoDialect as _};
 use readyset_sql_passes::adapter_rewrites::{self, AdapterRewriteParams, DfQueryParameters};
@@ -35,7 +35,8 @@ use schema_catalog::{RewriteContext, SchemaGeneration};
 use tokio::sync::RwLock;
 use tracing::{error, info, trace, warn};
 
-use crate::backend::SelectSchema;
+use crate::query_handler::SessionTimezone;
+use crate::query_status_cache::ManualCacheEntry;
 use crate::utils;
 
 #[derive(Clone, Debug)]
@@ -156,6 +157,21 @@ pub enum PrepareResult {
     },
 }
 
+impl PrepareResult {
+    /// Whether a manually parameterized cache (`AUTOPARAM`) backing this prepared SELECT can serve
+    /// an execution with the given `params`: `true` unless the cache's frozen literals don't match
+    /// (see [`DfQueryParameters::frozen_satisfied`]). Always `true` for non-SELECT prepares and
+    /// for SELECTs without a manual cache.
+    pub(crate) fn frozen_satisfied(&self, params: &[DfValue]) -> ReadySetResult<bool> {
+        match self {
+            PrepareResult::Select { statement, .. } => {
+                statement.processed_query_params.frozen_satisfied(params)
+            }
+            _ => Ok(true),
+        }
+    }
+}
+
 /// A single row in the variable table associated with [`QueryResult::MetaVariables`].
 #[derive(Debug)]
 pub struct MetaVariable {
@@ -266,9 +282,6 @@ pub struct NoriaConnector {
     /// but on subsequent requests, do not use a failed view.
     failed_views: HashSet<Relation>,
 
-    /// How to handle issuing reads against ReadySet. See [`ReadBehavior`].
-    read_behavior: ReadBehavior,
-
     /// A read request handler that may be used to service reads from readers
     /// on the same server.
     read_request_handler: request_handler::LocalReadHandler,
@@ -289,6 +302,13 @@ pub struct NoriaConnector {
     /// The encoding in which to return text results. Corresponds to `character_set_results` in
     /// MySQL and `SET NAMES` in both MySQL and Postgres.
     results_encoding: Encoding,
+
+    /// The encoding in which the client sends query text. Corresponds to `character_set_client`
+    /// in MySQL.
+    client_encoding: Encoding,
+
+    /// The session timezone for TIMESTAMP conversion.
+    timezone: SessionTimezone,
 }
 
 mod request_handler {
@@ -319,22 +339,6 @@ mod request_handler {
     unsafe impl Sync for LocalReadHandler {}
 }
 
-/// The read behavior used when executing a read against ReadySet.
-#[derive(Clone, Copy)]
-pub enum ReadBehavior {
-    /// If ReadySet is unable to immediately service the read due to a cache miss, block on the
-    /// response.
-    Blocking,
-    /// If ReadySet is unable to immediately service the read, return an error.
-    NonBlocking,
-}
-
-impl ReadBehavior {
-    fn is_blocking(&self) -> bool {
-        matches!(self, Self::Blocking)
-    }
-}
-
 /// Provides the necessary context to execute a select statement against noria, either for a
 /// prepared or an ad-hoc query
 #[allow(clippy::large_enum_variant)]
@@ -349,6 +353,10 @@ pub(crate) enum ExecuteSelectContext<'ctx> {
         create_if_missing: bool,
         processed_query_params: DfQueryParameters,
         schema_generation: SchemaGeneration,
+        /// Set to the cache name when the query's standard shape maps to a manually
+        /// parameterized cache (`CREATE CACHE WITH (AUTOPARAM ...)`); the read is served by that
+        /// cache. The frozen literals travel in `processed_query_params`.
+        manual_cache_name: Option<Relation>,
     },
 }
 
@@ -359,7 +367,6 @@ impl NoriaConnector {
         auto_increments: Arc<RwLock<HashMap<Relation, atomic::AtomicUsize>>>,
         view_name_cache: LocalCache<ViewCreateRequest, Relation>,
         view_cache: LocalCache<Relation, View>,
-        read_behavior: ReadBehavior,
         dialect: Dialect,
         parse_dialect: readyset_sql::Dialect,
         schema_search_path: Vec<SqlIdentifier>,
@@ -370,7 +377,6 @@ impl NoriaConnector {
             auto_increments,
             view_name_cache,
             view_cache,
-            read_behavior,
             None,
             dialect,
             parse_dialect,
@@ -386,7 +392,6 @@ impl NoriaConnector {
         auto_increments: Arc<RwLock<HashMap<Relation, atomic::AtomicUsize>>>,
         view_name_cache: LocalCache<ViewCreateRequest, Relation>,
         view_cache: LocalCache<Relation, View>,
-        read_behavior: ReadBehavior,
         read_request_handler: Option<ReadRequestHandler>,
         dialect: Dialect,
         parse_dialect: readyset_sql::Dialect,
@@ -400,12 +405,13 @@ impl NoriaConnector {
             auto_increments,
             view_name_cache,
             failed_views: HashSet::new(),
-            read_behavior,
             read_request_handler: request_handler::LocalReadHandler::new(read_request_handler),
             dialect,
             parse_dialect,
             schema_search_path,
             results_encoding: Encoding::Utf8,
+            client_encoding: Encoding::Utf8,
+            timezone: SessionTimezone::System,
         }
     }
 
@@ -450,23 +456,11 @@ impl NoriaConnector {
 
         let mut data = domains
             .into_iter()
-            .flat_map(|(di, shards)| {
-                shards
-                    .into_iter()
-                    .enumerate()
-                    .flat_map(move |(shard, replicas)| {
-                        replicas
-                            .into_iter()
-                            .enumerate()
-                            .map(move |(replica, worker)| {
-                                vec![
-                                    DfValue::from(format!("{di}.{shard}.{replica}")),
-                                    DfValue::from(
-                                        worker.map(|w| w.to_string()).unwrap_or_default(),
-                                    ),
-                                ]
-                            })
-                    })
+            .map(|(di, worker)| {
+                vec![
+                    DfValue::from(format!("{di}.0.0")),
+                    DfValue::from(worker.map(|w| w.to_string()).unwrap_or_default()),
+                ]
             })
             .collect::<Vec<_>>();
 
@@ -477,8 +471,16 @@ impl NoriaConnector {
 
     pub(crate) async fn explain_materializations(
         &mut self,
+        for_cache: Option<Relation>,
     ) -> ReadySetResult<QueryResult<'static>> {
-        let mut materializations = self.inner.noria.materialization_info().await?;
+        let mut materializations = if let Some(cache) = for_cache {
+            self.inner
+                .noria
+                .materialization_info_for_cache(cache)
+                .await?
+        } else {
+            self.inner.noria.materialization_info().await?
+        };
         materializations.sort_unstable_by_key(|mi| Reverse(mi.size.bytes));
         let cols = [
             ("domain_index", DfType::DEFAULT_TEXT),
@@ -879,11 +881,7 @@ impl NoriaConnector {
                     })
                     .collect(),
             ),
-            columns: Cow::Owned(vec![
-                "table".into(),
-                "replication status".into(),
-                "replication status description".into(),
-            ]),
+            columns: Cow::Owned(vec!["table".into(), "status".into(), "description".into()]),
         };
         let data = statuses
             .into_iter()
@@ -923,6 +921,31 @@ impl NoriaConnector {
     /// Returns the encoding for result sets
     pub fn results_encoding(&self) -> Encoding {
         self.results_encoding
+    }
+
+    /// Set the encoding in which the client sends query text
+    pub fn set_client_encoding(&mut self, encoding: Encoding) {
+        self.client_encoding = encoding;
+    }
+
+    /// Returns the encoding in which the client sends query text
+    pub fn client_encoding(&self) -> Encoding {
+        self.client_encoding
+    }
+
+    /// Set the session timezone for TIMESTAMP conversion.
+    ///
+    /// Non-UTC values would silently localize cached results because the wire
+    /// writer does UTC-wallclock passthrough; `Backend::handle_set` is
+    /// responsible for gating on `SessionTimezone::is_utc()`.
+    pub fn set_timezone(&mut self, tz: SessionTimezone) {
+        debug_assert!(tz.is_utc(), "non-UTC SessionTimezone bypassed is_utc gate");
+        self.timezone = tz;
+    }
+
+    /// Returns the session timezone for TIMESTAMP conversion.
+    pub fn timezone(&self) -> SessionTimezone {
+        self.timezone
     }
 
     pub(crate) async fn resnapshot_table(
@@ -987,6 +1010,35 @@ impl NoriaConnector {
         self.inner.noria.set_memory_limit(period, limit).await?;
         Ok(QueryResult::Empty)
     }
+
+    pub(crate) async fn stop_replication(&mut self) -> ReadySetResult<QueryResult<'static>> {
+        self.inner.noria.stop_replication().await?;
+        Ok(QueryResult::Empty)
+    }
+
+    pub(crate) async fn start_replication(&mut self) -> ReadySetResult<QueryResult<'static>> {
+        self.inner.noria.start_replication().await?;
+        Ok(QueryResult::Empty)
+    }
+
+    pub(crate) async fn set_replication_position(
+        &mut self,
+        position: &str,
+    ) -> ReadySetResult<QueryResult<'static>> {
+        self.inner
+            .noria
+            .set_replication_position(position.to_string())
+            .await?;
+        Ok(QueryResult::Empty)
+    }
+
+    pub(crate) async fn change_cdc_url(
+        &mut self,
+        url: &str,
+    ) -> ReadySetResult<QueryResult<'static>> {
+        self.inner.noria.change_cdc_url(url.to_string()).await?;
+        Ok(QueryResult::Empty)
+    }
 }
 
 impl NoriaConnector {
@@ -1000,8 +1052,9 @@ impl NoriaConnector {
         &mut self,
         name: Option<&Relation>,
         deep: ViewCreateRequest,
-        always: bool,
+        trx_cache_policy: TrxCachePolicy,
         concurrently: bool,
+        topk_buffer_multiplier: Option<usize>,
         schema_generation: SchemaGeneration,
     ) -> ReadySetResult<Option<u64>> {
         let name = match name {
@@ -1012,7 +1065,8 @@ impl NoriaConnector {
             Change::create_cache(
                 name.clone(),
                 deep.statement.clone(),
-                always,
+                trx_cache_policy,
+                topk_buffer_multiplier,
                 Some(schema_generation),
             ),
             self.dialect,
@@ -1047,7 +1101,8 @@ impl NoriaConnector {
             Change::create_cache(
                 id.to_string(),
                 req.statement.clone(),
-                false,
+                TrxCachePolicy::Never,
+                None,
                 Some(schema_generation),
             ),
             self.dialect,
@@ -1100,7 +1155,8 @@ impl NoriaConnector {
                         Change::create_cache(
                             qname.clone(),
                             q.clone(),
-                            false,
+                            TrxCachePolicy::Never,
+                            None,
                             Some(schema_generation),
                         ),
                         self.dialect,
@@ -1437,6 +1493,7 @@ impl NoriaConnector {
         mut statement: SelectStatement,
         create_if_not_exist: bool,
         rewrite_context: &RewriteContext,
+        manual_cache: Option<&ManualCacheEntry>,
     ) -> ReadySetResult<PrepareResult> {
         // extract parameter columns *for the client*
         // note that we have to do this *before* processing the query, otherwise the
@@ -1457,7 +1514,7 @@ impl NoriaConnector {
             .collect();
 
         trace!("select::collapse where-in clauses");
-        let processed_query_params = adapter_rewrites::rewrite_query(
+        let mut processed_query_params = adapter_rewrites::rewrite_query(
             &mut statement,
             self.rewrite_params(),
             rewrite_context,
@@ -1465,15 +1522,21 @@ impl NoriaConnector {
 
         // check if we already have this query prepared
         trace!("select::access view");
-        let qname = self
-            .get_view_name_cached(
+        let qname = if let Some(manual) = manual_cache {
+            // A manually parameterized cache (`AUTOPARAM`) claims this query's standard shape:
+            // serve from it, enforcing its inline literals at execute time.
+            processed_query_params.set_frozen(manual.frozen.clone());
+            manual.name.clone()
+        } else {
+            self.get_view_name_cached(
                 &statement,
                 true,
                 create_if_not_exist,
                 Some(rewrite_context.search_path().to_vec()),
                 rewrite_context.schema_generation(),
             )
-            .await?;
+            .await?
+        };
 
         let view_failed = self.failed_views.take(&qname).is_some();
         let getter = self.inner.get_noria_view(&qname, view_failed).await?;
@@ -1508,10 +1571,18 @@ impl NoriaConnector {
 
             params.extend(limit_columns);
 
-            PreparedSelectTypes::Schema(SelectPrepareResultInner {
-                params,
-                schema: getter_schema.schema(SchemaType::ReturnedSchema).to_vec(),
-            })
+            let mut schema = getter_schema.schema(SchemaType::ReturnedSchema).to_vec();
+
+            // Align the prepared-statement RowDescription with what
+            // postprocess_decompositions will emit at execute time
+            // (widen decomposed AVG types, strip helper columns).
+            readyset_client::post_processing::apply_post_lookup_to_prepared_schema(
+                &mut schema,
+                statement.processed_query_params.post_lookup_plan(),
+                self.dialect,
+            )?;
+
+            PreparedSelectTypes::Schema(SelectPrepareResultInner { params, schema })
         } else {
             PreparedSelectTypes::NoSchema
         };
@@ -1543,16 +1614,23 @@ impl NoriaConnector {
                 create_if_missing,
                 processed_query_params,
                 schema_generation,
+                manual_cache_name,
             } => {
-                let name = self
-                    .get_view_name_cached(
+                let name = if let Some(name) = manual_cache_name {
+                    // A manually parameterized cache (`AUTOPARAM`) claims this query's standard
+                    // shape: serve from it. The frozen literals are already carried by
+                    // `processed_query_params` and enforced when the lookup key is built.
+                    name
+                } else {
+                    self.get_view_name_cached(
                         statement,
                         false,
                         create_if_missing,
                         None,
                         schema_generation,
                     )
-                    .await?;
+                    .await?
+                };
                 (
                     Cow::Owned(name),
                     Cow::Owned(processed_query_params),
@@ -1564,15 +1642,30 @@ impl NoriaConnector {
         let view_failed = self.failed_views.take(qname.as_ref()).is_some();
         let getter = self.inner.get_noria_view(&qname, view_failed).await?;
 
-        let res = do_read(
-            getter,
-            processed_query_params.as_ref(),
-            params,
-            self.read_behavior,
-            self.read_request_handler.as_mut(),
-            self.dialect,
-        )
-        .await;
+        let plan = processed_query_params.post_lookup_plan();
+        let (limit, offset) = processed_query_params.limit_offset_params(params)?;
+        let raw_keys = processed_query_params.make_keys(params)?;
+        // When a manually parameterized cache serves this query, the incoming values at the
+        // frozen positions must equal the cache's inline literals -- otherwise the cache is
+        // specialized on different constants and this read is a miss for it -- and are stripped
+        // so the key matches the cache's parameter order.
+        let res = match processed_query_params.apply_frozen(raw_keys)? {
+            Some(raw_keys) => {
+                readyset_client::read::read_cache(
+                    getter,
+                    self.read_request_handler
+                        .as_mut()
+                        .map(|r| r as &mut dyn readyset_client::read::LocalReader),
+                    raw_keys,
+                    limit,
+                    offset,
+                    plan,
+                    self.dialect,
+                )
+                .await
+            }
+            None => Err(ReadySetError::NoCacheForQuery),
+        };
 
         if res.is_err() {
             self.failed_views.insert(qname.clone().into_owned());
@@ -1591,7 +1684,10 @@ impl NoriaConnector {
             qname.display_unquoted().to_string(),
         )));
 
-        Ok(res.result)
+        Ok(QueryResult::Select {
+            rows: res.rows,
+            schema: res.schema,
+        })
     }
 
     pub(crate) async fn handle_create_view<'a>(
@@ -1649,116 +1745,4 @@ impl NoriaConnector {
             .map(|names| names.into_iter().nth(0).unwrap())?
             .map(|info| info.name().clone()))
     }
-}
-
-/// Creates keys from processed query params, gets the select statement binops, and calls
-/// View::build_view_query.
-fn build_view_query<'a>(
-    getter: &'a mut View,
-    processed_query_params: &DfQueryParameters,
-    params: &[DfValue],
-    read_behavior: ReadBehavior,
-    dialect: Dialect,
-) -> ReadySetResult<Option<(&'a mut ReaderHandle, ViewQuery)>> {
-    let (limit, offset) = processed_query_params.limit_offset_params(params)?;
-    let raw_keys = processed_query_params.make_keys(params)?;
-
-    getter.build_view_query(
-        raw_keys,
-        limit,
-        offset,
-        read_behavior.is_blocking(),
-        dialect,
-    )
-}
-
-struct ReadResult<'a> {
-    result: QueryResult<'a>,
-    num_keys: u64,
-    cache_misses: u64,
-}
-
-/// Run the supplied [`SelectStatement`] on the supplied [`View`]
-/// Assumption: the [`View`] was created for that specific [`SelectStatement`]
-#[allow(clippy::too_many_arguments)]
-async fn do_read<'a>(
-    getter: &'a mut View,
-    processed_query_params: &DfQueryParameters,
-    params: &[DfValue],
-    read_behavior: ReadBehavior,
-    read_request_handler: Option<&'a mut ReadRequestHandler>,
-    dialect: Dialect,
-) -> ReadySetResult<ReadResult<'a>> {
-    let (reader_handle, vq) = match build_view_query(
-        getter,
-        processed_query_params,
-        params,
-        read_behavior,
-        dialect,
-    )? {
-        Some(res) => res,
-        None => return Err(ReadySetError::NoCacheForQuery),
-    };
-
-    let num_keys = vq.key_comparisons.len() as u64;
-
-    let data = if let Some(rh) = read_request_handler {
-        let request = readyset_client::Tagged::from(ReadQuery::Normal {
-            target: ReaderAddress {
-                node: *reader_handle.node(),
-                name: reader_handle.name().clone(),
-                shard: 0,
-            },
-            query: vq.clone(),
-        });
-
-        // Query the local reader if it is a read query, otherwise default to the traditional
-        // View API.
-        let tag = request.tag;
-        if let ReadQuery::Normal { target, query } = request.v {
-            // Issue a normal read query returning the raw unserialized results.
-            let result = match rh.handle_normal_read_query(tag, target, query, true) {
-                CallResult::Immediate(result) => result?,
-                CallResult::Async(chan) => chan.await?,
-            };
-
-            result
-                .v
-                .into_normal()
-                .ok_or_else(|| internal_err!("Unexpected response type from reader service"))??
-                .into_results()
-                .ok_or(ReadySetError::ReaderMissingKey)?
-                .pop()
-                .ok_or_else(|| internal_err!("Expected a single result set for local reader"))?
-                .into_unserialized()
-                .expect("Requested raw result")
-        } else {
-            reader_handle.raw_lookup(vq).await?
-        }
-    } else {
-        reader_handle.raw_lookup(vq).await?
-    };
-
-    let cache_misses = data.total_stats().map(|s| s.cache_misses).unwrap_or(0);
-
-    trace!("select::complete");
-
-    let result = QueryResult::from_iter(
-        SelectSchema {
-            schema: Cow::Borrowed(
-                reader_handle
-                    .schema()
-                    .unwrap()
-                    .schema(SchemaType::ReturnedSchema),
-            ), /* Safe because we already unwrapped above */
-            columns: Cow::Borrowed(reader_handle.columns()),
-        },
-        data,
-    );
-
-    Ok(ReadResult {
-        result,
-        num_keys,
-        cache_misses,
-    })
 }

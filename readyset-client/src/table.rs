@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::fmt::Display;
 use std::future::Future;
 use std::mem::discriminant;
@@ -7,27 +8,26 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
-use std::{fmt, iter};
 
-use async_bincode::tokio::{AsyncBincodeStream, AsyncDestination};
+use async_bincode::tokio::AsyncBincodeStream;
 use derive_more::TryInto;
+use futures_util::future::BoxFuture;
 use futures_util::future::TryFutureExt;
-use futures_util::stream::futures_unordered::FuturesUnordered;
-use futures_util::stream::TryStreamExt;
 use futures_util::{future, ready, Stream};
-use itertools::Either;
 use petgraph::graph::NodeIndex;
 use readyset_data::DfValue;
 use readyset_errors::{internal, rpc_err, table_err, unsupported, ReadySetError, ReadySetResult};
+use readyset_multiplex as multiplex;
 use readyset_sql::ast::{CreateTableBody, NotReplicatedReason, Relation, SqlIdentifier};
 use replication_offset::ReplicationOffset;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tokio_tower::multiplex;
 use tower::balance::p2c::Balance;
 use tower::buffer::Buffer;
 use tower::limit::concurrency::ConcurrencyLimit;
+use tower::util::BoxService;
+use tower::BoxError;
 use tower_service::Service;
 use tracing::{debug_span, error, trace, trace_span, Span};
 use vec_map::VecMap;
@@ -126,32 +126,6 @@ impl TableOperation {
             _ => None,
         }
     }
-
-    /// Construct an iterator over the shards this TableOperation should target.
-    ///
-    /// ## Invariants
-    /// * `key_col` must be in the rows.
-    /// * the `key`s must have at least one element.
-    #[inline]
-    pub fn shards(&self, key_col: usize, num_shards: usize) -> impl Iterator<Item = usize> {
-        let key = match self {
-            TableOperation::Insert(row) => Some(&row[key_col]),
-            TableOperation::DeleteByKey { key } => Some(&key[0]),
-            TableOperation::DeleteRow { row } => Some(&row[key_col]),
-            TableOperation::Update { key, .. } => Some(&key[0]),
-            TableOperation::InsertOrUpdate { row, .. } => Some(&row[key_col]),
-            TableOperation::Truncate
-            | TableOperation::SetReplicationOffset(_)
-            | TableOperation::SetSnapshotMode(_) => None,
-        };
-
-        if let Some(key) = key {
-            Either::Left(iter::once(crate::shard_by(key, num_shards)))
-        } else {
-            // unkeyed updates should hit all shards
-            Either::Right(0..num_shards)
-        }
-    }
 }
 
 impl From<Vec<DfValue>> for TableOperation {
@@ -160,20 +134,13 @@ impl From<Vec<DfValue>> for TableOperation {
     }
 }
 
-type Transport =
-    AsyncBincodeStream<tokio::net::TcpStream, Tagged<()>, Tagged<PacketData>, AsyncDestination>;
-
 #[derive(Debug)]
 struct Endpoint {
     addr: SocketAddr,
     timeout: Duration,
 }
 
-type InnerService = multiplex::Client<
-    multiplex::MultiplexTransport<Transport, Tagger>,
-    tokio_tower::Error<multiplex::MultiplexTransport<Transport, Tagger>, Tagged<PacketData>>,
-    Tagged<PacketData>,
->;
+type InnerService = multiplex::Client<Tagged<PacketData>, Tagged<()>>;
 
 impl Service<()> for Endpoint {
     type Response = InnerService;
@@ -195,9 +162,9 @@ impl Service<()> for Endpoint {
             s.write_all(&[CONNECTION_FROM_BASE]).await?;
             s.flush().await?;
             let s = AsyncBincodeStream::from(s).for_async();
-            let t = multiplex::MultiplexTransport::new(s, Tagger::default());
             Ok(multiplex::Client::with_error_handler(
-                t,
+                s,
+                Tagger::default(),
                 |e| error!(error = %e, "Table server went away"),
             ))
         })
@@ -230,7 +197,7 @@ pub(crate) type Discover = Pin<
 >;
 
 pub(crate) type TableRpc =
-    Buffer<ConcurrencyLimit<Balance<Discover, Tagged<PacketData>>>, Tagged<PacketData>>;
+    Buffer<Tagged<PacketData>, BoxFuture<'static, Result<Tagged<()>, BoxError>>>;
 
 /// Information used to uniquely identify: a packet, and the time a packet entered the
 /// system.
@@ -321,7 +288,7 @@ impl PartialEq for TableStatus {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TableBuilder {
-    pub txs: Vec<SocketAddr>,
+    pub tx: SocketAddr,
     pub ni: NodeIndex,
     pub addr: LocalNodeIndex,
     pub key_is_primary: bool,
@@ -341,40 +308,34 @@ impl TableBuilder {
         self,
         rpcs: Arc<Mutex<HashMap<(SocketAddr, usize), TableRpc>>>,
     ) -> Table {
-        let mut addrs = Vec::with_capacity(self.txs.len());
-        let mut conns = Vec::with_capacity(self.txs.len());
-        for (shardi, &addr) in self.txs.iter().enumerate() {
+        let addr = self.tx;
+        let shard = {
             use std::collections::hash_map::Entry;
 
-            addrs.push(addr);
-
-            // one entry per shard so that we can send sharded requests in parallel even if
-            // they happen to be targeting the same machine.
             let mut rpcs = rpcs.lock().await;
             #[allow(clippy::significant_drop_in_scrutinee)]
-            let s = match rpcs.entry((addr, shardi)) {
+            match rpcs.entry((addr, 0)) {
                 Entry::Occupied(e) => e.get().clone(),
                 Entry::Vacant(h) => {
                     // TODO: maybe always use the same local port?
                     let (c, w) = Buffer::pair(
-                        ConcurrencyLimit::new(
+                        BoxService::new(ConcurrencyLimit::new(
                             Balance::new(make_table_discover(addr, self.table_request_timeout)),
                             crate::PENDING_LIMIT,
-                        ),
+                        )),
                         crate::BUFFER_TO_POOL,
                     );
                     use tracing_futures::Instrument;
                     tokio::spawn(w.instrument(debug_span!(
                         "table_worker",
                         addr = %addr,
-                        shard = shardi
+                        shard = 0
                     )));
                     h.insert(c.clone());
                     c
                 }
-            };
-            conns.push(s);
-        }
+            }
+        };
 
         Table {
             ni: self.ni,
@@ -385,8 +346,7 @@ impl TableBuilder {
             dropped: self.dropped,
             table_name: self.table_name,
             schema: self.schema,
-            shard_addrs: addrs,
-            shards: conns,
+            shard,
             last_trace_sample: Instant::now(),
             request_timeout: self.table_request_timeout,
         }
@@ -410,8 +370,7 @@ pub struct Table {
     dropped: VecMap<DfValue>,
     table_name: Relation,
     schema: Option<CreateTableBody>,
-    shards: Vec<TableRpc>,
-    shard_addrs: Vec<SocketAddr>,
+    shard: TableRpc,
     last_trace_sample: Instant,
     request_timeout: Duration,
 }
@@ -427,7 +386,6 @@ impl fmt::Debug for Table {
             .field("dropped", &self.dropped)
             .field("table_name", &self.table_name)
             .field("schema", &self.schema)
-            .field("shard_addrs", &self.shard_addrs)
             .finish()
     }
 }
@@ -507,102 +465,13 @@ impl Table {
         };
 
         if let Err(e) = immediate_err() {
-            return future::Either::Left(future::Either::Left(async move { Err(e) }));
+            return future::Either::Left(async move { Err(e) });
         }
 
-        let nshards = self.shards.len();
-        future::Either::Right(match self.shards.first_mut() {
-            Some(table_rpc) if nshards == 1 => {
-                let request = Tagged::from(i);
-                let _guard = span.as_ref().map(Span::enter);
-                trace!("submit request");
-                future::Either::Left(future::Either::Right(table_rpc.call(request).map_err(
-                    rpc_err!(
-                        "Table::input",
-                        multiplex::MultiplexTransport<Transport, Tagger>,
-                        Tagged<PacketData>,
-                    ),
-                )))
-            }
-            _ => {
-                let key_len = self.key.len();
-                let key_col = match self.key.first() {
-                    // If it's `None`, then it's empty.
-                    None => {
-                        return future::Either::Right(future::Either::Left(future::Either::Left(
-                            future::Either::Left(
-                                async move { internal!("sharded base without a key") },
-                            ),
-                        )))
-                    }
-                    Some(_) if key_len != 1 => {
-                        return future::Either::Right(future::Either::Left(future::Either::Left(
-                            future::Either::Right(async move {
-                                internal!("base sharded by complex key")
-                            }),
-                        )))
-                    }
-                    Some(&k) => k,
-                };
-
-                let _guard = span.as_ref().map(Span::enter);
-                trace!("shard request");
-                let mut shard_writes = vec![Vec::new(); nshards];
-                let mut ops: Vec<TableOperation> = match i.data.clone().try_into() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return future::Either::Left(future::Either::Right(async move {
-                            internal!("couldn't get table operations from packet. Error: '{}'", e)
-                        }))
-                    }
-                };
-                for r in ops.drain(..) {
-                    for shard in r.shards(key_col, nshards) {
-                        shard_writes[shard].push(r.clone())
-                    }
-                }
-
-                let wait_for = FuturesUnordered::new();
-                for (s, rs) in shard_writes.drain(..).enumerate() {
-                    if !rs.is_empty() {
-                        let new_i = PacketData {
-                            dst: i.dst,
-                            data: PacketPayload::Input(rs),
-                            trace: i.trace.clone(),
-                        };
-
-                        let request = Tagged::from(new_i);
-
-                        // make a span per shard
-                        let span = if span.is_some() {
-                            Some(trace_span!("table-shard", s))
-                        } else {
-                            None
-                        };
-                        let _guard = span.as_ref().map(Span::enter);
-                        trace!("submit request shard");
-
-                        wait_for.push(self.shards[s].call(request));
-                    } else {
-                        // poll_ready reserves a sender slot which we have to release
-                        // we do that by dropping the old handle and replacing it with a clone
-                        // https://github.com/tokio-rs/tokio/issues/898
-                        self.shards[s] = self.shards[s].clone()
-                    }
-                }
-
-                future::Either::Right(
-                    wait_for
-                        .try_for_each(|_| async { Ok(()) })
-                        .map_err(rpc_err!(
-                            "Table::input",
-                            multiplex::MultiplexTransport<Transport, Tagger>,
-                            Tagged<PacketData>,
-                        ))
-                        .map_ok(Tagged::from),
-                )
-            }
-        })
+        let request = Tagged::from(i);
+        let _guard = span.as_ref().map(Span::enter);
+        trace!("submit request");
+        future::Either::Right(self.shard.call(request).map_err(rpc_err!("Table::input")))
     }
 }
 
@@ -619,10 +488,8 @@ impl Service<TableRequest> for Table {
     type Future = Pin<Box<dyn Future<Output = Result<Tagged<()>, ReadySetError>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        for s in &mut self.shards {
-            ready!(s.poll_ready(cx))
-                .map_err(rpc_err!("<Table as Service<TableRequest>>::poll_ready"))?;
-        }
+        ready!(self.shard.poll_ready(cx))
+            .map_err(rpc_err!("<Table as Service<TableRequest>>::poll_ready"))?;
         Poll::Ready(Ok(()))
     }
 

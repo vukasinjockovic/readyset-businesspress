@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 
-use readyset_client::metrics::recorded;
-use readyset_errors::{internal_err, invariant, ReadySetResult};
+use metrics::counter;
+use readyset_errors::{ReadySetResult, internal_err, invariant};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use crate::node::special::packet_filter::PacketFilter;
-use crate::payload::{ReplayPieceContext, SenderReplication};
 use crate::prelude::*;
 
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Copy)]
@@ -23,7 +22,6 @@ pub struct EgressTx {
     local: LocalNodeIndex,
     domain_index: DomainIndex,
     shard: usize,
-    replication: SenderReplication,
 }
 
 impl EgressTx {
@@ -32,14 +30,12 @@ impl EgressTx {
         local: LocalNodeIndex,
         domain_index: DomainIndex,
         shard: usize,
-        replication: SenderReplication,
     ) -> Self {
         Self {
             node,
             local,
             domain_index,
             shard,
-            replication,
         }
     }
 
@@ -53,11 +49,11 @@ impl EgressTx {
     }
 
     fn inc_sent(&mut self) {
-        metrics::counter!(recorded::EGRESS_NODE_SENT_PACKETS).increment(1);
+        counter!(metric::EGRESS_NODE_SENT_PACKETS).increment(1);
     }
 
     fn inc_dropped(&mut self) {
-        metrics::counter!(recorded::EGRESS_NODE_DROPPED_PACKETS).increment(1);
+        counter!(metric::EGRESS_NODE_DROPPED_PACKETS).increment(1);
     }
 }
 
@@ -101,7 +97,6 @@ impl Egress {
         message: &mut Option<Packet>,
         keyed_by: Option<&[usize]>,
         shard: usize,
-        replica: usize,
         output: &mut dyn Executor,
     ) -> ReadySetResult<()> {
         let Self {
@@ -161,74 +156,7 @@ impl Egress {
             }
             tx.inc_sent();
 
-            match tx.replication {
-                SenderReplication::Same => output.send(
-                    ReplicaAddress {
-                        domain_index: tx.domain_index,
-                        shard: tx.shard,
-                        replica,
-                    },
-                    m,
-                ),
-                SenderReplication::Fanout { num_replicas } => {
-                    match m.replay_piece_context() {
-                        Some(ReplayPieceContext::Partial {
-                            requesting_replica, ..
-                        }) => {
-                            // If the message is a piece of a replay that was requested by a
-                            // particular replica, only replay to that
-                            // replica
-                            invariant!(
-                                *requesting_replica < num_replicas,
-                                "Replica index for replay piece context out-of-bounds"
-                            );
-                            output.send(
-                                ReplicaAddress {
-                                    domain_index: tx.domain_index,
-                                    shard: tx.shard,
-                                    replica: *requesting_replica,
-                                },
-                                m.clone(),
-                            )
-                        }
-                        Some(ReplayPieceContext::Full {
-                            replicas: Some(replicas),
-                            ..
-                        }) => {
-                            // Otherwise if the message is a piece of a full replay that was
-                            // intended for only a particular set of replicas, only replay to those
-                            // replicas
-                            invariant!(
-                                replicas.iter().all(|r| *r < num_replicas),
-                                "Replica index(es) for full replay piece context out-of-bounds"
-                            );
-                            for replica in replicas {
-                                output.send(
-                                    ReplicaAddress {
-                                        domain_index: tx.domain_index,
-                                        shard: tx.shard,
-                                        replica: *replica,
-                                    },
-                                    m.clone(),
-                                )
-                            }
-                        }
-                        _ => {
-                            // Otherwise, replay to all replicas
-                            for replica in 0..num_replicas {
-                                output.send(
-                                    ReplicaAddress {
-                                        domain_index: tx.domain_index,
-                                        shard: tx.shard,
-                                        replica,
-                                    },
-                                    m.clone(),
-                                )
-                            }
-                        }
-                    }
-                }
-            }
+            output.send(tx.domain_index, m);
             if take {
                 break;
             }

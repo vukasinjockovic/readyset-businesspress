@@ -187,6 +187,15 @@ fn alter_readyset() {
         "expected MEMORY LIMIT or PERIOD after SET EVICTION"
     );
     check_parse_both!("ALTER READYSET CHANGE UPSTREAM TO 'mysql://host/db';");
+    check_parse_both!("ALTER READYSET STOP REPLICATION;");
+    check_parse_both!("ALTER READYSET START REPLICATION;");
+    check_parse_both!("ALTER READYSET SET REPLICATION POSITION 'mysql-bin.000003:154';");
+    check_parse_both!("ALTER READYSET CHANGE CDC TO 'mysql://host/db';");
+    check_parse_both!("ALTER READYSET ADD USER 'alice' PASSWORD 'secret';");
+    check_parse_both!("ALTER READYSET MODIFY USER 'alice' PASSWORD 'newsecret';");
+    check_parse_both!("ALTER READYSET DROP USER 'alice';");
+    // Embedded single quotes in the password are accepted by both parsers.
+    check_parse_both!("ALTER READYSET ADD USER 'alice' PASSWORD 'se''cret';");
 }
 
 #[test]
@@ -425,7 +434,7 @@ fn expr_postgres() {
     check_parse_fails!(
         Dialect::PostgreSQL,
         "SELECT lhs IN ((rhs1, rhs2))",
-        "nom-sql AST differs from sqlparser-rs AST"
+        "AST mismatch (left = nom-sql, right = sqlparser-rs)"
     );
 }
 
@@ -1203,6 +1212,97 @@ fn joins() {
     check_parse_postgres!(
         r#"SELECT "tags".* FROM "tags" INNER JOIN "taggings" ON ("tags"."id" = "taggings"."tag_id")"#
     );
+
+    // REA-4372: JOIN followed by a comma-separated subquery. nom-sql can't parse this;
+    // sqlparser handles it natively via its uniform TableFactor/TableWithJoins model.
+    for dialect in [Dialect::MySQL, Dialect::PostgreSQL] {
+        let sql = "SELECT * FROM t JOIN s ON t.id = s.id, (SELECT * FROM w) AS subquery";
+        parse_query_with_config(ParsingPreset::OnlySqlparser, dialect, sql)
+            .unwrap_or_else(|e| panic!("sqlparser should parse {sql:?} in {dialect:?}: {e}"));
+    }
+}
+
+// REA-5850: Postgres octal escape strings in E'...'. The ticket claimed all octal
+// escapes fail, but the real failure is scoped to null-byte-producing escapes —
+// \0 / \x00 / \u0000 all fail with a misleading "Unterminated" tokenizer error.
+// Non-null octal escapes work fine.
+#[test]
+fn postgres_octal_escape_in_e_string() {
+    for sql in [
+        r#"SELECT E'\1'"#,
+        r#"SELECT E'\123'"#,
+        r#"SELECT E'\177'"#,
+        r#"SELECT E'\x41'"#,
+        r#"SELECT E'\u0041'"#,
+    ] {
+        parse_query_with_config(ParsingPreset::OnlySqlparser, Dialect::PostgreSQL, sql)
+            .unwrap_or_else(|e| panic!("sqlparser should parse {sql:?}: {e}"));
+    }
+}
+
+// REA-3536: Postgres range types in CREATE TABLE. Check current state per-type so the
+// outcome is visible if readyset-sql lacks a SqlType variant for any of them.
+#[test]
+fn postgres_range_types() {
+    for ty in [
+        "int4range",
+        "int8range",
+        "numrange",
+        "tsrange",
+        "tstzrange",
+        "daterange",
+    ] {
+        let sql = format!("CREATE TABLE t (x {ty})");
+        parse_query_with_config(ParsingPreset::OnlySqlparser, Dialect::PostgreSQL, &sql)
+            .unwrap_or_else(|e| panic!("sqlparser should parse {sql:?}: {e}"));
+    }
+}
+
+// REA-4961: chbenchmark Q11 HAVING with a scalar subquery. nom-sql couldn't parse it;
+// sqlparser does.
+#[test]
+fn having_subquery() {
+    let sql = "SELECT s_i_id, sum(s_order_cnt) AS ordercount \
+               FROM stock, supplier, nation \
+               WHERE mod((s_w_id * s_i_id), 10000) = su_suppkey \
+                 AND su_nationkey = n_nationkey \
+                 AND n_name = 'Germany' \
+               GROUP BY s_i_id \
+               HAVING sum(s_order_cnt) > \
+                 (SELECT sum(s_order_cnt) * .005 \
+                  FROM stock, supplier, nation \
+                  WHERE mod((s_w_id * s_i_id), 10000) = su_suppkey \
+                    AND su_nationkey = n_nationkey \
+                    AND n_name = 'Germany') \
+               ORDER BY ordercount DESC";
+    for dialect in [Dialect::MySQL, Dialect::PostgreSQL] {
+        parse_query_with_config(ParsingPreset::OnlySqlparser, dialect, sql)
+            .unwrap_or_else(|e| panic!("sqlparser should parse chbenchmark Q11 in {dialect:?}: {e}"));
+    }
+}
+
+// REA-4373: nom-sql couldn't parse non-trivial LHS expressions in BETWEEN (casts,
+// function calls, arithmetic). sqlparser handles them natively.
+#[test]
+fn between_lhs_expressions() {
+    let pg_cases = [
+        r#"SELECT * FROM t WHERE c1::time BETWEEN "startTime" AND '23:59:59'"#,
+        "SELECT * FROM t WHERE (c1 + 1) BETWEEN 0 AND 10",
+        "SELECT * FROM t WHERE ABS(c1) BETWEEN 0 AND 10",
+        "SELECT * FROM t WHERE (c1 * c2) BETWEEN 0 AND 100",
+    ];
+    for sql in pg_cases {
+        parse_query_with_config(ParsingPreset::OnlySqlparser, Dialect::PostgreSQL, sql)
+            .unwrap_or_else(|e| panic!("sqlparser should parse {sql:?}: {e}"));
+    }
+    for sql in [
+        "SELECT * FROM t WHERE CAST(c1 AS TIME) BETWEEN '09:00:00' AND '23:59:59'",
+        "SELECT * FROM t WHERE (c1 + 1) BETWEEN 0 AND 10",
+        "SELECT * FROM t WHERE ABS(c1) BETWEEN 0 AND 10",
+    ] {
+        parse_query_with_config(ParsingPreset::OnlySqlparser, Dialect::MySQL, sql)
+            .unwrap_or_else(|e| panic!("sqlparser should parse {sql:?}: {e}"));
+    }
 }
 
 #[test]
@@ -1371,12 +1471,12 @@ fn select() {
     check_parse_fails!(
         Dialect::PostgreSQL,
         "select * from users limit all\n",
-        "nom-sql AST differs from sqlparser-rs AST"
+        "AST mismatch (left = nom-sql, right = sqlparser-rs)"
     );
     check_parse_fails!(
         Dialect::PostgreSQL,
         "select * from users limit all offset 10\n",
-        "nom-sql AST differs from sqlparser-rs AST"
+        "AST mismatch (left = nom-sql, right = sqlparser-rs)"
     );
 
     check_parse_postgres!("select * from users offset 10\n");
@@ -1681,6 +1781,9 @@ fn binary_modifier() {
 fn signed_modifier() {
     check_parse_type_mysql!("bigint(20) unsigned");
     check_parse_type_mysql!("bigint(20) signed");
+    // REA-5874: specifically `decimal(M, D) unsigned` was reported as failing.
+    check_parse_type_mysql!("decimal(20, 4) unsigned");
+    check_parse_type_mysql!("decimal(6, 2) unsigned");
 }
 
 // Not supported by sqlparser-rs, and may never be; not totally supported by nom-sql either.
@@ -1714,6 +1817,21 @@ fn transactions() {
     check_parse_postgres!("    END       TRANSACTION   ");
     check_parse_both!("    ROLLBACK ");
     check_parse_both!("    ROLLBACK       WORK   ");
+
+    // REA-5341: transaction-access-mode and isolation-level flags on BEGIN / START
+    // TRANSACTION. nom-sql drops these; sqlparser parses them natively. readyset-sql's
+    // current conversion also drops the flags but still produces
+    // `SqlQuery::StartTransaction(_)`, which the adapter recognises as a transaction
+    // boundary.
+    for sql in [
+        "BEGIN READ ONLY",
+        "BEGIN READ WRITE",
+        "START TRANSACTION READ ONLY",
+        "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    ] {
+        parse_query_with_config(ParsingPreset::OnlySqlparser, Dialect::MySQL, sql)
+            .unwrap_or_else(|e| panic!("sqlparser should parse {sql:?}: {e}"));
+    }
 }
 
 #[test]

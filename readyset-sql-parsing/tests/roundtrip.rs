@@ -196,7 +196,7 @@ fn create_table_like() {
 
 // TODO: Fix sqlparser upstream REA-6164
 #[test]
-#[should_panic = "nom-sql AST differs from sqlparser-rs AST"]
+#[should_panic = "AST mismatch (left = nom-sql, right = sqlparser-rs)"]
 fn create_table_like_parenthesized() {
     check_rt_mysql!("CREATE TABLE a(LIKE b)");
     check_rt_mysql!("CREATE TABLE a (LIKE b)");
@@ -333,4 +333,21 @@ fn unqualified_function_still_works() {
     check_rt_mysql_sqlparser!("SELECT myfunc(1, 2, 3)");
     check_rt_postgres_sqlparser!("SELECT myfunc()");
     check_rt_postgres_sqlparser!("SELECT myfunc(1, 2, 3)");
+}
+
+#[test]
+fn window_functions() {
+    // Named WINDOW clause.
+    check_rt_postgres_sqlparser!(
+        "SELECT p.BusinessEntityID, p.LastName, \
+                (SELECT MIN(ListPrice) FROM Production.Product) AS min_list \
+         FROM Person.Person p \
+         WINDOW win AS (PARTITION BY p.BusinessEntityID)"
+    );
+
+    // Aggregate OVER a window spec.
+    check_rt_postgres_sqlparser!(
+        "SELECT MIN(Amount) OVER (PARTITION BY BusinessEntityID ORDER BY OrderDate) \
+         FROM Sales.SalesOrderHeader"
+    );
 }

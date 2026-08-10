@@ -786,6 +786,49 @@ fn row() {
 #[test]
 fn explain_materialization() {
     check_parse_both!("EXPLAIN MATERIALIZATIONS");
+    check_parse_both!("EXPLAIN MATERIALIZATIONS FOR CACHE my_cache");
+    check_parse_mysql!("EXPLAIN MATERIALIZATIONS FOR CACHE `my_cache`");
+    check_parse_postgres!("EXPLAIN MATERIALIZATIONS FOR CACHE \"my_cache\"");
+}
+
+#[test]
+fn explain_materialization_roundtrip() {
+    check_rt_both!("EXPLAIN MATERIALIZATIONS");
+    check_rt_both!("EXPLAIN MATERIALIZATIONS FOR CACHE my_cache");
+    check_rt_mysql!("EXPLAIN MATERIALIZATIONS FOR CACHE `my_cache`");
+    check_rt_postgres!("EXPLAIN MATERIALIZATIONS FOR CACHE \"my_cache\"");
+}
+
+#[test]
+fn values_clause_in_join() {
+    check_parse_postgres!(
+        "SELECT v.a FROM (VALUES (1), (2)) AS v(a) CROSS JOIN categories c"
+    );
+    check_parse_mysql!(
+        "SELECT v.a FROM (VALUES ROW(1), ROW(2)) AS v(a) CROSS JOIN categories c"
+    );
+    check_parse_postgres!(
+        "SELECT v.a, v.b FROM (VALUES (1, 'x'), (2, 'y')) AS v(a, b) CROSS JOIN categories c"
+    );
+    check_parse_mysql!(
+        "SELECT v.a, v.b FROM (VALUES ROW(1, 'x'), ROW(2, 'y')) AS v(a, b) CROSS JOIN categories c"
+    );
+}
+
+#[test]
+fn values_clause_roundtrip() {
+    check_rt_postgres!(
+        "SELECT v.a FROM (VALUES (1), (2)) AS v(a) CROSS JOIN categories c"
+    );
+    check_rt_mysql!(
+        "SELECT v.a FROM (VALUES ROW(1), ROW(2)) AS v(a) CROSS JOIN categories c"
+    );
+    check_rt_postgres!(
+        "SELECT v.a, v.b FROM (VALUES (1, 'x'), (2, 'y')) AS v(a, b) CROSS JOIN categories c"
+    );
+    check_rt_mysql!(
+        "SELECT v.a, v.b FROM (VALUES ROW(1, 'x'), ROW(2, 'y')) AS v(a, b) CROSS JOIN categories c"
+    );
 }
 
 #[test]
@@ -887,6 +930,52 @@ fn create_cache() {
 }
 
 #[test]
+fn create_cache_with_clause_after_name() {
+    // The WITH (...) umbrella follows the optional cache name.
+    check_parse_both!("CREATE CACHE foo WITH (ALWAYS) FROM SELECT * FROM users WHERE id = $1");
+    check_parse_both!(
+        "CREATE CACHE foo WITH (ALWAYS, CONCURRENTLY) FROM SELECT * FROM users WHERE id = $1"
+    );
+    // No name: the umbrella sits where the name would be.
+    check_parse_both!("CREATE CACHE WITH (ALWAYS) FROM SELECT * FROM users WHERE id = $1");
+    check_parse_both!(
+        "CREATE SHALLOW CACHE bar WITH (POLICY TTL 5 SECONDS, COALESCE 250 MS) \
+         FROM SELECT * FROM users WHERE id = $1"
+    );
+}
+
+#[test]
+fn create_cache_rejects_mixing_bare_options_and_with_clause() {
+    // Bare options (before the name) and a WITH (...) clause (after it) are mutually exclusive.
+    check_parse_fails!(
+        Dialect::MySQL,
+        "CREATE CACHE ALWAYS foo WITH (CONCURRENTLY) FROM SELECT * FROM users WHERE id = ?",
+        "combine bare options with a WITH"
+    );
+    // Same with no name between the bare option and the clause.
+    check_parse_fails!(
+        Dialect::MySQL,
+        "CREATE CACHE ALWAYS WITH (CONCURRENTLY) FROM SELECT * FROM users WHERE id = ?",
+        "combine bare options with a WITH"
+    );
+    check_parse_fails!(
+        Dialect::PostgreSQL,
+        "CREATE CACHE CONCURRENTLY foo WITH (ALWAYS) FROM SELECT * FROM users WHERE id = $1",
+        "combine bare options with a WITH"
+    );
+}
+
+#[test]
+fn create_cache_rejects_with_clause_before_name() {
+    // The old `WITH (...) <name>` ordering no longer parses; the name comes first.
+    check_parse_fails!(
+        Dialect::MySQL,
+        "CREATE CACHE WITH (ALWAYS) foo FROM SELECT * FROM users WHERE id = ?",
+        "sqlparser error"
+    );
+}
+
+#[test]
 fn create_deep_shallow_cache() {
     check_parse_both!("CREATE DEEP CACHE FROM SELECT * FROM users WHERE id = $1");
     check_parse_both!("CREATE SHALLOW CACHE FROM SELECT * FROM users WHERE id = $1");
@@ -898,12 +987,87 @@ fn create_deep_cache_policy_fails() {
     check_parse_fails!(
         Dialect::MySQL,
         "CREATE DEEP CACHE POLICY TTL 10 SECONDS FROM SELECT * FROM arst",
-        "only shallow caches support caching policies"
+        "DEEP caches do not support caching policies"
     );
     check_parse_fails!(
         Dialect::PostgreSQL,
         "CREATE DEEP CACHE POLICY TTL 10 SECONDS FROM SELECT * FROM arst",
-        "only shallow caches support caching policies"
+        "DEEP caches do not support caching policies"
+    );
+    check_parse_fails!(
+        Dialect::MySQL,
+        "CREATE DEEP CACHE COALESCE 250 MS FROM SELECT * FROM arst",
+        "COALESCE is not supported for DEEP caches"
+    );
+}
+
+#[test]
+fn create_cache_policy_without_cache_type() {
+    check_parse_both!("CREATE CACHE POLICY TTL 10 SECONDS FROM SELECT * FROM foo");
+    check_parse_both!("CREATE CACHE COALESCE 250 MS FROM SELECT * FROM foo");
+    check_parse_both!(
+        "CREATE CACHE POLICY TTL 10 SECONDS REFRESH 2 SECONDS FROM SELECT * FROM foo"
+    );
+}
+
+#[test]
+fn create_shallow_cache_adaptive() {
+    check_parse_both!("CREATE SHALLOW CACHE ADAPTIVE FROM SELECT * FROM t WHERE id = $1");
+    check_parse_both!(
+        "CREATE SHALLOW CACHE POLICY TTL 5 SECONDS ADAPTIVE FROM SELECT * FROM t WHERE id = $1"
+    );
+    check_parse_both!(
+        "CREATE SHALLOW CACHE ADAPTIVE COALESCE 250 MS foo FROM SELECT * FROM t WHERE id = $1"
+    );
+    check_parse_both!("CREATE SHALLOW CACHE WITH (ADAPTIVE) FROM SELECT * FROM t WHERE id = $1");
+    check_parse_both!(
+        "CREATE SHALLOW CACHE foo WITH (POLICY TTL 5 SECONDS REFRESH EVERY 1 SECONDS, ADAPTIVE) \
+         FROM SELECT * FROM t WHERE id = $1"
+    );
+    check_parse_both!(
+        "CREATE SHALLOW CACHE foo WITH (ADAPTIVE, POLICY TTL 5 SECONDS REFRESH EVERY 1 SECONDS) \
+         FROM SELECT * FROM t WHERE id = $1"
+    );
+    check_parse_both!(
+        "CREATE SHALLOW CACHE WITH (COALESCE 250 MS, ADAPTIVE, ALWAYS) \
+         FROM SELECT * FROM t WHERE id = $1"
+    );
+    check_parse_fails!(
+        Dialect::MySQL,
+        "CREATE DEEP CACHE WITH (ADAPTIVE) FROM SELECT * FROM t",
+        "ADAPTIVE is not supported for DEEP caches"
+    );
+}
+
+#[test]
+fn create_shallow_cache_seconds_regression() {
+    // Existing SECONDS-only syntax must not regress.
+    check_parse_both!(
+        "CREATE SHALLOW CACHE POLICY TTL 10 SECONDS REFRESH 2 SECONDS FROM SELECT RAND()"
+    );
+    // Mixed: MS for TTL, SECONDS for REFRESH.
+    check_parse_both!(
+        "CREATE SHALLOW CACHE POLICY TTL 15000 MS REFRESH 2 SECONDS FROM SELECT RAND()"
+    );
+}
+
+#[test]
+fn create_shallow_cache_milliseconds() {
+    check_parse_both!(
+        "CREATE SHALLOW CACHE POLICY TTL 500 MILLISECONDS FROM SELECT * FROM t WHERE id = $1"
+    );
+    check_parse_both!(
+        "CREATE SHALLOW CACHE POLICY TTL 500 MS FROM SELECT * FROM t WHERE id = $1"
+    );
+    check_parse_both!(
+        "CREATE SHALLOW CACHE POLICY TTL 500 MS REFRESH 100 MS FROM SELECT * FROM t WHERE id = $1"
+    );
+    // Mixed units
+    check_parse_both!(
+        "CREATE SHALLOW CACHE POLICY TTL 5 SECONDS REFRESH 500 MS FROM SELECT * FROM t WHERE id = $1"
+    );
+    check_parse_both!(
+        "CREATE SHALLOW CACHE COALESCE 250 MS FROM SELECT * FROM t WHERE id = $1"
     );
 }
 
@@ -912,6 +1076,16 @@ fn drop_all_caches() {
     check_parse_both!("DROP ALL CACHES");
     check_parse_both!("DROP ALL DEEP CACHES");
     check_parse_both!("DROP ALL SHALLOW CACHES");
+}
+
+#[test]
+fn flush_all_shallow_caches() {
+    check_parse_both!("FLUSH ALL SHALLOW CACHES");
+}
+
+#[test]
+fn flush_cache() {
+    check_parse_both!("FLUSH CACHE my_cache");
 }
 
 #[test]
@@ -1019,7 +1193,7 @@ fn negating_large_numeric_literal() {
     check_parse_fails!(
         Dialect::MySQL,
         format!("SELECT -{}", u64::MAX as u128 + 1),
-        "nom-sql AST differs from sqlparser-rs AST"
+        "AST mismatch (left = nom-sql, right = sqlparser-rs)"
     );
 }
 
@@ -1058,17 +1232,17 @@ fn rename_table() {
     check_parse_fails!(
         Dialect::PostgreSQL,
         "ALTER TABLE tb1 RENAME TO tb2",
-        "nom-sql AST differs"
+        "AST mismatch"
     );
     check_parse_fails!(
         Dialect::MySQL,
         "ALTER TABLE tb1 RENAME TO tb2",
-        "nom-sql AST differs"
+        "AST mismatch"
     );
     check_parse_fails!(
         Dialect::MySQL,
         "ALTER TABLE tb1 RENAME AS tb2",
-        "nom-sql AST differs"
+        "AST mismatch"
     );
 }
 
@@ -1080,14 +1254,12 @@ fn create_with_index_type() {
 }
 
 #[test]
-#[ignore = "REA-5841"]
 fn create_with_unique_key_on_column() {
     check_parse_mysql!("CREATE TABLE foo (x int UNIQUE)");
     check_parse_mysql!("CREATE TABLE foo (x int UNIQUE KEY)");
 }
 
 #[test]
-#[ignore = "REA-5842"]
 fn create_with_unique_key_using_suffix() {
     check_parse_mysql!("CREATE TABLE users (id int, UNIQUE KEY id_k (id) USING HASH);");
     check_parse_mysql!("CREATE TABLE users (id int, UNIQUE KEY id_k (id) USING BTREE);");
@@ -1178,7 +1350,7 @@ fn postgres_bytea_casts() {
         check_parse_fails!(
             Dialect::PostgreSQL,
             sql,
-            "nom-sql AST differs from sqlparser-rs AST"
+            "AST mismatch (left = nom-sql, right = sqlparser-rs)"
         );
     }
     // For some reason nom-sql doesn't do this conversion if the string is not hex
@@ -1333,7 +1505,7 @@ fn create_table_like() {
 
 // TODO: Fix sqlparser upstream REA-6164
 #[test]
-#[should_panic = "nom-sql AST differs from sqlparser-rs AST"]
+#[should_panic = "AST mismatch (left = nom-sql, right = sqlparser-rs)"]
 fn create_table_like_parenthesized() {
     check_parse_mysql!("CREATE TABLE a(LIKE b)");
     check_parse_mysql!("CREATE TABLE a (LIKE b)");
@@ -1494,5 +1666,44 @@ fn alter_table_add_column_position_after_special_chars() {
         }
     } else {
         panic!("Expected AlterTable");
+    }
+}
+
+#[test]
+fn table_alias_with_column_renaming() {
+    for (query, expected_aliases) in &[
+        (
+            "SELECT * FROM users AS u(user_id, user_name)",
+            vec!["user_id", "user_name"],
+        ),
+        (
+            "SELECT * FROM (SELECT id, name FROM users) AS u(user_id, user_name)",
+            vec!["user_id", "user_name"],
+        ),
+    ] {
+        let result = parse_query_with_config(
+            ParsingPreset::BothErrorOnMismatch,
+            Dialect::PostgreSQL,
+            query,
+        )
+        .unwrap_or_else(|e| panic!("Failed to parse {:?}: {}", query, e));
+
+        let select = match result {
+            SqlQuery::Select(s) => s,
+            _ => panic!("Expected SELECT statement"),
+        };
+
+        let table_expr = select.tables.first().expect("Expected at least one table");
+        assert_eq!(
+            table_expr.alias.as_ref().map(|a| a.as_str()),
+            Some("u"),
+        );
+
+        let aliases: Vec<&str> = table_expr
+            .column_aliases
+            .iter()
+            .map(|a| a.as_str())
+            .collect();
+        assert_eq!(aliases, *expected_aliases);
     }
 }

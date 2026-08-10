@@ -1,6 +1,7 @@
-use assert_matches::assert_matches;
+use std::assert_matches;
+
 use chrono::{NaiveDate, NaiveDateTime};
-use test_utils::tags;
+use test_utils::{tags, upstream};
 use tokio_postgres::{CommandCompleteContents, SimpleQueryMessage};
 
 use database_utils::tls::ServerCertVerification;
@@ -1033,8 +1034,8 @@ async fn select_one() {
         .await
         .unwrap()
         .iter()
-        .map(|r| r.get(0))
-        .collect::<Vec<i64>>();
+        .map(|r| r.get::<_, i32>(0))
+        .collect::<Vec<i32>>();
     assert_eq!(res, vec![1]);
 
     shutdown_tx.shutdown().await;
@@ -1596,10 +1597,194 @@ async fn caches_go_in_authority_list() {
         unparsed_stmt,
         schema_search_path,
         dialect,
+        cache_name,
     } = res.first().unwrap();
     assert_eq!(unparsed_stmt, "CREATE CACHE q FROM SELECT x FROM t");
     assert_eq!(*dialect, Dialect::DEFAULT_POSTGRESQL);
     assert!(schema_search_path.is_empty());
+    assert_eq!(*cache_name, Some("q".into()));
+
+    shutdown_tx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_cache_removes_authority_entry() {
+    readyset_tracing::init_test_logging();
+
+    let (builder, authority, _dir) =
+        setup_standalone_with_authority("dropping_cache_removes_authority_entry", None);
+    let (config, _handle, shutdown_tx) = builder.build::<PostgreSQLAdapter>().await;
+
+    let conn = connect(config).await;
+    for query in [
+        "CREATE TABLE t (x int)",
+        "CREATE CACHE q FROM SELECT x FROM t",
+        "DROP CACHE q",
+    ] {
+        conn.simple_query(query).await.expect("query failed");
+        sleep().await;
+    }
+
+    let reqs = authority.cache_ddl_requests().await.unwrap();
+    assert!(reqs.is_empty(), "drop should leave no stored entry: {reqs:?}");
+
+    shutdown_tx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_drop_create_stores_one_entry() {
+    readyset_tracing::init_test_logging();
+
+    let (builder, authority, _dir) =
+        setup_standalone_with_authority("create_drop_create_stores_one_entry", None);
+    let (config, _handle, shutdown_tx) = builder.build::<PostgreSQLAdapter>().await;
+
+    let conn = connect(config).await;
+    for query in [
+        "CREATE TABLE t (x int)",
+        "CREATE CACHE q FROM SELECT x FROM t",
+        "DROP CACHE q",
+        "CREATE CACHE q FROM SELECT x FROM t",
+    ] {
+        conn.simple_query(query).await.expect("query failed");
+        sleep().await;
+    }
+
+    let reqs = authority.cache_ddl_requests().await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "create/drop/create should store one entry: {reqs:?}"
+    );
+    assert_eq!(reqs[0].cache_name, Some("q".into()));
+
+    shutdown_tx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn dropping_shallow_cache_removes_entry() {
+    readyset_tracing::init_test_logging();
+
+    let (builder, authority, _dir) =
+        setup_standalone_with_authority("dropping_shallow_cache_removes_entry", None);
+    let (config, _handle, shutdown_tx) = builder
+        .fallback_without_replication("noria")
+        .build::<PostgreSQLAdapter>()
+        .await;
+
+    let conn = connect(config).await;
+    for query in [
+        "CREATE TABLE shallow (a INT)",
+        "INSERT INTO shallow VALUES (42)",
+        "CREATE SHALLOW CACHE q FROM SELECT a FROM shallow",
+    ] {
+        conn.simple_query(query).await.expect("query failed");
+        sleep().await;
+    }
+
+    assert_eq!(
+        authority.shallow_cache_ddl_requests().await.unwrap().len(),
+        1
+    );
+    assert!(
+        authority.cache_ddl_requests().await.unwrap().is_empty(),
+        "creating a shallow cache must not write to the deep list",
+    );
+
+    conn.simple_query("DROP CACHE q").await.expect("drop failed");
+    sleep().await;
+
+    assert!(
+        authority
+            .shallow_cache_ddl_requests()
+            .await
+            .unwrap()
+            .is_empty(),
+        "dropped shallow cache should leave no stored entry",
+    );
+    assert!(
+        authority.cache_ddl_requests().await.unwrap().is_empty(),
+        "dropping a shallow cache must not write to the deep list",
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn dropped_shallow_cache_does_not_resurrect_after_restart() {
+    readyset_tracing::init_test_logging();
+
+    let dir = {
+        let (builder, authority, dir) =
+            setup_standalone_with_authority("shallow_no_resurrect", None);
+        let (config, handle, shutdown_tx) = builder
+            .fallback_without_replication("noria")
+            .build::<PostgreSQLAdapter>()
+            .await;
+
+        let mut conn = DatabaseURL::from(config)
+            .connect(&ServerCertVerification::Default)
+            .await
+            .unwrap();
+        for query in [
+            "CREATE TABLE shallow (a INT)",
+            "INSERT INTO shallow VALUES (42)",
+            "CREATE SHALLOW CACHE q FROM SELECT a FROM shallow",
+        ] {
+            conn.simple_query(query).await.expect("query failed");
+            sleep().await;
+        }
+
+        // Warm the cache so the second read is served by the shallow cache.
+        conn.simple_query("SELECT a FROM shallow").await.unwrap();
+        conn.simple_query("SELECT a FROM shallow").await.unwrap();
+        let info = explain_last_statement(&mut conn).await;
+        assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
+
+        conn.simple_query("DROP CACHE q").await.expect("drop failed");
+        sleep().await;
+        assert!(authority
+            .shallow_cache_ddl_requests()
+            .await
+            .unwrap()
+            .is_empty());
+
+        drop(conn);
+        shutdown_tx.shutdown().await;
+        sleep().await;
+        drop(handle);
+        while std::sync::Arc::strong_count(&authority) > 1 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+        dir
+    };
+
+    // Restart against the same storage and authority. The harness replays persisted shallow
+    // caches; the dropped one must not come back.
+    let (builder, _authority, _dir) =
+        setup_standalone_with_authority("shallow_no_resurrect", Some(dir));
+    let (config, _handle, shutdown_tx) = builder
+        .recreate_database(false)
+        .fallback_without_replication("noria")
+        .build::<PostgreSQLAdapter>()
+        .await;
+
+    let mut conn = DatabaseURL::from(config)
+        .connect(&ServerCertVerification::Default)
+        .await
+        .unwrap();
+    conn.simple_query("SELECT a FROM shallow").await.unwrap();
+    conn.simple_query("SELECT a FROM shallow").await.unwrap();
+    let info = explain_last_statement(&mut conn).await;
+    assert!(
+        !matches!(info.destination, QueryDestination::ReadysetShallow(_)),
+        "dropped shallow cache resurrected after restart: {:?}",
+        info.destination,
+    );
 
     shutdown_tx.shutdown().await;
 }
@@ -1860,34 +2045,6 @@ mod multiple_create_and_drop {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn drop_caches_go_in_authority_list() {
-    readyset_tracing::init_test_logging();
-
-    let (builder, authority, _) =
-        setup_standalone_with_authority("drop_caches_go_in_authority_list", None);
-    let (config, _handle, shutdown_tx) = builder.build::<PostgreSQLAdapter>().await;
-
-    let queries = [
-        "CREATE TABLE t (x int);",
-        "CREATE CACHE q FROM SELECT x FROM t;",
-        "DROP CACHE q;",
-    ];
-
-    let conn = connect(config).await;
-    for query in queries {
-        let _res = conn.simple_query(query).await.expect("query failed");
-        // give it some time to propagate
-        sleep().await;
-    }
-
-    let res = authority.cache_ddl_requests().await.unwrap();
-    let unparsed_stmt = &res.get(1).unwrap().unparsed_stmt;
-    assert_eq!(unparsed_stmt, "DROP CACHE q");
-
-    shutdown_tx.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn drop_all_caches_clears_authority_list() {
     readyset_tracing::init_test_logging();
 
@@ -1935,16 +2092,23 @@ async fn test_explain_create_cache() {
     );
 
     eventually! {
-        let res = explain_create_cache("SELECT * FROM t WHERE x = 5", &mut conn).await;
-
-        res.supported == "yes" && res.rewritten_query == r#"SELECT * FROM "t" WHERE ("x" = $1)"#
+        run_test: {
+            explain_create_cache("SELECT * FROM t WHERE x = 5", &mut conn).await
+        },
+        then_assert: |res| {
+            assert_eq!(res.supported, "yes");
+            assert_eq!(res.rewritten_query, r#"SELECT "t"."x", "t"."y" FROM "t" WHERE ("t"."x" = $1)"#);
+        }
     }
 
     eventually! {
-        let res = explain_create_cache("SELECT * FROM t WHERE t.x = RANDOM()", &mut conn).await;
-
-        res.supported.starts_with("no")
-        && res.rewritten_query == r#"SELECT * FROM "t" WHERE ("t"."x" = random())"#
+        run_test: {
+            explain_create_cache("SELECT * FROM t WHERE t.x = RANDOM()", &mut conn).await
+        },
+        then_assert: |res| {
+            assert!(res.supported.starts_with("no"), "Expected 'no' but got {:?}", res.supported);
+            assert_eq!(res.rewritten_query, r#"SELECT "t"."x", "t"."y" FROM "t" WHERE ("t"."x" = random())"#);
+        }
     }
 
     conn.simple_query("CREATE CACHE FROM SELECT * FROM t WHERE x = 5")
@@ -1953,7 +2117,10 @@ async fn test_explain_create_cache() {
 
     let res = explain_create_cache("SELECT * FROM t WHERE x = 1", &mut conn).await;
     assert_eq!(res.supported, "cached");
-    assert_eq!(res.rewritten_query, r#"SELECT * FROM "t" WHERE ("x" = $1)"#);
+    assert_eq!(
+        res.rewritten_query,
+        r#"SELECT "t"."x", "t"."y" FROM "t" WHERE ("t"."x" = $1)"#
+    );
 
     shutdown_tx.shutdown().await;
 }
@@ -2062,7 +2229,8 @@ WHERE
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn trunc_in_trx() {
     readyset_tracing::init_test_logging();
     let (opts, _handle, shutdown_tx) = TestBuilder::default()
@@ -2191,7 +2359,8 @@ async fn left_join_on_computed_predicate_filters_right_side() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, postgres_upstream)]
+#[tags(serial)]
+#[upstream(postgres)]
 async fn shallow_cache_scheduled_refresh() {
     readyset_tracing::init_test_logging();
     let (opts, _handle, shutdown_tx) = TestBuilder::default()
@@ -2245,7 +2414,7 @@ async fn shallow_cache_scheduled_refresh() {
     }
 
     let last = explain_last_statement(&mut conn).await;
-    assert_matches!(last.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(last.destination, QueryDestination::ReadysetShallow(_));
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     conn.simple_query("UPDATE test_data SET value = 101 WHERE id = 1")
@@ -2268,7 +2437,7 @@ async fn shallow_cache_scheduled_refresh() {
         assert_eq!(cached, expected);
 
         let last = explain_last_statement(&mut conn).await;
-        assert_matches!(last.destination, QueryDestination::ReadysetShallow);
+        assert_matches!(last.destination, QueryDestination::ReadysetShallow(_));
 
         conn.simple_query(&format!(
             "UPDATE test_data SET value = {} WHERE id = 1",
@@ -2282,7 +2451,8 @@ async fn shallow_cache_scheduled_refresh() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, postgres_upstream)]
+#[tags(serial)]
+#[upstream(postgres)]
 async fn shallow_cache_protocol_crossing() {
     readyset_tracing::init_test_logging();
     let (opts, _handle, shutdown_tx) = TestBuilder::default()
@@ -2319,14 +2489,14 @@ async fn shallow_cache_protocol_crossing() {
         .await
         .unwrap();
     let info = explain_last_statement(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     // should hit
     conn.simple_query("SELECT id, value FROM shallow WHERE id = 1")
         .await
         .unwrap();
     let info = explain_last_statement(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     // should miss due to no metadata
     let stmt = conn
@@ -2335,25 +2505,26 @@ async fn shallow_cache_protocol_crossing() {
         .unwrap();
     conn.execute(&stmt, &[&1]).await.unwrap();
     let info = explain_last_statement(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     // should hit
     conn.execute(&stmt, &[&1]).await.unwrap();
     let info = explain_last_statement(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     // should hit; metadata are present but unneeded
     conn.simple_query("SELECT id, value FROM shallow WHERE id = 1")
         .await
         .unwrap();
     let info = explain_last_statement(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     shutdown_tx.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, postgres_upstream)]
+#[tags(serial)]
+#[upstream(postgres)]
 async fn shallow_cache_prepared_statement_without_parameters() {
     readyset_tracing::init_test_logging();
     let (opts, _handle, shutdown_tx) = TestBuilder::default()
@@ -2384,17 +2555,18 @@ async fn shallow_cache_prepared_statement_without_parameters() {
 
     conn.execute::<_, &[&i32]>(&stmt, &[]).await.unwrap();
     let info = explain_last_statement(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     conn.execute::<_, &[&i32]>(&stmt, &[]).await.unwrap();
     let info = explain_last_statement(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     shutdown_tx.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, postgres_upstream)]
+#[tags(serial)]
+#[upstream(postgres)]
 async fn shallow_cache_equality_and_in_clause() {
     readyset_tracing::init_test_logging();
     let (opts, _handle, shutdown_tx) = TestBuilder::default()
@@ -2441,28 +2613,28 @@ async fn shallow_cache_equality_and_in_clause() {
         .await
         .unwrap();
     let info = explain_last_statement(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     // Second identical query should hit
     conn.simple_query("SELECT a, b, value FROM shallow_in WHERE a = 1 AND b IN (10, 20)")
         .await
         .unwrap();
     let info = explain_last_statement(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     // In set contents should be normalized (sorted)
     conn.simple_query("SELECT a, b, value FROM shallow_in WHERE a = 1 AND b IN (20, 10)")
         .await
         .unwrap();
     let info = explain_last_statement(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     // Different IN values should miss
     conn.simple_query("SELECT a, b, value FROM shallow_in WHERE a = 1 AND b IN (20, 30)")
         .await
         .unwrap();
     let info = explain_last_statement(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     shutdown_tx.shutdown().await;
 }

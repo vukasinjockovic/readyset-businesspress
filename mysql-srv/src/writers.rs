@@ -1,7 +1,9 @@
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::sync::Arc;
 
 use byteorder::{LittleEndian, WriteBytesExt};
+use readyset_data::encoding::Encoding;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::myc::constants::StatusFlags;
@@ -57,6 +59,27 @@ where
     buf.write_u8(0x00)?; // OK packet type
     buf.write_lenenc_int(rows)?;
     buf.write_lenenc_int(last_insert_id)?;
+    buf.write_u16::<LittleEndian>(s.bits())?;
+    buf.write_all(&[0x00, 0x00])?; // no warnings
+    conn.enqueue_packet(buf);
+    Ok(())
+}
+
+/// Write the result-set terminator used when the client negotiated CLIENT_DEPRECATE_EOF: an OK
+/// packet carrying the 0xFE header that replaces the legacy EOF terminator. Its short length
+/// (< 9 bytes) distinguishes it from a genuine OK packet at the start of a response.
+pub(crate) async fn write_ok_eof_packet<S>(
+    conn: &mut PacketConn<S>,
+    s: StatusFlags,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    const OK_EOF_PACKET_LEN: usize = 1 + 1 + 1 + 2 + 2;
+    let mut buf = conn.get_buffer(OK_EOF_PACKET_LEN);
+    buf.write_u8(0xFE)?; // EOF-shaped OK packet header
+    buf.write_lenenc_int(0)?; // affected rows
+    buf.write_lenenc_int(0)?; // last insert id
     buf.write_u16::<LittleEndian>(s.bits())?;
     buf.write_all(&[0x00, 0x00])?; // no warnings
     conn.enqueue_packet(buf);
@@ -120,34 +143,36 @@ const fn lenc_int_len(n: u64) -> usize {
 /// Pre-computed constant: length of "def" as a length-encoded string
 const LENC_DEF_LEN: usize = 4; // "def" (3 bytes) + 1 length byte
 
-/// Pre-computed constant: length of empty string as a length-encoded string
-const LENC_EMPTY_LEN: usize = 1; // just the length byte (0)
-
 /// Pre-computed constant: fixed overhead for column definition
-/// This includes: "def" + 3 empty strings (schema, original table, original name) + fixed-size fields
-const COL_FIXED_OVERHEAD: usize = LENC_DEF_LEN + (3 * LENC_EMPTY_LEN) + (1 + 2 + 4 + 1 + 2 + 1 + 2);
+/// This includes: "def" + the lenenc length byte + fixed-size fields. The five variable-length
+/// strings (schema, table, org_table, name, org_name) are added per-column in
+/// [`col_enc_len_upper_bound`].
+const COL_FIXED_OVERHEAD: usize = LENC_DEF_LEN + (1 + 2 + 4 + 1 + 2 + 1 + 2);
 
-/// Compute the size of the buffer required to encode this column definition
-fn col_enc_len(c: &Column) -> usize {
-    COL_FIXED_OVERHEAD + lenc_str_len(c.table.as_bytes()) + lenc_str_len(c.column.as_bytes())
+/// Upper bound on the size of this column definition payload, based on the canonical UTF-8
+/// string lengths. Exact for a UTF-8 results encoding. The other supported results encodings
+/// are single-byte, so they never produce more bytes than the UTF-8 input.
+fn col_enc_len_upper_bound(c: &Column) -> usize {
+    COL_FIXED_OVERHEAD
+        + lenc_str_len(c.schema.as_bytes())
+        + lenc_str_len(c.table.as_bytes())
+        + lenc_str_len(c.org_table.as_bytes())
+        + lenc_str_len(c.column.as_bytes())
+        + lenc_str_len(c.org_name.as_bytes())
 }
 
 // See https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset_column_definition.html for documentation
-fn write_column_definition(c: &Column, buf: &mut Vec<u8>) {
+fn write_column_definition(c: &Column, encoding: Encoding, buf: &mut Vec<u8>) {
     // The following unwraps are fine because writes to a Vec can't fail
 
     // Catalog (lenenc)
     buf.write_lenenc_str(b"def").unwrap();
-    // Schema (lenenc)
-    buf.write_lenenc_str(b"").unwrap();
-    // Table (lenenc)
-    buf.write_lenenc_str(c.table.as_bytes()).unwrap();
-    // Original Table (lenenc)
-    buf.write_lenenc_str(b"").unwrap();
-    // Name (lenenc)
-    buf.write_lenenc_str(c.column.as_bytes()).unwrap();
-    // Original Name (lenenc)
-    buf.write_lenenc_str(b"").unwrap();
+    // Schema, Table, Original Table, Name, Original Name (lenenc each). Encodings without a
+    // defined conversion (binary, unsupported) fall back to the canonical UTF-8 bytes.
+    for s in [&c.schema, &c.table, &c.org_table, &c.column, &c.org_name] {
+        let encoded = encoding.encode(s).unwrap_or(Cow::Borrowed(s.as_bytes()));
+        buf.write_lenenc_str(&encoded).unwrap();
+    }
     // Next Length (lenenc) - always 0x0c
     buf.write_lenenc_int(0x0C).unwrap();
     // Character Set (2 Bytes)
@@ -165,9 +190,10 @@ fn write_column_definition(c: &Column, buf: &mut Vec<u8>) {
     buf.write_all(&[c.decimals, 0x00, 0x00]).unwrap();
 }
 
-/// Preencode the column definitions into a buffer for future reuse
-pub fn prepare_column_definitions(cols: &[Column]) -> Vec<u8> {
-    let total_len: usize = cols.iter().map(|c| col_enc_len(c) + 4).sum();
+/// Preencode the column definitions into a buffer for future reuse, with the string fields
+/// encoded in the given results encoding
+pub fn prepare_column_definitions(cols: &[Column], encoding: Encoding) -> Vec<u8> {
+    let total_len: usize = cols.iter().map(|c| col_enc_len_upper_bound(c) + 4).sum();
     let mut buf = Vec::with_capacity(total_len + 9);
 
     let hdr = lenc_int_len(cols.len() as u64) as u32 | (1u32 << 24);
@@ -175,9 +201,11 @@ pub fn prepare_column_definitions(cols: &[Column]) -> Vec<u8> {
     buf.write_lenenc_int(cols.len() as u64).unwrap();
 
     for (seq, c) in cols.iter().enumerate() {
-        let hdr = col_enc_len(c) as u32 | (((seq + 2) as u32) << 24);
-        buf.write_u32::<LittleEndian>(hdr).unwrap();
-        write_column_definition(c, &mut buf);
+        let start = buf.len();
+        buf.extend([0; 4]);
+        write_column_definition(c, encoding, &mut buf);
+        let hdr = (buf.len() - start - 4) as u32 | (((seq + 2) as u32) << 24);
+        buf[start..start + 4].copy_from_slice(&hdr.to_le_bytes());
     }
     buf
 }
@@ -190,35 +218,44 @@ pub(crate) async fn write_column_definitions<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // If the client negotiated CLIENT_DEPRECATE_EOF, the column definitions are not followed by
+    // an EOF packet.
+    let trailing_eof = !conn.deprecate_eof();
+
     if columns.is_empty() {
-        return if only_eof_on_nonempty {
+        return if only_eof_on_nonempty || !trailing_eof {
             Ok(())
         } else {
             write_eof_packet(conn, StatusFlags::empty()).await
         };
     }
 
-    // Calculate total buffer size needed for all column definition packets + EOF packet
-    // Each column needs: 4 bytes for packet header + encoded column definition
-    // EOF packet needs: EOF_PACKET_TOTAL_LEN
-    let columns_size: usize = columns.iter().map(|c| 4 + col_enc_len(c)).sum();
-    let total_size = columns_size + EOF_PACKET_TOTAL_LEN;
+    // Calculate total buffer size needed for all column definition packets, plus the trailing EOF
+    // packet when one is emitted. Each column needs 4 header bytes plus its encoded definition.
+    let columns_size: usize = columns.iter().map(|c| 4 + col_enc_len_upper_bound(c)).sum();
+    let total_size = columns_size
+        + if trailing_eof {
+            EOF_PACKET_TOTAL_LEN
+        } else {
+            0
+        };
 
     // Allocate a single buffer for all packets with their headers
     let mut buf = Vec::with_capacity(total_size);
 
     // Write all column definition packets (with headers) into the single buffer
     for c in columns {
-        let col_len = col_enc_len(c);
-        let hdr = conn.packet_header_bytes(col_len);
-        buf.write_all(&hdr)?;
-        write_column_definition(c, &mut buf);
+        let start = buf.len();
+        buf.extend([0; 4]);
+        write_column_definition(c, conn.results_encoding, &mut buf);
+        let hdr = conn.packet_header_bytes(buf.len() - start - 4);
+        buf[start..start + 4].copy_from_slice(&hdr);
     }
 
-    // Write EOF packet inline into the same buffer
-    write_eof_packet_inline(&mut buf, conn, StatusFlags::empty())?;
+    if trailing_eof {
+        write_eof_packet_inline(&mut buf, conn, StatusFlags::empty())?;
+    }
 
-    // Enqueue the raw buffer containing all packets (column defs + EOF)
     conn.enqueue_plain(buf);
     Ok(())
 }
@@ -245,15 +282,52 @@ pub(crate) async fn column_definitions_cached<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Allocate a buffer for just the EOF packet to append after cached data
-    let mut buf = conn.get_buffer(EOF_PACKET_TOTAL_LEN);
-
-    // Enqueue the cached column definitions first
+    // Enqueue the cached column definitions, then advance past the column-count and column
+    // definition packets whose sequence ids are baked into the cached bytes.
     conn.enqueue_raw(cached);
     conn.seq = conn.seq.wrapping_add((1 + columns.len()) as u8);
 
-    // Write EOF packet inline into our buffer
-    write_eof_packet_inline(&mut buf, conn, StatusFlags::empty())?;
-    conn.enqueue_plain(buf);
+    // If the client negotiated CLIENT_DEPRECATE_EOF, the column definitions are not followed by
+    // an EOF packet.
+    if !conn.deprecate_eof() {
+        let mut buf = conn.get_buffer(EOF_PACKET_TOTAL_LEN);
+        write_eof_packet_inline(&mut buf, conn, StatusFlags::empty())?;
+        conn.enqueue_plain(buf);
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::myc::constants::{ColumnFlags, ColumnType};
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn column_definitions_encode_strings_per_results_encoding() {
+        let column = Column {
+            schema: String::new(),
+            table: String::new(),
+            org_table: String::new(),
+            column: "situação".to_owned(),
+            org_name: String::new(),
+            coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+            column_length: 32,
+            character_set: 8,
+            colflags: ColumnFlags::empty(),
+            decimals: 0,
+        };
+
+        // The needles include the length-encoded string's length byte, so a match also verifies
+        // that packet lengths account for the encoded size.
+        let utf8 = prepare_column_definitions(std::slice::from_ref(&column), Encoding::Utf8);
+        assert!(contains(&utf8, b"\x0asitua\xC3\xA7\xC3\xA3o"));
+
+        let latin1 = prepare_column_definitions(std::slice::from_ref(&column), Encoding::LATIN1);
+        assert!(contains(&latin1, b"\x08situa\xE7\xE3o"));
+        assert!(!contains(&latin1, b"situa\xC3\xA7\xC3\xA3o"));
+    }
 }

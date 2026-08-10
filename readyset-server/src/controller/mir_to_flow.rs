@@ -18,7 +18,9 @@ use dataflow::ops::join::{Join, JoinType};
 use dataflow::ops::project::Project;
 use dataflow::ops::window::{Window, WindowOperation, WindowOperationKind};
 use dataflow::ops::Side;
-use dataflow::{node, ops, Expr as DfExpr, PostLookupAggregates, ReaderProcessing};
+use dataflow::{
+    node, ops, Expr as DfExpr, PostLookupAggregates, PostLookupDistinct, ReaderProcessing,
+};
 use itertools::Itertools;
 use mir::graph::MirGraph;
 use mir::node::node_inner::MirNodeInner;
@@ -36,6 +38,18 @@ use readyset_errors::{
 };
 use readyset_sql::ast::{self, ColumnSpecification, Expr, NullOrder, OrderType, Relation};
 use readyset_sql::TryIntoDialect as _;
+use tracing::warn;
+
+/// Check whether a MIR node is backed by a Constant, looking through AliasTable wrappers.
+fn is_constant_backed(graph: &MirGraph, node: MirNodeIndex) -> bool {
+    match &graph[node].inner {
+        MirNodeInner::Constant { .. } => true,
+        MirNodeInner::AliasTable { .. } => graph
+            .neighbors_directed(node, Direction::Incoming)
+            .any(|parent| matches!(graph[parent].inner, MirNodeInner::Constant { .. })),
+        _ => false,
+    }
+}
 
 /// Sets the names of dataflow columns using the names determined in MIR to ensure aliases are used
 fn set_names(names: &[&str], columns: &mut [DfColumn]) -> ReadySetResult<()> {
@@ -89,7 +103,11 @@ pub(super) fn mir_node_to_flow_parts(
             record_reachable(mir_node_inner);
             let flow_node = match mir_node_inner {
                 MirNodeInner::Accumulator {
-                    on, group_by, kind, ..
+                    on,
+                    group_by,
+                    kind,
+                    skip_finalization,
+                    ..
                 } => {
                     invariant_eq!(ancestors.len(), 1);
                     let parent = ancestors[0];
@@ -101,6 +119,7 @@ pub(super) fn mir_node_to_flow_parts(
                         on,
                         group_by,
                         GroupedNodeType::Accumulation(kind.clone()),
+                        *skip_finalization,
                         mig,
                     )?)
                 }
@@ -117,6 +136,7 @@ pub(super) fn mir_node_to_flow_parts(
                         on,
                         group_by,
                         GroupedNodeType::Aggregation(kind.clone()),
+                        false,
                         mig,
                     )?)
                 }
@@ -146,6 +166,7 @@ pub(super) fn mir_node_to_flow_parts(
                         on,
                         group_by,
                         GroupedNodeType::Extremum(kind.clone()),
+                        false,
                         mig,
                     )?)
                 }
@@ -209,10 +230,12 @@ pub(super) fn mir_node_to_flow_parts(
                         on,
                         project,
                         JoinType::Inner,
+                        &[],
+                        custom_types,
                         mig,
                     )?)
                 }
-                MirNodeInner::JoinAggregates => {
+                MirNodeInner::JoinAggregates { ref group_by } => {
                     invariant_eq!(ancestors.len(), 2);
                     let left = ancestors[0];
                     let right = ancestors[1];
@@ -222,6 +245,7 @@ pub(super) fn mir_node_to_flow_parts(
                         left,
                         right,
                         &graph.referenced_columns(mir_node),
+                        group_by,
                         mig,
                     )?)
                 }
@@ -247,6 +271,7 @@ pub(super) fn mir_node_to_flow_parts(
                     returned_cols,
                     default_row,
                     aggregates,
+                    distinct,
                     ..
                 } => {
                     if !*lowered_to_df {
@@ -260,6 +285,7 @@ pub(super) fn mir_node_to_flow_parts(
                             returned_cols,
                             default_row.clone(),
                             aggregates,
+                            *distinct,
                         )?;
                         materialize_leaf_node(
                             graph,
@@ -273,7 +299,11 @@ pub(super) fn mir_node_to_flow_parts(
                     }
                     None
                 }
-                MirNodeInner::LeftJoin { on, project, .. } => {
+                MirNodeInner::LeftJoin {
+                    on,
+                    project,
+                    left_local_preds,
+                } => {
                     invariant_eq!(ancestors.len(), 2);
                     let left = ancestors[0];
                     let right = ancestors[1];
@@ -286,6 +316,8 @@ pub(super) fn mir_node_to_flow_parts(
                         on,
                         project,
                         JoinType::Left,
+                        left_local_preds,
+                        custom_types,
                         mig,
                     )?)
                 }
@@ -336,11 +368,6 @@ pub(super) fn mir_node_to_flow_parts(
                     group_by,
                     limit,
                     ..
-                }
-                | MirNodeInner::TopK {
-                    order,
-                    group_by,
-                    limit,
                 } => {
                     invariant_eq!(ancestors.len(), 1);
                     let parent = ancestors[0];
@@ -352,10 +379,46 @@ pub(super) fn mir_node_to_flow_parts(
                         order,
                         group_by,
                         *limit,
-                        matches!(graph[mir_node].inner, MirNodeInner::TopK { .. }),
+                        /* is_topk */ false,
+                        None,
+                        /* cache_name */ None,
                         mig,
                     )?)
                 }
+                MirNodeInner::TopK {
+                    order,
+                    group_by,
+                    limit,
+                    topk_buffer_multiplier,
+                    query_name: topk_query_name,
+                } => {
+                    invariant_eq!(ancestors.len(), 1);
+                    let parent = ancestors[0];
+                    Some(make_paginate_or_topk_node(
+                        graph,
+                        name,
+                        parent,
+                        &graph.columns(mir_node),
+                        order,
+                        group_by,
+                        *limit,
+                        /* is_topk */ true,
+                        *topk_buffer_multiplier,
+                        Some(topk_query_name.clone()),
+                        mig,
+                    )?)
+                }
+                MirNodeInner::Constant {
+                    rows,
+                    column_names,
+                    column_types,
+                } => Some(make_constant_node(
+                    name,
+                    rows,
+                    column_names,
+                    column_types,
+                    mig,
+                )?),
                 MirNodeInner::AliasTable { .. } => None,
             };
             if let MirNodeInner::Leaf {
@@ -395,6 +458,9 @@ fn record_reachable(node: &MirNodeInner) {
         MirNodeInner::Base { .. } => {
             record_reachable!(r#"{"id":"Create dataflow node","sub":"Base"}"#)
         }
+        MirNodeInner::Constant { .. } => {
+            record_reachable!(r#"{"id":"Create dataflow node","sub":"Constant"}"#)
+        }
         MirNodeInner::Window { .. } => {
             record_reachable!(r#"{"id":"Create dataflow node","sub":"Window"}"#)
         }
@@ -404,27 +470,28 @@ fn record_reachable(node: &MirNodeInner) {
         MirNodeInner::Filter { .. } => {
             record_reachable!(r#"{"id":"Create dataflow node","sub":"Filter"}"#)
         }
-        MirNodeInner::Identity => {
-            record_reachable!(r#"{"id":"Create dataflow node","sub":"Identity"}"#)
-        }
+        // Identity has no construction site in the sql-to-mir path and cannot
+        // reach this probe in practice.
+        MirNodeInner::Identity => {}
         MirNodeInner::Join { .. } => {
             record_reachable!(r#"{"id":"Create dataflow node","sub":"Join"}"#)
         }
-        MirNodeInner::JoinAggregates => {
+        MirNodeInner::JoinAggregates { .. } => {
             record_reachable!(r#"{"id":"Create dataflow node","sub":"JoinAggregates"}"#)
         }
         MirNodeInner::LeftJoin { .. } => {
             record_reachable!(r#"{"id":"Create dataflow node","sub":"LeftJoin"}"#)
         }
-        MirNodeInner::DependentJoin { .. } => {
-            record_reachable!(r#"{"id":"Create dataflow node","sub":"DependentJoin"}"#)
-        }
-        MirNodeInner::DependentLeftJoin { .. } => {
-            record_reachable!(r#"{"id":"Create dataflow node","sub":"DependentLeftJoin"}"#)
-        }
-        MirNodeInner::ViewKey { .. } => {
-            record_reachable!(r#"{"id":"Create dataflow node","sub":"ViewKey"}"#)
-        }
+        // DependentJoin and DependentLeftJoin are always decorrelated to Join/LeftJoin
+        // by eliminate_dependent_joins before lowering; if they somehow arrive here the
+        // lowering match in mir_node_to_flow_parts returns internal!(), so this probe is
+        // unreachable by design.
+        MirNodeInner::DependentJoin { .. } | MirNodeInner::DependentLeftJoin { .. } => {}
+        // ViewKey is always merged into the Leaf node (or returns UnsupportedPlaceholders)
+        // by pull_view_keys_to_leaf before lowering; the lowering match in
+        // mir_node_to_flow_parts returns UnsupportedPlaceholders, so this probe is
+        // unreachable by design.
+        MirNodeInner::ViewKey { .. } => {}
         MirNodeInner::Project { .. } => {
             record_reachable!(r#"{"id":"Create dataflow node","sub":"Project"}"#)
         }
@@ -552,6 +619,28 @@ fn make_base_node(
     };
 
     Ok(DfNodeIndex::new(mig.add_base(name, columns, base)))
+}
+
+fn make_constant_node(
+    name: Relation,
+    rows: &[Vec<DfValue>],
+    column_names: &[readyset_sql::ast::SqlIdentifier],
+    column_types: &[DfType],
+    mig: &mut Migration<'_>,
+) -> ReadySetResult<DfNodeIndex> {
+    use dataflow::node::special::Constant;
+
+    // Create column definitions from column names and types
+    let columns: Vec<DfColumn> = column_names
+        .iter()
+        .zip(column_types.iter())
+        .map(|(col_name, col_type)| DfColumn::new(col_name.clone(), col_type.clone(), None))
+        .collect();
+
+    let constant = Constant::new(rows.to_vec());
+
+    // Use add_constant() which handles Constant nodes like Base nodes
+    Ok(DfNodeIndex::new(mig.add_constant(name, columns, constant)))
 }
 
 fn make_union_node(
@@ -703,18 +792,21 @@ fn make_window_node(
         Avg => {
             let ty = find_input_type()?;
 
-            match ty {
-                DfType::Int
-                | DfType::TinyInt
-                | DfType::SmallInt
-                | DfType::BigInt
-                | DfType::UnsignedInt
-                | DfType::UnsignedTinyInt
-                | DfType::UnsignedSmallInt
-                | DfType::UnsignedBigInt
-                | DfType::Numeric { .. } => DfType::DEFAULT_NUMERIC,
-                DfType::Float | DfType::Double => DfType::Double,
-                t => unsupported!("Unsupported type {t:?} for AVG window function"),
+            match mig.dialect.engine() {
+                SqlEngine::MySQL => DfType::mysql_avg_output_type(&ty),
+                SqlEngine::PostgreSQL => match ty {
+                    DfType::Int
+                    | DfType::TinyInt
+                    | DfType::SmallInt
+                    | DfType::BigInt
+                    | DfType::UnsignedInt
+                    | DfType::UnsignedTinyInt
+                    | DfType::UnsignedSmallInt
+                    | DfType::UnsignedBigInt
+                    | DfType::Numeric { .. } => DfType::DEFAULT_NUMERIC,
+                    DfType::Float | DfType::Double => DfType::Double,
+                    t => unsupported!("Unsupported type {t:?} for AVG window function"),
+                },
             }
         }
         Sum => {
@@ -722,7 +814,7 @@ fn make_window_node(
 
             match mig.dialect.engine() {
                 SqlEngine::MySQL => {
-                    if ty.is_any_float() {
+                    if ty.is_any_float() || ty.is_any_text() {
                         DfType::Double
                     } else if ty.is_any_int() || ty.is_numeric() {
                         DfType::DEFAULT_NUMERIC
@@ -807,6 +899,7 @@ fn make_window_node(
         function,
         output_col_index,
         output_type,
+        mig.dialect,
     )?;
 
     Ok(DfNodeIndex::new(mig.add_ingredient(name, cols, window)))
@@ -820,6 +913,7 @@ fn make_grouped_node(
     on: &Column,
     group_by: &[Column],
     kind: GroupedNodeType,
+    skip_finalization: bool,
     mig: &mut Migration<'_>,
 ) -> ReadySetResult<DfNodeIndex> {
     let parent_na = graph.resolve_dataflow_node(parent).ok_or_else(|| {
@@ -851,6 +945,16 @@ fn make_grouped_node(
         .get(over_col_indx)
         .ok_or_else(|| internal_err!("Invalid index"))?
         .ty();
+    if matches!(over_col_ty, DfType::Unknown)
+        && matches!(kind, GroupedNodeType::Aggregation(Aggregation::Avg))
+    {
+        warn!(
+            ?name,
+            over_col_indx,
+            ?over_col_ty,
+            "AVG aggregation has Unknown over column type; decimal precision may be incorrect"
+        );
+    }
     let over_col_name = &columns
         .last()
         .ok_or_else(|| internal_err!("Grouped has no projections"))?
@@ -868,6 +972,7 @@ fn make_grouped_node(
                 group_col_indx.as_slice(),
                 over_col_ty,
                 &mig.dialect,
+                skip_finalization,
             )?;
             let agg_col = make_agg_col(grouped.output_col_type().or_ref(over_col_ty).clone());
             cols.push(agg_col);
@@ -976,6 +1081,8 @@ fn make_join_node(
     on: &[(Column, Column)],
     proj_cols: &[Column],
     kind: JoinType,
+    left_local_preds: &[Expr],
+    custom_types: &HashMap<Relation, DfType>,
     mig: &mut Migration<'_>,
 ) -> ReadySetResult<DfNodeIndex> {
     let mut left_na = graph.resolve_dataflow_node(left).ok_or_else(|| {
@@ -1002,23 +1109,37 @@ fn make_join_node(
         })
         .collect::<ReadySetResult<Vec<_>>>()?;
 
-    let (left, right) = match should_swap_join_sides(left_cols, right_cols, &on_idxs) {
-        Ok(true) => {
-            if kind == JoinType::Inner {
-                mem::swap(&mut left_na, &mut right_na);
-                mem::swap(&mut left_cols, &mut right_cols);
-                for item in on_idxs.iter_mut() {
-                    *item = (item.1, item.0);
+    // NOTE: on_idxs can be legitimately empty for certain join shapes.
+    // However, a bug upstream (e.g., in classify_conditionals or
+    // collect_join_predicates) could also produce an empty on_idxs
+    // unexpectedly — this would cause an "Empty join key" panic at
+    // runtime during replay.  If such a panic is observed, investigate
+    // how the join ended up with no equality key columns.
+
+    // Skip join side swapping for Constant nodes — they are always small
+    let (left, right) = if is_constant_backed(graph, left) || is_constant_backed(graph, right) {
+        (left, right)
+    } else {
+        match should_swap_join_sides(left_cols, right_cols, &on_idxs) {
+            Ok(true) => {
+                if kind == JoinType::Inner {
+                    mem::swap(&mut left_na, &mut right_na);
+                    mem::swap(&mut left_cols, &mut right_cols);
+                    for item in on_idxs.iter_mut() {
+                        *item = (item.1, item.0);
+                    }
+                    (right, left)
+                } else {
+                    unsupported!(
+                        "Swapping join sides is currently only supported for inner joins."
+                    );
                 }
-                (right, left)
-            } else {
-                unsupported!("Swapping join sides is currently only supported for inner joins.");
             }
+            Err(e) => {
+                return Err(e);
+            }
+            _ => (left, right),
         }
-        Err(e) => {
-            return Err(e);
-        }
-        _ => (left, right),
     };
 
     let mut emit = Vec::with_capacity(proj_cols.len());
@@ -1055,6 +1176,37 @@ fn make_join_node(
     // we need to check if the rhs parent is fully materialized, as this is needed for straddled join
     // upquery optimizations.
     let rhs_full_mat = mig.dataflow_state.ingredients[right_na.address()].is_full_mat();
+
+    // Lower left_local_preds (ON-clause predicates referencing only the left side)
+    // into a single dataflow expression for the join operator to evaluate.
+    let left_filter = if left_local_preds.is_empty() {
+        None
+    } else {
+        let left_cols = &mig.dataflow_state.ingredients[left_na.address()]
+            .columns()
+            .to_vec();
+        let lowered: Vec<DfExpr> = left_local_preds
+            .iter()
+            .map(|pred| {
+                lower_expression(
+                    graph,
+                    left,
+                    pred.clone(),
+                    left_cols,
+                    custom_types,
+                    mig.dialect,
+                )
+            })
+            .collect::<ReadySetResult<Vec<_>>>()?;
+        // Combine multiple predicates with AND
+        lowered.into_iter().reduce(|acc, expr| DfExpr::Op {
+            op: dataflow_expression::BinaryOperator::And,
+            left: Box::new(acc),
+            right: Box::new(expr),
+            ty: DfType::Bool,
+        })
+    };
+
     let j = Join::new(
         left_na.address(),
         right_na.address(),
@@ -1062,21 +1214,24 @@ fn make_join_node(
         on_idxs,
         emit,
         rhs_full_mat,
+        left_filter,
     );
     let n = mig.add_ingredient(name, cols, j);
 
     Ok(DfNodeIndex::new(n))
 }
 
-/// Joins two parent aggregate nodes together. Columns that are shared between both parents are
-/// assumed to be group_by columns and all unique columns are considered to be the aggregate
-/// columns themselves.
+/// Joins two parent aggregate nodes together. The explicit `group_by` columns are used to
+/// determine which columns are join keys vs. aggregate output columns. Previously this was
+/// inferred from column name matching, which failed when two different aggregates produced the
+/// same alias (e.g., `MAX(a.col)` and `MAX(b.col)` both aliasing to `max(col)`).
 fn make_join_aggregates_node(
     graph: &MirGraph,
     name: Relation,
     left: MirNodeIndex,
     right: MirNodeIndex,
     columns: &[Column],
+    group_by: &[Column],
     mig: &mut Migration<'_>,
 ) -> ReadySetResult<DfNodeIndex> {
     let mut left_na = graph.resolve_dataflow_node(left).ok_or_else(|| {
@@ -1092,67 +1247,72 @@ fn make_join_aggregates_node(
     let mut left_cols = mig.dataflow_state.ingredients[left_na.address()].columns();
     let mut right_cols = mig.dataflow_state.ingredients[right_na.address()].columns();
 
-    let mut on = vec![];
-    // We gather up all of the columns from each respective parent. If a column is in both parents,
-    // then we know it was a group_by column and add it as a join key. Otherwise if the column is
-    // exclusively in the left parent (such as the aggregate column itself), we make a Side::Left
-    // with the left parent index. We finally iterate through the right parent and add the columns
-    // that were exclusively in the right parent as Side::Right with the right parent index for
-    // each given unique column.
-    let mut project = graph
-        .columns(left)
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            if let Ok(j) = graph.column_id_for_column(right, c) {
-                // If the column was found in both, it's a group_by column and gets added as
-                // a join key
-                on.push((i, j));
-                (Side::Left, i)
-            } else {
-                // Column exclusively in left parent, so gets added as coming from the left.
-                (Side::Left, i)
-            }
-        })
-        .chain(
-            graph
-                .columns(right)
-                .iter()
-                .enumerate()
-                .filter_map(|(i, c)| {
-                    // If column is in left, don't do anything it's already been added.
-                    // If it's in right, add it with right index.
-                    if graph.column_id_for_column(left, c).is_ok() {
-                        None
-                    } else {
-                        // Column exclusively in right parent, so gets added as coming from the
-                        // right.
-                        Some((Side::Right, i))
-                    }
-                }),
-        )
-        .collect::<Vec<_>>();
+    let left_mir_cols = graph.columns(left);
+    let right_mir_cols = graph.columns(right);
 
-    match should_swap_join_sides(left_cols, right_cols, &on) {
-        Ok(true) => {
-            mem::swap(&mut left_na, &mut right_na);
-            mem::swap(&mut left_cols, &mut right_cols);
-            for item in on.iter_mut() {
-                *item = (item.1, item.0);
-            }
-            for item in project.iter_mut() {
-                item.0 = if item.0 == Side::Left {
-                    Side::Right
-                } else {
-                    Side::Left
-                };
-            }
+    let mut on = vec![];
+    // Use the explicit group_by columns to determine join keys. A left column is a join key
+    // only if it is a group-by column AND the same group-by column exists in the right parent.
+    // All other columns (aggregate outputs) are projected from their respective sides, even if
+    // they happen to share the same name.
+    antithesis_sdk::assert_sometimes!(
+        !group_by.is_empty(),
+        "JoinAggregates with explicit group_by columns",
+        &serde_json::json!({"group_by_count": group_by.len()})
+    );
+    antithesis_sdk::assert_sometimes!(
+        group_by.is_empty(),
+        "JoinAggregates with empty group_by (no GROUP BY or parameter columns)",
+        &serde_json::json!({})
+    );
+    let mut project: Vec<(Side, usize)> = Vec::with_capacity(left_mir_cols.len());
+    for (i, c) in left_mir_cols.iter().enumerate() {
+        if group_by.contains(c) {
+            let j = graph.column_id_for_column(right, c).map_err(|_| {
+                internal_err!(
+                    "group_by column {} not found in right parent of JoinAggregates",
+                    c
+                )
+            })?;
+            on.push((i, j));
         }
-        Err(e) => {
-            return Err(e);
+        project.push((Side::Left, i));
+    }
+
+    // Add columns from the right parent that are NOT group-by columns (i.e., aggregate
+    // outputs). Group-by columns are already represented via the left side of the join.
+    for (i, c) in right_mir_cols.iter().enumerate() {
+        if !group_by.contains(c) {
+            project.push((Side::Right, i));
         }
-        _ => {}
-    };
+    }
+
+    // Skip join side swapping for Constant nodes — they are always small
+    if !is_constant_backed(graph, left) && !is_constant_backed(graph, right) {
+        // Note: This function is only used for joins that are part of aggregations,
+        // which are typically inner joins. If we encounter a non-inner join here,
+        // we just skip the swap rather than erroring.
+        match should_swap_join_sides(left_cols, right_cols, &on) {
+            Ok(true) => {
+                mem::swap(&mut left_na, &mut right_na);
+                mem::swap(&mut left_cols, &mut right_cols);
+                for item in on.iter_mut() {
+                    *item = (item.1, item.0);
+                }
+                for item in project.iter_mut() {
+                    item.0 = if item.0 == Side::Left {
+                        Side::Right
+                    } else {
+                        Side::Left
+                    };
+                }
+            }
+            Err(e) => {
+                return Err(e);
+            }
+            _ => {}
+        };
+    }
 
     let mut cols = project
         .iter()
@@ -1182,6 +1342,7 @@ fn make_join_aggregates_node(
         on,
         project,
         rhs_full_mat,
+        None,
     );
     let n = mig.add_ingredient(name, cols, j);
 
@@ -1380,6 +1541,7 @@ fn make_distinct_node(
     Ok(DfNodeIndex::new(na))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_paginate_or_topk_node(
     graph: &MirGraph,
     name: Relation,
@@ -1389,6 +1551,8 @@ fn make_paginate_or_topk_node(
     group_by: &[Column],
     limit: usize,
     is_topk: bool,
+    topk_buffer_multiplier: Option<usize>,
+    cache_name: Option<Relation>,
     mig: &mut Migration<'_>,
 ) -> ReadySetResult<DfNodeIndex> {
     let parent_na = graph.resolve_dataflow_node(parent).ok_or_else(|| {
@@ -1446,11 +1610,17 @@ fn make_paginate_or_topk_node(
 
     // make the new operator and record its metadata
     let na = if is_topk {
-        mig.add_ingredient(
-            name,
-            parent_cols,
-            ops::topk::TopK::new(parent_na.address(), cmp_rows, group_by_indx, limit),
-        )
+        let mut topk = ops::topk::TopK::with_buffer_multiplier(
+            parent_na.address(),
+            cmp_rows,
+            group_by_indx,
+            limit,
+            topk_buffer_multiplier,
+        );
+        if let Some(cache_name) = cache_name {
+            topk = topk.with_cache_name(cache_name);
+        }
+        mig.add_ingredient(name, parent_cols, topk)
     } else {
         mig.add_ingredient(
             name,
@@ -1469,6 +1639,7 @@ fn make_reader_processing(
     returned_cols: &Option<Vec<Column>>,
     default_row: Option<Vec<DfValue>>,
     aggregates: &Option<PostLookupAggregates<Column>>,
+    distinct: bool,
 ) -> ReadySetResult<ReaderProcessing> {
     let order_by = if let Some(order) = order_by.as_ref() {
         Some(
@@ -1484,27 +1655,48 @@ fn make_reader_processing(
     } else {
         None
     };
-    let returned_cols = if let Some(col) = returned_cols.as_ref() {
-        let returned_cols = col
-            .iter()
-            .map(|col| graph.column_id_for_column(*parent, col))
-            .collect::<ReadySetResult<Vec<_>>>()?;
-
-        // In the future we will avoid reordering column, and must make sure that the returned
-        // columns are a contiguous slice at the start of the row
-        debug_assert!(returned_cols.iter().enumerate().all(|(i, v)| i == *v));
-
-        Some(returned_cols)
-    } else {
-        None
-    };
+    let returned_cols = returned_cols.as_ref().map(|cols| (0..cols.len()).collect());
 
     let aggregates = aggregates
         .clone()
         .map(|aggs| aggs.map_columns(|col| graph.column_id_for_column(*parent, &col)))
         .transpose()?;
 
-    ReaderProcessing::new(order_by, limit, returned_cols, default_row, aggregates)
+    let distinct = if distinct {
+        if aggregates.is_some() {
+            // Post-aggregation output is sorted by GROUP BY columns, not all projected
+            // columns, so non-adjacent duplicates are possible. Use HashSet dedup.
+            PostLookupDistinct::HashBased
+        } else {
+            // No aggregates: input can be merge-sorted by all projected columns for
+            // streaming O(1)-memory dedup.
+            let num_cols = returned_cols
+                .as_ref()
+                .map(|c: &Vec<usize>| c.len())
+                .ok_or_else(|| {
+                    internal_err!(
+                        "Sorted DISTINCT requires returned_cols to determine dedup columns"
+                    )
+                })?;
+            PostLookupDistinct::Sorted {
+                dedup_aggregates: PostLookupAggregates {
+                    group_by: (0..num_cols).collect(),
+                    aggregates: vec![],
+                },
+            }
+        }
+    } else {
+        PostLookupDistinct::None
+    };
+
+    ReaderProcessing::new(
+        order_by,
+        limit,
+        returned_cols,
+        default_row,
+        aggregates,
+        distinct,
+    )
 }
 
 fn materialize_leaf_node(

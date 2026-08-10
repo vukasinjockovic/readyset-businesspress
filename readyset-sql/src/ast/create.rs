@@ -826,6 +826,36 @@ impl TryFromDialect<sqlparser::ast::Query> for SelectSpecification {
     }
 }
 
+impl SelectSpecification {
+    /// Whether this query has an ORDER BY clause.
+    pub fn has_order_by(&self) -> bool {
+        match self {
+            Self::Simple(s) => s.order.is_some(),
+            Self::Compound(c) => c.order.is_some(),
+        }
+    }
+
+    /// Whether this query has a non-empty LIMIT clause.
+    pub fn has_limit(&self) -> bool {
+        match self {
+            Self::Simple(s) => !s.limit_clause.is_empty(),
+            Self::Compound(c) => !c.limit_clause.is_empty(),
+        }
+    }
+}
+
+impl From<SelectStatement> for SelectSpecification {
+    fn from(s: SelectStatement) -> Self {
+        Self::Simple(s)
+    }
+}
+
+impl From<CompoundSelectStatement> for SelectSpecification {
+    fn from(c: CompoundSelectStatement) -> Self {
+        Self::Compound(c)
+    }
+}
+
 impl DialectDisplay for SelectSpecification {
     fn display(&self, dialect: Dialect) -> impl fmt::Display + '_ {
         fmt_with(move |f| match self {
@@ -939,20 +969,35 @@ pub enum EvictionPolicy {
     },
 }
 
+/// Format a [`Duration`] as `N SECONDS` when it's a whole number of seconds, else
+/// `M MILLISECONDS`. Sub-millisecond precision is truncated.
+fn format_duration(f: &mut fmt::Formatter<'_>, d: &Duration) -> fmt::Result {
+    if d.subsec_millis() == 0 {
+        write!(f, "{} SECONDS", d.as_secs())
+    } else {
+        write!(f, "{} MILLISECONDS", d.as_millis())
+    }
+}
+
 impl DialectDisplay for EvictionPolicy {
     fn display(&self, _dialect: Dialect) -> impl fmt::Display + '_ {
         fmt_with(move |f| match self {
-            Self::Ttl { ttl } => write!(f, "POLICY TTL {} SECONDS", ttl.as_secs()),
+            Self::Ttl { ttl } => {
+                write!(f, "POLICY TTL ")?;
+                format_duration(f, ttl)
+            }
             Self::TtlAndPeriod {
                 ttl,
                 refresh,
                 schedule,
             } => {
-                write!(f, "POLICY TTL {} SECONDS REFRESH ", ttl.as_secs())?;
+                write!(f, "POLICY TTL ")?;
+                format_duration(f, ttl)?;
+                write!(f, " REFRESH ")?;
                 if *schedule {
                     write!(f, "EVERY ")?;
                 }
-                write!(f, "{} SECONDS", refresh.as_secs())
+                format_duration(f, refresh)
             }
         })
     }
@@ -1034,14 +1079,81 @@ impl From<SelectStatement> for CacheInner {
     }
 }
 
+/// Controls whether a cached query is served from the Readyset cache when the connection
+/// is inside a transaction (or implicit transaction under `autocommit=0`).
+///
+/// - `Never`: cached query is proxied upstream for the duration of the transaction.
+/// - `UntilWrite`: serve from cache until the transaction observes a write, then proxy
+///   upstream for the remainder of the transaction.
+/// - `Always`: serve from cache regardless of transaction state.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize, Arbitrary)]
+pub enum TrxCachePolicy {
+    #[default]
+    Never,
+    UntilWrite,
+    Always,
+}
+
+impl TrxCachePolicy {
+    /// Render the policy as it appears in `SHOW CACHES` output, or `None` for `Never`.
+    pub fn show_caches_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Never => None,
+            Self::UntilWrite => Some("until write"),
+            Self::Always => Some("always"),
+        }
+    }
+}
+
+/// Controls the adapter's autoparameterization pass for a `CREATE CACHE`. Intentionally left out
+/// of the public SQL reference; for internal and power-user use.
+///
+/// Autoparameterization can make some queries uncacheable or produce pathological indices, so
+/// power users sometimes want to keep specific literals inline and parameterize by hand. Set via
+/// `WITH (AUTOPARAM OFF)` (skip entirely) or `WITH (AUTOPARAM (EXCLUDE_JOINS, EXCLUDE_EXISTS,
+/// EXCLUDE_SUBQUERIES))` (preserve literals originating in the named clause kinds). `AUTOPARAM ON`
+/// is the explicit default (every default field `false`), accepted so generated DDL can always
+/// emit an `AUTOPARAM` clause. Only affects the deep (`Auto`) parameterization path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, Arbitrary)]
+pub struct AutoparamControl {
+    /// `AUTOPARAM OFF`: skip autoparameterization entirely; preserve every literal.
+    pub off: bool,
+    /// `EXCLUDE_JOINS`: preserve literals in JOIN ON conditions.
+    pub exclude_joins: bool,
+    /// `EXCLUDE_EXISTS`: preserve literals originating in `EXISTS` / `NOT EXISTS` clauses.
+    pub exclude_exists: bool,
+    /// `EXCLUDE_SUBQUERIES`: preserve literals originating in `IN (SELECT ...)`, derived tables,
+    /// and scalar subqueries (predicates the unnest/inline passes hoist into the outer query).
+    pub exclude_subqueries: bool,
+}
+
+impl AutoparamControl {
+    /// True when no exclusions are requested (autoparameterize normally).
+    pub fn is_default(&self) -> bool {
+        !self.off && !self.exclude_joins && !self.exclude_exists && !self.exclude_subqueries
+    }
+}
+
 /// Optional `CREATE CACHE` arguments. This struct is only used for parsing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreateCacheOptions {
-    pub always: bool,
+    /// The name of the cache. `None` when no name was given, in which case one is generated from
+    /// the statement.
+    pub name: Option<Relation>,
+    pub trx_cache_policy: TrxCachePolicy,
     pub concurrently: bool,
     pub cache_type: Option<CacheType>,
     pub policy: Option<EvictionPolicy>,
     pub coalesce_ms: Option<Duration>,
+    /// Adaptive refresh; see [`CreateCacheStatement::adaptive`].
+    pub adaptive: bool,
+    /// Multiplier applied to the `LIMIT k` value to size the TopK operator's buffer of rows
+    /// retained past the top-k window. `buffered = k * multiplier`. `0` disables buffering;
+    /// `None` (unset) preserves the legacy default of `buffered = k`. Only settable inside the
+    /// `WITH (...)` umbrella, and only meaningful for queries that lower to a TopK node.
+    pub topk_buffer_multiplier: Option<usize>,
+    /// Autoparameterization control; see [`AutoparamControl`].
+    pub autoparam: AutoparamControl,
 }
 
 /// `CREATE [DEEP|SHALLOW] CACHE [POLICY TTL N SECONDS] [CONCURRENTLY] [ALWAYS] [<name>] FROM ...`
@@ -1060,6 +1172,10 @@ pub struct CreateCacheStatement {
     /// The coalesce window for request deduplication (only for shallow caches)
     #[strategy(any::<Option<Duration>>())]
     pub coalesce_ms: Option<Duration>,
+    /// Adaptive refresh: adjust each key's refresh period based on whether its value changed
+    /// (only for shallow caches)
+    #[serde(default)]
+    pub adaptive: bool,
     /// The result of parsing the inner statement or query ID for the `CREATE CACHE` statement.
     ///
     /// If parsing succeeded, then this will contain an Ok result with the definition of the
@@ -1074,23 +1190,35 @@ pub struct CreateCacheStatement {
     /// don't divide up the input before starting parsing when using sqlparser-rs. See
     /// [`readyset_sql_parsing::parse_queries`].
     pub unparsed_create_cache_statement: Option<String>,
-    /// If `always` is true, a cached query executed inside a transaction can be served from
-    /// a readyset cache.
-    /// if false, cached queries within a transaction are proxied to upstream
-    pub always: bool,
+    /// Controls whether the cache is served when the connection is inside a transaction.
+    /// See [`TrxCachePolicy`] for the variants and their semantics.
+    pub trx_cache_policy: TrxCachePolicy,
     /// Whether the CREATE CACHE STATEMENT should block or run concurrently
     pub concurrently: bool,
+    /// Multiplier applied to the TopK operator's buffer size. See
+    /// [`CreateCacheOptions::topk_buffer_multiplier`]. Only settable via the `WITH (...)` clause.
+    #[serde(default)]
+    pub topk_buffer_multiplier: Option<usize>,
+    /// Autoparameterization control; see [`AutoparamControl`]. Not part of the public SQL
+    /// reference.
+    #[serde(default)]
+    pub autoparam: AutoparamControl,
 }
 
+// `trx_cache_policy` is intentionally excluded from `Eq`/`Hash`: two `CREATE CACHE`
+// statements that differ only in their transaction cache policy describe the same
+// cached query and should coalesce to a single entry.
 impl PartialEq for CreateCacheStatement {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
             && self.cache_type == other.cache_type
             && self.policy == other.policy
             && self.coalesce_ms == other.coalesce_ms
+            && self.adaptive == other.adaptive
             && self.inner == other.inner
-            && self.always == other.always
             && self.concurrently == other.concurrently
+            && self.topk_buffer_multiplier == other.topk_buffer_multiplier
+            && self.autoparam == other.autoparam
     }
 }
 
@@ -1102,38 +1230,144 @@ impl Hash for CreateCacheStatement {
         self.cache_type.hash(state);
         self.policy.hash(state);
         self.coalesce_ms.hash(state);
+        self.adaptive.hash(state);
         self.inner.hash(state);
-        self.always.hash(state);
         self.concurrently.hash(state);
+        self.topk_buffer_multiplier.hash(state);
+        self.autoparam.hash(state);
+    }
+}
+
+impl DialectDisplay for CreateCacheOptions {
+    /// Render `CREATE [type] CACHE [name] [WITH (...)]` — the head shared by the `CREATE CACHE`
+    /// DDL statement and the `/*rs+ ... */` hint directive. The `FROM <query>` tail is
+    /// statement-specific and appended by the caller. Because every option renders here, a new
+    /// option becomes visible in both surfaces at once.
+    fn display(&self, dialect: Dialect) -> impl fmt::Display + '_ {
+        fmt_with(move |f| {
+            write!(f, "CREATE ")?;
+            if let Some(cache_type) = &self.cache_type {
+                write!(f, "{} ", cache_type.display(dialect))?;
+            }
+            write!(f, "CACHE")?;
+            if let Some(name) = &self.name {
+                write!(f, " {}", name.display(dialect))?;
+            }
+            // Render options through the `WITH (...)` umbrella so the canonical text matches the
+            // grammar. The clause follows the name and is omitted entirely when there are no
+            // options to emit.
+            let has_options = self.policy.is_some()
+                || self.coalesce_ms.is_some()
+                || self.adaptive
+                || self.concurrently
+                || !matches!(self.trx_cache_policy, TrxCachePolicy::Never)
+                || self.topk_buffer_multiplier.is_some()
+                || !self.autoparam.is_default();
+            if has_options {
+                write!(f, " WITH (")?;
+                let mut first = true;
+                let mut sep = |f: &mut fmt::Formatter<'_>| -> fmt::Result {
+                    if !std::mem::take(&mut first) {
+                        write!(f, ", ")?;
+                    }
+                    Ok(())
+                };
+                if let Some(policy) = &self.policy {
+                    sep(f)?;
+                    write!(f, "{}", policy.display(dialect))?;
+                }
+                if let Some(duration) = &self.coalesce_ms {
+                    sep(f)?;
+                    write!(f, "COALESCE ")?;
+                    format_duration(f, duration)?;
+                }
+                if self.adaptive {
+                    sep(f)?;
+                    write!(f, "ADAPTIVE")?;
+                }
+                if self.concurrently {
+                    sep(f)?;
+                    write!(f, "CONCURRENTLY")?;
+                }
+                match self.trx_cache_policy {
+                    TrxCachePolicy::Always => {
+                        sep(f)?;
+                        write!(f, "ALWAYS")?;
+                    }
+                    TrxCachePolicy::UntilWrite => {
+                        sep(f)?;
+                        write!(f, "UNTIL WRITE")?;
+                    }
+                    TrxCachePolicy::Never => {}
+                }
+                if let Some(m) = self.topk_buffer_multiplier {
+                    sep(f)?;
+                    write!(f, "TOPK_BUFFER_MULTIPLIER = {m}")?;
+                }
+                if self.autoparam.off {
+                    sep(f)?;
+                    write!(f, "AUTOPARAM OFF")?;
+                } else if self.autoparam.exclude_joins
+                    || self.autoparam.exclude_exists
+                    || self.autoparam.exclude_subqueries
+                {
+                    sep(f)?;
+                    write!(f, "AUTOPARAM (")?;
+                    let mut excl_first = true;
+                    let mut excl_sep = |f: &mut fmt::Formatter<'_>| -> fmt::Result {
+                        if !std::mem::take(&mut excl_first) {
+                            write!(f, ", ")?;
+                        }
+                        Ok(())
+                    };
+                    if self.autoparam.exclude_joins {
+                        excl_sep(f)?;
+                        write!(f, "EXCLUDE_JOINS")?;
+                    }
+                    if self.autoparam.exclude_exists {
+                        excl_sep(f)?;
+                        write!(f, "EXCLUDE_EXISTS")?;
+                    }
+                    if self.autoparam.exclude_subqueries {
+                        excl_sep(f)?;
+                        write!(f, "EXCLUDE_SUBQUERIES")?;
+                    }
+                    write!(f, ")")?;
+                }
+                write!(f, ")")?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl CreateCacheStatement {
+    /// The parsing-time option bag for this statement, used to render the shared `CREATE CACHE`
+    /// head via [`CreateCacheOptions`]'s `DialectDisplay`.
+    fn options(&self) -> CreateCacheOptions {
+        CreateCacheOptions {
+            name: self.name.clone(),
+            cache_type: self.cache_type,
+            policy: self.policy,
+            coalesce_ms: self.coalesce_ms,
+            adaptive: self.adaptive,
+            concurrently: self.concurrently,
+            trx_cache_policy: self.trx_cache_policy,
+            topk_buffer_multiplier: self.topk_buffer_multiplier,
+            autoparam: self.autoparam,
+        }
     }
 }
 
 impl DialectDisplay for CreateCacheStatement {
     fn display(&self, dialect: Dialect) -> impl fmt::Display + '_ {
         fmt_with(move |f| {
-            write!(f, "CREATE ")?;
-            match &self.cache_type {
-                None => {}
-                Some(cache_type) => write!(f, "{} ", cache_type.display(dialect))?,
-            }
-            write!(f, "CACHE ")?;
-            if let Some(policy) = &self.policy {
-                write!(f, "{} ", policy.display(dialect))?;
-            }
-            if let Some(duration) = &self.coalesce_ms {
-                write!(f, "COALESCE {} SECONDS ", duration.as_secs())?;
-            }
-            if self.concurrently {
-                write!(f, "CONCURRENTLY ")?;
-            }
-            if self.always {
-                write!(f, "ALWAYS ")?;
-            }
-            if let Some(name) = &self.name {
-                write!(f, "{} ", name.display(dialect))?;
-            }
-            write!(f, "FROM ")?;
-            write!(f, "{}", self.inner.display(dialect))
+            write!(
+                f,
+                "{} FROM {}",
+                self.options().display(dialect),
+                self.inner.display(dialect)
+            )
         })
     }
 }
@@ -1144,6 +1378,10 @@ impl DialectDisplay for CreateCacheStatement {
 /// the same `parse_cache_options()` infrastructure as `CREATE CACHE` DDL parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadysetHintDirective {
-    /// `/*rs+ CREATE SHALLOW CACHE [TTL n] [REFRESH n] [ALWAYS] */`
+    /// `/*rs+ CREATE SHALLOW CACHE [TTL n] [REFRESH n] [ALWAYS] [<name>] */`. Hints create shallow
+    /// caches only; an explicit `DEEP` is rejected. The cache name, when present, rides in
+    /// [`CreateCacheOptions::name`].
     CreateCache(CreateCacheOptions),
+    /// `/*rs+ SKIP CACHE */` — bypass the cache and route directly to upstream.
+    SkipCache,
 }

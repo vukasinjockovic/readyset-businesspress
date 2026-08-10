@@ -5,7 +5,7 @@ use readyset_client_metrics::QueryDestination;
 use readyset_client_test_helpers::mysql_helpers::{self, MySQLAdapter};
 use readyset_client_test_helpers::{TestBuilder, sleep};
 use readyset_sql_parsing::ParsingPreset;
-use test_utils::tags;
+use test_utils::{tags, upstream};
 
 /// Helper that fires an `EXPLAIN LAST STATEMENT` and asserts that the last
 /// target/QueryDestination was `expected`.
@@ -15,7 +15,7 @@ async fn assert_last_target_was(rs_conn: &mut Conn, expected: QueryDestination) 
         .await
         .unwrap()
         .unwrap();
-    let msg = destination.noria_error;
+    let msg = destination.reason;
     assert_eq!(destination.destination, expected, "{msg}");
 }
 
@@ -25,7 +25,8 @@ async fn assert_last_target_was(rs_conn: &mut Conn, expected: QueryDestination) 
 /// 2. A different LIMIT value (2) falls back to upstream when no cache exists
 /// 3. A parameterized LIMIT cache can handle different values including the fallback case
 #[tokio::test]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn test_topk_dual_lookup() {
     readyset_tracing::init_test_logging();
     let db_name = "topk_dual_lookup_test";
@@ -40,7 +41,7 @@ async fn test_topk_dual_lookup() {
         .parsing_preset(ParsingPreset::OnlyNom)
         .fallback(true)
         .set_topk(true)
-        .replicate_db(db_name.to_string())
+        .replicate_db(db_name)
         .build::<MySQLAdapter>()
         .await;
 
@@ -161,13 +162,13 @@ async fn test_topk_dual_lookup() {
         .unwrap();
 }
 
-/// Tests plain LIMIT functionality (without ORDER BY) with literal LIMIT values.
-/// This test verifies that:
-/// 1. A literal LIMIT cache strips the LIMIT and acts as a catch-all for any LIMIT value
-/// 2. All queries with different LIMIT values hit the same cache
+/// A literal LIMIT with no ORDER BY is kept on the query and lowered to a TopK node (feature-topk
+/// on), so the nested-loop-limit collapse can detect it. It is no longer stripped to act as a
+/// catch-all, so each distinct LIMIT value is its own cached query.
 #[tokio::test]
-#[tags(serial, mysql_upstream)]
-async fn test_topk_limit_catch_all() {
+#[tags(serial)]
+#[upstream(mysql)]
+async fn test_topk_literal_limit_per_value() {
     readyset_tracing::init_test_logging();
     let db_name = "plain_literal_limit_test";
     mysql_helpers::recreate_database(db_name).await;
@@ -176,7 +177,7 @@ async fn test_topk_limit_catch_all() {
         .recreate_database(false)
         .migration_mode(MigrationMode::OutOfBand)
         .set_topk(true)
-        .replicate_db(db_name.to_string())
+        .replicate_db(db_name)
         .build::<MySQLAdapter>()
         .await;
 
@@ -194,10 +195,10 @@ async fn test_topk_limit_catch_all() {
 
     sleep().await;
 
-    // LIMIT should be stripped and applied by the adapter in post-processing
-    // doesn't matter if it's a literal or parameterized
+    // A literal LIMIT is kept on the query (lowered to a TopK), so the cache is specific to that
+    // LIMIT value rather than a catch-all that strips the cap.
     rs_conn
-        .query_drop("CREATE CACHE strip FROM SELECT * FROM test LIMIT 1")
+        .query_drop("CREATE CACHE lim1 FROM SELECT * FROM test LIMIT 1")
         .await
         .unwrap();
 
@@ -206,29 +207,20 @@ async fn test_topk_limit_catch_all() {
     let result: Vec<(i32, i32)> = rs_conn.query("SELECT * FROM test LIMIT 1").await.unwrap();
     assert_eq!(result.len(), 1);
 
-    assert_last_target_was(
-        &mut rs_conn,
-        QueryDestination::Readyset(Some("strip".into())),
-    )
-    .await;
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("lim1".into()))).await;
+
+    // A different LIMIT value is a distinct query with its own TopK cache.
+    rs_conn
+        .query_drop("CREATE CACHE lim2 FROM SELECT * FROM test LIMIT 2")
+        .await
+        .unwrap();
+
+    sleep().await;
 
     let result: Vec<(i32, i32)> = rs_conn.query("SELECT * FROM test LIMIT 2").await.unwrap();
     assert_eq!(result.len(), 2);
 
-    assert_last_target_was(
-        &mut rs_conn,
-        QueryDestination::Readyset(Some("strip".into())),
-    )
-    .await;
-
-    let result: Vec<(i32, i32)> = rs_conn.query("SELECT * FROM test").await.unwrap();
-    assert_eq!(result.len(), 5);
-
-    assert_last_target_was(
-        &mut rs_conn,
-        QueryDestination::Readyset(Some("strip".into())),
-    )
-    .await;
+    assert_last_target_was(&mut rs_conn, QueryDestination::Readyset(Some("lim2".into()))).await;
 
     shutdown_tx.shutdown().await;
 
@@ -242,7 +234,8 @@ async fn test_topk_limit_catch_all() {
 // This is here to make sure that the hook gets called correctly
 // and that the hook evicts as expected
 #[tokio::test]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn test_topk_eviction_aux_cleanup() {
     readyset_tracing::init_test_logging();
     let db_name = "topk_eviction_aux_cleanup";
@@ -252,7 +245,7 @@ async fn test_topk_eviction_aux_cleanup() {
         .recreate_database(false)
         .fallback(false)
         .set_topk(true)
-        .replicate_db(db_name.to_string())
+        .replicate_db(db_name)
         .build::<MySQLAdapter>()
         .await;
 

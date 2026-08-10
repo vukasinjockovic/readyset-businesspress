@@ -10,11 +10,12 @@ use rand::distr::uniform::SampleRange as _;
 use rand::distr::{StandardUniform, Uniform};
 use rand::prelude::Distribution;
 use rand::seq::SliceRandom;
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use rand_distr::Zipf;
 use readyset_data::Array;
 use readyset_data::{encoding::Encoding, DfType, DfValue, Dialect};
 use readyset_decimal::Decimal;
+use readyset_spatial::{make_postgis_point_bytes, make_postgis_polygon_bytes};
 use readyset_sql::ast::SqlType;
 
 mod distribution_annotation;
@@ -66,7 +67,7 @@ pub enum ColumnGenerationSpec {
 }
 
 impl ColumnGenerationSpec {
-    pub fn generator_for_col(&self, col_type: SqlType) -> ColumnGenerator {
+    pub fn generator_for_col(&self, col_type: SqlType, rng: &mut dyn Rng) -> ColumnGenerator {
         match self {
             ColumnGenerationSpec::Unique => ColumnGenerator::Unique(col_type.into()),
             ColumnGenerationSpec::UniqueFrom(index) => {
@@ -104,9 +105,9 @@ impl ColumnGenerationSpec {
                 *max_length,
                 charset,
             )),
-            ColumnGenerationSpec::Zipfian { min, max, alpha } => {
-                ColumnGenerator::Zipfian(ZipfianGenerator::new(min.clone(), max.clone(), *alpha))
-            }
+            ColumnGenerationSpec::Zipfian { min, max, alpha } => ColumnGenerator::Zipfian(
+                ZipfianGenerator::new(min.clone(), max.clone(), *alpha, rng),
+            ),
             ColumnGenerationSpec::Constant(val) => {
                 let col_type =
                     DfType::from_sql_type(&col_type, Dialect::DEFAULT_MYSQL, |_| None, None)
@@ -142,16 +143,16 @@ pub enum ColumnGenerator {
 }
 
 impl ColumnGenerator {
-    pub fn gen(&mut self) -> DfValue {
+    pub fn gen<R: Rng>(&mut self, rng: &mut R) -> DfValue {
         match self {
             ColumnGenerator::Constant(g) => g.gen(),
             ColumnGenerator::Unique(g) => g.gen(),
-            ColumnGenerator::Uniform(g) => g.gen(),
-            ColumnGenerator::Random(g) => g.gen(),
-            ColumnGenerator::RandomString(g) => g.gen(),
-            ColumnGenerator::RandomChars(g) => g.gen(),
-            ColumnGenerator::Zipfian(g) => g.gen(),
-            ColumnGenerator::NonRepeating(g) => g.gen(),
+            ColumnGenerator::Uniform(g) => g.gen(rng),
+            ColumnGenerator::Random(g) => g.gen(rng),
+            ColumnGenerator::RandomString(g) => g.gen(rng),
+            ColumnGenerator::RandomChars(g) => g.gen(rng),
+            ColumnGenerator::Zipfian(g) => g.gen(rng),
+            ColumnGenerator::NonRepeating(g) => g.gen(rng),
         }
     }
 }
@@ -205,8 +206,8 @@ impl<S: AsRef<str>> From<S> for RandomStringGenerator {
 }
 
 impl RandomStringGenerator {
-    pub fn gen(&self) -> DfValue {
-        let val: String = rand::rng().sample(&self.inner);
+    pub fn gen<R: Rng>(&self, rng: &mut R) -> DfValue {
+        let val: String = rng.sample(&self.inner);
         val.into()
     }
 }
@@ -287,14 +288,14 @@ pub struct UniformGenerator {
 }
 
 impl UniformGenerator {
-    pub fn gen(&mut self) -> DfValue {
+    pub fn gen<R: Rng>(&mut self, rng: &mut R) -> DfValue {
         if self.with_replacement {
-            uniform_random_value(&self.min, &self.max)
+            uniform_random_value(&self.min, &self.max, rng)
         } else {
-            let mut val = uniform_random_value(&self.min, &self.max);
+            let mut val = uniform_random_value(&self.min, &self.max, rng);
             let mut iters = 0;
             while self.pulled.contains(&val) {
-                val = uniform_random_value(&self.min, &self.max);
+                val = uniform_random_value(&self.min, &self.max, rng);
                 iters += 1;
 
                 assert!(
@@ -327,34 +328,54 @@ pub struct ZipfianGenerator {
 }
 
 impl ZipfianGenerator {
-    fn new(min: DfValue, max: DfValue, alpha: f64) -> Self {
-        let (num_elements, mapping): (u64, Vec<DfValue>) = match (&min, &max) {
+    fn new(min: DfValue, max: DfValue, alpha: f64, rng: &mut dyn Rng) -> Self {
+        let (num_elements, mut mapping): (u64, Vec<DfValue>) = match (&min, &max) {
             (DfValue::Int(i), DfValue::Int(j)) => {
-                let mut mapping: Vec<_> = (*i..*j).map(DfValue::Int).collect();
-                mapping.shuffle(&mut rand::rng());
-                ((j - i) as u64, mapping)
+                // Half-open `[i, j)`. When `i == j` the iterator is empty
+                // and `Zipf::new(0, _)` errors out — the old code unwrapped
+                // and panicked. Treat the empty range as a single-element
+                // distribution containing `min`, so callers that
+                // accidentally configure `min == max` get a deterministic
+                // constant rather than a process abort.
+                let mapping: Vec<_> = (*i..*j).map(DfValue::Int).collect();
+                let n = (j - i).max(1) as u64;
+                (n, mapping)
             }
             (DfValue::UnsignedInt(i), DfValue::UnsignedInt(j)) => {
-                let mut mapping: Vec<_> = (*i..*j).map(DfValue::UnsignedInt).collect();
-                mapping.shuffle(&mut rand::rng());
-                ((j - i), mapping)
+                let mapping: Vec<_> = (*i..*j).map(DfValue::UnsignedInt).collect();
+                let n = (j - i).max(1);
+                (n, mapping)
             }
             (_, _) => unimplemented!("DfValues unsupported for discrete zipfian value generation"),
         };
+        if mapping.is_empty() {
+            mapping.push(min.clone());
+        } else {
+            mapping.shuffle(rng);
+        }
 
         Self {
             min,
             max,
             alpha,
-            dist: Zipf::new(num_elements as _, alpha).unwrap(),
+            // `Zipf::new` requires `n >= 1`; we just clamped to ensure that.
+            // Use `expect` with context so a future invariant break surfaces
+            // a clear message instead of a bare unwrap panic.
+            dist: Zipf::new(num_elements as _, alpha).expect("Zipf::new requires n >= 1"),
             mapping,
         }
     }
 
-    pub fn gen(&mut self) -> DfValue {
-        let mut rng = rand::rng();
-        let offset = self.dist.sample(&mut rng);
-        self.mapping.get(offset.round() as usize).unwrap().clone()
+    pub fn gen<R: Rng>(&mut self, rng: &mut R) -> DfValue {
+        // `Zipf::sample` returns f64 in `[1, n]` inclusive — at the upper
+        // bound `offset.round() as usize == n` indexes one past the end.
+        // Clamp to `[0, len-1]` so the upper bound is well-defined instead
+        // of panicking on `mapping.get(n).unwrap()`.
+        let offset = self.dist.sample(rng);
+        let idx = (offset.round() as usize)
+            .saturating_sub(1)
+            .min(self.mapping.len().saturating_sub(1));
+        self.mapping[idx].clone()
     }
 }
 
@@ -378,8 +399,8 @@ impl From<SqlType> for RandomGenerator {
 }
 
 impl RandomGenerator {
-    pub fn gen(&self) -> DfValue {
-        random_value_of_type(&self.sql_type, &mut rand::rng())
+    pub fn gen<R: Rng>(&self, rng: &mut R) -> DfValue {
+        random_value_of_type(&self.sql_type, rng)
     }
 }
 
@@ -398,15 +419,15 @@ impl PartialEq for NonRepeatingGenerator {
 }
 
 impl NonRepeatingGenerator {
-    pub fn gen(&mut self) -> DfValue {
+    pub fn gen<R: Rng>(&mut self, rng: &mut R) -> DfValue {
         let mut reps = 0;
         loop {
             let d = match &mut *self.generator {
-                ColumnGenerator::Uniform(u) => u.gen(),
-                ColumnGenerator::Zipfian(z) => z.gen(),
-                ColumnGenerator::Random(r) => r.gen(),
-                ColumnGenerator::RandomString(r) => r.gen(),
-                ColumnGenerator::RandomChars(r) => r.gen(),
+                ColumnGenerator::Uniform(u) => u.gen(rng),
+                ColumnGenerator::Zipfian(z) => z.gen(rng),
+                ColumnGenerator::Random(r) => r.gen(rng),
+                ColumnGenerator::RandomString(r) => r.gen(rng),
+                ColumnGenerator::RandomChars(r) => r.gen(rng),
                 ColumnGenerator::Unique(_) => panic!("Non repeating over Unique"),
                 ColumnGenerator::Constant(_) => panic!("Non repeating over Constant"),
                 ColumnGenerator::NonRepeating(_) => panic!("Nested NonRepeating"),
@@ -441,9 +462,11 @@ impl RandomCharsGenerator {
         let (low, high, encoding) = match charset_name {
             "ascii" => (0, 127, Encoding::Utf8),
             "utf8" => (0, 255, Encoding::Utf8),
-            "latin1" => (0, 255, Encoding::Latin1),
             "binary" => (0, 255, Encoding::Binary),
-            _ => panic!("Invalid charset"),
+            name => match Encoding::from_mysql_character_set_name(name) {
+                Some(encoding @ Encoding::SingleByte(_)) => (0, 255, encoding),
+                _ => panic!("Invalid charset {name}"),
+            },
         };
         Self {
             min_length,
@@ -454,13 +477,12 @@ impl RandomCharsGenerator {
         }
     }
 
-    pub fn gen(&self) -> DfValue {
-        let mut rng = rand::rng();
+    pub fn gen<R: Rng>(&self, rng: &mut R) -> DfValue {
         let len = (self.min_length..self.max_length)
-            .sample_single(&mut rng)
+            .sample_single(rng)
             .unwrap();
         let sampler = Uniform::new_inclusive(self.low, self.high).unwrap();
-        let bytes: Vec<u8> = (0..len).map(|_| sampler.sample(&mut rng)).collect();
+        let bytes: Vec<u8> = (0..len).map(|_| sampler.sample(rng)).collect();
 
         // XXX: Hack alert! This goes through [`benchmarks::utils::generate::load_table_part`] as a
         // prepared statement parameter, which means it will be interpreted according to the client
@@ -550,8 +572,19 @@ pub fn value_of_type(typ: &SqlType) -> DfValue {
         }
         SqlType::Other(_) => unimplemented!(),
         SqlType::Point => unimplemented!(),
-        SqlType::PostgisPoint => unimplemented!(),
-        SqlType::PostgisPolygon => unimplemented!(),
+        SqlType::PostgisPoint => {
+            DfValue::ByteArray(Arc::new(make_postgis_point_bytes(1.0, 2.0, None, true)))
+        }
+        SqlType::PostgisPolygon => {
+            // A simple closed triangle, little-endian, no SRID.
+            let ring = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)];
+            DfValue::ByteArray(Arc::new(make_postgis_polygon_bytes(
+                Some(&ring),
+                None,
+                None,
+                true,
+            )))
+        }
         SqlType::Tsvector => DfValue::None,
     }
 }
@@ -560,7 +593,7 @@ pub fn value_of_type(typ: &SqlType) -> DfValue {
 /// is pulled from a uniform distribution over the set of possible ranges.
 pub fn random_value_of_type<R>(typ: &SqlType, rng: &mut R) -> DfValue
 where
-    R: RngCore,
+    R: Rng + RngExt + ?Sized,
 {
     match typ {
         SqlType::Char(Some(x)) | SqlType::VarChar(Some(x)) => {
@@ -710,8 +743,22 @@ where
         }
         SqlType::Other(_) => unimplemented!(),
         SqlType::Point => unimplemented!(),
-        SqlType::PostgisPoint => unimplemented!(),
-        SqlType::PostgisPolygon => unimplemented!(),
+        SqlType::PostgisPoint => {
+            let x = rng.random::<f64>() * 360.0 - 180.0;
+            let y = rng.random::<f64>() * 180.0 - 90.0;
+            DfValue::ByteArray(Arc::new(make_postgis_point_bytes(x, y, None, true)))
+        }
+        SqlType::PostgisPolygon => {
+            let x = rng.random::<f64>() * 360.0 - 180.0;
+            let y = rng.random::<f64>() * 180.0 - 90.0;
+            let ring = [(x, y), (x + 1.0, y), (x, y + 1.0), (x, y)];
+            DfValue::ByteArray(Arc::new(make_postgis_polygon_bytes(
+                Some(&ring),
+                None,
+                None,
+                true,
+            )))
+        }
         SqlType::Tsvector => DfValue::None,
     }
 }
@@ -719,8 +766,7 @@ where
 /// Generate a random value from a uniform distribution with the given integer
 /// [`SqlType`] for a given range of values.If the range of `min` and `max`
 /// exceeds the storage of the type, this truncates to fit.
-fn uniform_random_value(min: &DfValue, max: &DfValue) -> DfValue {
-    let mut rng = rand::rng();
+fn uniform_random_value<R: Rng>(min: &DfValue, max: &DfValue, rng: &mut R) -> DfValue {
     match (min, max) {
         (DfValue::Int(i), DfValue::Int(j)) => rng.random_range(*i..*j).into(),
         (DfValue::UnsignedInt(i), DfValue::UnsignedInt(j)) => rng.random_range(*i..*j).into(),
@@ -884,8 +930,145 @@ pub fn unique_value_of_type(typ: &SqlType, idx: u32) -> DfValue {
         }
         SqlType::Other(_) => unimplemented!(),
         SqlType::Point => unimplemented!(),
-        SqlType::PostgisPoint => unimplemented!(),
-        SqlType::PostgisPolygon => unimplemented!(),
+        SqlType::PostgisPoint => {
+            let x = idx as f64;
+            let y = (idx as f64) + 0.5;
+            DfValue::ByteArray(Arc::new(make_postgis_point_bytes(x, y, None, true)))
+        }
+        SqlType::PostgisPolygon => {
+            let x = idx as f64;
+            let y = (idx as f64) + 0.5;
+            let ring = [(x, y), (x + 1.0, y), (x, y + 1.0), (x, y)];
+            DfValue::ByteArray(Arc::new(make_postgis_polygon_bytes(
+                Some(&ring),
+                None,
+                None,
+                true,
+            )))
+        }
         SqlType::Tsvector => DfValue::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::rngs::SmallRng;
+    use rand::SeedableRng;
+    use readyset_data::DfValue;
+    use readyset_sql::ast::SqlType;
+
+    use super::*;
+
+    #[test]
+    fn zipfian_generator_handles_min_equals_max() {
+        // `Zipf::new(0, _)` errors; the old code unwrapped and panicked.
+        // Now `min == max` should be accepted and produce a deterministic
+        // constant value instead of crashing the run.
+        let mut rng = SmallRng::seed_from_u64(42);
+        let mut g = ZipfianGenerator::new(DfValue::Int(7), DfValue::Int(7), 1.0, &mut rng);
+        // Repeated calls must not panic; the value is whatever fallback
+        // we agreed on (currently `min`).
+        for _ in 0..100 {
+            let _ = g.gen(&mut rng);
+        }
+    }
+
+    #[test]
+    fn zipfian_generator_does_not_panic_at_upper_bound() {
+        // `Zipf::sample` returns f64 in `[1, n]` inclusive; rounding the
+        // upper bound used to index `mapping.get(n)` and panic.
+        // Run many samples across multiple seeds to flush out the boundary.
+        for seed in 0u64..32 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let mut g = ZipfianGenerator::new(DfValue::Int(0), DfValue::Int(4), 5.0, &mut rng);
+            for _ in 0..500 {
+                let _ = g.gen(&mut rng);
+            }
+        }
+    }
+
+    /// Two generators created from the same spec with the same seed must
+    /// produce identical sequences when given identical RNG streams.
+    #[test]
+    fn column_generator_is_deterministic_with_same_seed() {
+        let specs: Vec<(ColumnGenerationSpec, SqlType)> = vec![
+            (ColumnGenerationSpec::Random, SqlType::Int(None)),
+            (
+                ColumnGenerationSpec::Uniform(DfValue::Int(1), DfValue::Int(1000)),
+                SqlType::Int(None),
+            ),
+            (
+                ColumnGenerationSpec::Zipfian {
+                    min: DfValue::Int(1),
+                    max: DfValue::Int(100),
+                    alpha: 1.0,
+                },
+                SqlType::Int(None),
+            ),
+            (
+                ColumnGenerationSpec::RandomString("[a-z]{5,10}".to_string()),
+                SqlType::VarChar(Some(255)),
+            ),
+        ];
+
+        for (spec, sql_type) in &specs {
+            let mut rng1 = SmallRng::seed_from_u64(42);
+            let mut rng2 = SmallRng::seed_from_u64(42);
+
+            let mut gen1 = spec.generator_for_col(sql_type.clone(), &mut rng1);
+            let mut gen2 = spec.generator_for_col(sql_type.clone(), &mut rng2);
+
+            let vals1: Vec<_> = (0..10).map(|_| gen1.gen(&mut rng1)).collect();
+            let vals2: Vec<_> = (0..10).map(|_| gen2.gen(&mut rng2)).collect();
+
+            assert_eq!(vals1, vals2, "non-deterministic for spec: {spec:?}");
+        }
+    }
+
+    /// Parse generated PostGIS bytes back through the canonical readyset-spatial
+    /// parser, asserting they form a well-formed geometry of the expected kind.
+    #[track_caller]
+    fn assert_postgis_round_trips(val: &DfValue, expected_prefix: &str) {
+        let DfValue::ByteArray(bytes) = val else {
+            panic!("expected ByteArray, got {val:?}");
+        };
+        let text = readyset_spatial::try_get_postgis_spatial_text(bytes, false)
+            .expect("generated PostGIS bytes must parse");
+        assert!(
+            text.starts_with(expected_prefix),
+            "expected {expected_prefix} geometry, got {text}"
+        );
+    }
+
+    #[test]
+    fn value_of_type_postgis_point_round_trips() {
+        assert_postgis_round_trips(&value_of_type(&SqlType::PostgisPoint), "POINT");
+    }
+
+    #[test]
+    fn value_of_type_postgis_polygon_round_trips() {
+        assert_postgis_round_trips(&value_of_type(&SqlType::PostgisPolygon), "POLYGON");
+    }
+
+    #[test]
+    fn random_value_of_type_postgis_round_trips() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        assert_postgis_round_trips(
+            &random_value_of_type(&SqlType::PostgisPoint, &mut rng),
+            "POINT",
+        );
+        assert_postgis_round_trips(
+            &random_value_of_type(&SqlType::PostgisPolygon, &mut rng),
+            "POLYGON",
+        );
+    }
+
+    #[test]
+    fn unique_value_of_type_postgis_polygon_distinct_and_round_trips() {
+        let v0 = unique_value_of_type(&SqlType::PostgisPolygon, 0);
+        let v1 = unique_value_of_type(&SqlType::PostgisPolygon, 1);
+        assert_postgis_round_trips(&v0, "POLYGON");
+        assert_postgis_round_trips(&v1, "POLYGON");
+        assert_ne!(v0, v1, "unique generator must return distinct values");
     }
 }

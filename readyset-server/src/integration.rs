@@ -63,7 +63,6 @@ async fn it_completes() {
     readyset_tracing::init_test_logging();
 
     let mut builder = builder_for_tests();
-    builder.set_sharding(Some(DEFAULT_SHARDING));
     builder.set_persistence(get_persistence_params("it_completes"));
     let (mut g, shutdown_tx) = builder.start_local().await.unwrap();
 
@@ -102,7 +101,7 @@ async fn it_completes() {
     muta.insert(vec![id.clone(), 2.into()]).await.unwrap();
     eventually!(
         run_test: {
-            cq.lookup(slice::from_ref(&id), true).await.unwrap().into_vec()
+            cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
         },
         then_assert: |results| {
             assert_eq!(results, vec![vec![1.into(), 2.into()]])
@@ -111,7 +110,7 @@ async fn it_completes() {
     mutb.insert(vec![id.clone(), 4.into()]).await.unwrap();
     eventually!(
         run_test: {
-            cq.lookup(slice::from_ref(&id), true).await.unwrap().into_vec()
+            cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
         },
         then_assert: |res| {
             assert!(res.iter().any(|r| *r == vec![id.clone(), 2.into()]));
@@ -121,172 +120,12 @@ async fn it_completes() {
     muta.delete(vec![id.clone()]).await.unwrap();
     eventually!(
         run_test: {
-            cq.lookup(slice::from_ref(&id), true).await.unwrap().into_vec()
+            cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
         },
         then_assert: |results| {
             assert_eq!(results, vec![vec![1.into(), 4.into()]])
         }
     );
-
-    shutdown_tx.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "Ignoring sharded tests"]
-async fn sharded_shuffle() {
-    let (mut g, shutdown_tx) = start_simple("sharded_shuffle").await;
-
-    // in this test, we have a single sharded base node that is keyed on one column, and a sharded
-    // reader that is keyed by a different column. this requires a shuffle. we want to make sure
-    // that that shuffle happens correctly.
-
-    let a = g
-        .migrate(|mig| {
-            let a = mig.add_base(
-                "base",
-                make_columns(&["id", "non_id"]),
-                Base::new().with_primary_key([0]),
-            );
-            mig.maintain_anonymous(a, &Index::hash_map(vec![1]));
-            a
-        })
-        .await;
-
-    eprintln!("{}", g.graphviz(Default::default()).await.unwrap());
-
-    let mut base = g.table_by_index(a).await.unwrap();
-    let mut view = g.view("base").await.unwrap().into_reader_handle().unwrap();
-
-    // make sure there is data on >1 shard, and that we'd get multiple rows by querying the reader
-    // for a single key.
-    base.perform_all((0..100).map(|i| vec![i.into(), DfValue::Int(1)]))
-        .await
-        .unwrap();
-
-    eventually!(
-        run_test: {
-            view.lookup(&[DfValue::Int(1)], true)
-                .await
-                .unwrap()
-                .into_vec()
-        },
-        then_assert: |results| {
-            assert_eq!(results.len(), 100, "{results:?}")
-        }
-    );
-
-    shutdown_tx.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn broad_recursing_upquery() {
-    let nshards = 16;
-    let (mut g, shutdown_tx) = build("bru", Some(nshards), None).await;
-
-    // our goal here is to have a recursive upquery such that both levels of the upquery require
-    // contacting _all_ shards. in this setting, any miss at the leaf requires the upquery to go to
-    // all shards of the intermediate operator, and each miss there requires an upquery to each
-    // shard of the top level. as a result, we would expect every base to receive 2 upqueries for
-    // the same key, and a total of n^2+n upqueries. crucially, what we want to test is that the
-    // partial logic correctly manages all these requests, and the resulting responses (especially
-    // at the shard mergers). to achieve this, we're going to use this layout:
-    //
-    // base x    base y [sharded by a]
-    //   |         |
-    //   +----+----+ [lookup by b]
-    //        |
-    //      join [sharded by b]
-    //        |
-    //     reader [sharded by c]
-    //
-    // we basically _need_ a join in order to get this layout, since only joins allow us to
-    // introduce a new sharding without also dropping all columns that are not the sharding column
-    // (like aggregations would). with an aggregation for example, the downstream view could not be
-    // partial, since it would have no way to know the partial key to upquery for given a miss,
-    // since the miss would be on an _output_ column of the aggregation. we _could_ use a
-    // multi-column aggregation group by, but those have their own problems that we do not want to
-    // exercise here.
-    //
-    // we're also going to make the join a left join so that we know the upquery will go to base_x.
-
-    let (x, _y) = g
-        .migrate(|mig| {
-            // bases, both sharded by their first column
-            let x = mig.add_base(
-                "base_x",
-                make_columns(&["base_col", "join_col", "reader_col"]),
-                Base::new().with_primary_key([0]),
-            );
-            let y = mig.add_base(
-                "base_y",
-                make_columns(&["id"]),
-                Base::new().with_primary_key([0]),
-            );
-            // join, sharded by the join column, which is be the second column on x
-            let join = mig.add_ingredient(
-                "join",
-                make_columns(&["base_col", "join_col", "reader_col"]),
-                Join::new(
-                    x,
-                    y,
-                    JoinType::Left,
-                    vec![(1, 0)],
-                    vec![(Side::Left, 0), (Side::Left, 1), (Side::Left, 2)],
-                    true,
-                ),
-            );
-            // reader, sharded by the lookup column, which is the third column on x
-            mig.maintain(
-                "reader".into(),
-                join,
-                &Index::hash_map(vec![2]),
-                Default::default(),
-                Default::default(),
-            );
-            (x, y)
-        })
-        .await;
-
-    eprintln!("{}", g.graphviz(Default::default()).await.unwrap());
-
-    let mut base_x = g.table_by_index(x).await.unwrap();
-    let mut reader = g
-        .view("reader")
-        .await
-        .unwrap()
-        .into_reader_handle()
-        .unwrap();
-
-    // we want to make sure that all the upqueries recurse all the way to cause maximum headache
-    // for the partial logic. we do this by ensuring that every shard at every operator has at
-    // least one record. we also ensure that we can get _all_ the rows by querying a single key on
-    // the reader.
-    let n = 10_000;
-    base_x
-        .perform_all((0..n).map(|i| {
-            vec![
-                DfValue::Int(i),
-                DfValue::Int(i % nshards as i64),
-                DfValue::Int(1),
-            ]
-        }))
-        .await
-        .unwrap();
-
-    sleep().await;
-
-    // moment of truth
-    let rows = reader
-        .lookup(&[DfValue::Int(1)], true)
-        .await
-        .unwrap()
-        .into_vec();
-    assert_eq!(rows.len(), n as usize);
-    for i in 0..n {
-        assert!(rows
-            .iter()
-            .any(|row| get_col!(reader, row, "base_col", i64) == i));
-    }
 
     shutdown_tx.shutdown().await;
 }
@@ -315,7 +154,7 @@ async fn base_mutation() {
     write.insert(vec![1.into(), 2.into()]).await.unwrap();
     eventually!(
         run_test: {
-            read.lookup(&[1.into()], true).await.unwrap().into_vec()
+            read.lookup(&[1.into()], Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
         },
         then_assert: |results| {
             assert_eq!(results, vec![vec![1.into(), 2.into()]])
@@ -329,7 +168,7 @@ async fn base_mutation() {
         .unwrap();
     eventually!(
         run_test: {
-            read.lookup(&[1.into()], true).await.unwrap().into_vec()
+            read.lookup(&[1.into()], Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
         },
         then_assert: |results| {
             assert_eq!(results, vec![vec![1.into(), 3.into()]])
@@ -346,7 +185,7 @@ async fn base_mutation() {
         .unwrap();
     eventually!(
         run_test: {
-            read.lookup(&[1.into()], true).await.unwrap().into_vec()
+            read.lookup(&[1.into()], Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
         },
         then_assert: |results| {
             assert_eq!(results, vec![vec![1.into(), 4.into()]])
@@ -363,7 +202,7 @@ async fn base_mutation() {
         .unwrap();
     eventually!(
         run_test: {
-            read.lookup(&[1.into()], true).await.unwrap().into_vec()
+            read.lookup(&[1.into()], Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
         },
         then_assert: |results| {
             assert_eq!(results, vec![vec![1.into(), 5.into()]])
@@ -373,7 +212,7 @@ async fn base_mutation() {
     // delete should, well, delete
     write.delete(vec![1.into()]).await.unwrap();
     eventually!(read
-        .lookup(&[1.into()], true)
+        .lookup(&[1.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -389,7 +228,7 @@ async fn base_mutation() {
         .unwrap();
     eventually!(
         run_test: {
-            read.lookup(&[1.into()], true).await.unwrap().into_vec()
+            read.lookup(&[1.into()], Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
         },
         then_assert: |results| {
             assert_eq!(results, vec![vec![1.into(), 2.into()]])
@@ -399,7 +238,7 @@ async fn base_mutation() {
     // truncate deletes everything
     write.truncate().await.unwrap();
     eventually!(read
-        .lookup(&[1.into()], true)
+        .lookup(&[1.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -440,14 +279,14 @@ async fn shared_interdomain_ancestor() {
     muta.insert(vec![id.clone(), 2.into()]).await.unwrap();
     sleep().await;
     assert_eq!(
-        bq.lookup(slice::from_ref(&id), true)
+        bq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
         vec![vec![id.clone(), 2.into()]]
     );
     assert_eq!(
-        cq.lookup(slice::from_ref(&id), true)
+        cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -459,14 +298,14 @@ async fn shared_interdomain_ancestor() {
     muta.insert(vec![id.clone(), 4.into()]).await.unwrap();
     sleep().await;
     assert_eq!(
-        bq.lookup(slice::from_ref(&id), true)
+        bq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
         vec![vec![id.clone(), 4.into()]]
     );
     assert_eq!(
-        cq.lookup(slice::from_ref(&id), true)
+        cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -511,7 +350,7 @@ async fn it_works_w_mat() {
     // send a query to c
     // we should see all the a values
     let res = cq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -530,7 +369,7 @@ async fn it_works_w_mat() {
 
     // check that value was updated again
     let res = cq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -590,7 +429,7 @@ async fn it_works_w_partial_mat() {
 
     // now do some reads
     let res = cq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -643,7 +482,7 @@ async fn it_works_w_partial_mat_below_empty() {
 
     // now do some reads
     let res = cq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -693,7 +532,10 @@ async fn it_works_deletion() {
     muta.insert(vec![1.into(), 2.into()]).await.unwrap();
     sleep().await;
     assert_eq!(
-        cq.lookup(&[1.into()], true).await.unwrap().into_vec(),
+        cq.lookup(&[1.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec![1.into(), 2.into()]]
     );
 
@@ -703,7 +545,11 @@ async fn it_works_deletion() {
         .unwrap();
     sleep().await;
 
-    let res = cq.lookup(&[1.into()], true).await.unwrap().into_vec();
+    let res = cq
+        .lookup(&[1.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(res.len(), 2);
     assert!(res.contains(&vec![1.into(), 2.into()]));
     assert!(res.contains(&vec![1.into(), 4.into()]));
@@ -712,7 +558,10 @@ async fn it_works_deletion() {
     muta.delete(vec![2.into()]).await.unwrap();
     sleep().await;
     assert_eq!(
-        cq.lookup(&[1.into()], true).await.unwrap().into_vec(),
+        cq.lookup(&[1.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec![1.into(), 4.into()]]
     );
 
@@ -722,18 +571,20 @@ async fn it_works_deletion() {
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_row() {
     let (mut g, shutdown_tx) = start_simple_unsharded("delete_row").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t1 (x int, y int, z int)",
-                "CREATE CACHE all_rows FROM SELECT * FROM t1;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (x int, y int, z int)",
+                    "CREATE CACHE all_rows FROM SELECT * FROM t1;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
     let mut t = g.table("t1").await.unwrap();
     let mut all_rows = g
         .view("all_rows")
@@ -758,7 +609,11 @@ async fn delete_row() {
     sleep().await;
 
     assert_eq!(
-        all_rows.lookup(&[0.into()], true).await.unwrap().into_vec(),
+        all_rows
+            .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![
             vec![DfValue::from(1), DfValue::from(2), DfValue::from(3)],
             vec![DfValue::from(4), DfValue::from(5), DfValue::from(6)],
@@ -775,9 +630,11 @@ async fn it_works_with_sql_recipe() {
         "CREATE TABLE Car (id int, brand varchar(255), PRIMARY KEY(id))",
         "CREATE CACHE CountCars FROM SELECT COUNT(*) FROM Car WHERE brand = ?",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut mutator = g.table("Car").await.unwrap();
     let mut getter = g
@@ -804,7 +661,7 @@ async fn it_works_with_sql_recipe() {
             &[TinyText::try_new("Volvo", Collation::Utf8AiCi)
                 .unwrap()
                 .into()],
-            true,
+            Dialect::DEFAULT_MYSQL,
         )
         .await
         .unwrap()
@@ -828,9 +685,11 @@ async fn it_works_with_vote() {
                     ON (Article.id = VoteCount.article_id) WHERE Article.id = ?",
     ];
 
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     let mut article = g.table("Article").await.unwrap();
     let mut vote = g.table("Vote").await.unwrap();
     let mut awvc = g
@@ -852,11 +711,19 @@ async fn it_works_with_vote() {
 
     sleep().await;
 
-    let rs = awvc.lookup(&[0i64.into()], true).await.unwrap().into_vec();
+    let rs = awvc
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(rs.len(), 1);
     assert_eq!(rs[0], vec![0i64.into(), "Article".into(), 1.into()]);
 
-    let empty = awvc.lookup(&[1i64.into()], true).await.unwrap().into_vec();
+    let empty = awvc
+        .lookup(&[1i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(empty.len(), 1);
     assert_eq!(empty[0], vec![1i64.into(), "Article".into(), DfValue::None]);
 
@@ -872,9 +739,11 @@ async fn it_works_with_identical_queries() {
         "CREATE CACHE aq2 FROM SELECT Article.* FROM Article WHERE Article.aid = ?;",
     ];
 
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     let mut article = g.table("Article").await.unwrap();
     let mut aq1 = g.view("aq1").await.unwrap().into_reader_handle().unwrap();
     let mut aq2 = g.view("aq2").await.unwrap().into_reader_handle().unwrap();
@@ -882,13 +751,13 @@ async fn it_works_with_identical_queries() {
     let aid = 1u64;
 
     assert!(aq1
-        .lookup(&[aid.into()], true)
+        .lookup(&[aid.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
         .is_empty());
     assert!(aq2
-        .lookup(&[aid.into()], true)
+        .lookup(&[aid.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -896,7 +765,11 @@ async fn it_works_with_identical_queries() {
     article.insert(vec![aid.into()]).await.unwrap();
     sleep().await;
 
-    let result = aq2.lookup(&[aid.into()], true).await.unwrap().into_vec();
+    let result = aq2
+        .lookup(&[aid.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0], vec![aid.into()]);
 
@@ -917,9 +790,11 @@ async fn it_works_with_double_query_through() {
             WHERE J.aid = ?;",
     ];
 
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     let mut a = g.table("A").await.unwrap();
     let mut b = g.table("B").await.unwrap();
     let mut getter = g
@@ -936,7 +811,7 @@ async fn it_works_with_double_query_through() {
     sleep().await;
 
     let rs = getter
-        .lookup(&[1i64.into()], true)
+        .lookup(&[1i64.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -944,7 +819,7 @@ async fn it_works_with_double_query_through() {
     assert_eq!(rs[0], vec![1i64.into(), 5.into()]);
 
     let empty = getter
-        .lookup(&[2i64.into()], true)
+        .lookup(&[2i64.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -966,9 +841,11 @@ async fn it_works_with_duplicate_subquery() {
             ON (J.aid = B.bid)
             WHERE J.aid = ?;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     // Another query, with a subquery identical to the one above but named differently.
     let sql = vec![
@@ -980,9 +857,11 @@ async fn it_works_with_duplicate_subquery() {
             WHERE J2.aid = ?;",
     ];
 
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     let mut a = g.table("A").await.unwrap();
     let mut b = g.table("B").await.unwrap();
     let mut getter = g
@@ -999,7 +878,7 @@ async fn it_works_with_duplicate_subquery() {
     sleep().await;
 
     let rs = getter
-        .lookup(&[1i64.into()], true)
+        .lookup(&[1i64.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -1007,11 +886,99 @@ async fn it_works_with_duplicate_subquery() {
     assert_eq!(rs[0], vec![1i64.into(), 5.into()]);
 
     let empty = getter
-        .lookup(&[2i64.into()], true)
+        .lookup(&[2i64.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
     assert_eq!(empty.len(), 0);
+
+    shutdown_tx.shutdown().await;
+}
+
+/// REA-6339: LEFT JOIN + subquery with CROSS JOIN + COUNT(*) + parameterized WHERE on right-side
+/// column. The initial replay correctness is covered by logictests; this test exercises the
+/// incremental dataflow update path after the cache is filled.
+#[tokio::test(flavor = "multi_thread")]
+async fn left_join_subquery_count_parameterized() {
+    let (mut g, shutdown_tx) =
+        start_simple_unsharded("left_join_subquery_count_parameterized").await;
+    let sql = vec![
+        "CREATE TABLE s (sn int, PRIMARY KEY(sn));",
+        "CREATE TABLE spj (sn int, qty int);",
+        "CREATE TABLE dt (test_int int);",
+        "CREATE CACHE CountByTestInt FROM \
+            SELECT COUNT(*) FROM s \
+            LEFT OUTER JOIN (SELECT sn, qty, test_int FROM spj CROSS JOIN dt) sub \
+            ON s.sn = sub.sn \
+            WHERE sub.test_int = ?;",
+    ];
+
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
+
+    let mut s = g.table("s").await.unwrap();
+    let mut spj = g.table("spj").await.unwrap();
+    let mut dt = g.table("dt").await.unwrap();
+    let mut getter = g
+        .view("CountByTestInt")
+        .await
+        .unwrap()
+        .into_reader_handle()
+        .unwrap();
+
+    // s has 3 rows; spj has 2 matching (sn=1,2); dt has 2 rows (0,1).
+    // CROSS JOIN produces 4 rows; LEFT JOIN matches sn=1,2; WHERE filters by test_int.
+    s.insert(vec![1i64.into()]).await.unwrap();
+    s.insert(vec![2i64.into()]).await.unwrap();
+    s.insert(vec![3i64.into()]).await.unwrap();
+    spj.insert(vec![1i64.into(), 10.into()]).await.unwrap();
+    spj.insert(vec![2i64.into(), 20.into()]).await.unwrap();
+    dt.insert(vec![0i64.into()]).await.unwrap();
+    dt.insert(vec![1i64.into()]).await.unwrap();
+
+    sleep().await;
+
+    // Warm the cache with an initial lookup (correctness covered by logictests).
+    let rs = getter
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
+    assert_eq!(rs[0][0], readyset_data::DfValue::Int(2));
+
+    // Incremental update: insert spj row (sn=3, qty=30) so s.sn=3 now matches.
+    // CROSS JOIN with dt produces (sn=3,test_int=0) and (sn=3,test_int=1),
+    // so both counts should increase from 2 to 3.
+    spj.insert(vec![3i64.into(), 30.into()]).await.unwrap();
+
+    sleep().await;
+
+    let rs = getter
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
+    assert_eq!(
+        rs[0][0],
+        readyset_data::DfValue::Int(3),
+        "expected count=3 for test_int=0 after insert, got {:?}",
+        rs[0]
+    );
+
+    let rs = getter
+        .lookup(&[1i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
+    assert_eq!(
+        rs[0][0],
+        readyset_data::DfValue::Int(3),
+        "expected count=3 for test_int=1 after insert, got {:?}",
+        rs[0]
+    );
 
     shutdown_tx.shutdown().await;
 }
@@ -1027,9 +994,11 @@ async fn it_works_with_reads_before_writes() {
             WHERE Article.aid = Vote.aid AND Article.aid = ?;",
     ];
 
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     let mut article = g.table("Article").await.unwrap();
     let mut vote = g.table("Vote").await.unwrap();
     let mut awvc = g
@@ -1043,7 +1012,7 @@ async fn it_works_with_reads_before_writes() {
     let uid = 10;
 
     assert!(awvc
-        .lookup(&[aid.into()], true)
+        .lookup(&[aid.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -1054,7 +1023,11 @@ async fn it_works_with_reads_before_writes() {
     vote.insert(vec![aid.into(), uid.into()]).await.unwrap();
     sleep().await;
 
-    let result = awvc.lookup(&[aid.into()], true).await.unwrap().into_vec();
+    let result = awvc
+        .lookup(&[aid.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0], vec![aid.into(), uid.into()]);
 
@@ -1073,9 +1046,11 @@ async fn forced_shuffle_despite_same_shard() {
         "CREATE CACHE CarPrice FROM SELECT cid, price FROM Car
             JOIN Price ON Car.pid = Price.pid WHERE cid = ?;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut car_mutator = g.table("Car").await.unwrap();
     let mut price_mutator = g.table("Price").await.unwrap();
@@ -1102,7 +1077,11 @@ async fn forced_shuffle_despite_same_shard() {
     sleep().await;
 
     // Retrieve the result of the count query:
-    let result = getter.lookup(&[cid.into()], true).await.unwrap().into_vec();
+    let result = getter
+        .lookup(&[cid.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0][1], price.into());
 
@@ -1118,9 +1097,11 @@ async fn double_shuffle() {
         "CREATE CACHE CarPrice FROM SELECT cid, price FROM Car
             JOIN Price ON Car.pid = Price.pid WHERE cid = ?;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut car_mutator = g.table("Car").await.unwrap();
     let mut price_mutator = g.table("Price").await.unwrap();
@@ -1147,7 +1128,11 @@ async fn double_shuffle() {
     sleep().await;
 
     // Retrieve the result of the count query:
-    let result = getter.lookup(&[cid.into()], true).await.unwrap().into_vec();
+    let result = getter
+        .lookup(&[cid.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0][1], price.into());
 
@@ -1162,9 +1147,11 @@ async fn it_works_with_arithmetic_aliases() {
         "CREATE VIEW ModPrice AS SELECT pid, cent_price / 100 AS price FROM Price;",
         "CREATE CACHE AltPrice FROM SELECT pid, price FROM ModPrice WHERE pid = ?;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut price_mutator = g.table("Price").await.unwrap();
     let mut getter = g
@@ -1184,7 +1171,11 @@ async fn it_works_with_arithmetic_aliases() {
     sleep().await;
 
     // Retrieve the result of the count query:
-    let result = getter.lookup(&[pid.into()], true).await.unwrap().into_vec();
+    let result = getter
+        .lookup(&[pid.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0][1], (price / 100).into());
 
@@ -1218,9 +1209,11 @@ async fn it_recovers_persisted_bases() {
                 "CREATE TABLE Car (id int, price int, PRIMARY KEY(id));",
                 "CREATE CACHE CarPrice FROM SELECT price FROM Car WHERE id = ?;",
             ];
-            g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-                .await
-                .unwrap();
+            eventually! {
+                g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+                    .await
+                    .is_ok()
+            };
 
             let mut mutator = g.table("Car").await.unwrap();
 
@@ -1248,6 +1241,18 @@ async fn it_recovers_persisted_bases() {
     g.set_persistence(persistence_params);
     let (mut g, shutdown_tx) = g.start(authority.clone()).await.unwrap();
     g.backend_ready().await;
+
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE CACHE CarPrice FROM SELECT price FROM Car WHERE id = ?;"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
+        )
+        .await
+        .is_ok()
+    };
     {
         let mut getter = g
             .view("CarPrice")
@@ -1256,154 +1261,19 @@ async fn it_recovers_persisted_bases() {
             .into_reader_handle()
             .unwrap();
 
-        // Make sure that the new graph contains the old writes
+        // Make sure that the recovered base still contains the old writes
         for i in 1..10 {
             let price = i * 10;
-            let result = getter.lookup(&[i.into()], true).await.unwrap().into_vec();
-            assert_eq!(result.len(), 1);
-            assert_eq!(result[0][0], price.into());
-        }
-    }
-
-    shutdown_tx.shutdown().await;
-}
-
-// TODO(ENG-860): Flaky test.
-#[tokio::test(flavor = "multi_thread")]
-async fn it_recovers_persisted_bases_with_volume_id() {
-    let authority_store = Arc::new(LocalAuthorityStore::new());
-    let authority = Arc::new(Authority::from(LocalAuthority::new_with_store(
-        authority_store.clone(),
-    )));
-
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir
-        .path()
-        .join("it_recovers_persisted_bases_with_volume_id");
-    let persistence_params = PersistenceParameters::new(
-        DurabilityMode::Permanent,
-        Some(path.to_string_lossy().into()),
-        None,
-        None,
-        0,
-    );
-
-    {
-        let mut g = builder_for_tests();
-        g.set_persistence(persistence_params.clone());
-        g.set_volume_id("ef731j2".into());
-        let (mut g, shutdown_tx) = g.start(authority.clone()).await.unwrap();
-        g.backend_ready().await;
-        {
-            let sql = vec![
-                "CREATE TABLE Car (id int, price int, PRIMARY KEY(id));",
-                "CREATE CACHE CarPrice FROM SELECT price FROM Car WHERE id = ?;",
-            ];
-            g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
+            let result = getter
+                .lookup(&[i.into()], Dialect::DEFAULT_MYSQL)
                 .await
-                .unwrap();
-
-            let mut mutator = g.table("Car").await.unwrap();
-
-            for i in 1..10 {
-                let price = i * 10;
-                mutator.insert(vec![i.into(), price.into()]).await.unwrap();
-            }
-        }
-
-        // Let writes propagate:
-        sleep().await;
-        shutdown_tx.shutdown().await;
-        if let Authority::LocalAuthority(l) = authority.as_ref() {
-            l.delete_ephemeral();
-        }
-    }
-
-    sleep().await;
-
-    let authority = Arc::new(Authority::from(LocalAuthority::new_with_store(
-        authority_store.clone(),
-    )));
-    let mut g = builder_for_tests();
-    g.set_persistence(persistence_params);
-    g.set_volume_id("ef731j2".into());
-    let (mut g, shutdown_tx) = g.start(authority.clone()).await.unwrap();
-    g.backend_ready().await;
-    {
-        let mut getter = g
-            .view("CarPrice")
-            .await
-            .unwrap()
-            .into_reader_handle()
-            .unwrap();
-
-        // Make sure that the new graph contains the old writes
-        for i in 1..10 {
-            let price = i * 10;
-            let result = getter.lookup(&[i.into()], true).await.unwrap().into_vec();
+                .unwrap()
+                .into_vec();
             assert_eq!(result.len(), 1);
             assert_eq!(result[0][0], price.into());
         }
     }
-    shutdown_tx.shutdown().await;
-}
 
-#[tokio::test(flavor = "multi_thread")]
-async fn it_doesnt_recover_persisted_bases_with_wrong_volume_id() {
-    let authority = Arc::new(Authority::from(LocalAuthority::new()));
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir
-        .path()
-        .join("it_doesnt_recover_persisted_bases_with_wrong_volume_id");
-    let persistence_params = PersistenceParameters::new(
-        DurabilityMode::Permanent,
-        Some(path.to_string_lossy().into()),
-        None,
-        None,
-        0,
-    );
-
-    {
-        let mut g = builder_for_tests();
-        g.set_persistence(persistence_params.clone());
-        g.set_volume_id("ef731j2".into());
-        let (mut g, shutdown_tx) = g.start(authority.clone()).await.unwrap();
-        sleep().await;
-
-        let sql = vec![
-            "CREATE TABLE Car (id int, price int, PRIMARY KEY(id));",
-            "CREATE CACHE CarPrice FROM SELECT price FROM Car WHERE id = ?;",
-        ];
-        eventually!(g
-            .extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
-            .await
-            .is_ok());
-
-        let mut mutator = g.table("Car").await.unwrap();
-
-        for i in 1..10 {
-            let price = i * 10;
-            mutator.insert(vec![i.into(), price.into()]).await.unwrap();
-        }
-
-        // Let writes propagate:
-        sleep().await;
-        shutdown_tx.shutdown().await;
-        if let Authority::LocalAuthority(l) = authority.as_ref() {
-            l.delete_ephemeral();
-        }
-    }
-
-    sleep().await;
-
-    let mut g = builder_for_tests();
-    let authority = Arc::new(Authority::from(LocalAuthority::new()));
-    g.set_persistence(persistence_params);
-    g.set_volume_id("j3131t8".into());
-    let (mut g, shutdown_tx) = g.start(authority.clone()).await.unwrap();
-    let getter = g.view("CarPrice").await;
-    // This throws an error because there is no worker to place the domain on.
-    getter.unwrap_err();
     shutdown_tx.shutdown().await;
 }
 
@@ -1429,7 +1299,8 @@ async fn mutator_churn() {
             mig.maintain_anonymous_with_reader_processing(
                 vc,
                 &Index::hash_map(vec![0]),
-                ReaderProcessing::new(None, None, Some(vec![0, 1]), None, None).unwrap(),
+                ReaderProcessing::new(None, None, Some(vec![0, 1]), None, None, Default::default())
+                    .unwrap(),
             );
             vote
         })
@@ -1464,129 +1335,16 @@ async fn mutator_churn() {
     // check that all writes happened the right number of times
     for i in 0..ids {
         assert_eq!(
-            vc_state.lookup(&[i.into()], true).await.unwrap().into_vec(),
+            vc_state
+                .lookup(&[i.into()], Dialect::DEFAULT_MYSQL)
+                .await
+                .unwrap()
+                .into_vec(),
             vec![vec![i.into(), votes.into()]]
         );
     }
 
     shutdown_tx.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn view_connection_churn() {
-    let authority_store = Arc::new(LocalAuthorityStore::new());
-    let authority = Arc::new(Authority::from(LocalAuthority::new_with_store(
-        authority_store,
-    )));
-
-    let mut builder = builder_for_tests();
-    builder.set_sharding(Some(DEFAULT_SHARDING));
-    builder.set_persistence(get_persistence_params("view_connection_churn"));
-    let (mut g, shutdown_tx) = builder.start(authority.clone()).await.unwrap();
-
-    sleep().await;
-
-    eventually!(g
-        .extend_recipe(
-            ChangeList::from_strings(
-                vec![
-                    "CREATE TABLE A (id int, PRIMARY KEY(id));",
-                    "CREATE CACHE AID FROM SELECT id FROM A WHERE id = ?;",
-                ],
-                Dialect::DEFAULT_MYSQL,
-            )
-            .unwrap(),
-        )
-        .await
-        .is_ok());
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-
-    // continuously write to vote with entirely new connections
-    let jhs: Vec<_> = (0..20)
-        .map(|i| {
-            let authority = authority.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut builder = builder_for_tests();
-                builder.set_sharding(Some(DEFAULT_SHARDING));
-                builder.set_persistence(get_persistence_params("view_connection_churn"));
-                let (mut g, shutdown_tx) = builder.start(authority.clone()).await.unwrap();
-
-                g.view("AID")
-                    .await
-                    .unwrap()
-                    .into_reader_handle()
-                    .unwrap()
-                    .lookup(&[DfValue::from(i)], true)
-                    .await
-                    .unwrap();
-
-                drop(tx);
-                shutdown_tx.shutdown().await;
-            })
-        })
-        .collect();
-    drop(tx);
-    assert_eq!(rx.recv().await, None);
-    shutdown_tx.shutdown().await;
-    for jh in jhs {
-        jh.await.unwrap();
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn table_connection_churn() {
-    let authority_store = Arc::new(LocalAuthorityStore::new());
-    let authority = Arc::new(Authority::from(LocalAuthority::new_with_store(
-        authority_store,
-    )));
-
-    let mut builder = builder_for_tests();
-    builder.set_sharding(Some(DEFAULT_SHARDING));
-    builder.set_persistence(get_persistence_params("table_connection_churn"));
-    let (mut g, shutdown_tx) = builder.start(authority.clone()).await.unwrap();
-
-    eventually!(g
-        .extend_recipe(
-            ChangeList::from_strings(
-                vec!["CREATE TABLE A (id int, PRIMARY KEY(id));"],
-                Dialect::DEFAULT_MYSQL,
-            )
-            .unwrap(),
-        )
-        .await
-        .is_ok());
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-
-    // continuously write to vote with entirely new connections
-    let jhs: Vec<_> = (0..20)
-        .map(|i| {
-            let authority = authority.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut builder = builder_for_tests();
-                builder.set_sharding(Some(DEFAULT_SHARDING));
-                builder.set_persistence(get_persistence_params("table_connection_churn"));
-                let (mut g, shutdown_tx) = builder.start(authority.clone()).await.unwrap();
-
-                g.table("A")
-                    .await
-                    .unwrap()
-                    .insert(vec![DfValue::from(i)])
-                    .await
-                    .unwrap();
-
-                drop(tx);
-                shutdown_tx.shutdown().await;
-            })
-        })
-        .collect();
-    drop(tx);
-    assert_eq!(rx.recv().await, None);
-    shutdown_tx.shutdown().await;
-    for jh in jhs {
-        jh.await.unwrap();
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1624,9 +1382,11 @@ async fn it_recovers_persisted_bases_w_multiple_nodes() {
                 "CREATE CACHE BID FROM SELECT id FROM B WHERE id = ?;",
                 "CREATE CACHE CID FROM SELECT id FROM C WHERE id = ?;",
             ];
-            g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-                .await
-                .unwrap();
+            eventually! {
+                g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+                    .await
+                    .is_ok()
+            };
             for (i, table) in tables.iter().enumerate() {
                 let mut mutator = g.table(*table).await.unwrap();
                 mutator.insert(vec![i.into()]).await.unwrap();
@@ -1650,6 +1410,21 @@ async fn it_recovers_persisted_bases_w_multiple_nodes() {
     g.set_persistence(persistence_parameters);
     let (mut g, shutdown_tx) = g.start(authority.clone()).await.unwrap();
     g.backend_ready().await;
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE CACHE AID FROM SELECT id FROM A WHERE id = ?;",
+                    "CREATE CACHE BID FROM SELECT id FROM B WHERE id = ?;",
+                    "CREATE CACHE CID FROM SELECT id FROM C WHERE id = ?;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
+        )
+        .await
+        .is_ok()
+    };
     for (i, table) in tables.iter().enumerate() {
         let mut getter = g
             .view(&format!("{table}ID"))
@@ -1657,83 +1432,11 @@ async fn it_recovers_persisted_bases_w_multiple_nodes() {
             .unwrap()
             .into_reader_handle()
             .unwrap();
-        let result = getter.lookup(&[i.into()], true).await.unwrap().into_vec();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0][0], i.into());
-    }
-    shutdown_tx.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn it_recovers_persisted_bases_w_multiple_nodes_and_volume_id() {
-    let authority_store = Arc::new(LocalAuthorityStore::new());
-    let authority = Arc::new(Authority::from(LocalAuthority::new_with_store(
-        authority_store.clone(),
-    )));
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir
-        .path()
-        .join("it_recovers_persisted_bases_w_multiple_nodes_and_volume_id");
-    let tables = ["A", "B", "C"];
-    let persistence_parameters = PersistenceParameters::new(
-        DurabilityMode::Permanent,
-        Some(path.to_string_lossy().into()),
-        None,
-        None,
-        0,
-    );
-
-    {
-        let mut g = builder_for_tests();
-        g.set_persistence(persistence_parameters.clone());
-        g.set_volume_id("ef731j2".into());
-        let (mut g, shutdown_tx) = g.start(authority.clone()).await.unwrap();
-        g.backend_ready().await;
-
-        {
-            let sql = vec![
-                "CREATE TABLE A (id int, PRIMARY KEY(id));",
-                "CREATE TABLE B (id int, PRIMARY KEY(id));",
-                "CREATE TABLE C (id int, PRIMARY KEY(id));",
-                "CREATE CACHE AID FROM SELECT id FROM A WHERE id = ?;",
-                "CREATE CACHE BID FROM SELECT id FROM B WHERE id = ?;",
-                "CREATE CACHE CID FROM SELECT id FROM C WHERE id = ?;",
-            ];
-            g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-                .await
-                .unwrap();
-            for (i, table) in tables.iter().enumerate() {
-                let mut mutator = g.table(*table).await.unwrap();
-                mutator.insert(vec![i.into()]).await.unwrap();
-            }
-        }
-        sleep().await;
-        shutdown_tx.shutdown().await;
-        if let Authority::LocalAuthority(l) = authority.as_ref() {
-            l.delete_ephemeral();
-        }
-    }
-    sleep().await;
-
-    // Create a new controller with the same authority store, and make sure that it recovers to the
-    // same state that the other one had.
-    let authority = Arc::new(Authority::from(LocalAuthority::new_with_store(
-        authority_store,
-    )));
-    let mut g = builder_for_tests();
-    g.set_persistence(persistence_parameters);
-    g.set_volume_id("ef731j2".into());
-    let (mut g, shutdown_tx) = g.start(authority.clone()).await.unwrap();
-    g.backend_ready().await;
-    std::thread::sleep(Duration::from_secs(10));
-    for (i, table) in tables.iter().enumerate() {
-        let mut getter = g
-            .view(&format!("{table}ID"))
+        let result = getter
+            .lookup(&[i.into()], Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
-            .into_reader_handle()
-            .unwrap();
-        let result = getter.lookup(&[i.into()], true).await.unwrap().into_vec();
+            .into_vec();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0][0], i.into());
     }
@@ -1744,18 +1447,20 @@ async fn it_recovers_persisted_bases_w_multiple_nodes_and_volume_id() {
 async fn it_works_with_simple_arithmetic() {
     let (mut g, shutdown_tx) = start_simple_unsharded("it_works_with_simple_arithmetic").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE Car (id int, price int, PRIMARY KEY(id));",
-                "CREATE CACHE CarPrice FROM SELECT 2 * price FROM Car WHERE id = ?;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE Car (id int, price int, PRIMARY KEY(id));",
+                    "CREATE CACHE CarPrice FROM SELECT 2 * price FROM Car WHERE id = ?;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut mutator = g.table("Car").await.unwrap();
     let mut getter = g
@@ -1773,7 +1478,7 @@ async fn it_works_with_simple_arithmetic() {
 
     // Retrieve the result of the count query:
     let result = getter
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -1791,9 +1496,11 @@ async fn it_works_with_multiple_arithmetic_expressions() {
         "CREATE TABLE Car (id int, price int, PRIMARY KEY(id));",
         "CREATE CACHE CarPrice FROM SELECT 10 * 10, 2 * price, 10 * price FROM Car WHERE id = ?;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut mutator = g.table("Car").await.unwrap();
     let mut getter = g
@@ -1811,7 +1518,7 @@ async fn it_works_with_multiple_arithmetic_expressions() {
 
     // Retrieve the result of the count query:
     let result = getter
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -1835,9 +1542,11 @@ async fn it_works_with_join_arithmetic() {
                   JOIN Sales ON Price.price_id = Sales.price_id
                   WHERE car_id = ?;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut car_mutator = g.table("Car").await.unwrap();
     let mut price_mutator = g.table("Price").await.unwrap();
@@ -1872,7 +1581,11 @@ async fn it_works_with_join_arithmetic() {
     sleep().await;
 
     // Retrieve the result of the count query:
-    let result = getter.lookup(&[id.into()], true).await.unwrap().into_vec();
+    let result = getter
+        .lookup(&[id.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(result.len(), 1);
     assert_eq!(
         result[0][0],
@@ -1890,9 +1603,11 @@ async fn it_works_with_function_arithmetic() {
         "CREATE TABLE Bread (id int, price int, PRIMARY KEY(id));",
         "CREATE CACHE Price FROM SELECT 2 * MAX(price) FROM Bread;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut mutator = g.table("Bread").await.unwrap();
     let mut getter = g.view("Price").await.unwrap().into_reader_handle().unwrap();
@@ -1905,7 +1620,11 @@ async fn it_works_with_function_arithmetic() {
     // Let writes propagate:
     sleep().await;
 
-    let result = getter.lookup(&[0.into()], true).await.unwrap().into_vec();
+    let result = getter
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0][0], DfValue::from(max_price * 2));
 
@@ -1954,6 +1673,7 @@ async fn votes() {
                 vec![(0, 0)],
                 vec![(Side::Left, 0), (Side::Left, 1), (Side::Right, 1)],
                 true,
+                None,
             );
             let end = mig.add_ingredient("end", make_columns(&["id", "title", "votes"]), j);
             mig.maintain_anonymous(end, &Index::hash_map(vec![0]));
@@ -1987,7 +1707,7 @@ async fn votes() {
     // query articles to see that it was updated
     assert_eq!(
         articleq
-            .lookup(slice::from_ref(&a1), true)
+            .lookup(slice::from_ref(&a1), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -2004,7 +1724,7 @@ async fn votes() {
     // and that the old one is still present
     assert_eq!(
         articleq
-            .lookup(slice::from_ref(&a1), true)
+            .lookup(slice::from_ref(&a1), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -2012,7 +1732,7 @@ async fn votes() {
     );
     assert_eq!(
         articleq
-            .lookup(slice::from_ref(&a2), true)
+            .lookup(slice::from_ref(&a2), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -2027,7 +1747,7 @@ async fn votes() {
 
     // query vote count to see that the count was updated
     let res = vcq
-        .lookup(slice::from_ref(&a1), true)
+        .lookup(slice::from_ref(&a1), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -2036,7 +1756,7 @@ async fn votes() {
 
     // check that article 1 appears in the join view with a vote count of one
     let res = endq
-        .lookup(slice::from_ref(&a1), true)
+        .lookup(slice::from_ref(&a1), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -2049,7 +1769,7 @@ async fn votes() {
 
     // check that article 2 doesn't have any votes
     let res = endq
-        .lookup(slice::from_ref(&a2), true)
+        .lookup(slice::from_ref(&a2), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -2092,7 +1812,7 @@ async fn empty_migration() {
 
     // send a query to c
     assert_eq!(
-        cq.lookup(slice::from_ref(&id), true)
+        cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -2107,7 +1827,7 @@ async fn empty_migration() {
 
     // check that value was updated again
     let res = cq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -2142,7 +1862,7 @@ async fn simple_migration() {
 
     // check that a got it
     assert_eq!(
-        aq.lookup(slice::from_ref(&id), true)
+        aq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -2169,7 +1889,7 @@ async fn simple_migration() {
 
     // check that b got it
     assert_eq!(
-        bq.lookup(slice::from_ref(&id), true)
+        bq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -2205,7 +1925,7 @@ async fn add_columns() {
 
     // check that a got it
     assert_eq!(
-        aq.lookup(slice::from_ref(&id), true)
+        aq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -2225,7 +1945,7 @@ async fn add_columns() {
 
     // check that a got it, and added the new, third column's default
     let res = aq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -2242,7 +1962,7 @@ async fn add_columns() {
 
     // check that a got it, and included the third column
     let res = aq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -2317,7 +2037,7 @@ async fn migrate_added_columns() {
     // we should now see the pre-migration write and the old post-migration write with the default
     // value, and the new post-migration write with the value it contained.
     let res = bq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -2360,7 +2080,7 @@ async fn migrate_drop_columns() {
     // check that it's there
     sleep().await;
     let res = aq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -2382,7 +2102,7 @@ async fn migrate_drop_columns() {
     // so two rows now!
     sleep().await;
     let res = aq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -2408,7 +2128,7 @@ async fn migrate_drop_columns() {
     sleep().await;
 
     let res = aq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -2467,7 +2187,7 @@ async fn key_on_added() {
     // make sure we can read (may trigger a replay)
     let mut bq = g.view("x").await.unwrap().into_reader_handle().unwrap();
     assert!(bq
-        .lookup(&[3.into()], true)
+        .lookup(&[3.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -2524,6 +2244,7 @@ async fn replay_during_replay() {
                 vec![(0, 0)],
                 vec![(Side::Left, 0), (Side::Right, 1)],
                 true,
+                None,
             );
             let u = mig.add_ingredient("u", make_columns(&["u", "a"]), j);
             let j = Join::new(
@@ -2533,6 +2254,7 @@ async fn replay_during_replay() {
                 vec![(0, 1)],
                 vec![(Side::Left, 0), (Side::Right, 0)],
                 true,
+                None,
             );
             let end = mig.add_ingredient("end", make_columns(&["a", "u"]), j);
             mig.maintain_anonymous(end, &Index::hash_map(vec![0]));
@@ -2570,7 +2292,10 @@ async fn replay_during_replay() {
     let mut r = g.view("end").await.unwrap().into_reader_handle().unwrap();
 
     assert_eq!(
-        r.lookup(&[1.into()], true).await.unwrap().into_vec(),
+        r.lookup(&[1.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec![1.into(), "a".into()]]
     );
 
@@ -2586,7 +2311,11 @@ async fn replay_during_replay() {
     // second is partial and empty, so any read should trigger a replay.
     // though that shouldn't interact with target in any way.
     assert_eq!(
-        second.lookup(&["a".into()], true).await.unwrap().into_vec(),
+        second
+            .lookup(&["a".into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec!["a".into(), 1.into()]]
     );
 
@@ -2596,7 +2325,11 @@ async fn replay_during_replay() {
     // "a" value for which u has a hole. that record is then going to be forwarded to *both*
     // children, and it'll be interesting to see what the join then does.
     assert_eq!(
-        second.lookup(&["b".into()], true).await.unwrap().into_vec(),
+        second
+            .lookup(&["b".into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec!["b".into(), 2.into()]]
     );
 
@@ -2607,7 +2340,10 @@ async fn replay_during_replay() {
 
     // what happens if we now query for 2?
     assert_eq!(
-        r.lookup(&[2.into()], true).await.unwrap().into_vec(),
+        r.lookup(&[2.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec![2.into(), "b".into()], vec![2.into(), "b".into()]]
     );
 
@@ -2615,106 +2351,22 @@ async fn replay_during_replay() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Ignoring sharded tests"]
-async fn cascading_replays_with_sharding() {
-    let (mut g, shutdown_tx) = start_simple("cascading_replays_with_sharding").await;
-
-    // add each two bases. these are initially unsharded, but f will end up being sharded by u1,
-    // while v will be sharded by u
-
-    // force v to be in a different domain by adding it in a separate migration
-    let v = g
-        .migrate(|mig| {
-            mig.add_base(
-                "v",
-                make_columns(&["u", "s"]),
-                Base::new().with_default_values(vec!["".into(), 1.into()]),
-            )
-        })
-        .await;
-    // now add the rest
-    let _ = g
-        .migrate(move |mig| {
-            let f = mig.add_base(
-                "f",
-                make_columns(&["f1", "f2"]),
-                Base::new().with_default_values(vec!["".into(), "".into()]),
-            );
-            // add a join
-            let jb = Join::new(
-                f,
-                v,
-                JoinType::Inner,
-                vec![(0, 0)],
-                vec![(Side::Left, 0), (Side::Right, 1), (Side::Left, 1)],
-                true,
-            );
-            let j = mig.add_ingredient("j", make_columns(&["u", "s", "f2"]), jb);
-            // aggregate over the join. this will force a shard merger to be inserted because the
-            // group-by column ("f2") isn't the same as the join's output sharding column ("f1"/"u")
-            let a = Aggregation::Count
-                .over(j, 0, &[2], &DfType::Unknown, &Dialect::DEFAULT_MYSQL)
-                .unwrap();
-            let end = mig.add_ingredient("end", make_columns(&["u", "c"]), a);
-            mig.maintain_anonymous_with_reader_processing(
-                end,
-                &Index::hash_map(vec![0]),
-                ReaderProcessing::new(None, None, Some(vec![0, 1]), None, None).unwrap(),
-            );
-            (j, end)
-        })
-        .await;
-
-    let mut mutf = g.table("f").await.unwrap();
-    let mut mutv = g.table("v").await.unwrap();
-
-    //                f1           f2
-    mutf.insert(vec!["u1".into(), "u3".into()]).await.unwrap();
-    mutf.insert(vec!["u2".into(), "u3".into()]).await.unwrap();
-    mutf.insert(vec!["u3".into(), "u1".into()]).await.unwrap();
-
-    //                u
-    mutv.insert(vec!["u1".into(), 1.into()]).await.unwrap();
-    mutv.insert(vec!["u2".into(), 1.into()]).await.unwrap();
-    mutv.insert(vec!["u3".into(), 1.into()]).await.unwrap();
-
-    sleep().await;
-
-    let mut e = g.view("end").await.unwrap().into_reader_handle().unwrap();
-
-    assert_eq!(
-        e.lookup(&["u1".into()], true).await.unwrap().into_vec(),
-        vec![vec!["u1".into(), 1.into()]]
-    );
-    assert_eq!(
-        e.lookup(&["u2".into()], true).await.unwrap().into_vec(),
-        Vec::<Vec<DfValue>>::new()
-    );
-    assert_eq!(
-        e.lookup(&["u3".into()], true).await.unwrap().into_vec(),
-        vec![vec!["u3".into(), 2.into()]]
-    );
-
-    sleep().await;
-
-    shutdown_tx.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn replay_multiple_keys_then_write() {
     let (mut g, shutdown_tx) = start_simple_unsharded("replay_multiple_keys_then_write").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER);",
-                "CREATE CACHE q FROM SELECT id, value FROM t WHERE id = ?;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER);",
+                    "CREATE CACHE q FROM SELECT id, value FROM t WHERE id = ?;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
     let mut t = g.table("t").await.unwrap();
     let mut q = g.view("q").await.unwrap().into_reader_handle().unwrap();
 
@@ -2725,8 +2377,8 @@ async fn replay_multiple_keys_then_write() {
     .await
     .unwrap();
 
-    q.lookup(&[1.into()], true).await.unwrap();
-    q.lookup(&[2.into()], true).await.unwrap();
+    q.lookup(&[1.into()], Dialect::DEFAULT_MYSQL).await.unwrap();
+    q.lookup(&[2.into()], Dialect::DEFAULT_MYSQL).await.unwrap();
 
     t.update(
         vec![DfValue::from(1)],
@@ -2737,7 +2389,11 @@ async fn replay_multiple_keys_then_write() {
 
     sleep().await;
 
-    let res = &q.lookup(&[1.into()], true).await.unwrap().into_vec()[0];
+    let res = &q
+        .lookup(&[1.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec()[0];
 
     assert_eq!(*res, vec![DfValue::from(1), DfValue::from(2)]);
 
@@ -2789,7 +2445,8 @@ async fn full_aggregation_with_bogokey() {
             mig.maintain_anonymous_with_reader_processing(
                 agg,
                 &Index::hash_map(vec![0]),
-                ReaderProcessing::new(None, None, Some(vec![0, 1]), None, None).unwrap(),
+                ReaderProcessing::new(None, None, Some(vec![0, 1]), None, None, Default::default())
+                    .unwrap(),
             );
             agg
         })
@@ -2808,7 +2465,10 @@ async fn full_aggregation_with_bogokey() {
 
     // send a query to aggregation materialization
     assert_eq!(
-        aggq.lookup(&[0.into()], true).await.unwrap().into_vec(),
+        aggq.lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec![0.into(), 3.into()]]
     );
 
@@ -2820,7 +2480,10 @@ async fn full_aggregation_with_bogokey() {
 
     // check that value was updated again
     assert_eq!(
-        aggq.lookup(&[0.into()], true).await.unwrap().into_vec(),
+        aggq.lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec![0.into(), 4.into()]]
     );
 
@@ -2830,33 +2493,39 @@ async fn full_aggregation_with_bogokey() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pkey_then_full_table_with_bogokey() {
     let (mut g, shutdown_tx) = start_simple_unsharded("pkey_then_full_table_with_bogokey").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE TABLE posts (id int, title text)"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE TABLE posts (id int, title text)"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE CACHE by_id FROM SELECT id, title FROM posts WHERE id = ?"],
-            Dialect::DEFAULT_MYSQL,
+        .await
+        .is_ok()
+    };
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE CACHE by_id FROM SELECT id, title FROM posts WHERE id = ?"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE CACHE all_posts FROM SELECT id, title FROM posts"],
-            Dialect::DEFAULT_MYSQL,
+        .await
+        .is_ok()
+    };
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE CACHE all_posts FROM SELECT id, title FROM posts"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut posts = g.table("posts").await.unwrap();
     let mut by_id = g.view("by_id").await.unwrap().into_reader_handle().unwrap();
@@ -2876,7 +2545,11 @@ async fn pkey_then_full_table_with_bogokey() {
 
     // Looking up post with id 1 should return the correct post.
     assert_eq!(
-        by_id.lookup(&[1.into()], true).await.unwrap().into_vec(),
+        by_id
+            .lookup(&[1.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec![DfValue::from(1), DfValue::from("post 1")]]
     );
 
@@ -2886,7 +2559,7 @@ async fn pkey_then_full_table_with_bogokey() {
         .collect();
     assert_eq!(
         all_posts
-            .lookup(&[0.into()], true)
+            .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -2932,6 +2605,7 @@ async fn materialization_frontier() {
                 vec![(0, 0)],
                 vec![(Side::Left, 0), (Side::Left, 1), (Side::Right, 1)],
                 true,
+                None,
             );
             let end = mig.add_ingredient("awvc", make_columns(&["id", "title", "votes"]), j);
 
@@ -2966,17 +2640,27 @@ async fn materialization_frontier() {
     let one = 1.into();
     let two = 2.into();
     assert_eq!(
-        r.lookup(&[one], true).await.unwrap().into_vec(),
+        r.lookup(&[one], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec![1.into(), "Hello world #1".into(), 2.into()]]
     );
     assert_eq!(
-        r.lookup(&[two], true).await.unwrap().into_vec(),
+        r.lookup(&[two], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec![2.into(), "Hello world #2".into(), 3.into()]]
     );
 
     for _ in 0..1_000 {
         for &id in &[1, 2] {
-            let r = r.lookup(&[id.into()], true).await.unwrap().into_vec();
+            let r = r
+                .lookup(&[id.into()], Dialect::DEFAULT_MYSQL)
+                .await
+                .unwrap()
+                .into_vec();
             match id {
                 1 => {
                     assert_eq!(r, vec![vec![1.into(), "Hello world #1".into(), 2.into()]]);
@@ -3027,7 +2711,7 @@ async fn crossing_migration() {
     sleep().await;
 
     assert_eq!(
-        cq.lookup(slice::from_ref(&id), true)
+        cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -3039,7 +2723,7 @@ async fn crossing_migration() {
     sleep().await;
 
     let res = cq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -3075,7 +2759,7 @@ async fn independent_domain_migration() {
 
     // check that a got it
     assert_eq!(
-        aq.lookup(slice::from_ref(&id), true)
+        aq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -3102,7 +2786,7 @@ async fn independent_domain_migration() {
 
     // check that a got it
     assert_eq!(
-        bq.lookup(slice::from_ref(&id), true)
+        bq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -3146,7 +2830,7 @@ async fn domain_amend_migration() {
     sleep().await;
 
     assert_eq!(
-        cq.lookup(slice::from_ref(&id), true)
+        cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -3158,7 +2842,7 @@ async fn domain_amend_migration() {
     sleep().await;
 
     let res = cq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -3202,6 +2886,7 @@ async fn migration_depends_on_unchanged_domain() {
             vec![(0, 0)],
             vec![(Side::Left, 0), (Side::Right, 1)],
             true,
+            None,
         );
         mig.add_ingredient("join", make_columns(&["a", "b"]), j);
     })
@@ -3210,13 +2895,9 @@ async fn migration_depends_on_unchanged_domain() {
     shutdown_tx.shutdown().await;
 }
 
-async fn do_full_vote_migration(sharded: bool, old_puts_after: bool) {
+async fn do_full_vote_migration(old_puts_after: bool) {
     let name = format!("do_full_vote_migration_{old_puts_after}");
-    let (mut g, shutdown_tx) = if sharded {
-        start_simple(&name).await
-    } else {
-        start_simple_unsharded(&name).await
-    };
+    let (mut g, shutdown_tx) = start_simple_unsharded(&name).await;
     let (article, vote, vc, _end) = g
         .migrate(|mig| {
             // migrate
@@ -3249,6 +2930,7 @@ async fn do_full_vote_migration(sharded: bool, old_puts_after: bool) {
                 vec![(0, 0)],
                 vec![(Side::Left, 0), (Side::Left, 1), (Side::Right, 1)],
                 true,
+                None,
             );
             let end = mig.add_ingredient("awvc", make_columns(&["id", "title", "votes"]), j);
 
@@ -3273,7 +2955,11 @@ async fn do_full_vote_migration(sharded: bool, old_puts_after: bool) {
     let mut last = g.view("awvc").await.unwrap().into_reader_handle().unwrap();
     thread::sleep(get_settle_time().checked_mul(3).unwrap());
     for i in 0..n {
-        let rows = last.lookup(&[i.into()], true).await.unwrap().into_vec();
+        let rows = last
+            .lookup(&[i.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec();
         assert!(!rows.is_empty(), "every article should be voted for");
         assert_eq!(rows.len(), 1, "every article should have only one entry");
         let row = rows.into_iter().next().unwrap();
@@ -3313,6 +2999,7 @@ async fn do_full_vote_migration(sharded: bool, old_puts_after: bool) {
                 vec![(0, 0)],
                 vec![(Side::Left, 0), (Side::Left, 1), (Side::Right, 1)],
                 true,
+                None,
             );
             let total = mig.add_ingredient("total", make_columns(&["id", "ratings", "votes"]), j);
 
@@ -3329,6 +3016,7 @@ async fn do_full_vote_migration(sharded: bool, old_puts_after: bool) {
                     (Side::Right, 2),
                 ],
                 true,
+                None,
             );
             let newend =
                 mig.add_ingredient("awr", make_columns(&["id", "title", "ratings", "votes"]), j);
@@ -3351,7 +3039,11 @@ async fn do_full_vote_migration(sharded: bool, old_puts_after: bool) {
 
     thread::sleep(get_settle_time().checked_mul(3).unwrap());
     for i in 0..n {
-        let rows = last.lookup(&[i.into()], true).await.unwrap().into_vec();
+        let rows = last
+            .lookup(&[i.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec();
         assert!(!rows.is_empty(), "every article should be voted for");
         assert_eq!(rows.len(), 1, "every article should have only one entry");
         let row = rows.into_iter().next().unwrap();
@@ -3377,20 +3069,8 @@ async fn do_full_vote_migration(sharded: bool, old_puts_after: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "Ignoring sharded tests"]
-async fn full_vote_migration_only_new() {
-    do_full_vote_migration(true, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "Ignoring sharded tests"]
-async fn full_vote_migration_new_and_old() {
-    do_full_vote_migration(true, true).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn full_vote_migration_new_and_old_unsharded() {
-    do_full_vote_migration(false, true).await;
+    do_full_vote_migration(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3416,7 +3096,8 @@ async fn live_writes() {
             mig.maintain_anonymous_with_reader_processing(
                 vc,
                 &Index::hash_map(vec![0]),
-                ReaderProcessing::new(None, None, Some(vec![0, 1]), None, None).unwrap(),
+                ReaderProcessing::new(None, None, Some(vec![0, 1]), None, None, Default::default())
+                    .unwrap(),
             );
             (vote, vc)
         })
@@ -3459,7 +3140,8 @@ async fn live_writes() {
             mig.maintain_anonymous_with_reader_processing(
                 vc2,
                 &Index::hash_map(vec![0]),
-                ReaderProcessing::new(None, None, Some(vec![0, 1]), None, None).unwrap(),
+                ReaderProcessing::new(None, None, Some(vec![0, 1]), None, None, Default::default())
+                    .unwrap(),
             );
             vc2
         })
@@ -3483,12 +3165,16 @@ async fn live_writes() {
     // check that all writes happened the right number of times
     for i in 0..ids {
         assert_eq!(
-            vc_state.lookup(&[i.into()], true).await.unwrap().into_vec(),
+            vc_state
+                .lookup(&[i.into()], Dialect::DEFAULT_MYSQL)
+                .await
+                .unwrap()
+                .into_vec(),
             vec![vec![i.into(), votes.into()]]
         );
         assert_eq!(
             vc2_state
-                .lookup(&[i.into()], true)
+                .lookup(&[i.into()], Dialect::DEFAULT_MYSQL)
                 .await
                 .unwrap()
                 .into_vec(),
@@ -3534,6 +3220,7 @@ async fn state_replay_migration_query() {
                 vec![(0, 0)],
                 vec![(Side::Left, 0), (Side::Left, 1), (Side::Right, 1)],
                 true,
+                None,
             );
             let j = mig.add_ingredient("j", make_columns(&["x", "y", "z"]), j);
 
@@ -3548,23 +3235,192 @@ async fn state_replay_migration_query() {
     // if all went according to plan, the join should now be fully populated!
     // there are (/should be) two records in a with x == 1
     // they may appear in any order
-    let res = out.lookup(&[1.into()], true).await.unwrap().into_vec();
+    let res = out
+        .lookup(&[1.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert!(res.contains(&vec![1.into(), "a".into(), "n".into()]));
     assert!(res.contains(&vec![1.into(), "b".into(), "n".into()]));
 
     // there are (/should be) one record in a with x == 2
     assert_eq!(
-        out.lookup(&[2.into()], true).await.unwrap().into_vec(),
+        out.lookup(&[2.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec(),
         vec![vec![2.into(), "c".into(), "o".into()]]
     );
 
     // there are (/should be) no records with x == 3
     assert!(out
-        .lookup(&[3.into()], true)
+        .lookup(&[3.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
         .is_empty());
+
+    shutdown_tx.shutdown().await;
+}
+
+/// REA-6688: a row committed while a base is migrating a reader must not be dropped from the
+/// reader. The barrier flips the reader to `Replaying` before the racing write arrives, so the
+/// write buffers and is applied when the replay drains. A failpoint holds the chunker open to pin
+/// the write inside the snapshot/flip window, and we sync on the `replay_buffered_writes` gauge so
+/// the release races nothing. The reader replays through an `Identity`, exercising the barrier
+/// crossing an intermediate operator.
+#[cfg(feature = "failure_injection")]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_during_reader_migration_is_not_dropped() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use readyset_util::failpoints::FULL_REPLAY_POST_SNAPSHOT;
+
+    static SNAPSHOT_REACHED: AtomicBool = AtomicBool::new(false);
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+
+    // Release the held chunker and disarm the failpoint even on panic, so a failure neither wedges
+    // the chunker thread nor leaves the failpoint armed.
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            RELEASE.store(true, Ordering::SeqCst);
+            let _ = fail::cfg(FULL_REPLAY_POST_SNAPSHOT, "off");
+        }
+    }
+
+    SNAPSHOT_REACHED.store(false, Ordering::SeqCst);
+    RELEASE.store(false, Ordering::SeqCst);
+    // Install the recorder before the server starts so the buffered-writes gauge is recorded; the
+    // writer task below reads it back to know the racing write was buffered.
+    register_metric_recorder();
+    let _guard = Guard;
+
+    let (mut g, shutdown_tx) = start_simple_unsharded("write_during_reader_migration").await;
+
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(vec!["CREATE TABLE t (id int)"], Dialect::DEFAULT_MYSQL)
+                .unwrap(),
+        )
+        .await
+        .is_ok()
+    };
+    let mut mutt = g.table("t").await.unwrap();
+    mutt.insert_many((0..10i32).map(|id| vec![DfValue::from(id)]))
+        .await
+        .unwrap();
+    // Let the seed settle into the base materialization so it lands in the replay snapshot.
+    sleep().await;
+
+    fail::cfg_callback(FULL_REPLAY_POST_SNAPSHOT, || {
+        SNAPSHOT_REACHED.store(true, Ordering::SeqCst);
+        // Hold the chunker until released, bounded so a panic before release degrades to "replay
+        // proceeds" rather than a hung thread.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !RELEASE.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    })
+    .unwrap();
+
+    // Race a write against the migration: once the snapshot is pinned (chunker held), commit id 10,
+    // wait for it to be buffered behind the barrier (the gauge ticks up), then release.
+    let writer = tokio::spawn(async move {
+        eventually!(attempts: 6000, sleep: Duration::from_millis(5), {
+            SNAPSHOT_REACHED.load(Ordering::SeqCst)
+        });
+        mutt.insert(vec![DfValue::from(10)]).await.unwrap();
+        let handle = readyset_metrics::metrics_handle().expect("recorder installed");
+        eventually!(attempts: 6000, sleep: Duration::from_millis(5), {
+            let [buffered] = handle.gauges([metric::DOMAIN_REPLAY_BUFFERED_WRITES], []);
+            buffered.get() >= 1.0
+        });
+        RELEASE.store(true, Ordering::SeqCst);
+    });
+
+    // The keyless full-table cache fills by full replay, which holds at the chunker until the writer
+    // above releases it.
+    g.extend_recipe(
+        ChangeList::from_strings(
+            vec!["CREATE CACHE q FROM SELECT id FROM t"],
+            Dialect::DEFAULT_MYSQL,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    writer.await.unwrap();
+
+    let mut view = g.view("q").await.unwrap().into_reader_handle().unwrap();
+    // The migrated cache must contain the racing write, not just the snapshot rows.
+    eventually!(attempts: 200, sleep: Duration::from_millis(25), {
+        view.lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec()
+            .contains(&vec![DfValue::from(10)])
+    });
+
+    shutdown_tx.shutdown().await;
+}
+
+/// REA-6688 follow-up: the replay-start barrier must not disable a union's deduplication. `a OR a`
+/// lowers to a deduplicating (bag) union across two branches that match the same rows, so each row
+/// must appear once. When the cache fills by a full-replay reader migration, one barrier crosses
+/// the union per branch; if a barrier is folded into the union's dedup accounting it consumes the
+/// shared state before any data arrives, and every overlapping row is then emitted twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn overlapping_or_not_doubled_after_reader_migration() {
+    let (mut g, shutdown_tx) = start_simple_unsharded("overlapping_or_not_doubled").await;
+
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(vec!["CREATE TABLE t (id int)"], Dialect::DEFAULT_MYSQL)
+                .unwrap(),
+        )
+        .await
+        .is_ok()
+    };
+    let mut mutt = g.table("t").await.unwrap();
+    mutt.insert_many((0..10i32).map(|id| vec![DfValue::from(id)]))
+        .await
+        .unwrap();
+    // Let the rows settle into the base materialization so the cache fills by full replay.
+    sleep().await;
+
+    // Both branches of the OR match every non-null row; a deduplicating union must still yield each
+    // row once. Filling by full replay routes a per-branch barrier through that union.
+    g.extend_recipe(
+        ChangeList::from_strings(
+            vec!["CREATE CACHE q FROM SELECT id FROM t WHERE (id IS NOT NULL) OR (id IS NOT NULL)"],
+            Dialect::DEFAULT_MYSQL,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut view = g.view("q").await.unwrap().into_reader_handle().unwrap();
+    eventually!(attempts: 200, sleep: Duration::from_millis(25), {
+        view.lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec()
+            .len()
+            >= 10
+    });
+    let rows = view
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
+    assert_eq!(
+        rows.len(),
+        10,
+        "overlapping-OR cache doubled rows through the full-replay reader migration (REA-6688)"
+    );
 
     shutdown_tx.shutdown().await;
 }
@@ -3578,15 +3434,19 @@ async fn recipe_activates_and_migrates() {
     ];
 
     let (mut g, shutdown_tx) = start_simple_unsharded("recipe_activates_and_migrates").await;
-    g.extend_recipe(ChangeList::from_strings(r_txt, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(r_txt.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     // one base node
     assert_eq!(g.tables().await.unwrap().len(), 1);
 
-    g.extend_recipe(ChangeList::from_strings(r1_txt, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(r1_txt.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     // still one base node
     assert_eq!(g.tables().await.unwrap().len(), 1);
     // two leaf nodes
@@ -3605,16 +3465,20 @@ async fn recipe_activates_and_migrates_with_join() {
 
     let (mut g, shutdown_tx) =
         start_simple_unsharded("recipe_activates_and_migrates_with_join").await;
-    g.extend_recipe(ChangeList::from_strings(r_txt, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(r_txt.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     // two base nodes
     assert_eq!(g.tables().await.unwrap().len(), 2);
 
-    g.extend_recipe(ChangeList::from_strings(r1_txt, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(r1_txt.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     // still two base nodes
     assert_eq!(g.tables().await.unwrap().len(), 2);
@@ -3662,7 +3526,15 @@ async fn finkelstein1982_queries() {
                         .unwrap();
                 }
                 SqlQuery::Select(stmt) => {
-                    inc.add_query(None, stmt, false, &[], mig).unwrap();
+                    inc.add_query(
+                        None,
+                        stmt,
+                        readyset_sql::ast::TrxCachePolicy::Never,
+                        None,
+                        &[],
+                        mig,
+                    )
+                    .unwrap();
                 }
                 _ => panic!("unexpected query type"),
             }
@@ -3715,7 +3587,7 @@ async fn node_removal() {
 
     // send a query to c
     assert_eq!(
-        cq.lookup(slice::from_ref(&id), true)
+        cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -3731,7 +3603,7 @@ async fn node_removal() {
     sleep().await;
 
     // // check that value was updated again
-    // let res = cq.lookup(slice::from_ref(&id), true).await.unwrap();
+    // let res = cq.lookup(slice::from_ref(&id)).await.unwrap();
     // assert!(res.iter().any(|r| r == &vec![id.clone(), 2.into()]));
     // assert!(res.iter().any(|r| r == &vec![id.clone(), 4.into()]));
 
@@ -3743,7 +3615,7 @@ async fn node_removal() {
 
     // // send a query to c
     // assert_eq!(
-    //     cq.lookup(slice::from_ref(&id), true).await,
+    //     cq.lookup(slice::from_ref(&id)).await,
     //     Ok(vec![vec![1.into(), 4.into()]])
     // );
 
@@ -3766,9 +3638,11 @@ async fn remove_query() {
     ];
 
     let (mut g, shutdown_tx) = start_simple_unsharded("remove_query").await;
-    g.extend_recipe(ChangeList::from_strings(r_txt, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(r_txt.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     assert_eq!(g.tables().await.unwrap().len(), 1);
     assert_eq!(g.views().await.unwrap().len(), 2);
 
@@ -3785,18 +3659,28 @@ async fn remove_query() {
     sleep().await;
 
     assert_eq!(
-        qa.lookup(&[0.into()], true).await.unwrap().into_vec().len(),
+        qa.lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec()
+            .len(),
         2
     );
     assert_eq!(
-        qb.lookup(&[0.into()], true).await.unwrap().into_vec().len(),
+        qb.lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec()
+            .len(),
         1
     );
 
     // Remove qb and check that the graph still functions as expected.
-    g.extend_recipe(ChangeList::from_strings(r2_txt, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(r2_txt.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     assert_eq!(g.tables().await.unwrap().len(), 1);
     assert_eq!(g.views().await.unwrap().len(), 1);
     g.view("qb").await.unwrap_err();
@@ -3806,7 +3690,11 @@ async fn remove_query() {
         .unwrap();
     sleep().await;
 
-    match qb.lookup(&[0.into()], true).await.unwrap_err() {
+    match qb
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap_err()
+    {
         // FIXME(eta): this sucks and should be looking for ViewNotYetAvailable.
         readyset_errors::ReadySetError::ViewError { .. } => {}
         e => unreachable!("{:?}", e),
@@ -3822,18 +3710,24 @@ macro_rules! get {
         // try both O:)
         let aid: DfValue = TinyText::try_new($aid, Collation::Utf8AiCi).unwrap().into();
         let mut v = $private
-            .lookup(&[$uid.into(), aid.clone()], true)
+            .lookup(&[$uid.into(), aid.clone()], Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec();
         v.append(
             &mut $private
-                .lookup(&[aid.clone(), $uid.into()], true)
+                .lookup(&[aid.clone(), $uid.into()], Dialect::DEFAULT_MYSQL)
                 .await
                 .unwrap()
                 .into_vec(),
         );
-        v.append(&mut $public.lookup(&[aid], true).await.unwrap().into_vec());
+        v.append(
+            &mut $public
+                .lookup(&[aid], Dialect::DEFAULT_MYSQL)
+                .await
+                .unwrap()
+                .into_vec(),
+        );
         eprintln!("check {} as {}: {:?}", $aid, $uid, v);
         v
     }};
@@ -3842,19 +3736,21 @@ macro_rules! get {
 #[tokio::test(flavor = "multi_thread")]
 async fn albums() {
     let (mut g, shutdown_tx) = start_simple_unsharded("albums").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE friend (usera int, userb int);",
-                "CREATE TABLE album (a_id text, u_id int, public tinyint(1));",
-                "CREATE TABLE photo (p_id text, album text);",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE friend (usera int, userb int);",
+                    "CREATE TABLE album (a_id text, u_id int, public tinyint(1));",
+                    "CREATE TABLE photo (p_id text, album text);",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let sql = vec![
         "CREATE VIEW album_friends AS
@@ -3868,9 +3764,11 @@ async fn albums() {
         "CREATE CACHE public_photos FROM
             SELECT photo.p_id FROM photo JOIN album ON (photo.album = album.a_id) WHERE album.public = 1 AND album.a_id = ?;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut friends = g.table("friend").await.unwrap();
     let mut albums = g.table("album").await.unwrap();
@@ -3967,9 +3865,11 @@ async fn union_basic() {
         "CREATE VIEW twos_union_threes AS (SELECT id FROM twos) UNION ALL (SELECT id FROM threes);",
         "CREATE CACHE `query` FROM SELECT id FROM twos_union_threes;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut twos = g.table("twos").await.unwrap();
     twos.insert_many((0..10).filter(|i: &i32| i % 2 == 0).map(|i| vec![i.into()]))
@@ -3989,7 +3889,7 @@ async fn union_basic() {
     let mut query = g.view("query").await.unwrap().into_reader_handle().unwrap();
     let result_ids: Vec<i32> = sorted(
         query
-            .lookup(&[0.into()], true)
+            .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec()
@@ -4016,9 +3916,11 @@ async fn union_all_basic() {
         "CREATE VIEW twos_union_threes AS (SELECT id FROM twos) UNION ALL (SELECT id FROM threes);",
         "CREATE CACHE `query` FROM SELECT id FROM twos_union_threes;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut twos = g.table("twos").await.unwrap();
     twos.insert_many((0..10).filter(|i: &i32| i % 2 == 0).map(|i| vec![i.into()]))
@@ -4038,7 +3940,7 @@ async fn union_all_basic() {
     let mut query = g.view("query").await.unwrap().into_reader_handle().unwrap();
     let result_ids: Vec<i32> = sorted(
         query
-            .lookup(&[0.into()], true)
+            .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec()
@@ -4060,22 +3962,26 @@ async fn union_all_basic() {
 #[tokio::test(flavor = "multi_thread")]
 async fn between() {
     let (mut g, shutdown_tx) = start_simple_unsharded("between_query").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE TABLE things (bigness INT);"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE TABLE things (bigness INT);"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
-    g.extend_recipe(
-        ChangeList::from_strings(vec!["CREATE CACHE `between` FROM SELECT bigness FROM things WHERE bigness BETWEEN 3 and 5;"], Dialect::DEFAULT_MYSQL)
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(vec!["CREATE CACHE `between` FROM SELECT bigness FROM things WHERE bigness BETWEEN 3 and 5;"], Dialect::DEFAULT_MYSQL)
+            .unwrap(),
+        )
+        .await
+        .is_ok()
+    };
 
     let mut things = g.table("things").await.unwrap();
 
@@ -4093,7 +3999,10 @@ async fn between() {
     sleep().await;
 
     let expected: Vec<Vec<DfValue>> = (3..6).map(|i| vec![DfValue::from(i)]).collect();
-    let res = between_query.lookup(&[0.into()], true).await.unwrap();
+    let res = between_query
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let rows: Vec<Vec<DfValue>> = res.into();
     assert_eq!(rows, expected);
 
@@ -4104,25 +4013,29 @@ async fn between() {
 async fn between_parameterized() {
     let (mut g, shutdown_tx) = start_simple_unsharded("between_parameterized").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE TABLE things (bigness INT);"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE TABLE things (bigness INT);"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE CACHE q FROM SELECT bigness FROM things WHERE bigness BETWEEN $1 and $2;"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE CACHE q FROM SELECT bigness FROM things WHERE bigness BETWEEN $1 and $2;"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut things = g.table("things").await.unwrap();
 
@@ -4141,7 +4054,7 @@ async fn between_parameterized() {
             vec![KeyComparison::from_range(
                 &(vec1![DfValue::from(3)]..=vec1![DfValue::from(5)]),
             )],
-            true,
+            Dialect::DEFAULT_MYSQL,
         )
         .await
         .unwrap()
@@ -4154,19 +4067,21 @@ async fn between_parameterized() {
 #[tokio::test(flavor = "multi_thread")]
 async fn topk_updates() {
     let (mut g, shutdown_tx) = start_simple_unsharded("things").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE posts (id INTEGER PRIMARY KEY, number INTEGER);",
-                "CREATE CACHE top_posts FROM
-                 SELECT * FROM posts ORDER BY number LIMIT 3;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE posts (id INTEGER PRIMARY KEY, number INTEGER);",
+                    "CREATE CACHE top_posts FROM
+                     SELECT * FROM posts ORDER BY number LIMIT 3;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut posts = g.table("posts").await.unwrap();
     let mut top_posts = g
@@ -4183,7 +4098,10 @@ async fn topk_updates() {
 
     sleep().await;
 
-    let res = top_posts.lookup(&[0.into()], true).await.unwrap();
+    let res = top_posts
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let mut rows: Vec<Vec<DfValue>> = res.into();
     rows.sort();
     assert_eq!(
@@ -4197,7 +4115,10 @@ async fn topk_updates() {
 
     sleep().await;
 
-    let res = top_posts.lookup(&[0.into()], true).await.unwrap();
+    let res = top_posts
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let mut rows: Vec<Vec<DfValue>> = res.into();
     rows.sort();
     assert_eq!(
@@ -4211,15 +4132,194 @@ async fn topk_updates() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn topk_with_join_aggregate_order_by() {
+    let (mut g, shutdown_tx) = start_simple_unsharded("topk_with_join_aggregate_order_by").await;
+    g.extend_recipe(
+        ChangeList::from_strings(
+            vec![
+                "CREATE TABLE dept_emp (dept_no INTEGER, emp_id INTEGER);",
+                "CREATE TABLE departments (dept_no INTEGER, dept_name TEXT);",
+                "CREATE CACHE top_depts FROM
+                 SELECT departments.dept_name, count(*) AS employee_count
+                 FROM dept_emp
+                 JOIN departments ON (dept_emp.dept_no = departments.dept_no)
+                 GROUP BY dept_emp.dept_no
+                 ORDER BY employee_count DESC
+                 LIMIT 3;",
+            ],
+            Dialect::DEFAULT_MYSQL,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut dept_emp = g.table("dept_emp").await.unwrap();
+    let mut departments = g.table("departments").await.unwrap();
+    let mut top_depts = g
+        .view("top_depts")
+        .await
+        .unwrap()
+        .into_reader_handle()
+        .unwrap();
+
+    // Create 5 departments
+    departments
+        .insert_many((1..=5).map(|i| vec![i.into(), format!("Dept{}", i).into()]))
+        .await
+        .unwrap();
+
+    // dept 1 has 5 employees, dept 2 has 3, dept 3 has 2,
+    // dept 4 has 4, dept 5 has 1
+    dept_emp
+        .insert_many(
+            [
+                (1, 1),
+                (1, 2),
+                (1, 3),
+                (1, 4),
+                (1, 5),
+                (2, 1),
+                (2, 2),
+                (2, 3),
+                (3, 1),
+                (3, 2),
+                (4, 1),
+                (4, 2),
+                (4, 3),
+                (4, 4),
+                (5, 1),
+            ]
+            .map(|(d, e)| vec![d.into(), e.into()]),
+        )
+        .await
+        .unwrap();
+
+    sleep().await;
+
+    eventually!(
+        run_test: {
+            top_depts.lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
+        },
+        then_assert: |rows| {
+            assert_eq!(
+                rows.len(),
+                3,
+                "Expected 3 rows due to LIMIT 3, but got {}: {:?}",
+                rows.len(),
+                rows
+            );
+            // Verify the correct top-3 departments by employee count: 5, 4, 3
+            let counts: Vec<i64> = rows
+                .iter()
+                .map(|r| f64::try_from(&r[1]).unwrap() as i64)
+                .collect();
+            assert_eq!(counts, vec![5, 4, 3]);
+        }
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn topk_non_grouped_select_column() {
+    // Tests that TopK correctly limits results when a non-GROUP-BY column
+    // appears in SELECT (MySQL non-strict GROUP BY behavior).
+    // Without the add_column fix, pull_all_required_columns pushes
+    // the non-grouped column into TopK's group_by, fracturing the
+    // single global group and preventing proper LIMIT filtering.
+    let (mut g, shutdown_tx) = start_simple_unsharded("topk_non_grouped_select_column").await;
+    g.extend_recipe(
+        ChangeList::from_strings(
+            vec![
+                "CREATE TABLE products (category INT, name TEXT, price INT);",
+                "CREATE CACHE top_categories FROM
+                 SELECT name, SUM(price) AS total
+                 FROM products
+                 GROUP BY category
+                 ORDER BY total DESC
+                 LIMIT 3;",
+            ],
+            Dialect::DEFAULT_MYSQL,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut products = g.table("products").await.unwrap();
+    let mut top_categories = g
+        .view("top_categories")
+        .await
+        .unwrap()
+        .into_reader_handle()
+        .unwrap();
+
+    // 5 categories with different totals:
+    //   category 1: 10+20 = 30
+    //   category 2: 5+15  = 20
+    //   category 3: 30+25 = 55
+    //   category 4: 1+2   = 3
+    //   category 5: 100   = 100
+    products
+        .insert_many(
+            [
+                (1, "a", 10),
+                (1, "b", 20),
+                (2, "c", 5),
+                (2, "d", 15),
+                (3, "e", 30),
+                (3, "f", 25),
+                (4, "g", 1),
+                (4, "h", 2),
+                (5, "i", 100),
+            ]
+            .map(|(cat, name, price)| vec![cat.into(), DfValue::from(name), price.into()]),
+        )
+        .await
+        .unwrap();
+
+    sleep().await;
+
+    eventually!(
+        run_test: {
+            top_categories.lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
+        },
+        then_assert: |rows| {
+            assert_eq!(
+                rows.len(),
+                3,
+                "Expected 3 rows due to LIMIT 3, but got {}: {:?}",
+                rows.len(),
+                rows
+            );
+            // The non-GROUP-BY column "name" gets added to the Aggregate's
+            // group_by by pull_all_required_columns, so the aggregate groups
+            // by (category, name) producing per-row sums. TopK correctly
+            // limits to 3 from 9 groups.
+            let totals: Vec<i64> = rows
+                .iter()
+                .map(|r| f64::try_from(&r[1]).unwrap() as i64)
+                .collect();
+            assert_eq!(totals, vec![100, 30, 25]);
+        }
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn simple_pagination() {
     let (mut g, shutdown_tx) = start_simple_unsharded("simple_pagination").await;
     let sql = vec![
         "CREATE TABLE t (x int, y text);",
         "CREATE CACHE q FROM SELECT x, y FROM t WHERE y = $1 ORDER BY x ASC LIMIT 3 OFFSET $2;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     eprintln!("{}", g.graphviz(Default::default()).await.unwrap());
 
@@ -4260,7 +4360,7 @@ async fn simple_pagination() {
                 TinyText::try_new("a", Collation::Utf8AiCi).unwrap().into(),
                 0.into(),
             ],
-            true,
+            Dialect::DEFAULT_MYSQL,
         )
         .await
         .unwrap()
@@ -4281,7 +4381,7 @@ async fn simple_pagination() {
                 TinyText::try_new("a", Collation::Utf8AiCi).unwrap().into(),
                 1.into(),
             ],
-            true,
+            Dialect::DEFAULT_MYSQL,
         )
         .await
         .unwrap()
@@ -4302,7 +4402,7 @@ async fn simple_pagination() {
                 TinyText::try_new("b", Collation::Utf8AiCi).unwrap().into(),
                 0.into(),
             ],
-            true,
+            Dialect::DEFAULT_MYSQL,
         )
         .await
         .unwrap()
@@ -4335,11 +4435,12 @@ async fn correct_nested_view_schema() {
     let mut b = builder_for_tests();
     // need to disable partial due to lack of support for key subsumption (#99)
     b.disable_partial();
-    b.set_sharding(None);
     let (mut g, shutdown_tx) = b.start_local().await.unwrap();
-    g.extend_recipe(ChangeList::from_strings(r_txt, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(r_txt.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let q = g.view("swvc").await.unwrap().into_reader_handle().unwrap();
 
@@ -4373,9 +4474,11 @@ async fn join_column_projection() {
         "CREATE CACHE stories_authors_tables_star FROM SELECT stories.*, users.* FROM stories JOIN users ON (stories.author_id = users.u_id);",
         "CREATE CACHE stories_authors_star FROM SELECT * FROM stories JOIN users ON (stories.author_id = users.u_id);"
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let query = g
         .view("stories_authors_explicit")
@@ -4437,155 +4540,29 @@ async fn join_column_projection() {
     shutdown_tx.shutdown().await;
 }
 
-// Tests the case where the source is sharded by a different column than the key column
-// with no parameter.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "Ignoring sharded tests"]
-async fn test_join_across_shards() {
-    let (mut g, shutdown_tx) = start_simple("test_join_across_shards").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE votes (story int, user int)",
-                "CREATE TABLE recs (story int, other int)",
-                "CREATE CACHE all_user_recs FROM SELECT votes.user as u, recs.other as s
-                    FROM votes
-                    JOIN recs ON (votes.story = recs.story);",
-            ],
-            Dialect::DEFAULT_MYSQL,
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-
-    let mut votes = g.table("votes").await.unwrap();
-    votes.insert(vec![1i32.into(), 1i32.into()]).await.unwrap();
-    votes.insert(vec![2i32.into(), 1i32.into()]).await.unwrap();
-    votes.insert(vec![3i32.into(), 1i32.into()]).await.unwrap();
-    votes.insert(vec![2i32.into(), 2i32.into()]).await.unwrap();
-    votes.insert(vec![3i32.into(), 3i32.into()]).await.unwrap();
-    let mut recs = g.table("recs").await.unwrap();
-    recs.insert(vec![1i32.into(), 1i32.into()]).await.unwrap();
-    recs.insert(vec![2i32.into(), 1i32.into()]).await.unwrap();
-    recs.insert(vec![3i32.into(), 1i32.into()]).await.unwrap();
-    recs.insert(vec![2i32.into(), 2i32.into()]).await.unwrap();
-    recs.insert(vec![3i32.into(), 3i32.into()]).await.unwrap();
-
-    sleep().await;
-
-    // Check 'all_user_recs' results.
-    let mut query = g
-        .view("all_user_recs")
-        .await
-        .unwrap()
-        .into_reader_handle()
-        .unwrap();
-    let results: Vec<(i32, i32)> = query
-        .lookup(&[0i32.into()], true)
-        .await
-        .unwrap()
-        .into_vec()
-        .iter()
-        .map(|r| (get_col!(query, r, "u", i32), get_col!(query, r, "s", i32)))
-        .sorted()
-        .collect();
-    let expected = vec![
-        (1, 1),
-        (1, 1),
-        (1, 1),
-        (1, 2),
-        (1, 3),
-        (2, 1),
-        (2, 2),
-        (3, 1),
-        (3, 3),
-    ];
-    assert_eq!(results, expected);
-
-    shutdown_tx.shutdown().await;
-}
-
-// Tests the case where the source is sharded by a different column than the key column
-// with a parameter.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "Ignoring sharded tests"]
-async fn test_join_across_shards_with_param() {
-    let (mut g, shutdown_tx) = start_simple("test_join_across_shards_with_param").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE votes (story int, user int);",
-                "CREATE TABLE recs (story int, other int);",
-                "CREATE CACHE user_recs FROM SELECT votes.user as u, recs.other as s
-         FROM votes
-         JOIN recs ON (votes.story = recs.story) WHERE votes.user = ?;",
-            ],
-            Dialect::DEFAULT_MYSQL,
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-
-    let mut votes = g.table("votes").await.unwrap();
-    votes.insert(vec![1i32.into(), 1i32.into()]).await.unwrap();
-    votes.insert(vec![2i32.into(), 1i32.into()]).await.unwrap();
-    votes.insert(vec![3i32.into(), 1i32.into()]).await.unwrap();
-    votes.insert(vec![2i32.into(), 2i32.into()]).await.unwrap();
-    votes.insert(vec![3i32.into(), 3i32.into()]).await.unwrap();
-    let mut votes = g.table("recs").await.unwrap();
-    votes.insert(vec![1i32.into(), 1i32.into()]).await.unwrap();
-    votes.insert(vec![2i32.into(), 1i32.into()]).await.unwrap();
-    votes.insert(vec![3i32.into(), 1i32.into()]).await.unwrap();
-    votes.insert(vec![2i32.into(), 2i32.into()]).await.unwrap();
-    votes.insert(vec![3i32.into(), 3i32.into()]).await.unwrap();
-
-    sleep().await;
-
-    // Check 'user_recs' results.
-    let mut query = g
-        .view("user_recs")
-        .await
-        .unwrap()
-        .into_reader_handle()
-        .unwrap();
-    let results: Vec<(i32, i32)> = query
-        .lookup(&[1i32.into()], true)
-        .await
-        .unwrap()
-        .into_vec()
-        .iter()
-        .map(|r| (get_col!(query, r, "u", i32), get_col!(query, r, "s", i32)))
-        .sorted()
-        .collect();
-    let expected = vec![(1, 1), (1, 1), (1, 1), (1, 2), (1, 3)];
-    assert_eq!(results, expected);
-
-    shutdown_tx.shutdown().await;
-}
-
 // FIXME: The test is disabled because aliasing the result columns with names reused from other
 // columns causes incorrect results to be returned. (See above 'join_param_results' test for
 // correct behavior in the no-param case, when column names are not reused.)
 #[tokio::test(flavor = "multi_thread")]
 async fn test_join_with_reused_column_name() {
     let (mut g, shutdown_tx) = start_simple_unsharded("test_join_with_reused_column_name").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE votes (story int, user int);",
-                "CREATE TABLE recs (story int, other int);",
-                "CREATE CACHE all_user_recs FROM SELECT votes.user as user, recs.other as story
-         FROM votes
-         JOIN recs ON (votes.story = recs.story);",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE votes (story int, user int);",
+                    "CREATE TABLE recs (story int, other int);",
+                    "CREATE CACHE all_user_recs FROM SELECT votes.user as user, recs.other as story
+                         FROM votes
+                         JOIN recs ON (votes.story = recs.story);",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut votes = g.table("votes").await.unwrap();
     votes.insert(vec![1i32.into(), 1i32.into()]).await.unwrap();
@@ -4608,7 +4585,7 @@ async fn test_join_with_reused_column_name() {
         .into_reader_handle()
         .unwrap();
     let results: Vec<(i32, i32)> = query
-        .lookup(&[0i32.into()], true)
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -4640,21 +4617,23 @@ async fn test_join_with_reused_column_name() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_join_with_reused_column_name_with_param() {
     let (mut g, shutdown_tx) = start_simple_unsharded("test_join_with_reused_column_name").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE votes (story int, user int);",
-                "CREATE TABLE recs (story int, other int);",
-                "CREATE CACHE user_recs FROM SELECT votes.user as user, recs.other as story
-         FROM votes
-         JOIN recs ON (votes.story = recs.story) WHERE votes.user = ?;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE votes (story int, user int);",
+                    "CREATE TABLE recs (story int, other int);",
+                    "CREATE CACHE user_recs FROM SELECT votes.user as user, recs.other as story
+                         FROM votes
+                         JOIN recs ON (votes.story = recs.story) WHERE votes.user = ?;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut votes = g.table("votes").await.unwrap();
     votes.insert(vec![1i32.into(), 1i32.into()]).await.unwrap();
@@ -4677,7 +4656,7 @@ async fn test_join_with_reused_column_name_with_param() {
         .into_reader_handle()
         .unwrap();
     let results: Vec<(i32, i32)> = query
-        .lookup(&[1i32.into()], true)
+        .lookup(&[1i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -4700,21 +4679,23 @@ async fn test_join_with_reused_column_name_with_param() {
 #[ignore] // ENG-411
 async fn self_join_basic() {
     let (mut g, shutdown_tx) = start_simple_unsharded("self_join_basic").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE votes (story int, user int);",
-                "CREATE VIEW like_minded AS SELECT v1.user, v2.user AS agreer
-         FROM votes v1
-         JOIN votes v2 ON (v1.story = v2.story);",
-                "CREATE CACHE follow_on FROM SELECT user, agreer FROM like_minded;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE votes (story int, user int);",
+                    "CREATE VIEW like_minded AS SELECT v1.user, v2.user AS agreer
+                         FROM votes v1
+                         JOIN votes v2 ON (v1.story = v2.story);",
+                    "CREATE CACHE follow_on FROM SELECT user, agreer FROM like_minded;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut votes = g.table("votes").await.unwrap();
     votes.insert(vec![1i32.into(), 1i32.into()]).await.unwrap();
@@ -4745,7 +4726,7 @@ async fn self_join_basic() {
         .unwrap();
     assert_eq!(query.columns(), vec!["user", "agreer"]);
     let results: Vec<(i32, i32)> = query
-        .lookup(&[0i32.into()], true)
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -4766,24 +4747,26 @@ async fn self_join_basic() {
 #[tokio::test(flavor = "multi_thread")]
 async fn self_join_param() {
     let (mut g, shutdown_tx) = start_simple_unsharded("self_join_param").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE users (id int, friend int);",
-                "CREATE CACHE fof FROM SELECT u1.id AS user, u2.friend AS fof
-         FROM users u1
-         JOIN users u2 ON (u1.friend = u2.id) WHERE u1.id = ?;",
-                "CREATE VIEW fof2 AS SELECT u1.id AS user, u2.friend AS fof
-         FROM users u1
-         JOIN users u2 ON (u1.friend = u2.id);",
-                "CREATE CACHE follow_on FROM SELECT * FROM fof2 WHERE user = ?;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE users (id int, friend int);",
+                    "CREATE CACHE fof FROM SELECT u1.id AS user, u2.friend AS fof
+                         FROM users u1
+                         JOIN users u2 ON (u1.friend = u2.id) WHERE u1.id = ?;",
+                    "CREATE VIEW fof2 AS SELECT u1.id AS user, u2.friend AS fof
+                         FROM users u1
+                         JOIN users u2 ON (u1.friend = u2.id);",
+                    "CREATE CACHE follow_on FROM SELECT * FROM fof2 WHERE user = ?;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut votes = g.table("users").await.unwrap();
     votes.insert(vec![1i32.into(), 2i32.into()]).await.unwrap();
@@ -4798,7 +4781,7 @@ async fn self_join_param() {
     let mut query = g.view("fof").await.unwrap().into_reader_handle().unwrap();
     assert_eq!(query.columns(), vec!["user", "fof"]);
     let results: Vec<(i32, i32)> = query
-        .lookup(&[1i32.into()], true)
+        .lookup(&[1i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -4827,7 +4810,7 @@ async fn self_join_param() {
     // assert_eq!(query.columns(), vec!["user", "fof"]);
 
     let results: Vec<(i32, i32)> = query
-        .lookup(&[1i32.into()], true)
+        .lookup(&[1i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -4850,7 +4833,6 @@ async fn non_sql_materialized_range_query() {
     let (mut g, shutdown_tx) = {
         let mut builder = builder_for_tests();
         builder.disable_partial();
-        builder.set_sharding(None);
         builder.set_persistence(get_persistence_params("non_sql_materialized_range_query"));
         builder.start_local()
     }
@@ -4880,7 +4862,7 @@ async fn non_sql_materialized_range_query() {
     let res = reader
         .multi_lookup(
             vec![(vec1![DfValue::from(2)]..vec1![DfValue::from(5)]).into()],
-            false,
+            Dialect::DEFAULT_MYSQL,
         )
         .await
         .unwrap()
@@ -4898,7 +4880,6 @@ async fn non_sql_materialized_range_query() {
 async fn non_sql_range_upquery() {
     let (mut g, shutdown_tx) = {
         let mut builder = builder_for_tests();
-        builder.set_sharding(None);
         builder.set_persistence(get_persistence_params("non_sql_range_upquery"));
         builder.start_local()
     }
@@ -4928,7 +4909,7 @@ async fn non_sql_range_upquery() {
     let res = reader
         .multi_lookup(
             vec![(vec1![DfValue::from(2)]..vec1![DfValue::from(5)]).into()],
-            true,
+            Dialect::DEFAULT_MYSQL,
         )
         .await
         .unwrap()
@@ -4946,7 +4927,6 @@ async fn non_sql_range_upquery() {
 async fn range_upquery_after_point_queries() {
     let (mut g, shutdown_tx) = {
         let mut builder = builder_for_tests();
-        builder.set_sharding(None);
         builder.set_persistence(get_persistence_params("non_sql_range_upquery"));
         builder.start_local()
     }
@@ -4975,6 +4955,7 @@ async fn range_upquery_after_point_queries() {
                     vec![(0, 0)],
                     vec![(Side::Left, 0), (Side::Left, 1), (Side::Right, 1)],
                     true,
+                    None,
                 ),
             );
 
@@ -5033,7 +5014,7 @@ async fn range_upquery_after_point_queries() {
     // Do some point queries so we get keys covered by our range
     assert_eq!(
         &*hash_reader
-            .lookup(&[3.into()], true)
+            .lookup(&[3.into()], Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -5041,7 +5022,7 @@ async fn range_upquery_after_point_queries() {
     );
     assert_eq!(
         &*hash_reader
-            .lookup(&[3.into()], true)
+            .lookup(&[3.into()], Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -5051,7 +5032,7 @@ async fn range_upquery_after_point_queries() {
     let res = btree_reader
         .multi_lookup(
             vec![(vec1![DfValue::from(2)]..vec1![DfValue::from(5)]).into()],
-            true,
+            Dialect::DEFAULT_MYSQL,
         )
         .await
         .unwrap()
@@ -5070,32 +5051,36 @@ async fn range_upquery_after_point_queries() {
 #[tokio::test(flavor = "multi_thread")]
 async fn query_reuse_aliases() {
     let (mut g, shutdown_tx) = start_simple_unsharded("query_reuse_aliases").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t1 (a INT, b INT);",
-                "CREATE CACHE q1 FROM SELECT * FROM t1 WHERE a != 1;",
-                "CREATE CACHE q2 FROM SELECT * FROM t1 WHERE a != 1;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (a INT, b INT);",
+                    "CREATE CACHE q1 FROM SELECT * FROM t1 WHERE a != 1;",
+                    "CREATE CACHE q2 FROM SELECT * FROM t1 WHERE a != 1;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     g.view("q1").await.unwrap();
     g.view("q2").await.unwrap();
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE CACHE q3 FROM SELECT * FROM t1 WHERE a != 1"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE CACHE q3 FROM SELECT * FROM t1 WHERE a != 1"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     g.view("q1").await.unwrap();
     g.view("q2").await.unwrap();
@@ -5103,15 +5088,17 @@ async fn query_reuse_aliases() {
 
     // query rewriting means this ends up being identical to the above query, even though the source
     // is different - let's make sure that still aliases successfully.
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE CACHE q4 FROM SELECT * FROM t1 WHERE NOT (a = 1)"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE CACHE q4 FROM SELECT * FROM t1 WHERE NOT (a = 1)"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     g.view("q1").await.unwrap();
     g.view("q2").await.unwrap();
@@ -5124,18 +5111,20 @@ async fn query_reuse_aliases() {
 #[tokio::test(flavor = "multi_thread")]
 async fn same_table_columns_inequal() {
     let (mut g, shutdown_tx) = start_simple_unsharded("same_table_columns_inequal").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t1 (a INT, b INT);",
-                "CREATE CACHE q FROM SELECT * FROM t1 WHERE t1.a != t1.b;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (a INT, b INT);",
+                    "CREATE CACHE q FROM SELECT * FROM t1 WHERE t1.a != t1.b;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut t1 = g.table("t1").await.unwrap();
     t1.insert_many(vec![
@@ -5150,7 +5139,11 @@ async fn same_table_columns_inequal() {
     sleep().await;
 
     let mut q = g.view("q").await.unwrap().into_reader_handle().unwrap();
-    let res = q.lookup(&[0i32.into()], true).await.unwrap().into_vec();
+    let res = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(
         res,
         vec![
@@ -5169,21 +5162,23 @@ async fn view_reuse_aliases() {
     let (mut g, shutdown_tx) = start_simple_unsharded("view_reuse_aliases").await;
 
     // NOTE q1 causes panic
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t1 (a INT, b INT);",
-                "CREATE VIEW v1 AS SELECT * FROM t1 WHERE a != 1;",
-                "CREATE VIEW v2 AS SELECT * FROM t1 WHERE a != 1;",
-                "CREATE CACHE q1 FROM SELECT * FROM v1;",
-                "CREATE CACHE q2 FROM SELECT * FROM v2;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (a INT, b INT);",
+                    "CREATE VIEW v1 AS SELECT * FROM t1 WHERE a != 1;",
+                    "CREATE VIEW v2 AS SELECT * FROM t1 WHERE a != 1;",
+                    "CREATE CACHE q1 FROM SELECT * FROM v1;",
+                    "CREATE CACHE q2 FROM SELECT * FROM v2;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     g.view("v1").await.unwrap();
     g.view("v2").await.unwrap();
@@ -5200,7 +5195,6 @@ async fn post_read_ilike() {
     let (mut g, shutdown_tx) = {
         let mut builder = builder_for_tests();
         builder.disable_partial();
-        builder.set_sharding(None);
         builder.set_persistence(get_persistence_params("post_read_ilike"));
         builder.start_local()
     }
@@ -5223,6 +5217,7 @@ async fn post_read_ilike() {
                     None,
                     None,
                     None,
+                    Default::default(),
                 )
                 .unwrap(),
             );
@@ -5253,7 +5248,6 @@ async fn post_read_ilike() {
                 Bound::Excluded(vec1![DfValue::MIN]),
                 Bound::Excluded(vec1![DfValue::MAX]),
             ))],
-            block: true,
             filter: Some(DfExpr::Op {
                 left: Box::new(DfExpr::Column {
                     index: 0,
@@ -5268,6 +5262,9 @@ async fn post_read_ilike() {
             }),
             limit: None,
             offset: None,
+            post_lookup_plan: None,
+            result_schema: None,
+            dialect: Dialect::DEFAULT_MYSQL,
         })
         .await
         .unwrap()
@@ -5293,9 +5290,11 @@ async fn cast_projection() {
         "CREATE TABLE users (id int, created_at timestamp);",
         "CREATE CACHE user FROM SELECT id, CAST(created_at AS date) AS created_day FROM users WHERE id = ?;"
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut table = g.table("users").await.unwrap();
     table
@@ -5314,7 +5313,7 @@ async fn cast_projection() {
     let mut view = g.view("user").await.unwrap().into_reader_handle().unwrap();
 
     let result = view
-        .lookup(&[1i32.into()], true)
+        .lookup(&[1i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -5335,18 +5334,20 @@ async fn cast_projection() {
 async fn aggregate_expression() {
     let (mut g, shutdown_tx) = start_simple_unsharded("aggregate_expression").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t (string_num text);",
-                "CREATE CACHE q FROM SELECT max(cast(t.string_num as signed)) as max_num from t;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t (string_num text);",
+                    "CREATE CACHE q FROM SELECT max(cast(t.string_num as signed)) as max_num from t;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut t = g.table("t").await.unwrap();
     let mut q = g.view("q").await.unwrap().into_reader_handle().unwrap();
@@ -5358,7 +5359,7 @@ async fn aggregate_expression() {
     sleep().await;
 
     let res = &q
-        .lookup(&[0i32.into()], true)
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -5373,23 +5374,26 @@ async fn aggregate_expression() {
 async fn aggregate_missing_columns() {
     let (mut g, shutdown_tx) = start_simple_unsharded("aggregate_missing_columns").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(vec!["CREATE TABLE t (id INT);"], Dialect::DEFAULT_MYSQL).unwrap(),
-    )
-    .await
-    .unwrap();
-
-    let res = g
-        .extend_recipe(
-            ChangeList::from_strings(
-                vec!["CREATE CACHE q FROM SELECT max(idd) FROM t"],
-                Dialect::DEFAULT_MYSQL,
-            )
-            .unwrap(),
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(vec!["CREATE TABLE t (id INT);"], Dialect::DEFAULT_MYSQL).unwrap(),
         )
-        .await;
-    assert!(res.is_err());
-    assert!(res.err().unwrap().to_string().contains("idd"));
+        .await
+        .is_ok()
+    };
+
+    eventually! {
+        let res = g
+            .extend_recipe(
+                ChangeList::from_strings(
+                    vec!["CREATE CACHE q FROM SELECT max(idd) FROM t"],
+                    Dialect::DEFAULT_MYSQL,
+                )
+                .unwrap(),
+            )
+            .await;
+        res.is_err_and(|e| e.to_string().contains("idd"))
+    };
 
     shutdown_tx.shutdown().await;
 }
@@ -5398,23 +5402,25 @@ async fn aggregate_missing_columns() {
 async fn post_join_filter() {
     let (mut g, shutdown_tx) = start_simple_unsharded("post_join_filter").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t1 (id int, val_1 int);",
-                "CREATE TABLE t2 (id int, val_2 int);",
-                "CREATE CACHE q FROM
-        SELECT t1.id AS id_1, t1.val_1 AS val_1, t2.val_2 AS val_2
-        FROM t1
-        JOIN t2 ON t1.id = t2.id
-        WHERE t1.val_1 >= t2.val_2",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (id int, val_1 int);",
+                    "CREATE TABLE t2 (id int, val_2 int);",
+                    "CREATE CACHE q FROM
+                         SELECT t1.id AS id_1, t1.val_1 AS val_1, t2.val_2 AS val_2
+                         FROM t1
+                         JOIN t2 ON t1.id = t2.id
+                         WHERE t1.val_1 >= t2.val_2",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut t1 = g.table("t1").await.unwrap();
     let mut t2 = g.table("t2").await.unwrap();
@@ -5440,7 +5446,11 @@ async fn post_join_filter() {
 
     sleep().await;
 
-    let mut res: Vec<_> = q.lookup(&[0.into()], true).await.unwrap().into();
+    let mut res: Vec<_> = q
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into();
     res.sort();
 
     assert_eq!(
@@ -5460,23 +5470,25 @@ async fn post_join_filter() {
 async fn duplicate_column_names() {
     let (mut g, shutdown_tx) = start_simple_unsharded("duplicate_column_names").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t1 (id int, val int);",
-                "CREATE TABLE t2 (id int, val int);",
-                "CREATE CACHE q FROM
-        SELECT t1.id AS id_1, t1.val AS val_1, t2.val AS val_2
-        FROM t1
-        JOIN t2 ON t1.id = t2.id
-        WHERE t1.val >= t2.val",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (id int, val int);",
+                    "CREATE TABLE t2 (id int, val int);",
+                    "CREATE CACHE q FROM
+                         SELECT t1.id AS id_1, t1.val AS val_1, t2.val AS val_2
+                         FROM t1
+                         JOIN t2 ON t1.id = t2.id
+                         WHERE t1.val >= t2.val",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut t1 = g.table("t1").await.unwrap();
     let mut t2 = g.table("t2").await.unwrap();
@@ -5502,7 +5514,11 @@ async fn duplicate_column_names() {
 
     sleep().await;
 
-    let mut res: Vec<_> = q.lookup(&[0.into()], true).await.unwrap().into();
+    let mut res: Vec<_> = q
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into();
     res.sort();
 
     assert_eq!(
@@ -5523,9 +5539,11 @@ async fn filter_on_expression() {
         "CREATE TABLE users (id int, birthday date);",
         "CREATE CACHE friday_babies FROM SELECT id FROM users WHERE dayofweek(birthday) = 6;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("users").await.unwrap();
     let mut q = g
@@ -5550,7 +5568,11 @@ async fn filter_on_expression() {
 
     sleep().await;
 
-    let res = &q.lookup(&[0i32.into()], true).await.unwrap().into_vec();
+    let res = &q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
 
     assert_eq!(get_col!(q, res[0], "id"), &DfValue::from(1));
 
@@ -5560,24 +5582,25 @@ async fn filter_on_expression() {
 #[tokio::test(flavor = "multi_thread")]
 async fn compound_join_key() {
     let (mut g, shutdown_tx) = start_simple_unsharded("compound_join_key").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "
-              CREATE TABLE t1 (id_1 int, id_2 int, val_1 int);",
-                "CREATE TABLE t2 (id_1 int, id_2 int, val_2 int);",
-                "CREATE CACHE q FROM
-                SELECT t1.val_1, t2.val_2
-                FROM t1
-                JOIN t2
-                  ON t1.id_1 = t2.id_1 AND t1.id_2 = t2.id_2;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (id_1 int, id_2 int, val_1 int);",
+                    "CREATE TABLE t2 (id_1 int, id_2 int, val_2 int);",
+                    "CREATE CACHE q FROM
+                         SELECT t1.val_1, t2.val_2
+                         FROM t1
+                         JOIN t2
+                             ON t1.id_1 = t2.id_1 AND t1.id_2 = t2.id_2;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut t1 = g.table("t1").await.unwrap();
     let mut t2 = g.table("t2").await.unwrap();
@@ -5641,7 +5664,7 @@ async fn compound_join_key() {
     sleep().await;
 
     let res = q
-        .lookup(&[0i32.into()], true)
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_iter()
@@ -5663,9 +5686,11 @@ async fn left_join_null() {
         "CREATE TABLE bob (id int);",
         "CREATE CACHE funky FROM SELECT * FROM jim LEFT JOIN bob ON jim.id = bob.id WHERE bob.id IS NULL;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("jim").await.unwrap();
     let mut t2 = g.table("bob").await.unwrap();
@@ -5683,7 +5708,7 @@ async fn left_join_null() {
     sleep().await;
 
     let num_res = q
-        .lookup(&[0.into()], true)
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_iter()
@@ -5702,9 +5727,11 @@ async fn overlapping_indices() {
         "CREATE TABLE test (id int, a int, b int);",
         "CREATE CACHE overlapping FROM SELECT SUM(a) as s, id FROM test WHERE b = ? GROUP BY id ORDER BY id LIMIT 2;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -5730,7 +5757,10 @@ async fn overlapping_indices() {
 
     sleep().await;
 
-    let rows = q.lookup(&[3i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[3i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -5752,18 +5782,20 @@ async fn overlapping_indices() {
 async fn aggregate_after_filter_non_equality() {
     let (mut g, shutdown_tx) = start_simple_unsharded("aggregate_after_filter_non_equality").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE test (number int, value int);",
-                "CREATE CACHE filteragg FROM SELECT sum(value) AS s FROM test WHERE number > 2;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE test (number int, value int);",
+                    "CREATE CACHE filteragg FROM SELECT sum(value) AS s FROM test WHERE number > 2;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -5786,7 +5818,7 @@ async fn aggregate_after_filter_non_equality() {
     sleep().await;
 
     let res = q
-        .lookup(&[0i32.into()], true)
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec()
@@ -5803,21 +5835,23 @@ async fn aggregate_after_filter_non_equality() {
 async fn join_simple_cte() {
     let (mut g, shutdown_tx) = start_simple_unsharded("join_simple_cte").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t1 (id int, value int);",
-                "CREATE TABLE t2 (value int, name text);",
-                "CREATE CACHE join_simple_cte FROM
-                 WITH max_val AS (SELECT max(value) as value FROM t1)
-                 SELECT name FROM t2 JOIN max_val ON max_val.value = t2.value;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (id int, value int);",
+                    "CREATE TABLE t2 (value int, name text);",
+                    "CREATE CACHE join_simple_cte FROM
+                     WITH max_val AS (SELECT max(value) as value FROM t1)
+                     SELECT name FROM t2 JOIN max_val ON max_val.value = t2.value;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut t1 = g.table("t1").await.unwrap();
     let mut t2 = g.table("t2").await.unwrap();
@@ -5844,7 +5878,11 @@ async fn join_simple_cte() {
 
     sleep().await;
 
-    let res = view.lookup(&[0i32.into()], true).await.unwrap().into_vec();
+    let res = view
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(get_col!(view, res[0], "name"), &DfValue::from("four"));
 
     shutdown_tx.shutdown().await;
@@ -5860,9 +5898,11 @@ async fn multiple_aggregate_sum() {
         "CREATE TABLE test (number int, value1 int, value2 int);",
         "CREATE CACHE multiagg FROM SELECT sum(value1) AS s1, sum(value2) as s2 FROM test GROUP BY number;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -5904,7 +5944,10 @@ async fn multiple_aggregate_sum() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -5932,9 +5975,11 @@ async fn multiple_aggregate_same_col() {
         "CREATE TABLE test (number int, value int);",
         "CREATE CACHE multiaggsamecol FROM SELECT sum(value) AS s, avg(value) AS a FROM test GROUP BY number;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -5956,133 +6001,10 @@ async fn multiple_aggregate_same_col() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
-
-    let res = rows
-        .into_iter()
-        .map(|r| {
-            (
-                get_col!(q, r, "s", Decimal).try_into().unwrap(),
-                get_col!(q, r, "a", f64),
-            )
-        })
-        .sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
-        .collect::<Vec<(i32, f64)>>();
-
-    assert_eq!(res, vec![(1, 1.), (5, 2.5), (12, 6.0)]);
-
-    shutdown_tx.shutdown().await;
-}
-
-// multiple_aggregate_sum_sharded tests multiple aggregators of the same type, in this case sum(),
-// operating over different columns from the same table in a sharded environment.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "Ignoring sharded tests"]
-async fn multiple_aggregate_sum_sharded() {
-    let (mut g, shutdown_tx) = start_simple("multiple_aggregate_sharded").await;
-
-    let sql = vec![
-        "CREATE TABLE test (number int, value1 int, value2 int);",
-        "CREATE CACHE multiaggsharded FROM SELECT sum(value1) AS s1, sum(value2) as s2 FROM test GROUP BY number;",
-    ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap();
-
-    let mut t = g.table("test").await.unwrap();
-    let mut q = g
-        .view("multiaggsharded")
-        .await
-        .unwrap()
-        .into_reader_handle()
-        .unwrap();
-
-    t.insert_many(vec![
-        vec![
-            DfValue::from(1i32),
-            DfValue::from(1i32),
-            DfValue::from(5i32),
-        ],
-        vec![
-            DfValue::from(1i32),
-            DfValue::from(4i32),
-            DfValue::from(2i32),
-        ],
-        vec![
-            DfValue::from(2i32),
-            DfValue::from(5i32),
-            DfValue::from(7i32),
-        ],
-        vec![
-            DfValue::from(2i32),
-            DfValue::from(7i32),
-            DfValue::from(1i32),
-        ],
-        vec![
-            DfValue::from(3i32),
-            DfValue::from(1i32),
-            DfValue::from(3i32),
-        ],
-    ])
-    .await
-    .unwrap();
-
-    sleep().await;
-
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
-
-    let res = rows
-        .into_iter()
-        .map(|r| {
-            (
-                get_col!(q, r, "s1", Decimal).try_into().unwrap(),
-                get_col!(q, r, "s2", Decimal).try_into().unwrap(),
-            )
-        })
-        .sorted()
-        .collect::<Vec<(i32, i32)>>();
-
-    assert_eq!(res, vec![(1, 3), (5, 7), (12, 8)]);
-
-    shutdown_tx.shutdown().await;
-}
-
-// multiple_aggregate_same_col_sharded tests multiple aggregators of different types operating on
-// the same column in a sharded environment.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "Ignoring sharded tests"]
-async fn multiple_aggregate_same_col_sharded() {
-    let (mut g, shutdown_tx) = start_simple("multiple_aggregate_same_col_sharded").await;
-
-    let sql = vec![
-        "CREATE TABLE test (number int, value int);",
-        "CREATE CACHE multiaggsamecolsharded FROM SELECT sum(value) AS s, avg(value) AS a FROM test GROUP BY number;",
-    ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
-
-    let mut t = g.table("test").await.unwrap();
-    let mut q = g
-        .view("multiaggsamecolsharded")
-        .await
-        .unwrap()
-        .into_reader_handle()
-        .unwrap();
-
-    t.insert_many(vec![
-        vec![DfValue::from(1i32), DfValue::from(1i32)],
-        vec![DfValue::from(1i32), DfValue::from(4i32)],
-        vec![DfValue::from(2i32), DfValue::from(5i32)],
-        vec![DfValue::from(2i32), DfValue::from(7i32)],
-        vec![DfValue::from(3i32), DfValue::from(1i32)],
-    ])
-    .await
-    .unwrap();
-
-    sleep().await;
-
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
 
     let res = rows
         .into_iter()
@@ -6111,9 +6033,11 @@ async fn multiple_aggregate_over_two() {
         "CREATE TABLE test (number int, value int);",
         "CREATE CACHE multiaggovertwo FROM SELECT sum(value) AS s, avg(value) AS a, count(value) AS c, max(value) as m FROM test GROUP BY number;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6135,64 +6059,10 @@ async fn multiple_aggregate_over_two() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
-
-    let res = rows
-        .into_iter()
-        .map(|r| {
-            (
-                get_col!(q, r, "s", Decimal).try_into().unwrap(),
-                get_col!(q, r, "a", f64),
-                get_col!(q, r, "c", i32),
-                get_col!(q, r, "m", i32),
-            )
-        })
-        .sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
-        .collect::<Vec<(i32, f64, i32, i32)>>();
-
-    assert_eq!(res, vec![(1, 1., 1, 1), (5, 2.5, 2, 4), (12, 6.0, 2, 7)]);
-
-    shutdown_tx.shutdown().await;
-}
-
-// multiple_aggregate_over_two_sharded tests the case of more than two aggregate functions being
-// used in the same select query. This effectively tests our ability to appropriately generate
-// multiple MirNodeInner::JoinAggregates nodes and join them all together correctly in a sharded
-// environment.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "Ignoring sharded tests"]
-async fn multiple_aggregate_over_two_sharded() {
-    let (mut g, shutdown_tx) = start_simple("multiple_aggregate_over_two_sharded").await;
-
-    let sql = vec![
-        "CREATE TABLE test (number int, value int);",
-        "CREATE CACHE multiaggovertwosharded FROM SELECT sum(value) AS s, avg(value) AS a, count(value) AS c, max(value) as m FROM test GROUP BY number;"
-    ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap();
-
-    let mut t = g.table("test").await.unwrap();
-    let mut q = g
-        .view("multiaggovertwosharded")
-        .await
-        .unwrap()
-        .into_reader_handle()
-        .unwrap();
-
-    t.insert_many(vec![
-        vec![DfValue::from(1i32), DfValue::from(1i32)],
-        vec![DfValue::from(1i32), DfValue::from(4i32)],
-        vec![DfValue::from(2i32), DfValue::from(5i32)],
-        vec![DfValue::from(2i32), DfValue::from(7i32)],
-        vec![DfValue::from(3i32), DfValue::from(1i32)],
-    ])
-    .await
-    .unwrap();
-
-    sleep().await;
-
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
 
     let res = rows
         .into_iter()
@@ -6223,9 +6093,11 @@ async fn multiple_aggregate_with_expressions() {
         "CREATE TABLE test (number int, value int);",
         "CREATE CACHE multiaggwexpressions FROM SELECT sum(value) AS s, 5 * avg(value) AS a FROM test GROUP BY number;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6247,61 +6119,10 @@ async fn multiple_aggregate_with_expressions() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
-
-    let res = rows
-        .into_iter()
-        .map(|r| {
-            (
-                get_col!(q, r, "s", Decimal).try_into().unwrap(),
-                get_col!(q, r, "a", f64),
-            )
-        })
-        .sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
-        .collect::<Vec<(i32, f64)>>();
-
-    assert_eq!(res, vec![(1, 5.), (5, 12.5), (12, 30.0)]);
-
-    shutdown_tx.shutdown().await;
-}
-
-// multiple_aggregate_with_expressions_sharded tests multiple aggregates involving arithmetic
-// expressions that would modify the output of the resulting columns. This tests that when we join
-// aggregates that we are ignoring projection nodes appropriately in a sharded environment
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "Ignoring sharded tests"]
-async fn multiple_aggregate_with_expressions_sharded() {
-    let (mut g, shutdown_tx) = start_simple("multiple_aggregate_with_expressions_sharded").await;
-
-    let sql = vec![
-        "CREATE TABLE test (number int, value int);",
-        "CREATE CACHE multiaggwexpressionssharded FROM SELECT sum(value) AS s, 5 * avg(value) AS a FROM test GROUP BY number;",
-    ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap();
-
-    let mut t = g.table("test").await.unwrap();
-    let mut q = g
-        .view("multiaggwexpressionssharded")
-        .await
-        .unwrap()
-        .into_reader_handle()
-        .unwrap();
-
-    t.insert_many(vec![
-        vec![DfValue::from(1i32), DfValue::from(1i32)],
-        vec![DfValue::from(1i32), DfValue::from(4i32)],
-        vec![DfValue::from(2i32), DfValue::from(5i32)],
-        vec![DfValue::from(2i32), DfValue::from(7i32)],
-        vec![DfValue::from(3i32), DfValue::from(1i32)],
-    ])
-    .await
-    .unwrap();
-
-    sleep().await;
-
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
 
     let res = rows
         .into_iter()
@@ -6330,9 +6151,11 @@ async fn multiple_aggregate_reuse() {
         "CREATE TABLE test (number int, value int);",
         "CREATE CACHE multiaggfirstquery FROM SELECT sum(value) AS s, 5 * avg(value) AS a FROM test GROUP BY number;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6354,7 +6177,10 @@ async fn multiple_aggregate_reuse() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -6374,9 +6200,11 @@ async fn multiple_aggregate_reuse() {
     // second aggregate so as much is as similar as possible, to rule out names being different
     // forcing a false re-use.
     let sql = vec!["CREATE CACHE multiaggsecondquery FROM SELECT sum(value) AS s, max(value) AS a FROM test GROUP BY number;"];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     q = g
         .view("multiaggsecondquery")
@@ -6387,7 +6215,10 @@ async fn multiple_aggregate_reuse() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -6413,26 +6244,28 @@ async fn reuse_subquery_alias_name() {
     let (mut g, shutdown_tx) = start_simple_unsharded("reuse_subquery_alias_name").await;
 
     // Install two views, 'q1' and 'q2', each using the same subquery alias name 't2_data'.
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t1 (id int, value int);",
-                "CREATE TABLE t2 (value int, name text, bio text);",
-                "CREATE VIEW q1 AS
-        SELECT name
-        FROM t1
-        JOIN (SELECT value, name FROM t2) AS t2_data ON t1.value = t2_data.value;",
-                "CREATE VIEW q2 AS
-        SELECT bio
-        FROM t1
-        JOIN (SELECT value, name, bio FROM t2) AS t2_data ON t1.value = t2_data.value;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (id int, value int);",
+                    "CREATE TABLE t2 (value int, name text, bio text);",
+                    "CREATE VIEW q1 AS
+                         SELECT name
+                         FROM t1
+                         JOIN (SELECT value, name FROM t2) AS t2_data ON t1.value = t2_data.value;",
+                    "CREATE VIEW q2 AS
+                         SELECT bio
+                         FROM t1
+                         JOIN (SELECT value, name, bio FROM t2) AS t2_data ON t1.value = t2_data.value;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     // TODO Verify that q1 and q2 return correct values.
 
@@ -6445,18 +6278,20 @@ async fn reuse_subquery_alias_name() {
 async fn col_beginning_with_literal() {
     let (mut g, shutdown_tx) = start_simple_unsharded("col_beginning_with_literal").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t1 (id INT, null_hypothesis INT);",
-                "CREATE VIEW q1 AS SELECT null_hypothesis FROM t1;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (id INT, null_hypothesis INT);",
+                    "CREATE VIEW q1 AS SELECT null_hypothesis FROM t1;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     // TODO Verify that q1 returns correct values.
 
@@ -6474,9 +6309,11 @@ async fn simple_enum() {
     ",
     ];
 
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut mutator = g.table("t1").await.unwrap();
     let mut getter = g.view("c1").await.unwrap().into_reader_handle().unwrap();
@@ -6497,7 +6334,7 @@ async fn simple_enum() {
         .map(|k| KeyComparison::Equal(vec1![k.into()]))
         .collect();
     let result = getter
-        .multi_lookup(lookup_keys, true)
+        .multi_lookup(lookup_keys, Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -6536,18 +6373,20 @@ async fn simple_enum() {
 async fn round_int_to_int() {
     let (mut g, shutdown_tx) = start_simple_unsharded("round_int_to_int").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE test (value int);",
-                "CREATE CACHE roundinttoint FROM SELECT round(value, -3) as r FROM test;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE test (value int);",
+                    "CREATE CACHE roundinttoint FROM SELECT round(value, -3) as r FROM test;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6561,7 +6400,10 @@ async fn round_int_to_int() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -6577,18 +6419,20 @@ async fn round_int_to_int() {
 async fn round_float_to_float() {
     let (mut g, shutdown_tx) = start_simple_unsharded("round_float_to_float").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE test (value double);",
-                "CREATE CACHE roundfloattofloat FROM SELECT round(value, 2) as r FROM test;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE test (value double);",
+                    "CREATE CACHE roundfloattofloat FROM SELECT round(value, 2) as r FROM test;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6604,7 +6448,10 @@ async fn round_float_to_float() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -6620,18 +6467,20 @@ async fn round_float_to_float() {
 async fn round_float() {
     let (mut g, shutdown_tx) = start_simple_unsharded("round_float").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE test (value double);",
-                "CREATE CACHE roundfloat FROM SELECT round(value, 0) as r FROM test;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE test (value double);",
+                    "CREATE CACHE roundfloat FROM SELECT round(value, 0) as r FROM test;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6647,7 +6496,10 @@ async fn round_float() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -6670,9 +6522,11 @@ async fn round_with_precision_float() {
         "CREATE TABLE test (value double);",
         "CREATE CACHE roundwithprecisionfloat FROM SELECT round(value, -1.0) as r FROM test;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6688,7 +6542,10 @@ async fn round_with_precision_float() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -6704,18 +6561,20 @@ async fn round_with_precision_float() {
 async fn round_bigint_to_bigint() {
     let (mut g, shutdown_tx) = start_simple_unsharded("round_bigint_to_bigint").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE test (value bigint);",
-                "CREATE CACHE roundbiginttobigint FROM SELECT round(value, -3) as r FROM test;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE test (value bigint);",
+                    "CREATE CACHE roundbiginttobigint FROM SELECT round(value, -3) as r FROM test;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6729,7 +6588,10 @@ async fn round_bigint_to_bigint() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -6745,18 +6607,20 @@ async fn round_bigint_to_bigint() {
 async fn round_unsignedint_to_unsignedint() {
     let (mut g, shutdown_tx) = start_simple_unsharded("round_unsignedint_to_unsignedint").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE test (value int unsigned);",
-                "CREATE CACHE roundunsignedtounsigned FROM SELECT round(value, -3) as r FROM test;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE test (value int unsigned);",
+                    "CREATE CACHE roundunsignedtounsigned FROM SELECT round(value, -3) as r FROM test;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6770,7 +6634,10 @@ async fn round_unsignedint_to_unsignedint() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -6791,9 +6658,11 @@ async fn round_unsignedbigint_to_unsignedbitint() {
         "CREATE TABLE test (value bigint unsigned);",
         "CREATE CACHE roundunsignedbiginttounsignedbigint FROM SELECT round(value, -3) as r FROM test;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6807,7 +6676,10 @@ async fn round_unsignedbigint_to_unsignedbitint() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -6823,18 +6695,20 @@ async fn round_unsignedbigint_to_unsignedbitint() {
 async fn round_with_no_precision() {
     let (mut g, shutdown_tx) = start_simple_unsharded("round_with_no_precision").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE test (value bigint unsigned);",
-                "CREATE CACHE roundwithnoprecision FROM SELECT round(value) as r FROM test;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE test (value bigint unsigned);",
+                    "CREATE CACHE roundwithnoprecision FROM SELECT round(value) as r FROM test;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6850,7 +6724,10 @@ async fn round_with_no_precision() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -6866,18 +6743,20 @@ async fn round_with_no_precision() {
 async fn distinct_select_works() {
     let (mut g, shutdown_tx) = start_simple_unsharded("distinct_select_works").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE test (value int);",
-                "CREATE CACHE distinctselect FROM SELECT DISTINCT value as v FROM test;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE test (value int);",
+                    "CREATE CACHE distinctselect FROM SELECT DISTINCT value as v FROM test;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6899,7 +6778,10 @@ async fn distinct_select_works() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -6916,18 +6798,20 @@ async fn distinct_select_works() {
 async fn partial_distinct() {
     let (mut g, shutdown_tx) = start_simple_unsharded("partial_distinct").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE test (value int, k int);",
-                "CREATE CACHE distinctselect FROM SELECT DISTINCT value FROM test WHERE k = ?;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE test (value int, k int);",
+                    "CREATE CACHE distinctselect FROM SELECT DISTINCT value FROM test WHERE k = ?;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -6939,7 +6823,10 @@ async fn partial_distinct() {
 
     macro_rules! do_lookup {
         ($q: expr, $k: expr) => {{
-            let rows = $q.lookup(&[($k as i32).into()], true).await.unwrap();
+            let rows = $q
+                .lookup(&[($k as i32).into()], Dialect::DEFAULT_MYSQL)
+                .await
+                .unwrap();
             rows.into_iter()
                 .map(|r| get_col!(q, r, "value", i32))
                 .sorted()
@@ -6978,9 +6865,11 @@ async fn partial_distinct_multi() {
         "CREATE TABLE test (value int, number int, k int);",
         "CREATE CACHE distinctselectmulti FROM SELECT DISTINCT value, SUM(number) as s FROM test WHERE k = ?;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     eprintln!("{}", g.graphviz(Default::default()).await.unwrap());
 
@@ -7004,7 +6893,10 @@ async fn partial_distinct_multi() {
 
     sleep().await;
 
-    let rows = q.lookup(&[(0_i32).into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[(0_i32).into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let res = rows
         .into_iter()
         .map(|r| {
@@ -7029,9 +6921,11 @@ async fn distinct_select_multi_col() {
         "CREATE TABLE test (value int, number int);",
         "CREATE CACHE distinctselectmulticol FROM SELECT DISTINCT value as v, number as n FROM test;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -7054,7 +6948,10 @@ async fn distinct_select_multi_col() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -7076,9 +6973,11 @@ async fn join_straddled_columns() {
         "CREATE TABLE b (b1 int, b2 int);",
         "CREATE CACHE straddle FROM SELECT * FROM a INNER JOIN b ON a.a2 = b.b1 WHERE a.a1 = ? AND b.b2 = ?;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut a = g.table("a").await.unwrap();
     let mut b = g.table("b").await.unwrap();
@@ -7107,7 +7006,10 @@ async fn join_straddled_columns() {
 
     sleep().await;
 
-    let rows = q.lookup(&[1i32.into(), 1i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[1i32.into(), 1i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -7131,9 +7033,11 @@ async fn straddled_join_range_query() {
         "CREATE TABLE b (b1 int, b2 int);",
         "CREATE CACHE straddle FROM SELECT * FROM a INNER JOIN b ON a.a2 = b.b1 WHERE a.a1 > ? AND b.b2 > ?;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut a = g.table("a").await.unwrap();
     let mut b = g.table("b").await.unwrap();
@@ -7169,7 +7073,7 @@ async fn straddled_join_range_query() {
             vec![KeyComparison::Range(
                 vec1![1i32.into(), 1i32.into()].range_from(),
             )],
-            true,
+            Dialect::DEFAULT_MYSQL,
         )
         .await
         .unwrap();
@@ -7192,18 +7096,20 @@ async fn overlapping_range_queries() {
     readyset_tracing::init_test_logging();
     let (mut g, shutdown_tx) = start_simple_unsharded("straddled_join_range_query").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t (x int);",
-                "CREATE CACHE q FROM SELECT x FROM t WHERE x >= ?",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t (x int);",
+                    "CREATE CACHE q FROM SELECT x FROM t WHERE x >= ?",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("t").await.unwrap();
 
@@ -7224,7 +7130,7 @@ async fn overlapping_range_queries() {
                     vec![KeyComparison::Range(
                         vec1![DfValue::from(m * 10)].range_from_inclusive(),
                     )],
-                    true,
+                    Dialect::DEFAULT_MYSQL,
                 )
                 .await
                 .unwrap();
@@ -7270,9 +7176,11 @@ async fn overlapping_remapped_range_queries() {
         "CREATE TABLE b (b1 int, b2 int);",
         "CREATE CACHE q FROM SELECT * FROM a INNER JOIN b ON a.a2 = b.b1 WHERE a.a1 > ? AND b.b2 > ?;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut a = g.table("a").await.unwrap();
     let mut b = g.table("b").await.unwrap();
@@ -7297,7 +7205,7 @@ async fn overlapping_remapped_range_queries() {
                     vec![KeyComparison::Range(
                         vec1![DfValue::from(m * 10), DfValue::from(m * 10)].range_from_inclusive(),
                     )],
-                    true,
+                    Dialect::DEFAULT_MYSQL,
                 )
                 .await
                 .unwrap();
@@ -7341,18 +7249,20 @@ async fn range_query_through_union() {
     readyset_tracing::init_test_logging();
     let (mut g, shutdown_tx) = start_simple_unsharded("range_query_through_union").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t (a int, b int);",
-                "CREATE CACHE q FROM SELECT a, b FROM t WHERE (a = 1 OR a = 2) AND b > ?",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t (a int, b int);",
+                    "CREATE CACHE q FROM SELECT a, b FROM t WHERE (a = 1 OR a = 2) AND b > ?",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("t").await.unwrap();
     let mut q = g.view("q").await.unwrap().into_reader_handle().unwrap();
@@ -7370,7 +7280,7 @@ async fn range_query_through_union() {
     let rows = q
         .multi_lookup(
             vec![KeyComparison::Range(vec1![1.into()].range_from())],
-            true,
+            Dialect::DEFAULT_MYSQL,
         )
         .await
         .unwrap();
@@ -7392,7 +7302,6 @@ async fn mixed_inclusive_range_and_equality() {
 
     let (mut g, shutdown_tx) = {
         let mut builder = builder_for_tests();
-        builder.set_sharding(Some(DEFAULT_SHARDING));
         builder.set_persistence(get_persistence_params("mixed_inclusive_range_and_equality"));
         builder.set_mixed_comparisons(true);
         builder
@@ -7403,20 +7312,22 @@ async fn mixed_inclusive_range_and_equality() {
             .unwrap()
     };
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t (x INT, y INT, z INT, w INT);",
-                "CREATE CACHE q FROM
-                 SELECT x, y, z, w FROM t
-                 WHERE x >= $1 AND y = $2 AND z >= $3 AND w = $4;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t (x INT, y INT, z INT, w INT);",
+                    "CREATE CACHE q FROM
+                     SELECT x, y, z, w FROM t
+                     WHERE x >= $1 AND y = $2 AND z >= $3 AND w = $4;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("t").await.unwrap();
 
@@ -7478,7 +7389,7 @@ async fn mixed_inclusive_range_and_equality() {
                         DfValue::from(i32::MAX)
                     ]),
             )],
-            true,
+            Dialect::DEFAULT_MYSQL,
         )
         .await
         .unwrap();
@@ -7512,9 +7423,11 @@ async fn group_by_agg_col_count() {
         "CREATE TABLE test (value int, number int);",
         "CREATE CACHE groupbyaggcolcount FROM SELECT count(value) as c FROM test GROUP BY value;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -7540,7 +7453,10 @@ async fn group_by_agg_col_count() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -7561,9 +7477,11 @@ async fn group_by_agg_col_multi() {
         "CREATE TABLE test (value int, number int);",
         "CREATE CACHE groupbyaggcolmulti FROM SELECT count(value) as c, avg(number) as a FROM test GROUP BY value;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t = g.table("test").await.unwrap();
     let mut q = g
@@ -7589,7 +7507,10 @@ async fn group_by_agg_col_multi() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -7617,9 +7538,11 @@ async fn group_by_agg_col_with_join() {
     ",
     ];
 
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     let mut test = g.table("test").await.unwrap();
     let mut test2 = g.table("test2").await.unwrap();
     let mut q = g
@@ -7647,7 +7570,10 @@ async fn group_by_agg_col_with_join() {
 
     sleep().await;
 
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let res = rows
         .into_iter()
@@ -7666,9 +7592,11 @@ async fn count_emit_zero() {
     let sql = vec!["
         CREATE TABLE test (id int);", "CREATE CACHE countemitzero FROM SELECT count(id) as c FROM test GROUP BY id;", "CREATE CACHE countemitzeronogroup FROM SELECT count(*) as c FROM test;", "CREATE CACHE countemitzeromultiple FROM SELECT COUNT(id) AS c, COUNT(*) AS c2 FROM test;", "CREATE CACHE countemitzerowithcolumn FROM SELECT id, COUNT(*) AS c FROM test;", "CREATE CACHE countemitzerowithotheraggregations FROM SELECT COUNT(*) AS c, SUM(id) AS s, MIN(id) AS m FROM test;
     "];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     // With no data in the table, we should get no results with a GROUP BY
     let mut q = g
@@ -7677,7 +7605,10 @@ async fn count_emit_zero() {
         .unwrap()
         .into_reader_handle()
         .unwrap();
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let res = rows
         .into_iter()
         .map(|r| i32::try_from(&r[0]).unwrap())
@@ -7692,7 +7623,10 @@ async fn count_emit_zero() {
         .unwrap()
         .into_reader_handle()
         .unwrap();
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let res = rows
         .into_iter()
         .map(|r| i32::try_from(&r[0]).unwrap())
@@ -7707,7 +7641,10 @@ async fn count_emit_zero() {
         .unwrap()
         .into_reader_handle()
         .unwrap();
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let res = rows
         .into_iter()
         .map(|r| r.into_iter().map(|v| i32::try_from(v).unwrap()).collect())
@@ -7722,7 +7659,10 @@ async fn count_emit_zero() {
         .unwrap()
         .into_reader_handle()
         .unwrap();
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let res = rows.into_iter().collect::<Vec<Vec<DfValue>>>();
     assert_eq!(res, vec![vec![DfValue::None, DfValue::Int(0)]]);
 
@@ -7733,7 +7673,10 @@ async fn count_emit_zero() {
         .unwrap()
         .into_reader_handle()
         .unwrap();
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let res = rows.into_iter().collect::<Vec<Vec<DfValue>>>();
     assert_eq!(
         res,
@@ -7757,7 +7700,10 @@ async fn count_emit_zero() {
         .unwrap()
         .into_reader_handle()
         .unwrap();
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let res = rows
         .into_iter()
         .map(|r| i32::try_from(&r[0]).unwrap())
@@ -7771,7 +7717,10 @@ async fn count_emit_zero() {
         .unwrap()
         .into_reader_handle()
         .unwrap();
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let res = rows
         .into_iter()
         .map(|r| i32::try_from(&r[0]).unwrap())
@@ -7785,7 +7734,10 @@ async fn count_emit_zero() {
         .unwrap()
         .into_reader_handle()
         .unwrap();
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let res = rows
         .into_iter()
         .map(|r| r.into_iter().map(|v| i32::try_from(v).unwrap()).collect())
@@ -7799,7 +7751,10 @@ async fn count_emit_zero() {
         .unwrap()
         .into_reader_handle()
         .unwrap();
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let res = rows.into_iter().collect::<Vec<Vec<DfValue>>>();
     assert_eq!(res, vec![vec![DfValue::Int(0), DfValue::Int(3)]]);
 
@@ -7809,7 +7764,10 @@ async fn count_emit_zero() {
         .unwrap()
         .into_reader_handle()
         .unwrap();
-    let rows = q.lookup(&[0i32.into()], true).await.unwrap();
+    let rows = q
+        .lookup(&[0i32.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     let res = rows.into_iter().collect::<Vec<Vec<DfValue>>>();
     assert_eq!(
         res,
@@ -7826,20 +7784,20 @@ async fn count_emit_zero() {
 #[tokio::test(flavor = "multi_thread")]
 async fn partial_join_on_one_parent() {
     let (mut g, shutdown_tx) = start_simple_unsharded("partial_join_on_one_parent").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "
-                CREATE TABLE t1 (jk INT, val INT);",
-                "CREATE TABLE t2 (jk INT, pk INT PRIMARY KEY);
-            ",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (jk INT, val INT);",
+                    "CREATE TABLE t2 (jk INT, pk INT PRIMARY KEY);",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t1 = g.table("t1").await.unwrap();
     let mut t2 = g.table("t2").await.unwrap();
@@ -7856,17 +7814,19 @@ async fn partial_join_on_one_parent() {
         .await
         .unwrap();
 
-    g.extend_recipe(
-        ChangeList::from_strings(vec!["CREATE CACHE q FROM SELECT t1.val FROM t2 JOIN t1 ON t2.jk = t1.jk WHERE t1.val = ?"], Dialect::DEFAULT_MYSQL)
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(vec!["CREATE CACHE q FROM SELECT t1.val FROM t2 JOIN t1 ON t2.jk = t1.jk WHERE t1.val = ?"], Dialect::DEFAULT_MYSQL)
+                .unwrap(),
+        )
+        .await
+        .is_ok()
+    }
 
     let mut q = g.view("q").await.unwrap().into_reader_handle().unwrap();
 
     let res1 = q
-        .lookup(&[DfValue::from(1i32)], true)
+        .lookup(&[DfValue::from(1i32)], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -7877,7 +7837,7 @@ async fn partial_join_on_one_parent() {
     sleep().await;
 
     let res2 = q
-        .lookup(&[DfValue::from(1i32)], true)
+        .lookup(&[DfValue::from(1i32)], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -7891,7 +7851,6 @@ const LIMIT: usize = 10;
 async fn aggressive_eviction_setup() -> (crate::Handle, ShutdownSender) {
     let (mut g, shutdown_tx) = build(
         "aggressive_eviction",
-        None,
         Some((15000, Duration::from_millis(100))),
     )
     .await;
@@ -7918,9 +7877,11 @@ async fn aggressive_eviction_setup() -> (crate::Handle, ShutdownSender) {
         cache_one.as_str(),
         cache_two.as_str(),
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut users = g.table("users").await.unwrap();
     let mut articles = g.table("articles").await.unwrap();
@@ -7965,7 +7926,7 @@ async fn aggressive_eviction_impl() {
             .map(|k| KeyComparison::Equal(vec1::Vec1::new(DfValue::Int(k))))
             .collect();
 
-        let vq = ViewQuery::from((keys.clone(), true));
+        let vq = ViewQuery::from((keys.clone(), Dialect::DEFAULT_MYSQL));
 
         let r = view.raw_lookup(vq).await.unwrap().into_vec();
         assert_eq!(r.len(), LIMIT);
@@ -7986,7 +7947,7 @@ async fn aggressive_eviction_range_impl() {
                 Bound::Included(vec1![DfValue::Int(offset)]),
                 Bound::Excluded(vec1![DfValue::Int(offset + 20)]),
             ))],
-            true,
+            Dialect::DEFAULT_MYSQL,
         ));
 
         let r = view.raw_lookup(vq).await.unwrap().into_vec();
@@ -8032,32 +7993,40 @@ rusty_fork_test! {
 async fn partial_ingress_above_full_reader() {
     readyset_tracing::init_test_logging();
     let (mut g, shutdown_tx) = start_simple_unsharded("partial_ingress_above_full_reader").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE TABLE t1 (a INT, b INT);"],
-            Dialect::DEFAULT_MYSQL,
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE TABLE t2 (c int, d int);"],
-            Dialect::DEFAULT_MYSQL,
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-    g.extend_recipe(ChangeList::from_strings(vec!["CREATE CACHE q1 FROM select t1.a, t1.b, t2.c, t2.d from t1 inner join t2 on t1.a = t2.c where t1.b = ?;"], Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
-    g.extend_recipe(ChangeList::from_strings(vec!["CREATE CACHE q2 FROM select t1.a, t1.b, t2.c, t2.d from t1 inner join t2 on t1.a = t2.c;"], Dialect::DEFAULT_MYSQL)
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE TABLE t1 (a INT, b INT);"],
+                Dialect::DEFAULT_MYSQL,
+            )
             .unwrap(),
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .is_ok()
+    }
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE TABLE t2 (c int, d int);"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
+        )
+        .await
+        .is_ok()
+    }
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(vec!["CREATE CACHE q1 FROM select t1.a, t1.b, t2.c, t2.d from t1 inner join t2 on t1.a = t2.c where t1.b = ?;"], Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(vec!["CREATE CACHE q2 FROM select t1.a, t1.b, t2.c, t2.d from t1 inner join t2 on t1.a = t2.c;"], Dialect::DEFAULT_MYSQL)
+            .unwrap(),
+        )
+            .await
+            .is_ok()
+    }
 
     let mut m1 = g.table("t1").await.unwrap();
     let mut m2 = g.table("t2").await.unwrap();
@@ -8067,10 +8036,18 @@ async fn partial_ingress_above_full_reader() {
     m2.insert(vec![3.into(), 3.into()]).await.unwrap();
 
     let mut g1 = g.view("q1").await.unwrap().into_reader_handle().unwrap();
-    let r1 = g1.lookup(&[2i64.into()], true).await.unwrap().into_vec();
+    let r1 = g1
+        .lookup(&[2i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
 
     let mut g2 = g.view("q2").await.unwrap().into_reader_handle().unwrap();
-    let r2 = g2.lookup(&[0i64.into()], true).await.unwrap().into_vec();
+    let r2 = g2
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
 
     assert_eq!(
         r1,
@@ -8107,25 +8084,31 @@ async fn reroutes_recursively() {
         "create table t4 (g int, h int);
         ",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let sql = vec!["
         CREATE CACHE q1 FROM SELECT t2.c, t2.d, t3.e, t3.f FROM t2 INNER JOIN t3 ON t2.c = t3.e WHERE t2.c = ?;", "CREATE CACHE q2 FROM SELECT t1.a, t1.b, q1.c, q1.d FROM t1 INNER JOIN q1 on t1.a = q1.c WHERE t1.b = ?;", "CREATE CACHE q3 FROM SELECT t4.g, t4.h, q2.a, q2.b FROM t4 INNER JOIN q2 on t4.g = q2.a WHERE t4.g = ?;
         "];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let sql2 = vec![
         "
         CREATE CACHE q4 FROM SELECT t4.g, t4.h, q2.a, q2.b FROM t4 INNER JOIN q2 on t4.g = q2.a;
        ",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql2, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql2.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     eprintln!("{}", g.graphviz(Default::default()).await.unwrap());
     let mut m1 = g.table("t1").await.unwrap();
     m1.insert(vec![1.into(), 2.into()]).await.unwrap();
@@ -8140,7 +8123,7 @@ async fn reroutes_recursively() {
 
     let mut getter = g.view("q4").await.unwrap().into_reader_handle().unwrap();
     let res = getter
-        .lookup(&[0i64.into()], true)
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -8162,15 +8145,19 @@ async fn reroutes_two_children_at_once() {
         "create table t2 (c int, d int);
         ",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     let sql1 = vec!["
         CREATE CACHE q1 FROM SELECT t1.a, t1.b, t2.c, t2.d FROM t1 INNER JOIN t2 ON t1.a = t2.c WHERE t1.b = ?;
         "];
-    g.extend_recipe(ChangeList::from_strings(sql1, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql1.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     eprintln!("{}", g.graphviz(Default::default()).await.unwrap());
 
     let sql2 = vec![
@@ -8179,9 +8166,11 @@ async fn reroutes_two_children_at_once() {
         "CREATE CACHE q3 FROM SELECT t1.a, t1.b, t2.d FROM t1 INNER JOIN t2 ON t1.a = t2.c;
         ",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql2, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql2.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     eprintln!("{}", g.graphviz(Default::default()).await.unwrap());
 
     let mut m1 = g.table("t1").await.unwrap();
@@ -8192,13 +8181,25 @@ async fn reroutes_two_children_at_once() {
     m2.insert(vec![3.into(), 3.into()]).await.unwrap();
 
     let mut g1 = g.view("q1").await.unwrap().into_reader_handle().unwrap();
-    let r1 = g1.lookup(&[2i64.into()], true).await.unwrap().into_vec();
+    let r1 = g1
+        .lookup(&[2i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
 
     let mut g2 = g.view("q2").await.unwrap().into_reader_handle().unwrap();
-    let r2 = g2.lookup(&[0i64.into()], true).await.unwrap().into_vec();
+    let r2 = g2
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
 
     let mut g3 = g.view("q3").await.unwrap().into_reader_handle().unwrap();
-    let r3 = g3.lookup(&[0i64.into()], true).await.unwrap().into_vec();
+    let r3 = g3
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
 
     assert_eq!(
         r1,
@@ -8233,9 +8234,11 @@ async fn reroutes_same_migration() {
     let sql = vec!["
         create table t1 (a int, b int);", "create table t2 (c int, d int);", "CREATE CACHE q1 FROM SELECT t1.a, t1.b, t2.c, t2.d FROM t1 INNER JOIN t2 ON t1.a = t2.c WHERE t1.b = ?;", "CREATE CACHE q2 FROM SELECT t1.a, t1.b, t2.c, t2.d FROM t1 INNER JOIN t2 ON t1.a = t2.c;", "CREATE CACHE q3 FROM SELECT t1.b, t2.d FROM t1 INNER JOIN t2 ON t1.a = t2.c;
         "];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     eprintln!("{}", g.graphviz(Default::default()).await.unwrap());
 
     let mut m1 = g.table("t1").await.unwrap();
@@ -8246,13 +8249,22 @@ async fn reroutes_same_migration() {
     m2.insert(vec![3.into(), 3.into()]).await.unwrap();
 
     let mut g1 = g.view("q1").await.unwrap().into_reader_handle().unwrap();
-    let r1 = g1.lookup(&[2i64.into()], true).await.unwrap();
+    let r1 = g1
+        .lookup(&[2i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let mut g2 = g.view("q2").await.unwrap().into_reader_handle().unwrap();
-    let r2 = g2.lookup(&[0i64.into()], true).await.unwrap();
+    let r2 = g2
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     let mut g3 = g.view("q3").await.unwrap().into_reader_handle().unwrap();
-    let r3 = g3.lookup(&[0i64.into()], true).await.unwrap();
+    let r3 = g3
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
 
     assert_eq!(
         r1.into_vec(),
@@ -8287,24 +8299,30 @@ async fn reroutes_dependent_children() {
         "create table t2 (c int, d int);
         ",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     let sql1 = vec!["
         CREATE CACHE q1 FROM SELECT t1.a, t1.b, t2.c, t2.d FROM t1 INNER JOIN t2 ON t1.a = t2.c WHERE t1.b = ?;
         "];
-    g.extend_recipe(ChangeList::from_strings(sql1, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql1.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     let sql2 = vec![
         "
         CREATE CACHE q2 FROM SELECT t1.a, t1.b, t2.c, t2.d FROM t1 INNER JOIN t2 ON t1.a = t2.c;",
         "CREATE CACHE q3 FROM SELECT q2.a, q2.c FROM q2;
         ",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql2, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql2.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     eprintln!("{}", g.graphviz(Default::default()).await.unwrap());
 
     let mut m1 = g.table("t1").await.unwrap();
@@ -8315,13 +8333,25 @@ async fn reroutes_dependent_children() {
     m2.insert(vec![3.into(), 3.into()]).await.unwrap();
 
     let mut g1 = g.view("q1").await.unwrap().into_reader_handle().unwrap();
-    let r1 = g1.lookup(&[2i64.into()], true).await.unwrap().into_vec();
+    let r1 = g1
+        .lookup(&[2i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
 
     let mut g2 = g.view("q2").await.unwrap().into_reader_handle().unwrap();
-    let r2 = g2.lookup(&[0i64.into()], true).await.unwrap().into_vec();
+    let r2 = g2
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
 
     let mut g3 = g.view("q3").await.unwrap().into_reader_handle().unwrap();
-    let r3 = g3.lookup(&[0i64.into()], true).await.unwrap().into_vec();
+    let r3 = g3
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
 
     assert_eq!(
         r1,
@@ -8356,16 +8386,20 @@ async fn reroutes_count() {
         "CREATE CACHE q1 FROM select count(user) from votes where id = ? group by id;
             ",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     let sql2 = vec![
         "
             CREATE CACHE q2 FROM select count(user) from votes group by id;",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql2, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql2.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut m = g.table("votes").await.unwrap();
     let mut g1 = g.view("q1").await.unwrap().into_reader_handle().unwrap();
@@ -8378,8 +8412,14 @@ async fn reroutes_count() {
 
     sleep().await;
 
-    let r1 = g1.lookup(&[1i64.into()], true).await.unwrap();
-    let r2 = g2.lookup(&[0i64.into()], true).await.unwrap();
+    let r1 = g1
+        .lookup(&[1i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
+    let r2 = g2
+        .lookup(&[0i64.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     assert_eq!(r1.into_vec(), vec![vec![DfValue::Int(2)]]);
     assert_eq!(
         r2.into_vec(),
@@ -8400,8 +8440,7 @@ async fn reroutes_count() {
 #[ignore]
 async fn overwrite_with_changed_recipe() {
     let (mut g, shutdown_tx) = {
-        let mut builder = builder_for_tests();
-        builder.set_sharding(Some(DEFAULT_SHARDING));
+        let builder = builder_for_tests();
         builder
             .start_local_custom(Arc::new(Authority::from(LocalAuthority::new_with_store(
                 Arc::new(LocalAuthorityStore::new()),
@@ -8409,30 +8448,35 @@ async fn overwrite_with_changed_recipe() {
             .await
             .unwrap()
     };
-    g.extend_recipe(
-        ChangeList::from_strings(vec!["CREATE TABLE t (col INT)"], Dialect::DEFAULT_MYSQL).unwrap(),
-    )
-    .await
-    .unwrap();
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE CACHE q FROM SELECT * FROM t"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(vec!["CREATE TABLE t (col INT)"], Dialect::DEFAULT_MYSQL).unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-    let res = g
-        .extend_recipe(
+        .await
+        .is_ok()
+    }
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE CACHE q FROM SELECT * FROM t"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
+        )
+        .await
+        .is_ok()
+    }
+    eventually! {
+        g.extend_recipe(
             ChangeList::from_strings(
                 vec!["CREATE TABLE t (col INT COMMENT 'hi')"],
                 Dialect::DEFAULT_MYSQL,
             )
             .unwrap(),
         )
-        .await;
-    res.unwrap();
+        .await
+        .is_ok()
+    }
 
     shutdown_tx.shutdown().await;
 }
@@ -8460,7 +8504,6 @@ async fn it_recovers_fully_materialized() {
 
         let mut g = builder_for_tests();
         g.set_persistence(persistence_params.clone());
-        g.set_sharding(None);
         g.start(authority)
     };
     {
@@ -8474,9 +8517,11 @@ async fn it_recovers_fully_materialized() {
                 "CREATE VIEW tv AS SELECT x, COUNT(*) FROM t GROUP BY x ORDER BY x;
             ",
             ];
-            g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-                .await
-                .unwrap();
+            eventually! {
+                g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+                    .await
+                    .is_ok()
+            };
 
             let mut mutator = g.table("t").await.unwrap();
 
@@ -8497,7 +8542,11 @@ async fn it_recovers_fully_materialized() {
         let mut getter = g.view("tv").await.unwrap().into_reader_handle().unwrap();
 
         // Make sure that the new graph contains the old writes
-        let result = getter.lookup(&[0.into()], true).await.unwrap().into_vec();
+        let result = getter
+            .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec();
         assert_eq!(result.len(), 3);
         assert_eq!(
             result,
@@ -8519,7 +8568,11 @@ async fn it_recovers_fully_materialized() {
     {
         let mut getter = g.view("tv").await.unwrap().into_reader_handle().unwrap();
         // Make sure that the new graph contains the old writes
-        let result = getter.lookup(&[0.into()], true).await.unwrap().into_vec();
+        let result = getter
+            .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+            .await
+            .unwrap()
+            .into_vec();
         assert_eq!(
             result,
             vec![
@@ -8544,18 +8597,22 @@ async fn simple_drop_tables() {
         "CREATE CACHE t1 FROM SELECT * FROM table_1;
     ",
     ];
-    g.extend_recipe(ChangeList::from_strings(create_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(create_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     g.table("table_1").await.unwrap();
     g.table("table_2").await.unwrap();
     g.view("t1").await.unwrap();
 
     let drop_table = vec!["DROP TABLE table_1, table_2;"];
     // let drop_table = "CREATE TABLE table_4 (column_4 INT);";
-    g.extend_recipe(ChangeList::from_strings(drop_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(drop_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     sleep().await;
 
@@ -8564,9 +8621,11 @@ async fn simple_drop_tables() {
     assert_view_not_found(g.view("t1").await, "t1");
 
     let create_new_table = vec!["CREATE TABLE table_3 (column_3 INT);"];
-    g.extend_recipe(ChangeList::from_strings(create_new_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(create_new_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     g.table("table_3").await.unwrap();
 
     shutdown_tx.shutdown().await;
@@ -8579,18 +8638,22 @@ async fn join_drop_tables() {
     let create_table = vec!["
         CREATE TABLE table_1 (column_1 INT, column_2 INT);", "CREATE TABLE table_2 (column_1 INT, column_2 INT);", "CREATE TABLE table_3 (column_1 INT, column_2 INT);", "CREATE CACHE t1 FROM SELECT table_1.column_1, table_3.column_1 FROM table_1 JOIN table_3 ON table_1.column_2 = table_3.column_2;
     "];
-    g.extend_recipe(ChangeList::from_strings(create_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(create_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     g.table("table_1").await.unwrap();
     g.table("table_2").await.unwrap();
     g.table("table_3").await.unwrap();
     g.view("t1").await.unwrap();
 
     let drop_table = vec!["DROP TABLE table_1, table_2;"];
-    g.extend_recipe(ChangeList::from_strings(drop_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(drop_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     sleep().await;
 
@@ -8600,9 +8663,11 @@ async fn join_drop_tables() {
     assert_view_not_found(g.view("t1").await, "t1");
 
     let create_new_table = vec!["CREATE TABLE table_1 (column_1 INT);"];
-    g.extend_recipe(ChangeList::from_strings(create_new_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(create_new_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     g.table("table_1").await.unwrap();
 
     shutdown_tx.shutdown().await;
@@ -8619,9 +8684,11 @@ async fn simple_drop_tables_with_data() {
         "CREATE CACHE t1 FROM SELECT * FROM table_1;
     ",
     ];
-    g.extend_recipe(ChangeList::from_strings(create_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(create_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut table_1 = g.table("table_1").await.unwrap();
     table_1.insert(vec![11.into()]).await.unwrap();
@@ -8629,7 +8696,7 @@ async fn simple_drop_tables_with_data() {
 
     let mut view = g.view("t1").await.unwrap().into_reader_handle().unwrap();
     eventually!(run_test: {
-        view.lookup(&[0.into()], true).await.unwrap().into_vec()
+        view.lookup(&[0.into()], Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
     }, then_assert: |results| {
         assert!(!results.is_empty());
         assert_eq!(results[0][0], 11.into());
@@ -8637,29 +8704,39 @@ async fn simple_drop_tables_with_data() {
     });
 
     let drop_table = vec!["DROP TABLE table_1, table_2;"];
-    g.extend_recipe(ChangeList::from_strings(drop_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(drop_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     assert_table_not_found(g.table("table_1").await, "table_1");
     assert_table_not_found(g.table("table_2").await, "table_2");
     assert_view_not_found(g.view("t1").await, "t1");
 
     let recreate_table = vec!["CREATE TABLE table_1 (column_1 INT);"];
-    g.extend_recipe(ChangeList::from_strings(recreate_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(recreate_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     g.table("table_1").await.unwrap();
     assert_view_not_found(g.view("t1").await, "t1");
 
     let recreate_query = vec!["CREATE CACHE t2 FROM SELECT * FROM table_1"];
-    g.extend_recipe(ChangeList::from_strings(recreate_query, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(recreate_query.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     sleep().await;
 
     let mut view = g.view("t2").await.unwrap().into_reader_handle().unwrap();
-    let results = view.lookup(&[0.into()], true).await.unwrap().into_vec();
+    let results = view
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert!(results.is_empty());
 
     shutdown_tx.shutdown().await;
@@ -8670,7 +8747,6 @@ async fn simple_drop_tables_with_persisted_data() {
     let mut builder = builder_for_tests();
     let dir = TempDir::new().unwrap();
     let path = dir.path().to_path_buf();
-    builder.set_sharding(None);
     builder.set_persistence(PersistenceParameters::new(
         DurabilityMode::Permanent,
         Some("simple_drop_tables_with_persisted_data".to_string()),
@@ -8687,9 +8763,11 @@ async fn simple_drop_tables_with_persisted_data() {
         "CREATE CACHE t1 FROM SELECT * FROM table_1;
     ",
     ];
-    g.extend_recipe(ChangeList::from_strings(create_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(create_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     assert!(path.exists());
 
@@ -8705,15 +8783,21 @@ async fn simple_drop_tables_with_persisted_data() {
     table_1.insert(vec![12.into()]).await.unwrap();
 
     let mut view = g.view("t1").await.unwrap().into_reader_handle().unwrap();
-    let results = view.lookup(&[0.into()], true).await.unwrap().into_vec();
+    let results = view
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert!(!results.is_empty());
     assert_eq!(results[0][0], 11.into());
     assert_eq!(results[1][0], 12.into());
 
     let drop_table = vec!["DROP TABLE table_1, table_2;"];
-    g.extend_recipe(ChangeList::from_strings(drop_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(drop_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     assert_table_not_found(g.table("table_1").await, "table_1");
     assert_table_not_found(g.table("table_2").await, "table_2");
     assert_view_not_found(g.view("t1").await, "t1");
@@ -8722,21 +8806,28 @@ async fn simple_drop_tables_with_persisted_data() {
     eventually!(!table_2_path.exists());
 
     let recreate_table = vec!["CREATE TABLE table_1 (column_1 INT);"];
-    g.extend_recipe(ChangeList::from_strings(recreate_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(recreate_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
     g.table("table_1").await.unwrap();
     assert_view_not_found(g.view("t1").await, "t1");
 
     let recreate_query = vec!["CREATE CACHE t2 FROM SELECT * FROM table_1"];
-    g.extend_recipe(ChangeList::from_strings(recreate_query, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(recreate_query.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     sleep().await;
 
     let mut view = g.view("t2").await.unwrap().into_reader_handle().unwrap();
-    let results = view.lookup(&[0.into()], true).await.unwrap();
+    let results = view
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap();
     assert!(results.into_vec().is_empty());
 
     shutdown_tx.shutdown().await;
@@ -8755,9 +8846,11 @@ async fn create_and_drop_table() {
         "CREATE TABLE table_4 (column_4 INT);
     ",
     ];
-    g.extend_recipe(ChangeList::from_strings(create_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(create_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     g.table("table_1").await.unwrap();
     assert_table_not_found(g.table("table_2").await, "table_2");
@@ -8778,9 +8871,11 @@ async fn drop_and_recreate_different_columns() {
         "CREATE CACHE t1 FROM SELECT * FROM table_1;
     ",
     ];
-    g.extend_recipe(ChangeList::from_strings(create_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(create_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut table = g.table("table_1").await.unwrap();
     table.insert(vec![11.into(), 12.into()]).await.unwrap();
@@ -8788,7 +8883,7 @@ async fn drop_and_recreate_different_columns() {
     let mut view = g.view("t1").await.unwrap().into_reader_handle().unwrap();
     eventually!(
         run_test: {
-            view.lookup(&[0.into()], true).await.unwrap().into_vec()
+            view.lookup(&[0.into()], Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
         },
         then_assert: |results| {
             assert!(!results.is_empty());
@@ -8821,14 +8916,14 @@ async fn simple_dry_run() {
 async fn simple_dry_run_unsupported() {
     let (mut g, shutdown_tx) = start_simple_unsharded("simple_dry_run").await;
     let query = vec![
-        "
-        CREATE TABLE table_1 (column_1 INT);",
-        "CREATE CACHE t1 FROM SELECT * FROM table_1;
-    ",
+        "CREATE TABLE table_1 (column_1 INT);",
+        "CREATE CACHE t1 FROM SELECT * FROM table_1;",
     ];
-    g.extend_recipe(ChangeList::from_strings(query, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(query.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    }
 
     g.table("table_1").await.unwrap();
     g.view("t1").await.unwrap();
@@ -8854,19 +8949,21 @@ async fn multiple_simultaneous_migrations() {
     let (mut g, shutdown_tx) = start_simple_unsharded("multiple_simultaneous_migrations").await;
     let mut g2 = g.clone();
 
-    g.extend_recipe(ChangeList::from_change(
-        Change::CreateTable {
-            statement: parse_create_table(
-                readyset_sql::Dialect::MySQL,
-                "CREATE TABLE t (x int, y int)",
-            )
-            .unwrap(),
-            pg_meta: None,
-        },
-        Dialect::DEFAULT_MYSQL,
-    ))
-    .await
-    .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_change(
+            Change::CreateTable {
+                statement: parse_create_table(
+                    readyset_sql::Dialect::MySQL,
+                    "CREATE TABLE t (x int, y int)",
+                )
+                .unwrap(),
+                pg_meta: None,
+            },
+            Dialect::DEFAULT_MYSQL,
+        ))
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("t").await.unwrap();
 
@@ -8877,40 +8974,51 @@ async fn multiple_simultaneous_migrations() {
     .await
     .unwrap();
 
-    let (r1, r2) = join!(
-        g.extend_recipe(ChangeList::from_change(
-            Change::CreateCache(CreateCache {
-                name: Some("q1".into()),
-                statement: Box::new(
-                    parse_select(readyset_sql::Dialect::MySQL, "SELECT * FROM t WHERE x = ?")
-                        .unwrap()
-                ),
-                always: false,
-                schema_generation_used: None,
-            }),
-            Dialect::DEFAULT_MYSQL
-        )),
-        g2.extend_recipe(ChangeList::from_change(
-            Change::CreateCache(CreateCache {
-                name: Some("q2".into()),
-                statement: Box::new(
-                    parse_select(readyset_sql::Dialect::MySQL, "SELECT * FROM t WHERE y = ?")
-                        .unwrap()
-                ),
-                always: false,
-                schema_generation_used: None,
-            }),
-            Dialect::DEFAULT_MYSQL
-        ))
-    );
-    r1.unwrap();
-    r2.unwrap();
+    eventually! {
+        let (r1, r2) = join!(
+            g.extend_recipe(ChangeList::from_change(
+                Change::CreateCache(CreateCache {
+                    name: Some("q1".into()),
+                    statement: Box::new(
+                        parse_select(readyset_sql::Dialect::MySQL, "SELECT * FROM t WHERE x = ?")
+                            .unwrap()
+                    ),
+                    trx_cache_policy: readyset_sql::ast::TrxCachePolicy::Never,
+                    schema_generation_used: None,
+                    topk_buffer_multiplier: None,
+                }),
+                Dialect::DEFAULT_MYSQL
+            )),
+            g2.extend_recipe(ChangeList::from_change(
+                Change::CreateCache(CreateCache {
+                    name: Some("q2".into()),
+                    statement: Box::new(
+                        parse_select(readyset_sql::Dialect::MySQL, "SELECT * FROM t WHERE y = ?")
+                            .unwrap()
+                    ),
+                    trx_cache_policy: readyset_sql::ast::TrxCachePolicy::Never,
+                    schema_generation_used: None,
+                    topk_buffer_multiplier: None,
+                }),
+                Dialect::DEFAULT_MYSQL
+            ))
+        );
+        r1.is_ok() && r2.is_ok()
+    }
 
     let mut q1 = g.view("q1").await.unwrap().into_reader_handle().unwrap();
     let mut q2 = g.view("q1").await.unwrap().into_reader_handle().unwrap();
 
-    let res1 = q1.lookup(&[1.into()], true).await.unwrap().into_vec();
-    let res2 = q2.lookup(&[3.into()], true).await.unwrap().into_vec();
+    let res1 = q1
+        .lookup(&[1.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
+    let res2 = q2
+        .lookup(&[3.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
 
     assert_eq!(res1, vec![vec![1.into(), 2.into()]]);
     assert_eq!(res2, vec![vec![3.into(), 4.into()]]);
@@ -8922,52 +9030,61 @@ async fn multiple_simultaneous_migrations() {
 async fn drop_view() {
     let (mut g, shutdown_tx) = start_simple_unsharded("drop_view").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t1 (id int);",
-                "CREATE CACHE t1_view FROM SELECT * FROM t1;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (id int);",
+                    "CREATE CACHE t1_view FROM SELECT * FROM t1;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE CACHE t1_select FROM SELECT * FROM t1_view"],
-            Dialect::DEFAULT_MYSQL,
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-
-    g.extend_recipe(
-        ChangeList::from_strings(vec!["DROP CACHE t1_select;"], Dialect::DEFAULT_MYSQL).unwrap(),
-    )
-    .await
-    .unwrap();
-
-    g.extend_recipe(
-        ChangeList::from_strings(vec!["DROP VIEW t1_view;"], Dialect::DEFAULT_MYSQL).unwrap(),
-    )
-    .await
-    .unwrap();
-
-    let select_from_view_res = g
-        .extend_recipe(
+    eventually! {
+        g.extend_recipe(
             ChangeList::from_strings(
                 vec!["CREATE CACHE t1_select FROM SELECT * FROM t1_view"],
                 Dialect::DEFAULT_MYSQL,
             )
             .unwrap(),
         )
-        .await;
-    let err = select_from_view_res.unwrap_err();
-    assert!(err.to_string().contains("t1_view"));
+        .await
+        .is_ok()
+    };
+
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(vec!["DROP CACHE t1_select;"], Dialect::DEFAULT_MYSQL).unwrap(),
+        )
+        .await
+        .is_ok()
+    };
+
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(vec!["DROP VIEW t1_view;"], Dialect::DEFAULT_MYSQL).unwrap(),
+        )
+        .await
+        .is_ok()
+    };
+
+    eventually! {
+        let res = g
+            .extend_recipe(
+                ChangeList::from_strings(
+                    vec!["CREATE CACHE t1_select FROM SELECT * FROM t1_view"],
+                    Dialect::DEFAULT_MYSQL,
+                )
+                .unwrap(),
+            )
+            .await;
+        res.is_err_and(|e| e.to_string().contains("t1_view"))
+    };
 
     shutdown_tx.shutdown().await;
 }
@@ -8977,36 +9094,42 @@ async fn drop_view_schema_qualified() {
     readyset_tracing::init_test_logging();
     let (mut g, shutdown_tx) = start_simple_unsharded("drop_view_schema_qualified").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE public.t1 (id int);",
-                "CREATE VIEW public.t1_view AS SELECT * FROM public.t1;",
-            ],
-            Dialect::DEFAULT_MYSQL,
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE CACHE t1_select FROM SELECT * FROM t1_view"],
-            Dialect::DEFAULT_MYSQL,
-        )
-        .unwrap()
-        .with_schema_search_path(vec!["public".into()]),
-    )
-    .await
-    .unwrap();
-
-    g.extend_recipe(
-        ChangeList::from_strings(vec!["DROP VIEW public.t1_view;"], Dialect::DEFAULT_MYSQL)
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE public.t1 (id int);",
+                    "CREATE VIEW public.t1_view AS SELECT * FROM public.t1;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
             .unwrap(),
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .is_ok()
+    }
+
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE CACHE t1_select FROM SELECT * FROM t1_view"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap()
+            .with_schema_search_path(vec!["public".into()]),
+        )
+        .await
+        .is_ok()
+    }
+
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(vec!["DROP VIEW public.t1_view;"], Dialect::DEFAULT_MYSQL)
+                .unwrap(),
+        )
+        .await
+        .is_ok()
+    }
 
     g.view("t1_select").await.unwrap_err();
 
@@ -9017,28 +9140,32 @@ async fn drop_view_schema_qualified() {
 async fn read_from_dropped_query() {
     let (mut g, shutdown_tx) = start_simple_unsharded("read_from_dropped_query").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t1 (id int);",
-                "CREATE CACHE q FROM SELECT id FROM t1;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t1 (id int);",
+                    "CREATE CACHE q FROM SELECT id FROM t1;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut view = g.view("q").await.unwrap().into_reader_handle().unwrap();
 
-    g.extend_recipe(
-        ChangeList::from_strings(vec!["DROP TABLE t1;"], Dialect::DEFAULT_MYSQL).unwrap(),
-    )
-    .await
-    .unwrap();
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(vec!["DROP TABLE t1;"], Dialect::DEFAULT_MYSQL).unwrap(),
+        )
+            .await
+            .is_ok()
+    }
 
-    let view_res = view.lookup(&[0.into()], true).await;
+    let view_res = view.lookup(&[0.into()], Dialect::DEFAULT_MYSQL).await;
     assert!(view_res.is_err());
     assert!(view_res.err().unwrap().caused_by_view_destroyed());
 
@@ -9053,9 +9180,11 @@ async fn double_create_table_with_multiple_modifications() {
         "CREATE TABLE table_1 (column_1 INT, column_2 TEXT, column_3 TEXT, column_4 TEXT);",
         "CREATE CACHE t1 FROM SELECT * FROM table_1;",
     ];
-    g.extend_recipe(ChangeList::from_strings(create_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(create_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut table = g.table("table_1").await.unwrap();
     table
@@ -9068,20 +9197,28 @@ async fn double_create_table_with_multiple_modifications() {
         .unwrap();
 
     let new_table = vec!["CREATE TABLE table_1 (alternative_col_1 TEXT);"];
-    g.extend_recipe(ChangeList::from_strings(new_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(new_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     // Altering a table currently means we delete and recreate the whole thing.
     g.view("t1").await.unwrap_err();
 
     let recreate_view = vec!["CREATE CACHE t1 FROM SELECT * FROM table_1;"];
-    g.extend_recipe(ChangeList::from_strings(recreate_view, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(recreate_view.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut view = g.view("t1").await.unwrap().into_reader_handle().unwrap();
-    let results = view.lookup(&[0.into()], true).await.unwrap().into_vec();
+    let results = view
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert!(results.is_empty());
 
     let mut table = g.table("table_1").await.unwrap();
@@ -9097,7 +9234,11 @@ async fn double_create_table_with_multiple_modifications() {
         .unwrap();
 
     sleep().await;
-    let results = view.lookup(&[0.into()], true).await.unwrap().into_vec();
+    let results = view
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert!(!results.is_empty());
     assert_eq!(results[0][0], "11".into());
     assert_eq!(results[1][0], "21".into());
@@ -9115,9 +9256,11 @@ async fn double_identical_create_table() {
         "CREATE CACHE t1 FROM SELECT * FROM table_1;
     ",
     ];
-    g.extend_recipe(ChangeList::from_strings(create_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(create_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut table = g.table("table_1").await.unwrap();
     table
@@ -9126,9 +9269,11 @@ async fn double_identical_create_table() {
         .unwrap();
 
     let new_table = vec!["CREATE TABLE table_1 (column_1 INT);"];
-    g.extend_recipe(ChangeList::from_strings(new_table, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(new_table.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     // Although `extend_recipe` shouldn't return until the migration is finished and the point is to
     // make sure it didn't affect the existing cache, let's be a bit more sure everything is
@@ -9140,7 +9285,7 @@ async fn double_identical_create_table() {
 
     eventually!(
         run_test: {
-            view.lookup(&[0.into()], true).await.unwrap().into_vec()
+            view.lookup(&[0.into()], Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
         },
         then_assert: |results| {
             assert!(!results.is_empty());
@@ -9157,22 +9302,24 @@ async fn double_identical_create_table() {
 async fn multiple_schemas_explicit() {
     readyset_tracing::init_test_logging();
     let (mut g, shutdown_tx) = start_simple_unsharded("multiple_schemas_explicit").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE schema_1.t (id int, val int);",
-                "CREATE TABLE schema_2.t (id int, val int);",
-                "CREATE CACHE q FROM
-                 SELECT schema_1.t.val AS val1, schema_2.t.val as val2
-                 FROM schema_1.t JOIN schema_2.t
-                 ON schema_1.t.id = schema_2.t.id",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE schema_1.t (id int, val int);",
+                    "CREATE TABLE schema_2.t (id int, val int);",
+                    "CREATE CACHE q FROM
+                     SELECT schema_1.t.val AS val1, schema_2.t.val as val2
+                     FROM schema_1.t JOIN schema_2.t
+                     ON schema_1.t.id = schema_2.t.id",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut schema_1_t = g
         .table(Relation {
@@ -9203,7 +9350,7 @@ async fn multiple_schemas_explicit() {
 
     eventually!(
         run_test: {
-            q.lookup(&[0.into()], true).await.unwrap().into_vec()
+            q.lookup(&[0.into()], Dialect::DEFAULT_MYSQL).await.unwrap().into_vec()
         },
         then_assert: |res| {
             assert_eq!(
@@ -9219,19 +9366,21 @@ async fn multiple_schemas_explicit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn multiple_aggregates_and_predicates() {
     let (mut g, shutdown_tx) = start_simple_unsharded("multiple_aggregates_and_predicates").await;
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE t (a int, b int, c int);",
-                "CREATE CACHE q FROM
-            SELECT count(t.a), min(t.b) FROM t WHERE (t.a) = (t.c) AND (t.b) = (t.c)",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE t (a int, b int, c int);",
+                    "CREATE CACHE q FROM
+                     SELECT count(t.a), min(t.b) FROM t WHERE (t.a) = (t.c) AND (t.b) = (t.c)",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     let mut t = g.table("t").await.unwrap();
     t.insert_many(vec![
@@ -9244,7 +9393,11 @@ async fn multiple_aggregates_and_predicates() {
     .unwrap();
 
     let mut q = g.view("q").await.unwrap().into_reader_handle().unwrap();
-    let res = q.lookup(&[0.into()], true).await.unwrap().into_vec();
+    let res = q
+        .lookup(&[0.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(res, vec![vec![DfValue::from(1), DfValue::from(4)]]);
 
     shutdown_tx.shutdown().await;
@@ -9262,9 +9415,11 @@ async fn cascade_drop_view() {
         "CREATE VIEW v3 AS SELECT a, e FROM v2 JOIN t3 ON v2.c = t3.f;",
         "CREATE CACHE q FROM SELECT a, c, e FROM v1 JOIN v2 ON v1.a = v2.a JOIN v3 ON v2.a = v3.a",
     ];
-    g.extend_recipe(ChangeList::from_strings(sql, Dialect::DEFAULT_MYSQL).unwrap())
-        .await
-        .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_strings(sql.clone(), Dialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .is_ok()
+    };
 
     let mut t1 = g.table("t1").await.unwrap();
     g.table("t2").await.unwrap();
@@ -9278,15 +9433,17 @@ async fn cascade_drop_view() {
     .await
     .unwrap();
 
-    g.extend_recipe(ChangeList::from_change(
-        Change::Drop {
-            name: "v2".into(),
-            if_exists: false,
-        },
-        Dialect::DEFAULT_MYSQL,
-    ))
-    .await
-    .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_change(
+            Change::Drop {
+                name: "v2".into(),
+                if_exists: false,
+            },
+            Dialect::DEFAULT_MYSQL,
+        ))
+        .await
+        .is_ok()
+    };
 
     g.table("t1").await.unwrap();
     g.table("t2").await.unwrap();
@@ -9299,51 +9456,60 @@ async fn cascade_drop_view() {
 #[tokio::test(flavor = "multi_thread")]
 async fn views_out_of_order() {
     let (mut g, shutdown_tx) = start_simple_unsharded("cascade_drop_view").await;
-    g.extend_recipe(
-        ChangeList::from_strings(vec!["CREATE TABLE t1 (x int);"], Dialect::DEFAULT_MYSQL).unwrap(),
-    )
-    .await
-    .unwrap();
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(vec!["CREATE TABLE t1 (x int);"], Dialect::DEFAULT_MYSQL).unwrap(),
+        )
+            .await
+            .is_ok()
+    }
 
     // two views, one of which references the other, migrated out of order (with the referencing
     // view added before the referenced view)
-    g.extend_recipe(ChangeList::from_change(
-        Change::CreateView(
-            parse_create_view(
-                readyset_sql::Dialect::MySQL,
-                "CREATE VIEW v2 AS SELECT x FROM v1",
-            )
-            .unwrap(),
-        ),
-        Dialect::DEFAULT_MYSQL,
-    ))
-    .await
-    .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_change(
+            Change::CreateView(
+                parse_create_view(
+                    readyset_sql::Dialect::MySQL,
+                    "CREATE VIEW v2 AS SELECT x FROM v1",
+                )
+                .unwrap(),
+            ),
+            Dialect::DEFAULT_MYSQL,
+        ))
+        .await
+        .is_ok()
+    }
 
-    g.extend_recipe(ChangeList::from_change(
-        Change::CreateView(
-            parse_create_view(
-                readyset_sql::Dialect::MySQL,
-                "CREATE VIEW v1 AS SELECT x FROM t1",
-            )
-            .unwrap(),
-        ),
-        Dialect::DEFAULT_MYSQL,
-    ))
-    .await
-    .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_change(
+            Change::CreateView(
+                parse_create_view(
+                    readyset_sql::Dialect::MySQL,
+                    "CREATE VIEW v1 AS SELECT x FROM t1",
+                )
+                    .unwrap(),
+            ),
+            Dialect::DEFAULT_MYSQL,
+        ))
+        .await
+        .is_ok()
+    }
 
-    g.extend_recipe(ChangeList::from_change(
-        Change::create_cache(
-            "q",
-            parse_select(readyset_sql::Dialect::MySQL, "SELECT x FROM v2").unwrap(),
-            false,
-            None,
-        ),
-        Dialect::DEFAULT_MYSQL,
-    ))
-    .await
-    .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_change(
+            Change::create_cache(
+                "q",
+                parse_select(readyset_sql::Dialect::MySQL, "SELECT x FROM v2").unwrap(),
+                readyset_sql::ast::TrxCachePolicy::Never,
+                None,
+                None,
+            ),
+            Dialect::DEFAULT_MYSQL,
+        ))
+        .await
+        .is_ok()
+    }
 
     shutdown_tx.shutdown().await;
 }
@@ -9353,33 +9519,42 @@ async fn evict_single() {
     readyset_tracing::init_test_logging();
     let (mut g, shutdown_tx) = start_simple_unsharded("evict_single").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE TABLE t1 (x int, y int);"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE TABLE t1 (x int, y int);"],
+                Dialect::DEFAULT_MYSQL,
+            )
+                .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
-    g.extend_recipe(ChangeList::from_change(
-        Change::create_cache(
-            "q",
-            parse_select(readyset_sql::Dialect::MySQL, "SELECT x FROM t1 where y = ?").unwrap(),
-            false,
-            None,
-        ),
-        Dialect::DEFAULT_MYSQL,
-    ))
-    .await
-    .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_change(
+            Change::create_cache(
+                "q",
+                parse_select(readyset_sql::Dialect::MySQL, "SELECT x FROM t1 where y = ?").unwrap(),
+                readyset_sql::ast::TrxCachePolicy::Never,
+                None,
+                None,
+            ),
+            Dialect::DEFAULT_MYSQL,
+        ))
+        .await
+        .is_ok()
+    }
 
     // insert and query to get an item in state
     let mut t = g.table("t1").await.unwrap();
     let mut rh = g.view("q").await.unwrap().into_reader_handle().unwrap();
     t.insert(vec![1.into(), 2.into()]).await.unwrap();
-    let res = rh.lookup(&[2.into()], true).await.unwrap().into_vec();
+    let res = rh
+        .lookup(&[2.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(res, vec![vec![DfValue::from(1)]]);
 
     // Call /evict_random and ensure we get the key we just looked up. Ignores the Tag and
@@ -9395,7 +9570,11 @@ async fn evict_single() {
         .is_none());
 
     // Lookup again to fill the hole
-    let res = rh.lookup(&[2.into()], true).await.unwrap().into_vec();
+    let res = rh
+        .lookup(&[2.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(res, vec![vec![DfValue::from(1)]]);
 
     // Evicting by key should now succeed
@@ -9403,7 +9582,11 @@ async fn evict_single() {
     assert_eq!(eviction.key, vec![2.into()]);
 
     // Make sure nothing went so wrong that we can't lookup again
-    let res = rh.lookup(&[2.into()], true).await.unwrap().into_vec();
+    let res = rh
+        .lookup(&[2.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(res, vec![vec![DfValue::from(1)]]);
 
     shutdown_tx.shutdown().await;
@@ -9414,40 +9597,49 @@ async fn evict_single_intermediate_state() {
     readyset_tracing::init_test_logging();
     let (mut g, shutdown_tx) = start_simple_unsharded("evict_single_intermediate_state").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE TABLE t1 (x int, y int);"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE TABLE t1 (x int, y int);"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    }
 
     // A partially stateful intermediary node will be generated to satisfy the aggregate
     // Note: if an update to dataflow causes this migration to generate other than exactly two
     // partially stateful nodes, the test will break.
-    g.extend_recipe(ChangeList::from_change(
-        Change::create_cache(
-            "q",
-            parse_select(
-                readyset_sql::Dialect::MySQL,
-                "SELECT sum(x) FROM t1 WHERE y = ?",
-            )
-            .unwrap(),
-            false,
-            None,
-        ),
-        Dialect::DEFAULT_MYSQL,
-    ))
-    .await
-    .unwrap();
+    eventually! {
+        g.extend_recipe(ChangeList::from_change(
+            Change::create_cache(
+                "q",
+                parse_select(
+                    readyset_sql::Dialect::MySQL,
+                    "SELECT sum(x) FROM t1 WHERE y = ?",
+                )
+                    .unwrap(),
+                readyset_sql::ast::TrxCachePolicy::Never,
+                None,
+                None,
+            ),
+            Dialect::DEFAULT_MYSQL,
+        ))
+        .await
+        .is_ok()
+    }
 
     // insert and query to get an item in state
     let mut t = g.table("t1").await.unwrap();
     let mut rh = g.view("q").await.unwrap().into_reader_handle().unwrap();
     t.insert(vec![1.into(), 2.into()]).await.unwrap();
-    let res = rh.lookup(&[2.into()], true).await.unwrap().into_vec();
+    let res = rh
+        .lookup(&[2.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(res, vec![vec![DfValue::from(Decimal::new(10, 1))]]);
 
     // Call /evict_random and ensure we get the key we just looked up. Ignores the Tag and
@@ -9478,7 +9670,11 @@ async fn evict_single_intermediate_state() {
         .is_none());
 
     // Lookup again to fill the hole
-    let res = rh.lookup(&[2.into()], true).await.unwrap().into_vec();
+    let res = rh
+        .lookup(&[2.into()], Dialect::DEFAULT_MYSQL)
+        .await
+        .unwrap()
+        .into_vec();
     assert_eq!(res, vec![vec![DfValue::from(Decimal::new(10, 1))]]);
 
     // Evicting by key should now succeed
@@ -9496,25 +9692,29 @@ async fn evict_single_intermediate_state() {
 async fn check_supported_mysql_storage_engines() {
     let (mut g, shutdown_tx) = start_simple_unsharded("unsupported_engine").await;
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE TABLE test (value double) ENGINE=MEMORY;"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE TABLE test (value double) ENGINE=MEMORY;"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .expect_err("Should not replicate table with unsupported storage engine");
+        .await
+        .is_err_and(|e| !matches!(e, ReadySetError::SchemaGenerationMismatch { .. }))
+    };
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE TABLE test (value double) ENGINE=innodb;"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE TABLE test (value double) ENGINE=innodb;"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .expect("Should replicate table with supported storage engine");
+        .await
+        .is_ok()
+    }
 
     shutdown_tx.shutdown().await;
 }
@@ -9536,64 +9736,69 @@ async fn window_output_column_filter_patterns() {
     builder.set_persistence(get_persistence_params(
         "window_output_column_filter_patterns",
     ));
-    builder.set_sharding(None);
     builder.set_parsing_preset(ParsingPreset::OnlySqlparser);
     builder.set_mixed_comparisons(true);
     let (mut g, shutdown_tx) = builder.start_local_custom(authority.clone()).await.unwrap();
 
     // Test 1: Simple count with ROW_NUMBER filter (REA-6092)
-    g.extend_recipe(
-        ChangeList::from_strings_with_config(
-            vec![
-                "CREATE TABLE t1 (id int PRIMARY KEY)",
-                "CREATE CACHE q1 FROM SELECT count(*) FROM (
-                    SELECT ROW_NUMBER() OVER() AS rn FROM t1
-                ) AS inner_q WHERE inner_q.rn <= ?",
-            ],
-            Dialect::DEFAULT_MYSQL,
-            ParsingPreset::OnlySqlparser.into_config(),
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings_with_config(
+                vec![
+                    "CREATE TABLE t1 (id int PRIMARY KEY)",
+                    "CREATE CACHE q1 FROM SELECT count(*) FROM (
+                         SELECT ROW_NUMBER() OVER() AS rn FROM t1
+                     ) AS inner_q WHERE inner_q.rn <= ?",
+                ],
+                Dialect::DEFAULT_MYSQL,
+                ParsingPreset::OnlySqlparser.into_config(),
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .expect("cache creation should succeed for ROW_NUMBER with range filter");
+        .await
+        .is_ok()
+    }
 
     // Test 2: Filter on BOTH partition column AND output column (REA-6092)
     // Combining = and <= creates a BTreeMap index that triggers the bug.
-    g.extend_recipe(
-        ChangeList::from_strings_with_config(
-            vec![
-                "CREATE TABLE products (id int PRIMARY KEY, category varchar(255), qty int)",
-                "CREATE CACHE q2 FROM SELECT * FROM (
-                    SELECT *, ROW_NUMBER() OVER (PARTITION BY category ORDER BY qty) AS rn
-                    FROM products
-                ) ranked WHERE category = ? AND rn <= ?",
-            ],
-            Dialect::DEFAULT_MYSQL,
-            ParsingPreset::OnlySqlparser.into_config(),
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings_with_config(
+                vec![
+                    "CREATE TABLE products (id int PRIMARY KEY, category varchar(255), qty int)",
+                    "CREATE CACHE q2 FROM SELECT * FROM (
+SELECT *, ROW_NUMBER() OVER (PARTITION BY category ORDER BY qty) AS rn
+FROM products
+) ranked WHERE category = ? AND rn <= ?",
+                ],
+                Dialect::DEFAULT_MYSQL,
+                ParsingPreset::OnlySqlparser.into_config(),
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .expect("cache creation should succeed for partition + output column filter");
+        .await
+        .is_ok()
+    }
 
     // Test 3: DISTINCT with DENSE_RANK and range filter (REA-5942)
-    g.extend_recipe(
-        ChangeList::from_strings_with_config(
-            vec![
-                "CREATE TABLE t3 (id int PRIMARY KEY, val int)",
-                "CREATE CACHE q3 FROM SELECT DISTINCT val FROM (
-                    SELECT val, DENSE_RANK() OVER (ORDER BY val DESC) AS rnk
-                    FROM t3
-                ) AS Olap WHERE rnk <= ?",
-            ],
-            Dialect::DEFAULT_MYSQL,
-            ParsingPreset::OnlySqlparser.into_config(),
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings_with_config(
+                vec![
+                    "CREATE TABLE t3 (id int PRIMARY KEY, val int)",
+                    "CREATE CACHE q3 FROM SELECT DISTINCT val FROM (
+SELECT val, DENSE_RANK() OVER (ORDER BY val DESC) AS rnk
+FROM t3
+) AS Olap WHERE rnk <= ?",
+                ],
+                Dialect::DEFAULT_MYSQL,
+                ParsingPreset::OnlySqlparser.into_config(),
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .expect("cache creation should succeed for DISTINCT with DENSE_RANK filter");
+        .await
+        .is_ok()
+    }
 
     // Verify all views were created
     g.view("q1").await.expect("q1 should be accessible");
@@ -9607,23 +9812,21 @@ async fn window_output_column_filter_patterns() {
 async fn create_type_requires_schema() {
     let (mut g, shutdown_tx) = start_simple_unsharded("create_type_requires_schema").await;
 
-    let err = g
-        .extend_recipe(ChangeList::from_change(
-            Change::CreateType {
-                name: Relation {
-                    schema: None,
-                    name: "missing_schema".into(),
+    eventually! {
+        let res = g
+            .extend_recipe(ChangeList::from_change(
+                Change::CreateType {
+                    name: Relation {
+                        schema: None,
+                        name: "missing_schema".into(),
+                    },
+                    ty: DfType::from_enum_variants(vec!["a".to_string(), "b".to_string()], None),
                 },
-                ty: DfType::from_enum_variants(vec!["a".to_string(), "b".to_string()], None),
-            },
-            Dialect::DEFAULT_POSTGRESQL,
-        ))
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("must be schema-qualified"),
-        "unexpected error: {err}"
-    );
+                Dialect::DEFAULT_POSTGRESQL,
+            ))
+            .await;
+        res.is_err_and(|e| e.to_string().contains("must be schema-qualified"))
+    };
 
     shutdown_tx.shutdown().await;
 }
@@ -9640,20 +9843,22 @@ async fn schema_catalog() {
     assert_eq!(initial_catalog.uncompiled_views.len(), 0);
     assert_eq!(initial_catalog.custom_types.len(), 0);
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE TABLE users (id int PRIMARY KEY, name varchar(255));",
-                "CREATE TABLE posts (id int PRIMARY KEY, user_id int, title varchar(255));",
-                "CREATE CACHE FROM SELECT * FROM users;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE TABLE users (id int PRIMARY KEY, name varchar(255));",
+                    "CREATE TABLE posts (id int PRIMARY KEY, user_id int, title varchar(255));",
+                    "CREATE CACHE FROM SELECT * FROM users;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+                .unwrap()
+                .with_schema_search_path(vec!["public".into()]),
         )
-        .unwrap()
-        .with_schema_search_path(vec!["public".into()]),
-    )
-    .await
-    .expect("Should be able to extend recipe with supported tables");
+        .await
+        .is_ok()
+    }
 
     // Check the schema catalog now contains the tables
     let catalog = g

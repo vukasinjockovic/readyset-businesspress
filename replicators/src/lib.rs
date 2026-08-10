@@ -3,14 +3,15 @@ pub(crate) mod mysql_connector;
 pub(crate) mod noria_adapter;
 pub(crate) mod postgres_connector;
 pub mod redis_notifier;
+pub mod replication_lag_reporter;
+pub(crate) mod row_diagnostics;
 pub mod table_filter;
 
 use std::time::{Duration, Instant};
 
 use metrics::{gauge, Gauge};
-pub use mysql_connector::MYSQL_INTERNAL_DBS;
-pub use noria_adapter::{cleanup, NoriaAdapter};
-use readyset_client::metrics::recorded;
+pub use mysql_connector::{is_gtid_mode_enabled, MYSQL_INTERNAL_DBS};
+pub use noria_adapter::{cleanup, replication_slot_name, NoriaAdapter};
 use readyset_client::{TableStatus, TABLE_STATUS_REPORT_INTERVAL};
 use readyset_errors::ReadySetError;
 use readyset_sql::ast::Relation;
@@ -20,7 +21,7 @@ use strum::EnumDiscriminants;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info};
 
-/// Event notification sent to the controller.
+/// Event notification sent from the replicator to the controller.
 #[derive(Debug, EnumDiscriminants)]
 pub enum ControllerMessage {
     /// The replicator is about to begin a snapshot (initial or re-snapshot)
@@ -58,7 +59,7 @@ impl TablesSnapshottingGaugeGuard {
     /// Creates a new handle and increments the gauge by 1. The gauge is automatically decremented
     /// when the handle is dropped.
     fn new() -> Self {
-        let gauge = gauge!(recorded::REPLICATOR_TABLES_SNAPSHOTTING);
+        let gauge = gauge!(metric::REPLICATOR_TABLES_SNAPSHOTTING);
         gauge.increment(1.0);
         Self(gauge)
     }

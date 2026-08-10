@@ -10,6 +10,10 @@ autotests = false
 name = "tests"
 path = "tests.rs"
 
+[[bench]]
+name = "json_object_agg"
+harness = false
+
 [build-dependencies]
 test-discovery = { path = "../test-discovery" }
 
@@ -39,9 +43,9 @@ readyset-data = { path = "../readyset-data" }
 readyset-decimal = { path = "../readyset-decimal" }
 readyset-errors = { path = "../readyset-errors" }
 readyset-spatial = { path = "../readyset-spatial" }
-partial-map = { path = "../partial-map" }
 
 [dev-dependencies]
+criterion = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 mysql_async = { workspace = true }
@@ -49,9 +53,9 @@ nom-sql = { path = "../nom-sql" }
 postgres = { workspace = true, features = [
     "with-chrono-0_4",
     "with-eui48-1",
-    "with-uuid-0_8",
+    "with-uuid-1",
     "with-serde_json-1",
-    "with-bit-vec-0_6",
+    "with-bit-vec-0_9",
 ] }
 pretty_assertions = { workspace = true }
 readyset-sql-parsing = { path = "../readyset-sql-parsing" }
@@ -61,9 +65,9 @@ tokio = { workspace = true, features = ["full"] }
 tokio-postgres = { workspace = true, features = [
     "with-chrono-0_4",
     "with-eui48-1",
-    "with-uuid-0_8",
+    "with-uuid-1",
     "with-serde_json-1",
-    "with-bit-vec-0_6",
+    "with-bit-vec-0_9",
 ] }
 
 [lints]

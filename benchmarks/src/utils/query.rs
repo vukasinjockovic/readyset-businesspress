@@ -22,7 +22,9 @@ use database_utils::{
     DatabaseConnection, DatabaseError, DatabaseStatement, DatabaseType, QueryableConnection,
 };
 use readyset_data::DfValue;
-use readyset_sql::ast::{CacheInner, CreateCacheStatement, Literal, SqlQuery, SqlType};
+use readyset_sql::ast::{
+    CacheInner, CreateCacheStatement, Literal, SqlQuery, SqlType, TrxCachePolicy,
+};
 use readyset_sql::{Dialect, DialectDisplay};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -225,9 +227,12 @@ impl ArbitraryQueryParameters {
                 deep: Ok(Box::new(stmt.clone())),
                 shallow: Err("Not used".into()),
             },
-            always: false,
+            trx_cache_policy: TrxCachePolicy::Never,
             concurrently: false,
+            adaptive: false,
             unparsed_create_cache_statement: None,
+            topk_buffer_multiplier: None,
+            autoparam: Default::default(),
         };
 
         conn.query_drop(create_cache_query.display(conn.dialect()).to_string())
@@ -313,10 +318,12 @@ impl PreparedStatement {
         let params = statement
             .query_param_types()
             .into_iter()
-            .zip(spec.0.into_iter())
+            .zip(spec.0)
             .map(|(sql_type, annotation)| ParameterGenerationSpec {
                 column_type: sql_type.clone(),
-                generator: annotation.spec.generator_for_col(sql_type),
+                generator: annotation
+                    .spec
+                    .generator_for_col(sql_type, &mut rand::rng()),
             })
             .collect();
 
@@ -375,7 +382,10 @@ impl PreparedStatement {
 
     /// Returns just the parameters to execute our prepared statement
     pub fn generate_parameters(&mut self) -> Vec<DfValue> {
-        self.params.iter_mut().map(|t| t.generator.gen()).collect()
+        self.params
+            .iter_mut()
+            .map(|t| t.generator.gen(&mut rand::rng()))
+            .collect()
     }
 }
 
@@ -384,7 +394,7 @@ pub struct GeneratorSet(Vec<ColumnGenerator>);
 impl GeneratorSet {
     /// Generate a value from each generator into a vector
     pub fn generate(&mut self) -> Vec<DfValue> {
-        self.0.iter_mut().map(|g| g.gen()).collect()
+        self.0.iter_mut().map(|g| g.gen(&mut rand::rng())).collect()
     }
 
     /// Generate a value from each generator into a vector but scaling the output
@@ -399,7 +409,7 @@ impl GeneratorSet {
         self.0
             .iter_mut()
             .map(|g| {
-                let v = g.gen();
+                let v = g.gen(&mut rand::rng());
                 if matches!(g, ColumnGenerator::Uniform(_) | ColumnGenerator::Zipfian(_)) {
                     match v {
                         DfValue::Int(i) => DfValue::Int((i as f64 * scale) as i64),

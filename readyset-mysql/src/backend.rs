@@ -6,10 +6,11 @@ use std::fmt::Formatter;
 use std::ops::{Deref, DerefMut};
 
 use itertools::{izip, Itertools};
+use metrics::counter;
 use mysql_async::consts::StatusFlags;
 use mysql_srv::{
-    CachedSchema, Column, ColumnFlags, ColumnType, InitWriter, MsqlSrvError, MySqlShim,
-    QueryResultWriter, QueryResultsResponse, RowWriter, StatementMetaWriter,
+    CachedSchema, Column, ColumnFlags, ColumnType, MsqlSrvError, MySqlShim, QueryResultWriter,
+    QueryResultsResponse, RowWriter, StatementMetaWriter,
 };
 use readyset_adapter::backend::noria_connector::{
     MetaVariable, PreparedSelectTypes, SelectPrepareResultInner,
@@ -33,7 +34,7 @@ use upstream::StatementMeta;
 use crate::constants::DEFAULT_CHARACTER_SET;
 use crate::schema::convert_column;
 use crate::upstream::{self, CacheEntry, MySqlUpstream};
-use crate::value::mysql_value_to_dataflow_value;
+use crate::value::mysql_param_to_dataflow_value;
 use crate::{Error, MySqlQueryHandler};
 
 /// Helper struct to correctly transform a binary type value into its correct [`String`]
@@ -147,20 +148,17 @@ async fn write_column<S: AsyncRead + AsyncWrite + Unpin>(
 
         DfValue::TimestampTz(ts) => match cs.coltype {
             mysql_srv::ColumnType::MYSQL_TYPE_DATETIME
-            | mysql_srv::ColumnType::MYSQL_TYPE_DATETIME2 => rw.write_col(ts),
-            mysql_srv::ColumnType::MYSQL_TYPE_TIMESTAMP
-            | mysql_srv::ColumnType::MYSQL_TYPE_TIMESTAMP2 => {
+            | mysql_srv::ColumnType::MYSQL_TYPE_DATETIME2
+            | mysql_srv::ColumnType::MYSQL_TYPE_TIMESTAMP
+            | mysql_srv::ColumnType::MYSQL_TYPE_TIMESTAMP2 => rw.write_col(ts),
+            mysql_srv::ColumnType::MYSQL_TYPE_DATE => {
+                // NOTE: `to_chrono()` panics on a zero TIMESTAMP, so the
+                // `is_zero()` guard is load-bearing for panic prevention —
+                // do not remove without first checking `TimestampTz::to_chrono`.
                 if ts.is_zero() {
                     rw.write_col(ts)
                 } else {
-                    rw.write_col(ts.to_local())
-                }
-            }
-            ColumnType::MYSQL_TYPE_DATE => {
-                if ts.is_zero() {
-                    rw.write_col(ts)
-                } else {
-                    rw.write_col(ts.to_chrono().naive_local().date())
+                    rw.write_col(ts.to_chrono().naive_utc().date())
                 }
             }
             _ => return Err(conv_error())?,
@@ -211,8 +209,11 @@ async fn write_meta_table<S: AsyncRead + AsyncWrite + Unpin>(
     let cols = vars
         .iter()
         .map(|v| Column {
+            schema: String::new(),
             table: "".to_owned(),
+            org_table: String::new(),
             column: v.name.to_string(),
+            org_name: String::new(),
             coltype: ColumnType::MYSQL_TYPE_STRING,
             column_length: 1024,
             colflags: ColumnFlags::empty(),
@@ -241,8 +242,11 @@ async fn write_meta_variables<S: AsyncRead + AsyncWrite + Unpin>(
     // [`SHOW STATUS`](https://dev.mysql.com/doc/refman/8.0/en/show-status.html)
     let cols = vec![
         Column {
+            schema: String::new(),
             table: "".to_owned(),
+            org_table: String::new(),
             column: "Variable_name".to_string(),
+            org_name: String::new(),
             coltype: ColumnType::MYSQL_TYPE_STRING,
             column_length: 1024,
             colflags: ColumnFlags::empty(),
@@ -250,8 +254,11 @@ async fn write_meta_variables<S: AsyncRead + AsyncWrite + Unpin>(
             decimals: 0,
         },
         Column {
+            schema: String::new(),
             table: "".to_owned(),
+            org_table: String::new(),
             column: "Value".to_string(),
+            org_name: String::new(),
             coltype: ColumnType::MYSQL_TYPE_STRING,
             column_length: 1024,
             colflags: ColumnFlags::empty(),
@@ -278,8 +285,11 @@ async fn write_meta_with_header<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> io::Result<()> {
     let cols = vec![
         Column {
+            schema: String::new(),
             table: "".to_owned(),
+            org_table: String::new(),
             column: vars[0].name.to_string(),
+            org_name: String::new(),
             coltype: ColumnType::MYSQL_TYPE_STRING,
             column_length: 1024,
             colflags: ColumnFlags::empty(),
@@ -287,8 +297,11 @@ async fn write_meta_with_header<S: AsyncRead + AsyncWrite + Unpin>(
             decimals: 0,
         },
         Column {
+            schema: String::new(),
             table: "".to_owned(),
+            org_table: String::new(),
             column: vars[0].value.to_string(),
+            org_name: String::new(),
             coltype: ColumnType::MYSQL_TYPE_STRING,
             column_length: 1024,
             colflags: ColumnFlags::empty(),
@@ -487,9 +500,20 @@ where
     }
 }
 
+fn encode_text_value(s: &str, results_encoding: Encoding) -> io::Result<mysql_async::Value> {
+    let bytes = results_encoding.encode(s).map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("failed encoding text value as {results_encoding}: {e}"),
+        )
+    })?;
+    Ok(mysql_async::Value::Bytes(bytes.into_owned()))
+}
+
 async fn handle_shallow_result<S>(
     result: readyset_shallow::QueryResult<CacheEntry>,
     writer: QueryResultWriter<'_, S>,
+    results_encoding: Encoding,
     status_flags: StatusFlags,
 ) -> io::Result<()>
 where
@@ -502,7 +526,7 @@ where
     let formatted_cols = metadata
         .columns
         .iter()
-        .map(|c| c.into())
+        .map(|c| Column::from_mysql(c, metadata.columns_encoding))
         .collect::<Vec<_>>();
     let mut rw = writer.start(&formatted_cols).await?;
 
@@ -511,12 +535,18 @@ where
             CacheEntry::Text(values) | CacheEntry::Binary(values) => values,
         };
         for val in row.iter() {
-            let val: mysql_async::Value = val.try_into().map_err(|e| {
-                io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("Failed to convert DfValue to mysql::Value: {val:?}, error: {e}"),
-                )
-            })?;
+            // Text values are stored charset-canonically as UTF-8; encode them in the session's
+            // results charset. Other values (including raw bytes of binary columns) pass through.
+            let val: mysql_async::Value = match val {
+                DfValue::Text(t) => encode_text_value(t.as_str(), results_encoding)?,
+                DfValue::TinyText(t) => encode_text_value(t.as_str(), results_encoding)?,
+                _ => val.try_into().map_err(|e| {
+                    io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("Failed to convert DfValue to mysql::Value: {val:?}, error: {e}"),
+                    )
+                })?,
+            };
             rw.write_col(val)?;
         }
         rw.end_row().await?;
@@ -527,15 +557,36 @@ where
 async fn handle_upstream_result<S>(
     result: upstream::QueryResult<'_>,
     writer: QueryResultWriter<'_, S>,
-    cache: Option<CacheInsertGuard<Vec<DfValue>, CacheEntry>>,
+    cache: Option<CacheInsertGuard<readyset_adapter::shallow_key::ShallowKey, CacheEntry>>,
+    results_encoding: Encoding,
     status_flags_override: Option<StatusFlags>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     result
-        .process(Some(writer), cache, status_flags_override)
+        .process(Some(writer), cache, status_flags_override, results_encoding)
         .await
+}
+
+async fn handle_readyset_schema_result<S>(
+    result: readyset_schema::ReadysetSchemaResult,
+    writer: QueryResultWriter<'_, S>,
+    status_flags: StatusFlags,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let columns = readyset_schema::mysql::extract_columns(&result);
+    let mut rw = writer.start(&columns).await?;
+    let mut iter = result.borrowed_iter();
+    while let Some((cols, row_idx)) = iter.next_row() {
+        for col in cols {
+            rw.write_col(readyset_schema::mysql::to_mysql_value(col, row_idx))?;
+        }
+        rw.end_row().await?;
+    }
+    rw.set_status_flags(status_flags).finish().await
 }
 
 async fn handle_execute_result<S>(
@@ -552,10 +603,11 @@ where
             handle_readyset_result(result, writer, results_encoding, status_flags).await
         }
         Ok(QueryResult::Shallow(result)) => {
-            handle_shallow_result(result, writer, status_flags).await
+            handle_shallow_result(result, writer, results_encoding, status_flags).await
         }
         Ok(QueryResult::Upstream(result, cache, _)) => {
-            handle_upstream_result(result, writer, cache, Some(status_flags)).await
+            handle_upstream_result(result, writer, cache, results_encoding, Some(status_flags))
+                .await
         }
         Ok(QueryResult::UpstreamBufferedInMemory(..)) => handle_error!(
             Error::ReadySet(readyset_errors::unsupported_err!(
@@ -569,6 +621,9 @@ where
             )),
             writer
         ),
+        Ok(QueryResult::ReadysetSchema(result)) => {
+            handle_readyset_schema_result(result, writer, status_flags).await
+        }
         Err(error) => handle_error!(error, writer),
     }
 }
@@ -598,6 +653,14 @@ where
         self.build_status_flags()
     }
 
+    fn client_encoding(&self) -> Encoding {
+        self.noria.connectors.noria.client_encoding()
+    }
+
+    fn results_encoding(&self) -> Encoding {
+        self.noria.connectors.noria.results_encoding()
+    }
+
     fn on_connect_attrs(&mut self, attrs: &HashMap<&str, &str>) {
         if attrs
             .get("_program_name")
@@ -619,6 +682,7 @@ where
         use noria_connector::PrepareResult::*;
 
         trace!("delegate");
+        let results_encoding = self.noria.connectors.noria.results_encoding();
         let prepare_result = self
             .prepare(query, (), PreparedStatementType::Named)
             .await
@@ -672,8 +736,14 @@ where
                     ..
                 }),
             )) => {
-                let params = params.iter().map(|c| c.into()).collect::<Vec<_>>();
-                let schema = schema.iter().map(|c| c.into()).collect::<Vec<_>>();
+                let params = params
+                    .iter()
+                    .map(|c| Column::from_mysql(c, results_encoding))
+                    .collect::<Vec<_>>();
+                let schema = schema
+                    .iter()
+                    .map(|c| Column::from_mysql(c, results_encoding))
+                    .collect::<Vec<_>>();
                 schema_cache.remove(&statement_id);
                 info.reply(statement_id, &params, &schema).await
             }
@@ -728,10 +798,13 @@ where
     ) -> io::Result<()> {
         // TODO(DAN): Param conversions are unnecessary for fallback execution. Params should be
         // derived directly from ParamParser.
+        let client_encoding = self.noria.connectors.noria.client_encoding();
         let params_result = params
             .into_iter()
             .flat_map(|p| {
-                p.map(|pval| mysql_value_to_dataflow_value(pval.value).map_err(Error::from))
+                p.map(|pval| {
+                    mysql_param_to_dataflow_value(pval, client_encoding).map_err(Error::from)
+                })
             })
             .collect::<Result<Vec<DfValue>, Error>>();
 
@@ -749,7 +822,7 @@ where
             info!(target: "client_statement", "Execute: {{id: {id}, params: {:?}}}", value_params)
         }
 
-        let results_encoding = self.noria.noria.results_encoding();
+        let results_encoding = self.noria.connectors.noria.results_encoding();
         let pre_flags = self.build_status_flags();
 
         let (execute_result, post_state) = match self.execute(id, &value_params, &()).await {
@@ -766,9 +839,23 @@ where
                     mysql_schema,
                     column_types,
                     preencoded_schema,
+                    ..
                 } = match schema_cache.entry(id) {
                     // `or_insert_with` would be cleaner but we need an async closure here
-                    Entry::Occupied(schema) => schema.into_mut(),
+                    Entry::Occupied(entry) => {
+                        let cached = entry.into_mut();
+                        // A change in session character set invalidates previously encoded
+                        // metadata.
+                        if cached.encoding != results_encoding {
+                            cached.preencoded_schema = mysql_srv::prepare_column_definitions(
+                                &cached.mysql_schema,
+                                results_encoding,
+                            )
+                            .into();
+                            cached.encoding = results_encoding;
+                        }
+                        cached
+                    }
                     Entry::Vacant(entry) => {
                         let mysql_schema = convert_columns!(schema.schema, results);
                         let column_types = schema
@@ -778,12 +865,13 @@ where
                             .collect();
 
                         let preencoded_schema =
-                            mysql_srv::prepare_column_definitions(&mysql_schema);
+                            mysql_srv::prepare_column_definitions(&mysql_schema, results_encoding);
 
                         entry.insert(CachedSchema {
                             mysql_schema,
                             column_types,
                             preencoded_schema: preencoded_schema.into(),
+                            encoding: results_encoding,
                         })
                     }
                 };
@@ -819,42 +907,44 @@ where
         Ok(())
     }
 
+    async fn set_interactive(&mut self, interactive: bool) -> io::Result<()> {
+        self.noria.set_interactive(interactive);
+        Ok(())
+    }
+
     async fn set_charset(&mut self, charset: u16) -> io::Result<()> {
-        metrics::counter!(
-            readyset_client_metrics::recorded::CHARACTER_SET_USAGE,
+        counter!(
+            metric::CHARACTER_SET_USAGE,
             "type" => "protocol",
             "charset" => charset.to_string(),
         )
         .increment(1);
         let encoding = readyset_data::encoding::Encoding::from_mysql_collation_id(charset);
-        self.noria.noria.set_results_encoding(encoding);
+        let prev = self.noria.connectors.noria.client_encoding();
+        self.noria.connectors.noria.set_results_encoding(encoding);
+        self.noria.connectors.noria.set_client_encoding(encoding);
+        // Mirror the client's charset to the upstream session's character_set_results so proxied
+        // result rows come back in the client's charset. Skip the common case where the charset
+        // stays at the utf8mb4 default. Unsupported charsets (no name) leave the upstream at
+        // utf8mb4 as before.
+        if encoding != Encoding::Utf8 || prev != Encoding::Utf8 {
+            if let Some(name) = encoding.mysql_character_set_name() {
+                self.noria
+                    .set_upstream_results_character_set(name)
+                    .await
+                    .map_err(io::Error::other)?;
+            }
+        }
         Ok(())
     }
 
-    async fn on_init(&mut self, database: &str, w: Option<InitWriter<'_, S>>) -> io::Result<()> {
+    async fn on_init(&mut self, database: &str) -> io::Result<()> {
         if self.enable_statement_logging {
             info!(target: "client_statement", "database: {database}");
         }
-        match self.set_database(database).await {
-            Ok(()) => {
-                if let Some(w) = w {
-                    w.ok().await
-                } else {
-                    Ok(())
-                }
-            }
-            Err(e) => {
-                if let Some(w) = w {
-                    w.error(
-                        mysql_srv::ErrorKind::ER_UNKNOWN_ERROR,
-                        e.to_string().as_bytes(),
-                    )
-                    .await
-                } else {
-                    Err(io::Error::other(e.to_string()))
-                }
-            }
-        }
+        self.set_database(database)
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     async fn on_change_user(
@@ -892,7 +982,7 @@ where
             info!(target: "client_statement", "Query: {query}");
         }
 
-        let results_encoding = self.noria.noria.results_encoding();
+        let results_encoding = self.noria.connectors.noria.results_encoding();
         let pre_flags = self.build_status_flags();
         let (query_result, status_flags) = match self.query(query).await {
             Ok((result, state)) => (Ok(result), Self::flags_from_proxy_state(state)),
@@ -902,7 +992,7 @@ where
     }
 
     fn password_for_username(&self, username: &str) -> Option<Vec<u8>> {
-        self.users.get(username).cloned().map(String::into_bytes)
+        self.password_for_user(username).map(String::into_bytes)
     }
 
     fn require_authentication(&self) -> bool {

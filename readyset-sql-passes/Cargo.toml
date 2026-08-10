@@ -8,13 +8,17 @@ edition = "2024"
 [dependencies]
 hex = { workspace = true }
 itertools = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 vec1 = { workspace = true }
 
 # Local dependencies
 readyset-errors = { path = "../readyset-errors" }
+readyset-post-lookup = { path = "../readyset-post-lookup" }
 readyset-data = { path = "../readyset-data" }
+readyset-decimal = { path = "../readyset-decimal" }
 readyset-sql = { path = "../readyset-sql" }
 dataflow-expression = { path = "../dataflow-expression" }
 strum = { workspace = true }

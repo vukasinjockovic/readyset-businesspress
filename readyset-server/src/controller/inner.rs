@@ -8,25 +8,24 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use database_utils::{DatabaseURL, UpstreamConfig};
 use dataflow::DomainIndex;
 use failpoint_macros::failpoint;
 use futures::future::Fuse;
 use futures::{Future, FutureExt};
-use hyper::Method;
+use http::Method;
 use metrics::gauge;
 use readyset_client::consensus::{Authority, AuthorityControl};
 use readyset_client::debug::stats::PersistentStats;
-use readyset_client::internal::ReplicaAddress;
-use readyset_client::metrics::recorded;
 use readyset_client::query::QueryId;
 use readyset_client::recipe::changelist::Change;
 use readyset_client::recipe::{ChangeList, ExtendRecipeResult, ExtendRecipeSpec, MigrationStatus};
 use readyset_client::replay_path::ReplayPathInfo;
-use readyset_client::status::{CurrentStatus, ReadySetControllerStatus};
+use readyset_client::status::{CurrentStatus, ReadySetControllerStatus, ReplicationStatus};
 use readyset_client::{GraphvizOptions, TableStatus, ViewCreateRequest, WorkerDescriptor};
 use readyset_errors::{internal_err, ReadySetError, ReadySetResult};
 use readyset_sql::ast::Relation;
@@ -40,6 +39,7 @@ use readyset_util::shutdown::ShutdownReceiver;
 use readyset_util::time_scope;
 use readyset_version::RELEASE_VERSION;
 use replication_offset::ReplicationOffset;
+use replicators::replication_lag_reporter::SharedLagStatus;
 use replicators::table_filter::TableFilter;
 use replicators::{ControllerMessage, ReplicatorMessage};
 use reqwest::Url;
@@ -54,7 +54,7 @@ use tracing::{debug, error, info, info_span, warn};
 use crate::controller::events::EventsHandle;
 use crate::controller::state::{DfState, DfStateHandle};
 use crate::controller::{ControllerState, Worker, WorkerIdentifier};
-use crate::worker::WorkerRequestKind;
+use crate::worker::WorkerRequest;
 
 use super::table_status::TableStatusState;
 
@@ -80,11 +80,10 @@ type RunningMigration = Fuse<JoinHandle<ReadySetResult<()>>>;
 /// occur at any given point in time.
 pub struct Leader {
     pub(super) dataflow_state_handle: Arc<DfStateHandle>,
-    /// Number of workers to wait for before we start trying to run any domains at all
-    min_workers: usize,
     controller_uri: Url,
-    /// The amount of time to wait for a worker request to complete.
-    worker_request_timeout: Duration,
+    /// Sender end of the worker's request channel; cloned into the
+    /// `controller::Worker` we construct from a `WorkerDescriptor`.
+    worker_tx: tokio::sync::mpsc::Sender<WorkerRequest>,
     /// Interval on which to automatically run recovery as long as there are unscheduled domains
     background_recovery_interval: Duration,
     /// Are we currently trying to run recovery in the background?
@@ -114,6 +113,12 @@ pub struct Leader {
     table_statuses: TableStatusState,
     /// Any TableStatus updates sent here will update this controller's state machine.
     table_status_tx: UnboundedSender<(Relation, TableStatus)>,
+    /// Handle to the running replicator task, used to stop it for failover.
+    pub(super) replicator_handle: Option<JoinHandle<()>>,
+    /// Dedicated stop signal for the replicator task (separate from process shutdown).
+    pub(super) replicator_stop_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// Shared replication lag status, written by the replicator's background task.
+    pub(super) replication_lag_status: SharedLagStatus,
 }
 
 impl Leader {
@@ -147,8 +152,14 @@ impl Leader {
 
         // When the controller becomes the leader, we need to read updates
         // from the binlog.
-        self.start_replication_task(controller_tx, replicator_rx, telemetry_sender, shutdown_rx)
-            .await;
+        self.start_replication_task(
+            controller_tx,
+            replicator_rx,
+            telemetry_sender,
+            shutdown_rx,
+            true, // server_startup: resnapshot to capture config changes
+        )
+        .await;
     }
 
     /// Start replication/binlog synchronization in an infinite loop
@@ -157,17 +168,20 @@ impl Leader {
     /// connect again, and catch up from the binlog
     ///
     /// TODO: how to handle the case where we need a full new replica
-    async fn start_replication_task(
+    /// Returns `true` if a replication task was actually spawned, `false` if
+    /// replication was skipped due to configuration (disabled, no URL, etc.).
+    pub(super) async fn start_replication_task(
         &mut self,
         controller_tx: UnboundedSender<ControllerMessage>,
         mut replicator_rx: UnboundedReceiver<ReplicatorMessage>,
         telemetry_sender: TelemetrySender,
         mut shutdown_rx: ShutdownReceiver,
-    ) {
+        server_startup: bool,
+    ) -> bool {
         if !self.replicator_config.replication_enabled {
             let _ = controller_tx.send(ControllerMessage::SnapshotDone);
             info!("Replication disabled; skipping snapshotting and replication");
-            return;
+            return false;
         }
 
         if self.replicator_config.cdc_db_url.is_none()
@@ -180,7 +194,7 @@ impl Leader {
             // of the channel
             let _ = controller_tx.send(ControllerMessage::SnapshotDone);
             info!("No primary instance specified");
-            return;
+            return false;
         }
         let url: DatabaseURL = match self.replicator_config.get_cdc_db_url() {
             Ok(url) => url,
@@ -189,7 +203,7 @@ impl Leader {
                 if let Err(e) = controller_tx.send(ControllerMessage::UnrecoverableError(e)) {
                     error!("Failed to notify controller of replication config error: {e}");
                 }
-                return;
+                return false;
             }
         };
         let mut table_filter = match TableFilter::try_new(
@@ -207,29 +221,36 @@ impl Leader {
                 if let Err(e) = controller_tx.send(ControllerMessage::UnrecoverableError(e)) {
                     error!("Failed to notify controller of replication filter config error: {e}");
                 }
-                return;
+                return false;
             }
         };
 
-        let authority = Arc::clone(&self.authority);
+        let controller_uri = self.controller_uri.clone();
         let replicator_restart_timeout = self.replicator_config.replicator_restart_timeout;
         let config = self.replicator_config.clone();
         let replicator_statement_logging = self.replicator_statement_logging;
         let parsing_preset = self.parsing_preset;
         let table_status_tx = self.table_status_tx.clone();
+        let replication_lag_status = self.replication_lag_status.clone();
+
+        let (stop_tx, mut stop_rx) = watch::channel(false);
 
         // The replication task ideally won't panic, but if it does and we arent replicating, that
         // will mean the data we return, will be more and more stale, and the transaction logs on
         // the upstream will be filling up disk
         // So, we abort on any panic of the replicator task.
-        tokio::spawn(abort_on_panic(async move {
+        let handle = tokio::spawn(abort_on_panic(async move {
             let replication_future = async move {
                 // The replicator wants to know if we're restarting the server so that it can
                 // resnapshot to capture changes made to replication-tables.
-                let mut server_startup = true;
+                let mut server_startup = server_startup;
                 loop {
                     let noria: readyset_client::ReadySetHandle =
-                        readyset_client::ReadySetHandle::new(Arc::clone(&authority)).await;
+                        readyset_client::ReadySetHandle::make_raw(
+                            controller_uri.clone(),
+                            None,
+                            None,
+                        );
 
                     match replicators::NoriaAdapter::start(
                         noria,
@@ -243,6 +264,7 @@ impl Leader {
                         replicator_statement_logging,
                         parsing_preset,
                         table_status_tx.clone(),
+                        replication_lag_status.clone(),
                     )
                     .await
                     {
@@ -278,8 +300,13 @@ impl Leader {
             tokio::select! {
                 _ = replication_future => {},
                 _ = shutdown_rx.recv() => {},
+                _ = stop_rx.wait_for(|v| *v) => {},
             }
         }));
+
+        self.replicator_handle = Some(handle);
+        self.replicator_stop_tx = Some(stop_tx);
+        true
     }
 
     fn log_incoming_create_cache_stmts(&self, changelist: &ChangeList) {
@@ -289,7 +316,7 @@ impl Leader {
                 info!(
                     query_id = %query_id,
                     name = cc.name.as_ref().map(|n| n.display_unquoted().to_string()),
-                    always = %cc.always,
+                    trx_cache_policy = ?cc.trx_cache_policy,
                     "creating cache"
                 );
             }
@@ -300,13 +327,14 @@ impl Leader {
     #[allow(clippy::let_unit_value)]
     pub(super) async fn external_request(
         &self,
-        method: hyper::Method,
+        method: Method,
         path: &str,
         query: Option<String>,
-        body: hyper::body::Bytes,
+        body: Bytes,
         authority: &Arc<Authority>,
         leader_ready: bool,
         maintenance_mode: bool,
+        replication_stopped: bool,
     ) -> ReadySetResult<Vec<u8>> {
         macro_rules! return_serialized {
             ($expr:expr) => {{
@@ -383,16 +411,21 @@ impl Leader {
             }
             (&Method::GET | &Method::POST, "/domains") => {
                 let ds = self.dataflow_state_handle.read().await;
-                let res: HashMap<DomainIndex, Vec<Vec<Option<WorkerIdentifier>>>> = ds
+                let res: HashMap<DomainIndex, Option<WorkerIdentifier>> = ds
                     .domains
                     .iter()
-                    .map(|(di, dh)| (*di, dh.shards().map(|wis| wis.to_vec()).collect::<Vec<_>>()))
+                    .map(|(di, dh)| (*di, dh.worker().cloned()))
                     .collect();
                 return_serialized!(res)
             }
             (&Method::GET | &Method::POST, "/materialization_info") => {
                 let ds = self.dataflow_state_handle.read().await;
                 return_serialized!(ds.materialization_info().await?);
+            }
+            (&Method::POST, "/materialization_info_for_cache") => {
+                let cache: Relation = bincode::deserialize(&body)?;
+                let ds = self.dataflow_state_handle.read().await;
+                return_serialized!(ds.materialization_info_for_cache(&cache).await?);
             }
             (&Method::GET, "/allocated_bytes") => {
                 let alloc_bytes = tikv_jemalloc_ctl::epoch::mib()
@@ -406,10 +439,8 @@ impl Leader {
                 let (period, limit) = bincode::deserialize(&body)?;
                 let res: Result<(), ReadySetError> = {
                     let ds = self.dataflow_state_handle.read().await;
-                    for (_, worker) in ds.workers.iter() {
-                        worker
-                            .rpc::<()>(WorkerRequestKind::SetMemoryLimit { period, limit })
-                            .await?;
+                    for worker in ds.workers.values() {
+                        worker.set_memory_limit(period, limit).await?;
                     }
                     Ok(())
                 };
@@ -476,7 +507,7 @@ impl Leader {
             }
             (&Method::POST, "/views_info") => {
                 let (queries, dialect): (Vec<ViewCreateRequest>, _) = bincode::deserialize(&body)?;
-                gauge!(recorded::CONTROLLER_RPC_VIEWS_INFO_NUM_QUERIES,).set(queries.len() as f64);
+                gauge!(metric::CONTROLLER_RPC_VIEWS_INFO_NUM_QUERIES,).set(queries.len() as f64);
                 let ds = self.dataflow_state_handle.read().await;
                 return_serialized!(ds.views_info(queries, dialect))
             }
@@ -486,20 +517,20 @@ impl Leader {
                     let pairs = querystring::querify(query);
                     if let Some((_, worker)) = &pairs.into_iter().find(|(k, _)| *k == "w") {
                         ds.nodes_on_worker(Some(&worker.parse()?))
-                            .into_iter()
-                            .flat_map(|(_, ni)| ni)
+                            .into_values()
+                            .flatten()
                             .collect::<Vec<_>>()
                     } else {
                         ds.nodes_on_worker(None)
-                            .into_iter()
-                            .flat_map(|(_, ni)| ni)
+                            .into_values()
+                            .flatten()
                             .collect::<Vec<_>>()
                     }
                 } else {
                     // all data-flow nodes
                     ds.nodes_on_worker(None)
-                        .into_iter()
-                        .flat_map(|(_, ni)| ni)
+                        .into_values()
+                        .flatten()
                         .collect::<Vec<_>>()
                 };
                 return_serialized!(&nodes
@@ -553,6 +584,18 @@ impl Leader {
                 }?;
                 return_serialized!(res);
             }
+            (&Method::POST, "/replication_lag_status") => {
+                let status = self
+                    .replication_lag_status
+                    .read()
+                    .map_err(|e| {
+                        ReadySetError::Internal(format!(
+                            "Failed to read replication lag status: {e}"
+                        ))
+                    })?
+                    .clone();
+                return_serialized!(status);
+            }
             (&Method::POST, "/replication_offsets") => {
                 // During recovery, domains are not yet placed so we can't query replication
                 // offsets. Return a retryable error instead of a confusing NoSuchReplica error.
@@ -591,7 +634,7 @@ impl Leader {
             }
             (&Method::POST, "/status") => {
                 let ds = self.dataflow_state_handle.read().await;
-                let replication_offsets = if ds.all_replicas_placed() {
+                let replication_offsets = if ds.all_domains_placed() {
                     Some(ds.replication_offsets().await?)
                 } else {
                     None
@@ -608,6 +651,13 @@ impl Leader {
                         }
                     } else {
                         CurrentStatus::SnapshotInProgress
+                    },
+                    replication_status: if !self.replicator_config.replication_enabled {
+                        ReplicationStatus::Disabled
+                    } else if replication_stopped {
+                        ReplicationStatus::Stopped
+                    } else {
+                        ReplicationStatus::Running
                     },
 
                     max_replication_offset: replication_offsets
@@ -648,8 +698,8 @@ impl Leader {
 
                 // Flatten replay paths into ReplayPathInfo structs
                 let mut result: Vec<ReplayPathInfo> = Vec::new();
-                for (domain_idx, array) in replay_paths {
-                    for paths_map in array.into_cells().into_iter().flatten() {
+                for (domain_idx, paths) in replay_paths {
+                    if let Some(paths_map) = paths {
                         for (tag, path) in paths_map {
                             result.push(
                                 dataflow::ReplayPathWithContext {
@@ -804,11 +854,6 @@ impl Leader {
                 self.dataflow_state_handle.commit(writer, authority).await?;
                 return_serialized!(());
             }
-            (&Method::POST, "/domain_died") => {
-                let body = bincode::deserialize(&body)?;
-                self.handle_failed_domain(body).await?;
-                return_serialized!(());
-            }
             _ => Err(ReadySetError::UnknownEndpoint),
         }
     }
@@ -830,15 +875,18 @@ impl Leader {
 
             info!(%worker_uri, %reader_addr, "received registration payload from worker");
 
+            if ds.workers.contains_key(&worker_uri) {
+                return Err(internal_err!("worker {worker_uri} already registered"));
+            }
+
             let ws = Worker::new(
                 worker_uri.clone(),
                 domain_scheduling_config,
-                self.worker_request_timeout,
+                self.worker_tx.clone(),
             );
-            let domain_addresses = ds.domain_addresses();
 
             // Clean up any potential stale domains that may have been running on that worker
-            if let Err(e) = ws.rpc::<()>(WorkerRequestKind::ClearDomains).await {
+            if let Err(e) = ws.clear_domains().await {
                 error!(
                     %worker_uri,
                     %e,
@@ -846,29 +894,13 @@ impl Leader {
                 );
             }
 
-            // Then, tell the worker about the addresses of all the other domains within the cluster
-            if let Err(e) = ws
-                .rpc::<()>(WorkerRequestKind::GossipDomainInformation(domain_addresses))
-                .await
-            {
-                error!(
-                    %worker_uri,
-                    %e,
-                    "Worker could not be reached and was not updated on domain information",
-                );
-            }
-
             ds.workers.insert(worker_uri.clone(), ws);
             ds.read_addrs.insert(worker_uri, reader_addr);
 
-            info!(
-                "now have {} of {} required workers",
-                ds.workers.len(),
-                self.min_workers
-            );
+            info!("registered worker; now have {}", ds.workers.len());
         }
 
-        let dmp = if ds.workers.len() >= self.min_workers && !ds.all_replicas_placed() {
+        let dmp = if !ds.workers.is_empty() && !ds.all_domains_placed() {
             let domain_nodes = ds.unplaced_domain_nodes();
             debug!(
                 num_unplaced_domains = domain_nodes.len(),
@@ -935,7 +967,7 @@ impl Leader {
         for wi in failed {
             warn!(worker = %wi, "handling failure of worker");
             for di in ds.remove_worker(&wi) {
-                downstream_domains.extend(ds.downstream_domains(di.domain_index)?);
+                downstream_domains.extend(ds.downstream_domains(di)?);
             }
         }
 
@@ -947,7 +979,7 @@ impl Leader {
             ds.kill_domains(downstream_domains).await?;
         }
 
-        if !ds.all_replicas_placed()
+        if !ds.all_domains_placed()
             && !self
                 .background_recovery_running
                 .swap(true, Ordering::AcqRel)
@@ -1010,7 +1042,7 @@ impl Leader {
             .await
     }
 
-    pub(super) async fn handle_failed_domain(&self, addr: ReplicaAddress) -> ReadySetResult<()> {
+    pub(super) async fn handle_failed_domain(&self, addr: DomainIndex) -> ReadySetResult<()> {
         // It's important that this happens in the background not just for parallelism /
         // performance, but because the worker thread blocks on this RPC completing before it can
         // accept any additional domain requests from us - both the "run this domain" request that
@@ -1025,16 +1057,16 @@ impl Leader {
             let ds = writer.as_mut();
 
             // 1. Remove the domain from our internal state
-            let Some(dh) = ds.domains.get_mut(&addr.domain_index) else {
+            let Some(dh) = ds.domains.get_mut(&addr) else {
                 warn!(domain = %addr, "Notified about failure of unknown domain");
                 return Ok(());
             };
-            dh.remove_assignment(addr.shard, addr.replica);
+            dh.clear_assignment();
 
-            let mut domains_to_recover = vec![addr.domain_index];
+            let mut domains_to_recover = vec![addr];
 
             // 2. Kill and clean up any downstream domains
-            let downstream_domains = ds.downstream_domains(addr.domain_index)?;
+            let downstream_domains = ds.downstream_domains(addr)?;
             if !downstream_domains.is_empty() {
                 info!(
                     num_downstream_domains = downstream_domains.len(),
@@ -1044,11 +1076,18 @@ impl Leader {
                 ds.kill_domains(downstream_domains).await?;
             }
 
-            // 3. Try to recover all now-non-running domains
+            // 3. Try to recover all now-non-running domains. Skip any domain whose
+            //    `domain_nodes` entry has already been purged — that means it was reclaimed
+            //    by `reclaim_orphaned_domains` (the recipe no longer references it, so
+            //    there's nothing to re-place).
             info!(?domains_to_recover, "Recovering domains");
             let domain_nodes: HashMap<_, HashSet<_>> = domains_to_recover
                 .into_iter()
-                .map(|d| (d, ds.domain_nodes[&d].values().copied().collect()))
+                .filter_map(|d| {
+                    ds.domain_nodes
+                        .get(&d)
+                        .map(|nm| (d, nm.values().copied().collect()))
+                })
                 .collect();
             info!(num_domains = %domain_nodes.len(), "Recovering domains");
             let dmp = ds.plan_recovery(&domain_nodes).await?;
@@ -1110,7 +1149,7 @@ impl Leader {
         background_task_failed: mpsc::Sender<ReadySetError>,
         replicator_statement_logging: bool,
         replicator_config: UpstreamConfig,
-        worker_request_timeout: Duration,
+        worker_tx: mpsc::Sender<crate::worker::WorkerRequest>,
         background_recovery_interval: Duration,
         parsing_preset: ParsingPreset,
         replicator_tx: UnboundedSender<ReplicatorMessage>,
@@ -1119,8 +1158,6 @@ impl Leader {
         table_status_tx: UnboundedSender<(Relation, TableStatus)>,
         events_handle: EventsHandle,
     ) -> Self {
-        assert_ne!(state.config.min_workers, 0);
-
         let dataflow_state_handle = Arc::new(DfStateHandle::new(
             state.dataflow_state,
             Some(events_handle),
@@ -1128,12 +1165,11 @@ impl Leader {
 
         Leader {
             dataflow_state_handle,
-            min_workers: state.config.min_workers,
             controller_uri,
             replicator_statement_logging,
             replicator_config,
             authority,
-            worker_request_timeout,
+            worker_tx,
             background_recovery_interval,
             background_recovery_running: Arc::new(AtomicBool::new(false)),
             parsing_preset,
@@ -1144,6 +1180,9 @@ impl Leader {
             controller_tx,
             table_statuses,
             table_status_tx,
+            replicator_handle: None,
+            replicator_stop_tx: None,
+            replication_lag_status: Arc::new(RwLock::new(None)),
         }
     }
 }

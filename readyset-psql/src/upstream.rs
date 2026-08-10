@@ -8,6 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fallible_iterator::FallibleIterator;
 use futures::{StreamExt, TryStreamExt};
+use metrics::gauge;
 use postgres_native_tls::MakeTlsConnector;
 use postgres_types::Kind;
 use tokio::task::JoinHandle;
@@ -25,13 +26,14 @@ use psql_srv::{Column, TransferFormat};
 use readyset_adapter::upstream_database::{Refresh, UpstreamDestination, UpstreamStatementId};
 use readyset_adapter::{UpstreamConfig, UpstreamDatabase, UpstreamPrepare};
 use readyset_adapter_types::{DeallocateId, PreparedStatementType};
-use readyset_client_metrics::recorded;
 use readyset_data::DfValue;
+use readyset_data::encoding::Encoding;
 use readyset_errors::{ReadySetError, ReadySetResult, internal_err, invariant_eq, unsupported};
-use readyset_shallow::{CacheInsertGuard, QueryMetadata};
+use readyset_shallow::{CacheInsertGuard, ContentHash, QueryMetadata};
 use readyset_sql::Dialect;
-use readyset_sql::ast::{SqlIdentifier, StartTransactionStatement};
+use readyset_sql::ast::SqlIdentifier;
 use readyset_util::SizeOf;
+use readyset_util::hash::hash;
 use readyset_util::redacted::RedactedString;
 
 use crate::Error;
@@ -128,8 +130,24 @@ impl SizeOf for CacheEntry {
         size + size_of::<Self>()
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         false
+    }
+}
+
+impl ContentHash for CacheEntry {
+    fn content_hash(&self) -> u64 {
+        match self {
+            // Hash the raw wire bytes of the row; identical values produce identical bodies.
+            CacheEntry::Simple(SimpleQueryMessage::Row(row)) => hash(&(0u8, row.body().buffer())),
+            CacheEntry::Simple(SimpleQueryMessage::CommandComplete(cc)) => {
+                hash(&(1u8, cc.rows, &cc.tag))
+            }
+            // Only Row and CommandComplete are ever stored in the cache; see
+            // copy_simple_query_message.
+            CacheEntry::Simple(_) => unimplemented!("variant is never cached"),
+            CacheEntry::DfValue(values) => hash(&(2u8, values)),
+        }
     }
 }
 
@@ -176,7 +194,8 @@ impl Refresh for QueryResult {
 
     async fn refresh(
         self,
-        mut cache: CacheInsertGuard<Vec<DfValue>, Self::Entry>,
+        mut cache: CacheInsertGuard<readyset_adapter::shallow_key::ShallowKey, Self::Entry>,
+        _encoding: Encoding,
     ) -> std::io::Result<()> {
         async fn drain_resultset(resultset: Resultset) -> std::io::Result<()> {
             // Run the stream to trigger cache population.
@@ -314,6 +333,7 @@ impl UpstreamDatabase for PostgreSqlUpstream {
         upstream_config: UpstreamConfig,
         username: Option<String>,
         password: Option<String>,
+        _interactive: bool,
     ) -> Result<Self, Error> {
         let url = upstream_config
             .upstream_db_url
@@ -326,6 +346,9 @@ impl UpstreamDatabase for PostgreSqlUpstream {
         }
         if let Some(password) = password {
             pg_config.password(password);
+        }
+        if let Some(program_name) = upstream_config.program_name.as_deref() {
+            pg_config.application_name(program_name);
         }
         let user = pg_config.get_user().map(|s| s.to_owned());
 
@@ -370,7 +393,7 @@ impl UpstreamDatabase for PostgreSqlUpstream {
         let version = format!("{version} Readyset");
         let _connection_handle = tokio::spawn(connection);
         span.in_scope(|| debug!("Established connection to upstream"));
-        metrics::gauge!(recorded::CLIENT_UPSTREAM_CONNECTIONS).increment(1.0);
+        gauge!(metric::CLIENT_UPSTREAM_CONNECTIONS).increment(1.0);
 
         Ok(Self {
             client,
@@ -383,6 +406,13 @@ impl UpstreamDatabase for PostgreSqlUpstream {
     }
 
     async fn reset(&mut self) -> Result<(), Self::Error> {
+        // `DISCARD ALL` drops session-state on this upstream so that a
+        // sticky `SET LOCAL` from a previous client cannot leak into
+        // the next fill. Required for the RLS shallow cache to remain
+        // correct under transaction-mode pooling (Supavisor, PgBouncer):
+        // a Postgres backend recycled to a different logical session
+        // must not carry forward `request.jwt.claims` from the prior
+        // tenant. See open-issues RLS-15.
         self.client.simple_query("DISCARD ALL").await?;
         Ok(())
     }
@@ -645,12 +675,9 @@ impl UpstreamDatabase for PostgreSqlUpstream {
     }
 
     /// Handle starting a transaction with the upstream database.
-    async fn start_tx<'a>(
-        &'a mut self,
-        stmt: &StartTransactionStatement,
-    ) -> Result<Self::QueryResult<'a>, Error> {
+    async fn start_tx<'a>(&'a mut self, query: &'a str) -> Result<Self::QueryResult<'a>, Error> {
         Ok(QueryResult::SimpleQuery(
-            self.client.simple_query(&stmt.to_string()).await?,
+            self.client.simple_query(query).await?,
         ))
     }
 
@@ -734,6 +761,39 @@ impl UpstreamDatabase for PostgreSqlUpstream {
 
 impl Drop for PostgreSqlUpstream {
     fn drop(&mut self) {
-        metrics::gauge!(recorded::CLIENT_UPSTREAM_CONNECTIONS).decrement(1.0);
+        gauge!(metric::CLIENT_UPSTREAM_CONNECTIONS).decrement(1.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_postgres::CommandCompleteContents;
+
+    #[test]
+    fn cache_entry_content_hash() {
+        let a = CacheEntry::DfValue(vec![DfValue::from(1), DfValue::from("x")]);
+        let b = CacheEntry::DfValue(vec![DfValue::from(1), DfValue::from("x")]);
+        let c = CacheEntry::DfValue(vec![DfValue::from(2), DfValue::from("x")]);
+        assert_eq!(a.content_hash(), b.content_hash());
+        assert_ne!(a.content_hash(), c.content_hash());
+
+        let cc = |rows: u64, tag: &str| {
+            CacheEntry::Simple(SimpleQueryMessage::CommandComplete(
+                CommandCompleteContents {
+                    fields: None,
+                    rows,
+                    tag: tag.as_bytes().to_vec().into(),
+                },
+            ))
+        };
+        assert_eq!(
+            cc(1, "SELECT 1").content_hash(),
+            cc(1, "SELECT 1").content_hash()
+        );
+        assert_ne!(
+            cc(1, "SELECT 1").content_hash(),
+            cc(2, "SELECT 2").content_hash()
+        );
     }
 }

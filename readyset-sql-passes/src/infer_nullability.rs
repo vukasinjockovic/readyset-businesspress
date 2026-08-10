@@ -25,102 +25,123 @@ use crate::rewrite_utils::{
     alias_for_expr, as_sub_query_with_alias, expect_field_as_expr, get_from_item_reference_name,
 };
 use crate::unnest_subqueries::NonNullSchema;
-use dataflow_expression::BuiltinFunctionDiscriminants;
 use readyset_errors::{ReadySetResult, invariant};
 use readyset_sql::ast::{
     BinaryOperator, Column, Expr, FunctionExpr, InValue, JoinConstraint, Literal, Relation,
     SelectStatement, SqlIdentifier, TableExpr, TableExprInner, UnaryOperator,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
-use strum::IntoEnumIterator;
 
-/// Whitelist of functions whose return is non-NULL **iff** all arguments are non-NULL.
-/// Used by `call_returns_nonnull_if_all_args_nonnull` during expression inference.
-/// Keep this conservative; only include built-ins with well-known strictness.
-static FUNCS_NONNULL_IF_ALL_ARGS_NONNULL: OnceLock<HashMap<&'static str, bool>> = OnceLock::new();
-
-/// Returns `true` if the named built-in is known to produce a non-NULL result
-/// whenever **all** its arguments are non-NULL (i.e., strict in every argument).
-/// The whitelist is conservative and engine-specific.
+/// Returns `(null_rejecting, null_preserving)` for a function expression.
 ///
-/// Safety: Expanding this set incorrectly can cause false-positive nullability.
-/// Only add functions with well-known 3VL-strict semantics for all arguments.
-fn call_returns_nonnull_if_all_args_nonnull(name: &str) -> bool {
-    FUNCS_NONNULL_IF_ALL_ARGS_NONNULL
-        .get_or_init(build_nonnull_if_all_args_nonnull_functions_map)
-        .get(name.to_ascii_lowercase().as_str())
-        .is_some_and(|v| *v)
+/// - **null_rejecting**: non-NULL arguments guarantee non-NULL result (strict).
+/// - **null_preserving**: any NULL argument guarantees NULL result (NULL propagation).
+///
+/// Aggregates, window functions, and special-case functions (`COALESCE`,
+/// `IFNULL`, etc.) return `(false, false)` — their nullability is handled by
+/// dedicated logic in `infer_expr_nullability`.
+///
+/// **Important:** this match is intentionally exhaustive (no `_ =>` arm)
+/// so that adding a new variant forces explicit classification.
+fn call_null_attributes(func_expr: &FunctionExpr) -> (bool, bool) {
+    match func_expr {
+        // ── Strict scalar functions ──
+        FunctionExpr::DayOfWeek(..)
+        | FunctionExpr::Month(..)
+        | FunctionExpr::Timediff(..)
+        | FunctionExpr::Addtime(..)
+        | FunctionExpr::DateFormat(..)
+        | FunctionExpr::DateTrunc(..)
+        | FunctionExpr::Round(..)
+        | FunctionExpr::SplitPart(..)
+        | FunctionExpr::Extract { .. }
+        | FunctionExpr::Lower { .. }
+        | FunctionExpr::Upper { .. }
+        | FunctionExpr::Substring { .. }
+        | FunctionExpr::Length(..)
+        | FunctionExpr::OctetLength(..)
+        | FunctionExpr::CharLength(..)
+        | FunctionExpr::Ascii(..)
+        | FunctionExpr::Hex(..)
+        | FunctionExpr::JsonDepth(..)
+        | FunctionExpr::JsonArrayLength(..)
+        | FunctionExpr::JsonbInsert(..)
+        | FunctionExpr::JsonbPretty(..)
+        | FunctionExpr::StAsText(..)
+        | FunctionExpr::StAsWkt(..)
+        | FunctionExpr::StAsEwkt(..) => (true, true),
+
+        // ── Non-strict scalars (dialect-dependent, special semantics, or
+        //    can return NULL from non-NULL inputs) ──
+        FunctionExpr::ConvertTz(..)
+        | FunctionExpr::IfNull(..)
+        | FunctionExpr::Coalesce(..)
+        | FunctionExpr::Concat(..)
+        | FunctionExpr::ConcatWs(..)
+        | FunctionExpr::Greatest(..)
+        | FunctionExpr::Least(..)
+        | FunctionExpr::ArrayToString(..)
+        | FunctionExpr::Bucket { .. }
+        | FunctionExpr::JsonValid(..)
+        | FunctionExpr::JsonQuote(..)
+        | FunctionExpr::JsonOverlaps(..)
+        | FunctionExpr::JsonTypeof(..)
+        | FunctionExpr::JsonObject(..)
+        | FunctionExpr::JsonbObject(..)
+        | FunctionExpr::JsonBuildObject(..)
+        | FunctionExpr::JsonbBuildObject(..)
+        | FunctionExpr::JsonBuildArray(..)
+        | FunctionExpr::JsonbBuildArray(..)
+        | FunctionExpr::JsonStripNulls(..)
+        | FunctionExpr::JsonbStripNulls(..)
+        | FunctionExpr::JsonExtractPath(..)
+        | FunctionExpr::JsonbExtractPath(..)
+        | FunctionExpr::JsonExtractPathText(..)
+        | FunctionExpr::JsonbSet(..)
+        | FunctionExpr::JsonbSetLax(..) => (false, false),
+
+        // ── Aggregates ──
+        // Aggregates skip NULLs and operate over groups, so their output being
+        // non-NULL does not prove individual input values are non-NULL.
+        // `derive_from_expr` relies on `(false, _)` to avoid recursing into
+        // aggregate arguments; `infer_expr_nullability` handles aggregate
+        // output nullability with dedicated arms instead.
+        FunctionExpr::Avg { .. }
+        | FunctionExpr::Count { .. }
+        | FunctionExpr::CountStar
+        | FunctionExpr::Sum { .. }
+        | FunctionExpr::Max(..)
+        | FunctionExpr::Min(..)
+        | FunctionExpr::GroupConcat { .. }
+        | FunctionExpr::StringAgg { .. }
+        | FunctionExpr::ArrayAgg { .. }
+        | FunctionExpr::JsonObjectAgg { .. } => (false, false),
+
+        // ── Window functions ──
+        FunctionExpr::RowNumber | FunctionExpr::Rank | FunctionExpr::DenseRank => (false, false),
+
+        // ── No-paren / session functions ──
+        FunctionExpr::CurrentDate
+        | FunctionExpr::CurrentTimestamp(..)
+        | FunctionExpr::CurrentTime
+        | FunctionExpr::LocalTimestamp
+        | FunctionExpr::LocalTime
+        | FunctionExpr::CurrentUser
+        | FunctionExpr::SessionUser
+        | FunctionExpr::CurrentCatalog
+        | FunctionExpr::SqlUser => (false, false),
+
+        // ── UDF — unknown semantics ──
+        FunctionExpr::Udf { .. } => (false, false),
+    }
 }
 
-fn build_nonnull_if_all_args_nonnull_functions_map() -> HashMap<&'static str, bool> {
-    // Always add explicit arms to this match, do not use default arm here `_ =>`.
-    // We have to make sure, any newly added buil-ins will be added to this `match` explicitly.
-    BuiltinFunctionDiscriminants::iter()
-        .flat_map(|bf| match bf {
-            BuiltinFunctionDiscriminants::ConvertTZ => vec![("convert_tz", false)],
-            BuiltinFunctionDiscriminants::DayOfWeek => vec![("dayofweek", true)],
-            BuiltinFunctionDiscriminants::IfNull => vec![("ifnull", false)],
-            BuiltinFunctionDiscriminants::Month => vec![("month", true)],
-            BuiltinFunctionDiscriminants::Timediff => vec![("timediff", true)],
-            BuiltinFunctionDiscriminants::Addtime => vec![("addtime", true)],
-            BuiltinFunctionDiscriminants::DateFormat => vec![("date_format", true)],
-            BuiltinFunctionDiscriminants::Round => vec![("round", true)],
-            BuiltinFunctionDiscriminants::JsonDepth => vec![("json_depth", true)],
-            BuiltinFunctionDiscriminants::JsonValid => vec![("json_valid", false)],
-            BuiltinFunctionDiscriminants::JsonQuote => vec![("json_quote", false)],
-            BuiltinFunctionDiscriminants::JsonOverlaps => vec![("json_overlaps", true)],
-            BuiltinFunctionDiscriminants::JsonTypeof => {
-                vec![("json_typeof", false), ("jsonb_typeof", false)]
-            }
-            BuiltinFunctionDiscriminants::JsonObject => vec![("json_object", false)],
-            BuiltinFunctionDiscriminants::JsonBuildObject => {
-                vec![("json_build_object", false), ("jsonb_build_object", false)]
-            }
-            BuiltinFunctionDiscriminants::JsonArrayLength => {
-                vec![("json_array_length", true), ("jsonb_array_length", true)]
-            }
-            BuiltinFunctionDiscriminants::JsonStripNulls => {
-                vec![("json_strip_nulls", true), ("jsonb_strip_nulls", true)]
-            }
-            BuiltinFunctionDiscriminants::JsonExtractPath => vec![
-                ("json_extract_path", false),
-                ("jsonb_extract_path", false),
-                ("json_extract_path_text", false),
-                ("jsonb_extract_path_text", false),
-            ],
-            BuiltinFunctionDiscriminants::JsonbInsert => vec![("jsonb_insert", true)],
-            BuiltinFunctionDiscriminants::JsonbSet => {
-                vec![("jsonb_set", true), ("jsonb_set_lax", true)]
-            }
-            BuiltinFunctionDiscriminants::JsonbPretty => vec![("jsonb_pretty", true)],
-            BuiltinFunctionDiscriminants::Coalesce => vec![("coalesce", false)],
-            BuiltinFunctionDiscriminants::Concat => vec![("concat", true)],
-            BuiltinFunctionDiscriminants::ConcatWs => vec![("concat_ws", false)],
-            BuiltinFunctionDiscriminants::Substring => vec![("substring", true), ("substr", true)],
-            BuiltinFunctionDiscriminants::SplitPart => vec![("split_part", true)],
-            BuiltinFunctionDiscriminants::Greatest => vec![("greatest", true)],
-            BuiltinFunctionDiscriminants::Least => vec![("least", true)],
-            BuiltinFunctionDiscriminants::ArrayToString => vec![("array_to_string", true)],
-            BuiltinFunctionDiscriminants::DateTrunc => vec![("date_trunc", true)],
-            BuiltinFunctionDiscriminants::Extract => vec![("extract", false)],
-            BuiltinFunctionDiscriminants::Length => vec![
-                ("length", true),
-                ("octet_length", true),
-                ("char_length", true),
-                ("character_length", true),
-            ],
-            BuiltinFunctionDiscriminants::Ascii => vec![("ascii", true)],
-            BuiltinFunctionDiscriminants::Lower => vec![("lower", true)],
-            BuiltinFunctionDiscriminants::Upper => vec![("upper", true)],
-            BuiltinFunctionDiscriminants::Hex => vec![("hex", true)],
-            BuiltinFunctionDiscriminants::SpatialAsText => {
-                vec![("st_astext", true), ("st_aswkt", true)]
-            }
-            BuiltinFunctionDiscriminants::SpatialAsEWKT => vec![("st_asewkt", true)],
-            BuiltinFunctionDiscriminants::Bucket => vec![("bucket", false)],
-        })
-        .collect::<HashMap<&str, bool>>()
+fn is_null_rejecting_call(func_expr: &FunctionExpr) -> bool {
+    call_null_attributes(func_expr).0
+}
+
+fn is_null_preserving_call(func_expr: &FunctionExpr) -> bool {
+    call_null_attributes(func_expr).1
 }
 
 /// Identifies **strict** binary operators whose truth value in a filter is
@@ -156,8 +177,21 @@ fn is_null_rejecting_binary_op(op: &BinaryOperator) -> bool {
 /// Walks a predicate and collects **columns proven non-NULL** for surviving rows
 /// by recognizing null-rejecting constructs.
 ///
+/// This function derives **column-level** facts: "column X must be non-NULL for
+/// every row that survives the filter." It must NOT recurse into aggregate
+/// function arguments because aggregates operate over groups, skipping NULLs —
+/// the aggregate's output being non-NULL does not prove that individual input
+/// column values are non-NULL. (That output-level reasoning is handled by
+/// `infer_expr_nullability` instead.) Aggregates return `(false, false)` from
+/// `call_null_attributes`, so `is_null_rejecting_call` returns false for them
+/// and recursion stops.
+///
 /// Evidence sources:
 /// - Conjunctive descent (`AND`) and strict binary ops (e.g., `=`, `>`, `LIKE`).
+/// - Disjunctive descent (`OR`): a column is proven non-NULL only when BOTH disjuncts
+///   prove it (intersection of per-disjunct evidence). Sound under 3VL because if
+///   `P1 OR P2` is TRUE, at least one disjunct is TRUE, and a column in the intersection
+///   is rejected by whichever side held.
 /// - `x IS NOT NULL` and normalized `NOT (x IS NULL)`.
 /// - `BETWEEN` (operand/min/max must all be non-NULL to be TRUE).
 /// - `IN (...)` / `IN (subquery)` (LHS must be non-NULL to be TRUE).
@@ -173,6 +207,20 @@ fn derive_from_expr(predicate: &Expr, non_null_columns: &mut HashSet<Column>) {
         {
             derive_from_expr(lhs.as_ref(), non_null_columns);
             derive_from_expr(rhs.as_ref(), non_null_columns)
+        }
+        // `OR` -> intersection of disjunct evidence
+        Expr::BinaryOp {
+            op: BinaryOperator::Or,
+            lhs,
+            rhs,
+        } => {
+            let mut lhs_set = HashSet::new();
+            let mut rhs_set = HashSet::new();
+            derive_from_expr(lhs.as_ref(), &mut lhs_set);
+            derive_from_expr(rhs.as_ref(), &mut rhs_set);
+            for col in lhs_set.intersection(&rhs_set) {
+                non_null_columns.insert(col.clone());
+            }
         }
         // x IS NOT NULL -> null rejecting
         Expr::BinaryOp {
@@ -204,8 +252,10 @@ fn derive_from_expr(predicate: &Expr, non_null_columns: &mut HashSet<Column>) {
             derive_from_expr(min.as_ref(), non_null_columns);
             derive_from_expr(max.as_ref(), non_null_columns);
         }
-        // lhs IN (values) / lhs IN (subquery) -> null rejecting
-        Expr::In { lhs, .. } => {
+        // `x IN (...)` rejects a NULL x -- `NULL IN (anything)` is never TRUE, and
+        // `x NOT IN (values)` rejects it too. But `x NOT IN (subquery)` does NOT: an
+        // empty subquery makes `NULL NOT IN (empty)` TRUE, so a NULL x survives.
+        Expr::In { lhs, rhs, negated } if !(*negated && matches!(rhs, InValue::Subquery(_))) => {
             derive_from_expr(lhs.as_ref(), non_null_columns);
         }
         // Survived column
@@ -217,36 +267,11 @@ fn derive_from_expr(predicate: &Expr, non_null_columns: &mut HashSet<Column>) {
             derive_from_expr(expr.as_ref(), non_null_columns);
         }
         // Function calls
-        Expr::Call(func_expr) => match func_expr {
-            FunctionExpr::Call {
-                name,
-                arguments: Some(arguments),
-            } => {
-                // Never derive through COALESCE/IFNULL (result may be non-NULL even if some args are NULL)
-                if name.eq_ignore_ascii_case("coalesce") || name.eq_ignore_ascii_case("ifnull") {
-                    // intentionally no-op
-                } else if call_returns_nonnull_if_all_args_nonnull(name) {
-                    for arg in arguments {
-                        derive_from_expr(arg, non_null_columns);
-                    }
-                }
+        Expr::Call(func_expr) if is_null_rejecting_call(func_expr) => {
+            for arg in func_expr.arguments() {
+                derive_from_expr(arg, non_null_columns);
             }
-            FunctionExpr::Extract { expr, .. }
-            | FunctionExpr::Lower { expr, .. }
-            | FunctionExpr::Upper { expr, .. } => {
-                derive_from_expr(expr, non_null_columns);
-            }
-            FunctionExpr::Substring { string, pos, len } => {
-                derive_from_expr(string, non_null_columns);
-                if let Some(pos) = pos {
-                    derive_from_expr(pos, non_null_columns);
-                }
-                if let Some(len) = len {
-                    derive_from_expr(len, non_null_columns);
-                }
-            }
-            _ => {}
-        },
+        }
         // Unknown
         _ => {}
     }
@@ -333,6 +358,7 @@ fn collect_relations<'a>(
         } else if let TableExpr {
             inner: TableExprInner::Table(base_table),
             alias: Some(alias),
+            ..
         } = tab_expr
         {
             alias_to_base.insert(alias.into(), base_table.clone());
@@ -354,7 +380,7 @@ fn collect_relations<'a>(
 ///    (`present_sides`). This avoids false positives due to join-introduced NULLs.
 ///
 /// Returns the set of columns proven non-NULL at projection time.
-fn derive_from_stmt(
+pub(crate) fn derive_from_stmt(
     stmt: &SelectStatement,
     schema: &dyn NonNullSchema,
 ) -> ReadySetResult<HashSet<Column>> {
@@ -438,8 +464,73 @@ fn derive_from_stmt(
     Ok(non_null_columns)
 }
 
+/// Returns true if the expression is null-preserving:
+/// that is, it evaluates to NULL if any of its inputs are NULL.
+/// Used to detect whether expressions are safe to inline from the RHS of LEFT JOINs
+/// without breaking NULL extension semantics.
+///
+/// Aggregates return `false` here (via `is_null_preserving_call`) because they
+/// do not propagate NULLs — they skip them. This is correct: this function asks
+/// "does a NULL column value flow through to a NULL expression result?", and
+/// aggregates break that flow.
+pub(crate) fn is_expr_null_preserving(expr: &Expr) -> bool {
+    fn is_expr_null_preserving_inner(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(Literal::Null) => true,
+            Expr::Literal(_) => true,
+            Expr::Column(_) => true,
+            Expr::UnaryOp { rhs, .. } => is_expr_null_preserving_inner(rhs),
+            Expr::BinaryOp { lhs, rhs, .. } => {
+                is_expr_null_preserving_inner(lhs) && is_expr_null_preserving_inner(rhs)
+            }
+            Expr::Between {
+                operand, min, max, ..
+            } => {
+                is_expr_null_preserving_inner(operand)
+                    && is_expr_null_preserving_inner(min)
+                    && is_expr_null_preserving_inner(max)
+            }
+            Expr::In { lhs, rhs, .. } => {
+                is_expr_null_preserving_inner(lhs)
+                    && match rhs {
+                        InValue::List(values) => values.iter().all(is_expr_null_preserving_inner),
+                        _ => false,
+                    }
+            }
+            Expr::Cast { expr, .. } => is_expr_null_preserving_inner(expr),
+            Expr::CaseWhen {
+                branches,
+                else_expr,
+            } => branches
+                // We must be sure that all arms are null-preserving *and*
+                // none of them are unconditional non-null literals
+                .iter()
+                .map(|b| &b.body)
+                .chain(else_expr.as_ref().into_iter().map(|b| b.as_ref()))
+                .all(|e| {
+                    !matches!(e, Expr::Literal(lit) if !matches!(lit, Literal::Null))
+                        && is_expr_null_preserving_inner(e)
+                }),
+            Expr::Call(func_expr) if is_null_preserving_call(func_expr) => {
+                func_expr.arguments().all(is_expr_null_preserving_inner)
+            }
+            _ => false,
+        }
+    }
+
+    !matches!(expr, Expr::Literal(lit) if !matches!(lit, Literal::Null))
+        && is_expr_null_preserving_inner(expr)
+}
+
 /// Infers whether `expr` is guaranteed non-NULL given the set of columns proven
 /// non-NULL at projection time.
+///
+/// Unlike `derive_from_expr` (which extracts **column-level** non-NULL facts
+/// from predicates), this function answers an **expression-level** question:
+/// "is the result of evaluating this expression guaranteed non-NULL?"
+/// Because of this, it is the only function that handles aggregates explicitly:
+/// `COUNT` always returns non-NULL; `AVG/SUM/MIN/MAX` return non-NULL iff their
+/// argument column is non-NULL (assuming non-empty groups post-GROUP BY).
 ///
 /// Conservative 3VL-aware rules:
 /// - Literals: NULL → false; non-NULL → true
@@ -452,9 +543,9 @@ fn derive_from_stmt(
 /// - `CASE`: non-NULL only if every THEN and ELSE is non-NULL (no branch pruning)
 /// - `CAST`: mirrors argument nullability
 /// - Window: `count/rank/dense_rank/row_number` → non-NULL; others mirror argument nullability per frame (assume no empty frames)
-/// - Aggregates: `count` → non-NULL; others mirror argument nullability per group (this function is never invoked for scalar aggregates),
-/// - Calls: `coalesce/ifnull` → non-NULL if any arg is non-NULL; otherwise only functions
-///   whitelisted by `call_returns_nonnull_if_all_args_nonnull`
+/// - Aggregates: `count` → non-NULL; others mirror argument nullability per group
+/// - Calls: `coalesce/ifnull` → non-NULL if any arg is non-NULL; strict scalars
+///   (per `is_null_rejecting_call`) → non-NULL iff all args are non-NULL
 ///
 /// Any unrecognized construct yields `false` to avoid false positives.
 fn infer_expr_nullability(expr: &Expr, non_null_columns: &HashSet<Column>) -> ReadySetResult<bool> {
@@ -573,32 +664,25 @@ fn infer_expr_nullability(expr: &Expr, non_null_columns: &HashSet<Column>) -> Re
             | FunctionExpr::Sum { expr, .. } => {
                 infer_expr_nullability(expr.as_ref(), non_null_columns)
             }
-            // General built-in functions
-            FunctionExpr::Call {
-                name,
-                arguments: Some(arguments),
-            } => {
-                if name.eq_ignore_ascii_case("coalesce") || name.eq_ignore_ascii_case("ifnull") {
-                    for arg in arguments {
-                        if infer_expr_nullability(arg, non_null_columns)? {
-                            return Ok(true);
-                        }
+            FunctionExpr::Coalesce(..) | FunctionExpr::IfNull(..) => {
+                for arg in func_expr.arguments() {
+                    if infer_expr_nullability(arg, non_null_columns)? {
+                        return Ok(true);
                     }
-                    Ok(false)
-                } else if call_returns_nonnull_if_all_args_nonnull(name) {
-                    for arg in arguments {
-                        if !infer_expr_nullability(arg, non_null_columns)? {
-                            return Ok(false);
-                        }
-                    }
-                    Ok(true)
-                } else {
-                    // Not sure about that function NULL-ability properties.
-                    Ok(false)
                 }
+                Ok(false)
             }
-            // Avoid false positive
-            _ => Ok(false),
+            // General built-in functions
+            _ => Ok(if is_null_rejecting_call(func_expr) {
+                for arg in func_expr.arguments() {
+                    if !infer_expr_nullability(arg, non_null_columns)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            } else {
+                false
+            }),
         },
         // Avoid false positive
         _ => Ok(false),

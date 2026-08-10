@@ -45,8 +45,8 @@ use readyset_data::{DfType, PgEnumMetadata};
 use readyset_errors::ReadySetError::ReplicationFailed;
 use readyset_errors::ReadySetResult;
 use readyset_sql::ast::{
-    AlterTableStatement, Column, ColumnConstraint, ColumnSpecification, CreateTableBody,
-    CreateTableStatement, NonReplicatedRelation, NotReplicatedReason, Relation,
+    AlterTableStatement, Column, ColumnSpecification, CreateTableBody, CreateTableStatement,
+    NonReplicatedRelation, NotReplicatedReason, Relation,
 };
 use readyset_sql::Dialect;
 use readyset_sql_parsing::{
@@ -67,16 +67,23 @@ where
     T: MakeTlsConnect<pgsql::Socket> + Send,
     <T as MakeTlsConnect<pgsql::Socket>>::Stream: Send + 'static,
 {
-    let (client, conn) = config
-        .connect(tls)
-        .await
-        .map_err(|e| ReplicationFailed(format!("Failed to connect: {e}")))?;
+    let (client, conn) = config.connect(tls).await.map_err(|e| {
+        ReplicationFailed(format!(
+            "Failed to connect: {}",
+            readyset_errors::postgres_err(&e)
+        ))
+    })?;
     let conn_handle = tokio::spawn(conn);
     info!("Setting up DDL replication");
     client
         .batch_execute(include_str!("./ddl_replication.sql"))
         .await
-        .map_err(|e| ReplicationFailed(format!("Failed to install event triggers: {e}")))?;
+        .map_err(|e| {
+            ReplicationFailed(format!(
+                "Failed to install event triggers: {}",
+                readyset_errors::postgres_err(&e)
+            ))
+        })?;
     info!("Set up DDL replication");
     conn_handle.abort();
 
@@ -89,6 +96,15 @@ pub(crate) struct DdlCreateTableColumn {
     name: String,
     column_type: String,
     not_null: bool,
+    /// The upstream Postgres collation name for this column, if any. `None` for non-collatable
+    /// types (e.g. integers, where `pg_attribute.attcollation = 0`). Set to `"default"` (with
+    /// `collation_provider = Some("d")`) for columns that inherit the database default.
+    collation_name: Option<String>,
+    /// The `pg_collation.collprovider` character serialized through JSON as a 1-character string:
+    /// `"c"` (libc), `"i"` (ICU), `"b"` (builtin, PG 17+), or `"d"` (default). Same Some/None
+    /// semantics as `collation_name`.
+    #[allow(dead_code)]
+    collation_provider: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -163,6 +179,10 @@ impl DdlEvent {
                 let create_table_body: Result<_, String> = columns
                     .into_iter()
                     .map(|col| {
+                        let constraints = super::pg_column_constraints(
+                            col.not_null,
+                            col.collation_name.as_deref(),
+                        );
                         Ok(ColumnSpecification {
                             column: Column {
                                 name: col.name.into(),
@@ -174,12 +194,9 @@ impl DdlEvent {
                                 col.column_type,
                             )?,
                             generated: None,
-                            constraints: if col.not_null {
-                                vec![ColumnConstraint::NotNull]
-                            } else {
-                                vec![]
-                            },
+                            constraints,
                             comment: None,
+                            invisible: false,
                         })
                     })
                     .collect::<Result<_, _>>()
@@ -214,7 +231,11 @@ impl DdlEvent {
                             like: None,
                             options: Ok(vec![]),
                         },
-                        pg_meta: Some(PostgresTableMetadata { oid, column_oids }),
+                        pg_meta: Some(PostgresTableMetadata {
+                            oid,
+                            column_oids,
+                            replica_identity_key: None,
+                        }),
                     }),
                     Err(desc) => Ok(Change::AddNonReplicatedRelation(NonReplicatedRelation {
                         name: table,
@@ -319,7 +340,7 @@ mod tests {
         Relation, SelectSpecification, SqlType, TableExpr,
     };
     use readyset_sql_parsing::{parse_alter_table, parse_create_view};
-    use test_utils::tags;
+    use test_utils::{tags, upstream};
     use tokio::task::JoinHandle;
     use tokio::time::sleep;
     use tracing::error;
@@ -467,13 +488,21 @@ mod tests {
         Ok(serde_json::from_slice(&ddl)?)
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn create_table() {
         let client = setup("create_table").await;
 
         client
-            .simple_query("create table t1 (id integer primary key, value text, unique(value))")
+            .simple_query(
+                "create table t1 (
+                    id integer primary key,
+                    value text,
+                    s_c text collate \"C\",
+                    unique(value)
+                )",
+            )
             .await
             .unwrap();
 
@@ -503,13 +532,25 @@ mod tests {
                             attnum: 1,
                             name: "id".into(),
                             column_type: "integer".into(),
-                            not_null: true
+                            not_null: true,
+                            collation_name: None,
+                            collation_provider: None,
                         },
                         DdlCreateTableColumn {
                             attnum: 2,
                             name: "value".into(),
                             column_type: "text".into(),
-                            not_null: false
+                            not_null: false,
+                            collation_name: Some("default".into()),
+                            collation_provider: Some("d".into()),
+                        },
+                        DdlCreateTableColumn {
+                            attnum: 3,
+                            name: "s_c".into(),
+                            column_type: "text".into(),
+                            not_null: false,
+                            collation_name: Some("C".into()),
+                            collation_provider: Some("c".into()),
                         },
                     ]
                 );
@@ -531,7 +572,8 @@ mod tests {
         client.teardown().await;
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn create_table_with_reserved_keyword_as_name() {
         readyset_tracing::init_test_logging();
@@ -553,7 +595,8 @@ mod tests {
         client.teardown().await;
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn create_table_with_foreign_key_and_no_pk() {
         readyset_tracing::init_test_logging();
@@ -585,7 +628,8 @@ mod tests {
         client.teardown().await;
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn create_partitioned_table() {
         readyset_tracing::init_test_logging();
@@ -606,7 +650,8 @@ mod tests {
         }
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn alter_table() {
         let client = setup("alter_table").await;
@@ -641,7 +686,8 @@ mod tests {
         client.teardown().await;
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn alter_table_rename_column() {
         readyset_tracing::init_test_logging();
@@ -679,7 +725,8 @@ mod tests {
         client.teardown().await;
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn create_view() {
         let client = setup("create_view").await;
@@ -735,7 +782,8 @@ mod tests {
         client.teardown().await;
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn drop_table() {
         let client = setup("drop_table").await;
@@ -755,7 +803,8 @@ mod tests {
         client.teardown().await;
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn create_type() {
         let client = setup("create_type").await;
@@ -780,7 +829,8 @@ mod tests {
         client.teardown().await;
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn rollback_no_ddl() {
         readyset_tracing::init_test_logging();
@@ -809,7 +859,8 @@ mod tests {
         client.teardown().await;
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn alter_type_add_value_before() {
         readyset_tracing::init_test_logging();
@@ -859,7 +910,8 @@ mod tests {
         client.teardown().await;
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn drop_type() {
         let client = setup("drop_type").await;
@@ -882,7 +934,8 @@ mod tests {
         client.teardown().await;
     }
 
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     #[tokio::test]
     async fn rename_type() {
         let client = setup("rename_type").await;

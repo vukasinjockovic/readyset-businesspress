@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use readyset_errors::ReadySetError;
 use readyset_sql::{Dialect, DialectDisplay};
 use readyset_sql_parsing::ParsingPreset;
 use readyset_sql_passes::anonymize::{Anonymize, Anonymizer};
@@ -112,7 +111,7 @@ impl CreateSchema {
     }
 
     fn anonymize_tables(&mut self, anonymizer: &mut Anonymizer) {
-        for (_, table) in self.table_creates.iter_mut() {
+        for table in self.table_creates.values_mut() {
             tracing::trace!("create table: {table:?}");
             if let Dialect::PostgreSQL = self.dialect {
                 // HACK: strip out the backticks from these since they aren't valid in PostgreSQL
@@ -135,7 +134,7 @@ impl CreateSchema {
     }
 
     fn anonymize_views(&mut self, anonymizer: &mut Anonymizer) {
-        for (_, view) in self.view_creates.iter_mut() {
+        for view in self.view_creates.values_mut() {
             tracing::trace!("create view: {view:?}");
             *view = match readyset_sql_parsing::parse_create_view_with_config(
                 self.parsing_preset,
@@ -186,13 +185,6 @@ impl fmt::Display for CreateSchema {
 
 fn strip_backticks(table: &mut String) {
     table.retain(|c| c != '`');
-}
-
-/// Checks if the passed in ReadySetError is due to the slot slot_name not existing, such as from
-/// when trying to drop a replication slot which doesn't exist
-pub fn error_is_slot_not_found(err: &ReadySetError, slot_name: &str) -> bool {
-    err.to_string()
-        .ends_with(&format!("replication slot \"{slot_name}\" does not exist"))
 }
 
 #[cfg(test)]

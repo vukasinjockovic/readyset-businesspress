@@ -14,9 +14,8 @@ use readyset_sql_parsing::ParsingPreset;
 use readyset_telemetry_reporter::TelemetrySender;
 use readyset_util::shutdown::{self, ShutdownSender};
 
-use crate::controller::replication::ReplicationStrategy;
 use crate::handle::Handle;
-use crate::{Config, FrontierStrategy, ReuseConfigType, VolumeId};
+use crate::{Config, FrontierStrategy, ReuseConfigType};
 
 /// Used to construct a worker.
 #[derive(Clone)]
@@ -75,11 +74,6 @@ impl Builder {
         builder.set_eviction_kind(opts.eviction_kind);
         builder.set_unquery(!opts.no_unquery);
 
-        builder.set_sharding(match opts.shards {
-            0 | 1 => None,
-            x => Some(x),
-        });
-        builder.set_min_workers(opts.min_workers);
         if opts.no_partial {
             builder.disable_partial();
         }
@@ -99,22 +93,18 @@ impl Builder {
         builder.set_mixed_comparisons(opts.feature_mixed_comparisons);
         builder.set_straddled_joins(opts.feature_straddled_joins);
         builder.set_post_lookup(opts.feature_post_lookup);
-        builder.set_parsing_preset(opts.parsing_preset);
-        builder.set_worker_timeout(Duration::from_secs(opts.worker_request_timeout_seconds));
+        builder.set_parsing_preset(opts.parsing_preset.unwrap_or_else(ParsingPreset::for_prod));
         builder.set_table_request_timeout(Duration::from_secs(opts.table_request_timeout_seconds));
         builder.set_background_recovery_interval(Duration::from_secs(
             opts.background_recovery_interval_seconds,
         ));
+        builder.set_upquery_timeout(Duration::from_millis(opts.upquery_timeout_ms));
 
-        builder.set_replication_strategy(opts.domain_replication_options.into());
         builder.set_verbose_domain_metrics(opts.verbose_domain_metrics);
         builder.set_frontier_strategy(opts.materialization_frontier);
+        builder.set_non_blocking_index_build(opts.feature_non_blocking_index_build);
 
-        if let Some(volume_id) = opts.volume_id {
-            builder.set_volume_id(volume_id);
-        }
-
-        let persistence_params = PersistenceParameters::new(
+        let mut persistence_params = PersistenceParameters::new(
             opts.durability,
             Some(deployment.into()),
             Some(deployment_dir),
@@ -125,6 +115,7 @@ impl Builder {
                 .status_update_interval_secs
                 .into(),
         );
+        persistence_params.block_cache_bytes = (opts.rocksdb_block_cache_mb as usize) * 1024 * 1024;
         builder.set_persistence(persistence_params);
 
         builder.set_replicator_config(opts.replicator_config);
@@ -167,16 +158,12 @@ impl Builder {
         self.config.materialization_config.frontier_strategy = f;
     }
 
-    /// Set sharding policy for all subsequent migrations; `None` or `Some(x)` where x <= 1 disables
-    pub fn set_sharding(&mut self, shards: Option<usize>) {
-        self.config.sharding = shards.filter(|s| *s > 1);
-    }
-
-    /// Set how many workers this worker should wait for before becoming a controller. More workers
-    /// can join later, but they won't be assigned any of the initial domains.
-    pub fn set_min_workers(&mut self, min_workers: usize) {
-        assert_ne!(min_workers, 0);
-        self.config.min_workers = min_workers;
+    /// Set whether to use non-blocking index builds for base tables.
+    ///
+    /// When enabled (default), index builds use snapshot-based scanning with WAL catch-up,
+    /// allowing writes to continue during index creation.
+    pub fn set_non_blocking_index_build(&mut self, enabled: bool) {
+        self.config.materialization_config.non_blocking_index_build = enabled;
     }
 
     /// Set the memory limit (target) and how often we check it (in millis).
@@ -226,11 +213,6 @@ impl Builder {
         self.config.mir_config.allow_post_lookup = allow_post_lookup;
     }
 
-    /// Set the value of [`controller::sql::Config::worker_request_timeout`]
-    pub fn set_worker_timeout(&mut self, worker_request_timeout: Duration) {
-        self.config.worker_request_timeout = worker_request_timeout;
-    }
-
     /// Set the value of [`Config::background_recovery_interval`]
     pub fn set_background_recovery_interval(&mut self, background_recovery_interval: Duration) {
         self.config.background_recovery_interval = background_recovery_interval;
@@ -259,6 +241,29 @@ impl Builder {
         self.config.replicator_config = config;
     }
 
+    /// Enable or disable pt-heartbeat-style replication lag measurement.
+    pub fn set_replication_heartbeat(&mut self, enabled: bool) {
+        self.config.replicator_config.replication_heartbeat = enabled;
+    }
+
+    /// Set the replication lag polling interval in seconds.
+    pub fn set_replication_lag_interval(&mut self, seconds: u16) {
+        self.config.replicator_config.replication_lag_interval = seconds;
+    }
+
+    /// Set the replication tables filter (allowlist).
+    ///
+    /// Format: comma-separated `schema.table` patterns (e.g., `"mydb.t1, mydb.t2"`).
+    /// When set, only matching tables are replicated; all others are marked non-replicated.
+    pub fn set_replication_tables(&mut self, tables: Option<String>) {
+        self.config.replicator_config.replication_tables = tables;
+    }
+
+    /// Require GTID-based replication for MySQL.
+    pub fn set_require_gtid(&mut self, require: bool) {
+        self.config.replicator_config.require_gtid = require;
+    }
+
     /// Set the server ID for replication
     pub fn set_replicator_server_id(&mut self, server_id: ReplicationServerId) {
         self.config.replicator_config.replication_server_id = Some(server_id);
@@ -269,11 +274,6 @@ impl Builder {
         self.config
             .replicator_config
             .disable_upstream_ssl_verification = value;
-    }
-
-    /// Sets the strategy to use to determine how many times to replicate domains
-    pub fn set_replication_strategy(&mut self, replication_strategy: ReplicationStrategy) {
-        self.config.replication_strategy = replication_strategy
     }
 
     /// Configures this ReadySet server to accept only domains that contain reader nodes.
@@ -295,11 +295,6 @@ impl Builder {
     /// Configures this ReadySet server to be unable to become the leader
     pub fn cannot_become_leader(&mut self) {
         self.leader_eligible = false;
-    }
-
-    /// Configures the volume id associated with this server.
-    pub fn set_volume_id(&mut self, volume_id: VolumeId) {
-        self.domain_scheduling_config.volume_id = Some(volume_id);
     }
 
     /// Set the value of [`Config::abort_on_task_failure`]. See the documentation of that field for

@@ -11,17 +11,22 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use readyset_data::DfValue;
-use readyset_errors::ReadySetError;
-use readyset_sql::ast::{CacheType, Relation, SelectStatement, ShallowCacheQuery, SqlIdentifier};
-use readyset_sql::DialectDisplay;
-use readyset_sql_passes::adapter_rewrites::anonymize_shallow_query;
-use readyset_sql_passes::anonymize::{Anonymize, Anonymizer};
-use readyset_util::fmt::fmt_with;
-use readyset_util::hash::hash;
 use serde::ser::{SerializeSeq, SerializeTuple};
 use serde::{Deserialize, Serialize, Serializer};
 use vec1::Vec1;
+
+use readyset_data::DfValue;
+use readyset_errors::ReadySetError;
+use readyset_sql::ast::{
+    CacheType, Relation, SelectStatement, ShallowCacheQuery, SqlIdentifier, TrxCachePolicy,
+};
+use readyset_sql::DialectDisplay;
+use readyset_sql_passes::anonymize::{Anonymize, Anonymizer};
+use readyset_sql_passes::shallow::anonymize_shallow_query;
+use readyset_util::fmt::fmt_with;
+use readyset_util::hash::hash;
+
+use schema_catalog::SchemaGeneration;
 
 use crate::{PlaceholderIdx, ShallowViewRequest, ViewCreateRequest};
 
@@ -29,9 +34,7 @@ use crate::{PlaceholderIdx, ShallowViewRequest, ViewCreateRequest};
 /// `s1_query_id == s2_query_id` **only if** `s1 == s2`. This means that the unparsed,
 /// pre-adapter-rewrite version of a SELECT statement will not have the same `QueryId` as the
 /// parsed, rewritten version of the same SELECT statement.
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct QueryId(u64);
 
@@ -52,6 +55,11 @@ impl QueryId {
         schema_search_path: &[SqlIdentifier],
     ) -> Self {
         QueryId(hash(&(query, schema_search_path)))
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn random() -> Self {
+        QueryId(rand::random())
     }
 }
 
@@ -245,18 +253,24 @@ pub struct QueryStatus {
     pub migration_state: MigrationState,
     /// The execution info of the query, if any
     pub execution_info: Option<ExecutionInfo>,
-    /// If we should always cache the query (never proxy to upstream)
-    pub always: bool,
+    /// Controls whether the cached query is served when the connection is inside a
+    /// transaction. See [`TrxCachePolicy`].
+    pub trx_cache_policy: TrxCachePolicy,
+    /// Schema generation active when this query was last rewritten by the adapter.
+    /// `None` for shallow queries (which are schema-insensitive) or queries that entered
+    /// the cache before this field was added.
+    pub schema_generation: Option<SchemaGeneration>,
 }
 
 impl QueryStatus {
-    /// Constructs a QueryStatus with the default migration state for the query, no migration state,
-    /// and always set to false
+    /// Constructs a QueryStatus with the default migration state for the query, no
+    /// migration state, and the default transaction cache policy ([`TrxCachePolicy::Never`]).
     pub fn default_for_query(query: &Query) -> Self {
         Self {
             migration_state: MigrationState::default_for_query(query),
             execution_info: None,
-            always: false,
+            trx_cache_policy: TrxCachePolicy::default(),
+            schema_generation: None,
         }
     }
 
@@ -265,45 +279,45 @@ impl QueryStatus {
         Self {
             migration_state,
             execution_info: None,
-            always: false,
+            trx_cache_policy: TrxCachePolicy::default(),
+            schema_generation: None,
         }
     }
 
-    /// Returns true if this query status represents a [pending][] query
-    ///
-    /// [pending]: MigrationState::Pending
+    /// Returns true if the query is inlined.
+    #[must_use]
+    pub fn is_inlined(&self) -> bool {
+        self.migration_state.is_inlined()
+    }
+
+    /// Returns true if we don't yet know if this query is supported.
     #[must_use]
     pub fn is_pending(&self) -> bool {
-        self.migration_state == MigrationState::Pending
+        self.migration_state.is_pending()
     }
 
-    /// Returns true if this query status represents a [successfully migrated][] query
-    ///
-    /// [successfully migrated]: MigrationState::Successful
-    #[must_use]
-    pub fn is_successful(&self, cache_type: Option<CacheType>) -> bool {
-        matches!(self.migration_state,
-            MigrationState::Successful(t) if cache_type == Some(t) || cache_type.is_none())
-    }
-
-    /// Returns true if this query status represents an [unsupported][] query
-    ///
-    /// [unsupported]: MigrationState::Unsupported
-    #[must_use]
-    pub fn is_unsupported(&self) -> bool {
-        matches!(self.migration_state, MigrationState::Unsupported(_))
-    }
-
-    /// Returns true if this query status is supported
+    /// Returns true if the query is supported.
     #[must_use]
     pub fn is_supported(&self) -> bool {
-        self.migration_state == MigrationState::Supported
+        self.migration_state.is_supported()
     }
 
-    /// Returns true if the query should be proxied.
+    /// Returns true if this query is unsupported.
+    #[must_use]
+    pub fn is_unsupported(&self) -> bool {
+        self.migration_state.is_unsupported()
+    }
+
+    /// Returns true if this query is proxied.
     #[must_use]
     pub fn is_proxied(&self) -> bool {
-        self.is_unsupported() || self.is_pending() || self.is_supported()
+        self.migration_state.is_proxied()
+    }
+
+    /// Returns true if this query is cached.
+    #[must_use]
+    pub fn is_cached(&self, cache_type: Option<CacheType>) -> bool {
+        self.migration_state.is_cached(cache_type)
     }
 }
 
@@ -387,7 +401,7 @@ pub enum MigrationState {
     Unsupported(String),
     /// For deep caches, indicates that a dry run of the query has succeeded.  It's very likely but
     /// not guaranteed that migration of the query will succeed if it's attempted.  For shallow
-    /// caches, indicates that we successfully prepared this query on the upstream.
+    /// caches, indicates that we successfully ran/prepared this query on the upstream.
     Supported,
 }
 
@@ -404,22 +418,41 @@ impl MigrationState {
         }
     }
 
-    /// Returns true if the query is inlined
+    /// Returns true if this query is inlined.
+    #[must_use]
     pub fn is_inlined(&self) -> bool {
-        matches!(self, MigrationState::Inlined(_))
+        matches!(self, MigrationState::Inlined(..))
     }
 
-    /// Returns true if the migration state of the query indicates that we are still processing it
+    /// Returns true if we don't yet know if this query is supported.
+    #[must_use]
     pub fn is_pending(&self) -> bool {
         matches!(self, MigrationState::Pending)
     }
 
-    /// Returns true if the query should be considered "supported"
+    /// Returns true if the query is supported.
+    #[must_use]
     pub fn is_supported(&self) -> bool {
-        matches!(
-            self,
-            MigrationState::Supported | MigrationState::Successful(_)
-        )
+        matches!(self, MigrationState::Supported)
+    }
+
+    /// Returns true if this query is unsupported.
+    #[must_use]
+    pub fn is_unsupported(&self) -> bool {
+        matches!(self, MigrationState::Unsupported(..))
+    }
+
+    /// Returns true if this query is proxied.
+    #[must_use]
+    pub fn is_proxied(&self) -> bool {
+        self.is_pending() || self.is_supported() || self.is_unsupported()
+    }
+
+    /// Returns true if this query is cached.
+    #[must_use]
+    pub fn is_cached(&self, cache_type: Option<CacheType>) -> bool {
+        matches!(self,
+            MigrationState::Successful(t) if cache_type == Some(*t) || cache_type.is_none())
     }
 }
 

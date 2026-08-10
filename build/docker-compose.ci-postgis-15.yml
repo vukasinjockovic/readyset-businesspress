@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: docker.io/postgis/postgis:15-3.5
+    image: ${DOCKER_HUB_BASE:-docker.io}/postgis/postgis:15-3.5
     environment:
       - POSTGRES_PASSWORD=noria
       - POSTGRES_DB=noria
@@ -16,7 +16,3 @@ services:
       - ALLOW_UNAUTHENTICATED_CONNECTIONS=true
       - POSTGRESQL_HOST=postgres
       - PGHOST=postgres
-      # Some tests are currently configured to connect to a separate postgres13 instance, but those
-      # tests should run against 15 as well.
-      - PGHOST13=postgres
-      - PGPORT13=5432

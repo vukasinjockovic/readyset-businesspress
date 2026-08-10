@@ -13,8 +13,6 @@ use dataflow::prelude::*;
 use dataflow::{DomainRequest, LookupIndex};
 use petgraph::graph::NodeIndex;
 use readyset_errors::{internal, internal_err, invariant, ReadySetError, ReadySetResult};
-use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
 use tracing::{debug, error, info_span, trace};
 
 use crate::controller::keys::{self, RawReplayPath};
@@ -35,7 +33,7 @@ pub(crate) struct InvalidEdge {
 ///
 /// Note that no matter what this is set to, all nodes whose name starts with `SHALLOW_` will be
 /// placed beyond the frontier.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Default)]
 pub enum FrontierStrategy {
     /// Place no nodes beyond the frontier (this is the default).
     #[default]
@@ -72,7 +70,7 @@ enum IndexObligation {
     Replay(Index),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     /// Whether the creation of [`PacketFilter`]s for egresses before readers is enabled.
     ///
@@ -88,7 +86,6 @@ pub struct Config {
     /// return [`ReadySetError::Unsupported`].
     ///
     /// Defaults to `false`
-    #[serde(default)]
     pub allow_straddled_joins: bool,
 
     /// Strategy for determining which (partial) materializations should be placed beyond the
@@ -101,6 +98,9 @@ pub struct Config {
     ///
     /// Defaults to true.
     pub partial_enabled: bool,
+
+    /// Whether to use non-blocking index builds for base tables.
+    pub non_blocking_index_build: bool,
 }
 
 impl Default for Config {
@@ -110,6 +110,7 @@ impl Default for Config {
             allow_straddled_joins: false,
             partial_enabled: true,
             frontier_strategy: FrontierStrategy::None,
+            non_blocking_index_build: true,
         }
     }
 }
@@ -117,13 +118,9 @@ impl Default for Config {
 /// Struct containing (authoritative!) information about which nodes in a graph are materialized
 /// (store their output state either in-memory or on-disk), and in what way those materializations
 /// are indexed.
-#[serde_as]
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Default)]
 pub(in crate::controller) struct Materializations {
     /// Nodes that are (fully or partially) materialized.
-    // Skipping this field as we will rebuild the [`Materializations`] state
-    // upon recovery.
-    #[serde(skip)]
     have: HashMap<NodeIndex, Indices>,
     /// Nodes that *were* (fully or partially) as of the last time we called [`commit`].
     ///
@@ -132,32 +129,23 @@ pub(in crate::controller) struct Materializations {
     ///
     /// [`extend`]: Materializations::extend
     /// [`commit`]: Materializations::commit
-    #[serde(skip)]
     had: HashSet<NodeIndex>,
     /// Nodes materialized since the last time `commit()` was invoked.
-    #[serde(skip)]
     added: HashMap<NodeIndex, Indices>,
 
     /// Weak indices added since the last time `commit()` was invoked
-    #[serde(skip)]
     added_weak: HashMap<NodeIndex, Indices>,
 
     /// Readers added since the last time `commit()` was invoked.
-    #[serde(skip)]
     new_readers: HashSet<NodeIndex>,
 
     /// A list of replay paths for each node, indexed by tag.
-    #[serde_as(as = "Vec<(_, _)>")]
     pub(in crate::controller) paths: HashMap<NodeIndex, BiHashMap<Tag, (Index, Vec<NodeIndex>)>>,
 
     /// Map of full nodes that are duplicates of partial nodes. Entries are added when we perform
     /// rerouting of full nodes found below partial nodes in migration planning.
-    #[serde_as(as = "Vec<(_, _)>")]
     pub(in crate::controller) redundant_partial: HashMap<NodeIndex, NodeIndex>,
 
-    // Skipping this field as we will rebuild the [`Materializations`] state
-    // upon recovery.
-    #[serde(skip)]
     partial: HashSet<NodeIndex>,
 
     pub(in crate::controller) tag_generator: usize,
@@ -297,8 +285,8 @@ impl Materializations {
                     .collect()
             };
 
-            if indices.is_empty() && n.is_base() {
-                // we must *always* materialize base nodes
+            if indices.is_empty() && n.is_source() {
+                // we must *always* materialize base and constant nodes
                 // so, just make up some column to index on
                 indices.insert(
                     ni,
@@ -341,8 +329,8 @@ impl Materializations {
                             .iter()
                             .map(|&col| {
                                 if !n.is_internal() {
-                                    if n.is_base() {
-                                        internal!("map_indices called with base table");
+                                    if n.is_source() {
+                                        internal!("map_indices called with base or constant table");
                                     }
                                     return Ok(col);
                                 }
@@ -460,7 +448,7 @@ impl Materializations {
         let mut ordered = Vec::with_capacity(graph.node_count());
         let mut topo = petgraph::visit::Topo::new(graph as &Graph);
         while let Some(node) = topo.next(graph as &Graph) {
-            if graph[node].is_source() {
+            if graph[node].is_graph_root() {
                 continue;
             }
             if graph[node].is_dropped() {
@@ -491,8 +479,8 @@ impl Materializations {
             let mut able = self.config.partial_enabled;
             let mut add = HashMap::new();
 
-            // bases can't be partial
-            if graph[ni].is_base() {
+            // bases and constants can't be partial
+            if graph[ni].is_source() {
                 able = false;
             }
 
@@ -940,71 +928,6 @@ impl Materializations {
             drop(non_purge);
         }
 
-        // check that we don't have any cases where a subgraph is sharded by one column, and then
-        // has a replay path on a duplicated copy of that column. for example, a join with
-        // [B(0, 0), R(0)] where the join's subgraph is sharded by .0, but a downstream replay path
-        // looks up by .1. this causes terrible confusion where the target (correctly) queries only
-        // one shard, but the shard merger expects to have to wait for all shards (since the replay
-        // key and the sharding key do not match at the shard merger).
-        {
-            for &node in new {
-                let n = &graph[node];
-                if !n.is_shard_merger() {
-                    continue;
-                }
-
-                // we don't actually store replay paths anywhere in Materializations (perhaps we
-                // should). however, we can check a proxy for the necessary property by making sure
-                // that our parent's sharding key is never aliased. this will lead to some false
-                // positives (all replay paths may use the same alias as we shard by), but we'll
-                // deal with that.
-                let parent = graph
-                    .neighbors_directed(node, petgraph::EdgeDirection::Incoming)
-                    .next()
-                    .ok_or_else(|| internal_err!("shard mergers must have a parent"))?;
-                let psharding = graph[parent].sharded_by();
-
-                if let Sharding::ByColumn(col, _) = psharding {
-                    // we want to resolve col all the way to its nearest materialized ancestor.
-                    // and then check whether any other cols of the parent alias that source column
-                    let columns: Vec<_> = (0..n.columns().len()).collect();
-                    for path in keys::provenance_of(graph, parent, &columns[..])? {
-                        let (mat_anc, cols) = path
-                            .into_iter()
-                            .find(|&(n, _)| self.have.contains_key(&n))
-                            .ok_or_else(|| {
-                                internal_err!(
-                                    "since bases are materialized, \
-                                 every path must eventually have a materialized node",
-                                )
-                            })?;
-                        let src = cols[col];
-                        if src.is_none() {
-                            continue;
-                        }
-
-                        if let Some((c, res)) = cols
-                            .iter()
-                            .enumerate()
-                            .find(|&(c, res)| c != col && res == &src)
-                        {
-                            // another column in the merger's parent resolved to the source column!
-                            //println!("{}", graphviz(graph, &self));
-                            error!(
-                                parent = %mat_anc.index(),
-                                aliased = ?res,
-                                sharded = %parent.index(),
-                                alias = c,
-                                shard = col,
-                                "attempting to merge sharding by aliased column"
-                            );
-                            internal!("attempting to merge sharding by aliased column (parent {:?}, aliased {:?}, sharded {:?}, alias {:?}, shard {:?})", mat_anc.index(), res, parent.index(), c, col)
-                        }
-                    }
-                }
-            }
-        }
-
         Ok(None)
     }
 
@@ -1023,7 +946,7 @@ impl Materializations {
         let mut make = Vec::with_capacity(new.len());
         let mut topo = petgraph::visit::Topo::new(&*graph);
         while let Some(node) = topo.next(&*graph) {
-            if graph[node].is_source() {
+            if graph[node].is_graph_root() {
                 continue;
             }
             if graph[node].is_dropped() {
@@ -1215,8 +1138,9 @@ impl Materializations {
         }
 
         if n.is_base() {
-            // a new base must be empty, so we can materialize it immediately
-            debug!(node = %ni.index(), "no need to replay empty new base");
+            // a new base table must be empty (or already populated), so we can
+            // materialize it immediately
+            debug!(node = %ni.index(), "no need to replay empty new base table");
             assert!(!self.partial.contains(&ni));
             return Ok(());
         }
@@ -1315,7 +1239,6 @@ impl Materializations {
                     DomainRequest::StartReplay {
                         tag: pending.tag,
                         from: pending.source,
-                        replicas: None,
                         targeting_domain: pending.target_domain,
                     },
                 )?;

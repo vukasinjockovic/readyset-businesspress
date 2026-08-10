@@ -1,4 +1,4 @@
-use crate::infer_nullability::infer_select_field_nullability;
+use crate::infer_nullability::{derive_from_stmt, infer_select_field_nullability};
 use crate::rewrite_utils::expect_field_as_expr;
 use crate::unnest_subqueries::NonNullSchema;
 use readyset_sql::Dialect;
@@ -81,13 +81,13 @@ fn assert_nullability(sql: &str, expect_non_null: bool, schema: &dyn NonNullSche
 
 #[test]
 fn null_inf_01_where_is_not_null_plus_concat_call() {
-    // WHERE proves s.city non-NULL; concat is strict → result non-NULL.
+    // WHERE proves s.city non-NULL; concat is not strict → result NULL-able.
     let sql = r#"
         SELECT concat(s.city, '-ok') AS x
         FROM s
         WHERE s.city IS NOT NULL
     "#;
-    assert_nullability(sql, true, &TestSchema::new());
+    assert_nullability(sql, false, &TestSchema::new());
 }
 
 #[test]
@@ -535,7 +535,7 @@ fn null_inf_30_where_only_on_outer_base_does_not_promote_dp() {
 
 #[test]
 fn null_inf_31_concat_of_present_rhs_and_present_derived() {
-    // p present via WHERE; dp present via INNER JOIN ON; concat(strict) over both → non-NULL.
+    // p present via WHERE; dp present via INNER JOIN ON; concat(not strict) over both → NULL-able.
     let sql = r#"
         SELECT concat(p.city, (dp.c)::text) AS s
         FROM spj
@@ -548,5 +548,100 @@ fn null_inf_31_concat_of_present_rhs_and_present_derived() {
         JOIN (SELECT 1 AS t) AS t ON dp.c > 0
         WHERE p.city = 'LONDON'
         "#;
+    assert_nullability(sql, false, &TestSchema::new());
+}
+
+#[test]
+fn null_inf_32_or_same_column_both_disjuncts_promote() {
+    // Both disjuncts null-reject p.city → intersection contains p.city → p present.
+    let sql = r#"
+        SELECT p.city
+        FROM spj
+        LEFT JOIN p ON spj.pn = p.pn
+        WHERE p.city = 'LONDON' OR p.city = 'PARIS'
+        "#;
     assert_nullability(sql, true, &TestSchema::new());
+}
+
+#[test]
+fn null_inf_33_or_same_column_mixed_strict_ops_promotes() {
+    // Equality + LIKE both null-reject p.city → intersection still contains p.city.
+    let sql = r#"
+        SELECT p.city
+        FROM spj
+        LEFT JOIN p ON spj.pn = p.pn
+        WHERE p.city = 'LONDON' OR p.city LIKE 'P%'
+        "#;
+    assert_nullability(sql, true, &TestSchema::new());
+}
+
+#[test]
+fn null_inf_34_or_of_and_compounds_shared_column_promotes() {
+    // (A AND B) OR (A AND C): A is in both disjuncts; B/C are each in only one.
+    // Intersection retains p.city; p.weight (LHS-only) and p.pn (RHS-only) are excluded.
+    let sql = r#"
+        SELECT p.city
+        FROM spj
+        LEFT JOIN p ON spj.pn = p.pn
+        WHERE (p.city = 'LONDON' AND p.weight > 0)
+           OR (p.city = 'PARIS'  AND p.pn = 'P1')
+        "#;
+    assert_nullability(sql, true, &TestSchema::new());
+}
+
+#[test]
+fn null_inf_35_or_inside_and_promotes_via_disjunctive_evidence() {
+    // (A OR B) AND C: the AND arm adds C's evidence and recurses into the OR;
+    // OR's intersection of A,B contributes p.city.
+    let sql = r#"
+        SELECT p.city
+        FROM spj
+        LEFT JOIN p ON spj.pn = p.pn
+        WHERE (p.city = 'LONDON' OR p.city = 'PARIS')
+          AND spj.qty > 0
+        "#;
+    assert_nullability(sql, true, &TestSchema::new());
+}
+
+/// Direct `derive_from_stmt` probe: does the pass prove `<table>.<col>` non-NULL?
+/// Guards the null-rejection soundness that LOJ->INNER promotion depends on.
+fn derives_non_null(sql: &str, table: &str, col: &str, schema: &dyn NonNullSchema) -> bool {
+    let stmt = parse_select(sql);
+    let non_null = derive_from_stmt(&stmt, schema).expect("derive_from_stmt succeeds");
+    non_null.contains(&Column {
+        name: col.into(),
+        table: Some(table.into()),
+    })
+}
+
+#[test]
+fn derive_not_in_subquery_does_not_prove_non_null() {
+    // `x NOT IN (subquery)` is NOT null-rejecting: an empty subquery makes
+    // `NULL NOT IN (empty)` TRUE, so a NULL x survives. Proving x non-NULL here
+    // would let LOJ->INNER promotion silently drop null-extended rows.
+    let sql = "SELECT t.col FROM t WHERE t.col NOT IN (SELECT u.x FROM u)";
+    assert!(
+        !derives_non_null(sql, "t", "col", &TestSchema::new()),
+        "NOT IN (subquery) must not prove the LHS non-NULL"
+    );
+}
+
+#[test]
+fn derive_in_subquery_proves_non_null() {
+    // `x IN (subquery)` IS null-rejecting -- `NULL IN (anything)` is never TRUE.
+    let sql = "SELECT t.col FROM t WHERE t.col IN (SELECT u.x FROM u)";
+    assert!(
+        derives_non_null(sql, "t", "col", &TestSchema::new()),
+        "IN (subquery) rejects a NULL LHS"
+    );
+}
+
+#[test]
+fn derive_not_in_value_list_proves_non_null() {
+    // `x NOT IN (values)` IS null-rejecting -- `NULL NOT IN (1,2)` is UNKNOWN -> filtered.
+    let sql = "SELECT t.col FROM t WHERE t.col NOT IN (1, 2)";
+    assert!(
+        derives_non_null(sql, "t", "col", &TestSchema::new()),
+        "NOT IN (value-list) rejects a NULL LHS"
+    );
 }

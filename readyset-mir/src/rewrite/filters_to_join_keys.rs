@@ -55,35 +55,15 @@ impl FunctionProcessor<'_> {
             | FunctionExpr::Upper { expr, .. }
             | FunctionExpr::Extract { expr, .. }
             | FunctionExpr::Substring { string: expr, .. } => expr,
-            FunctionExpr::Call {
-                name,
-                arguments: Some(arguments),
-            } if matches!(
-                name.as_str(),
-                // TODO: Support more ?
-                "ascii"
-                    | "substring"
-                    | "substr"
-                    | "lower"
-                    | "upper"
-                    | "length"
-                    | "octet_length"
-                    | "char_length"
-                    | "character_length"
-                    | "hex"
-            ) =>
-            {
-                arguments.first().ok_or_else(|| {
-                    internal_err!(
-                        "Call to {} must have at least one argument",
-                        f.alias(self.dialect).unwrap_or_default()
-                    )
-                })?
-            }
+            FunctionExpr::Ascii(expr)
+            | FunctionExpr::Length(expr)
+            | FunctionExpr::OctetLength(expr)
+            | FunctionExpr::CharLength(expr)
+            | FunctionExpr::Hex(expr) => expr,
             _ => return Ok(None),
         };
 
-        Ok(match expr {
+        Ok(match expr.as_ref() {
             Expr::Column(c) => Some(Column::from(c)),
             Expr::Call(func) => self.find_column(func)?,
             _ => None,
@@ -110,7 +90,7 @@ impl FunctionProcessor<'_> {
                     .or_default()
                     .push(ProjectExpr::Expr {
                         expr: Expr::Call(f.clone()),
-                        alias: f.alias(self.dialect).unwrap_or_default().into(),
+                        alias: f.qualified_alias(self.dialect).unwrap_or_default().into(),
                     });
 
                 Ok(true)
@@ -168,20 +148,20 @@ pub(crate) fn convert_filters_to_join_keys(
                     None,
                 ),
                 (Expr::Call(f1), Expr::Column(c2)) => (
-                    Column::named(f1.alias(dialect).unwrap()),
+                    Column::named(f1.qualified_alias(dialect).unwrap()),
                     Column::from(c2.clone()),
                     Some(f1),
                     None,
                 ),
                 (Expr::Column(c1), Expr::Call(f2)) => (
                     Column::from(c1.clone()),
-                    Column::named(f2.alias(dialect).unwrap()),
+                    Column::named(f2.qualified_alias(dialect).unwrap()),
                     None,
                     Some(f2),
                 ),
                 (Expr::Call(f1), Expr::Call(f2)) => (
-                    Column::named(f1.alias(dialect).unwrap()),
-                    Column::named(f2.alias(dialect).unwrap()),
+                    Column::named(f1.qualified_alias(dialect).unwrap()),
+                    Column::named(f2.qualified_alias(dialect).unwrap()),
                     Some(f1),
                     Some(f2),
                 ),
@@ -323,9 +303,10 @@ pub(crate) fn convert_filters_to_join_keys(
                     trace!(join_idx = %ancestor_idx.index(), "Will make filter a join key");
                 }
                 MirNodeInner::Base { .. }
+                | MirNodeInner::Constant { .. }
                 | MirNodeInner::Filter { .. }
                 | MirNodeInner::Identity
-                | MirNodeInner::JoinAggregates
+                | MirNodeInner::JoinAggregates { .. }
                 | MirNodeInner::DependentJoin { .. }
                 | MirNodeInner::DependentLeftJoin { .. }
                 | MirNodeInner::ViewKey { .. }
@@ -359,7 +340,7 @@ pub(crate) fn convert_filters_to_join_keys(
                     }
                 }
 
-                for (_, projections) in projections_to_inject.iter() {
+                for projections in projections_to_inject.values() {
                     project.extend(
                         projections
                             .iter()
@@ -408,6 +389,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                     ColumnSpecification {
                         column: ast::Column::from("t1.b"),
@@ -415,6 +397,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                     ColumnSpecification {
                         column: ast::Column::from("t1.c"),
@@ -422,6 +405,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                 ],
                 primary_key: Some([Column::new(Some("t1"), "a")].into()),
@@ -447,6 +431,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                     ColumnSpecification {
                         column: ast::Column::from("t2.b"),
@@ -454,6 +439,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                 ],
                 primary_key: Some([Column::new(Some("t2"), "a")].into()),

@@ -12,19 +12,30 @@ use clap::ValueEnum;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use lru::LruCache;
-use metrics::gauge;
+use metrics::{counter, gauge};
 use parking_lot::RwLock;
 use tracing::warn;
 
-use readyset_client::metrics::recorded;
 use readyset_client::query::*;
 use readyset_client::{ShallowViewRequest, ViewCreateRequest};
 use readyset_data::DfValue;
-use readyset_sql::ast::{CacheType, Relation};
+use readyset_sql::ast::{CacheType, Relation, SqlIdentifier, TrxCachePolicy};
+
+use schema_catalog::{SchemaChangeHandler, SchemaGeneration};
 
 use crate::table_extraction_visitor::extract_referenced_tables;
 
 pub const DEFAULT_QUERY_STATUS_CAPACITY: usize = 100_000;
+
+/// Soft cap on the number of [`QueryId`]s the in-request-path shallow auto-
+/// cache filter will remember.  When this is exceeded the map is bulk-cleared
+/// and the overflow counter increments.  A realistic workload's set of
+/// ineligible queries is on the order of hundreds; crossing this cap is a
+/// signal of pathological client behaviour rather than a normal condition.
+/// Memory footprint at the cap is on the order of 100 MB (a `u64` key and a
+/// short reason `String` per entry plus `hashbrown` slot + control-byte
+/// overhead).
+pub const SHALLOW_AUTO_CREATE_SKIP_SOFT_CAP: usize = 1_000_000;
 
 /// A metadata cache for all queries that have been processed by this
 /// adapter. Thread-safe.
@@ -51,6 +62,43 @@ pub struct QueryStatusCache {
     ///
     /// Currently unused.
     placeholder_inlining: bool,
+
+    /// Maps [`QueryId`]s the in-request-path shallow-cache eligibility filter
+    /// has rejected to the reason for the rejection.  Consulted by
+    /// `try_auto_create_shallow_cache` so the AST walk only runs once per
+    /// ineligible query; the reason surfaces in `SHOW PROXIED QUERIES`.
+    ///
+    /// Strictly an implementation detail of the implicit auto-create path:
+    /// explicit `CREATE SHALLOW CACHE` DDL and `/*rs+ CREATE SHALLOW CACHE */`
+    /// hint flows do not consult it, so a stuck entry never blocks a user
+    /// from creating a cache deliberately.  Bounded by
+    /// [`SHALLOW_AUTO_CREATE_SKIP_SOFT_CAP`]; on overflow the map is bulk-
+    /// cleared and a warning is logged.
+    shallow_auto_create_skip: DashMap<QueryId, String, ahash::RandomState>,
+
+    /// Deep caches created with manual parameterization (`CREATE CACHE WITH (AUTOPARAM ...)`),
+    /// keyed by the [`QueryId`] of the *standard* (fully autoparameterized) form of their query.
+    /// Incoming SELECTs hash to that standard form, so this map is what routes them to the
+    /// manually parameterized cache. Strictly 1:1: a second manual cache with the same standard
+    /// shape but a different manual form is rejected at creation.
+    manual_caches: DashMap<QueryId, ManualCacheEntry, ahash::RandomState>,
+}
+
+/// A deep cache created with manual parameterization (`CREATE CACHE WITH (AUTOPARAM ...)`),
+/// registered under the standard (fully autoparameterized) shape of its query. See
+/// [`QueryStatusCache::manual_caches`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualCacheEntry {
+    /// The name of the manually parameterized cache; incoming SELECTs that map here are executed
+    /// against this view.
+    pub name: Relation,
+    /// The manual (registered) form of the query, used to detect idempotent re-creates vs
+    /// genuine collisions on the standard shape.
+    pub manual: ViewCreateRequest,
+    /// The literals the cache keeps inline, by position in the standard form's merged parameter
+    /// order. At execute time the incoming values at these positions must equal these literals
+    /// (else the query is a cache miss), and are stripped from the lookup key.
+    pub frozen: Vec<(usize, readyset_sql::ast::Literal)>,
 }
 
 #[derive(Debug)]
@@ -100,7 +148,7 @@ impl PersistentStatusCacheHandle {
         match self.statuses.try_write_for(Duration::from_millis(10)) {
             Some(mut status_guard) => {
                 status_guard.put(id, (q, status));
-                gauge!(recorded::QUERY_STATUS_CACHE_PERSISTENT_CACHE_SIZE)
+                gauge!(metric::QUERY_STATUS_CACHE_PERSISTENT_CACHE_SIZE)
                     .set(status_guard.len() as f64);
             }
             None => {
@@ -115,7 +163,7 @@ impl PersistentStatusCacheHandle {
             .iter()
             .filter_map(|(query_id, (query, status))| match query {
                 Query::Parsed(view) => {
-                    if status.is_successful(None) {
+                    if status.is_cached(None) {
                         Some((*query_id, view.clone(), status.clone()))
                     } else {
                         None
@@ -129,13 +177,19 @@ impl PersistentStatusCacheHandle {
             .collect::<Vec<_>>()
     }
 
-    fn proxied_list(&self, style: MigrationStyle, cache_type: CacheType) -> Vec<ProxiedQuery> {
+    fn proxied_list(
+        &self,
+        style: MigrationStyle,
+        cache_type: CacheType,
+        shallow_auto_create_skip: &DashMap<QueryId, String, ahash::RandomState>,
+    ) -> Vec<ProxiedQuery> {
         let statuses = self.statuses.read();
         statuses
             .iter()
             .filter_map(|(query_id, (query, status))| {
                 if matches!(style, MigrationStyle::Async | MigrationStyle::InRequestPath)
                     && !status.is_unsupported()
+                    && !(status.is_supported() && shallow_auto_create_skip.contains_key(query_id))
                 {
                     return None;
                 }
@@ -306,6 +360,8 @@ impl QueryStatusCache {
             persistent_handle: Default::default(),
             style: MigrationStyle::InRequestPath,
             placeholder_inlining: false,
+            shallow_auto_create_skip: Default::default(),
+            manual_caches: Default::default(),
         }
     }
 
@@ -317,7 +373,102 @@ impl QueryStatusCache {
             persistent_handle: PersistentStatusCacheHandle::with_capacity(capacity),
             style: MigrationStyle::InRequestPath,
             placeholder_inlining: false,
+            shallow_auto_create_skip: Default::default(),
+            manual_caches: Default::default(),
         }
+    }
+
+    /// Look up the manually parameterized cache registered for the given standard-form query id.
+    pub fn manual_cache(&self, id: &QueryId) -> Option<ManualCacheEntry> {
+        self.manual_caches.get(id).map(|e| e.value().clone())
+    }
+
+    /// Register a manually parameterized cache under the standard-form query id it should serve.
+    /// Re-registering the same manual form is idempotent; a different manual form colliding on
+    /// the same standard shape is rejected, returning the existing entry so the caller can name
+    /// it in the error.
+    pub fn insert_manual_cache(
+        &self,
+        id: QueryId,
+        entry: ManualCacheEntry,
+    ) -> Result<(), Box<ManualCacheEntry>> {
+        match self.manual_caches.entry(id) {
+            Entry::Occupied(occupied) => {
+                if occupied.get().manual == entry.manual {
+                    Ok(())
+                } else {
+                    Err(Box::new(occupied.get().clone()))
+                }
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(entry);
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove any manual-cache registrations pointing at the given cache name. Used by
+    /// DROP CACHE so a dropped manual cache stops capturing its standard shape.
+    pub fn remove_manual_cache_by_name(&self, name: &Relation) {
+        self.manual_caches.retain(|_, entry| entry.name != *name);
+    }
+
+    /// Remove all manual-cache registrations. Used by DROP ALL CACHES.
+    pub fn clear_manual_caches(&self) {
+        self.manual_caches.clear();
+    }
+
+    /// Returns true if the in-request-path shallow auto-create filter has
+    /// previously rejected this query; the caller should skip auto-creation
+    /// without re-walking the AST.
+    pub fn is_shallow_auto_create_skipped(&self, id: QueryId) -> bool {
+        self.shallow_auto_create_skip.contains_key(&id)
+    }
+
+    /// The reason the in-request-path filter rejected this query, if any.
+    pub fn shallow_auto_create_skip_reason(&self, id: QueryId) -> Option<String> {
+        self.shallow_auto_create_skip
+            .get(&id)
+            .map(|reason| reason.value().clone())
+    }
+
+    /// Forget all remembered auto-create rejections, so previously-skipped
+    /// queries are re-evaluated on their next execution. Called when the
+    /// shallow-cache function allowlist changes (e.g.
+    /// `ALTER READYSET ADD SHALLOW CACHE ALLOWED FUNCTION ...`): a query that
+    /// was rejected for a now-allowed function must get another chance without
+    /// requiring a restart.
+    pub fn clear_shallow_auto_create_skips(&self) {
+        self.shallow_auto_create_skip.clear();
+        gauge!(metric::SHALLOW_AUTO_CREATE_SKIP_SET_SIZE)
+            .set(self.shallow_auto_create_skip.len() as f64);
+    }
+
+    /// Record that the in-request-path filter has rejected this query, and
+    /// why.  When the map crosses [`SHALLOW_AUTO_CREATE_SKIP_SOFT_CAP`] it is
+    /// bulk-cleared, the overflow counter increments, and a warning is logged.
+    /// Reaching the cap indicates pathological client traffic (e.g. queries
+    /// with literal-injected unique values) and warrants investigation.
+    pub fn record_shallow_auto_create_skip(&self, id: QueryId, reason: String) {
+        self.shallow_auto_create_skip.insert(id, reason);
+        let len = self.shallow_auto_create_skip.len();
+        if len >= SHALLOW_AUTO_CREATE_SKIP_SOFT_CAP {
+            // A small race here is benign: concurrent inserts that all
+            // observe `len >= cap` will each clear-and-warn, but the next
+            // refill takes ~SHALLOW_AUTO_CREATE_SKIP_SOFT_CAP inserts, so
+            // duplicate log lines and counter bumps are bounded by thread
+            // count, not request rate.
+            self.shallow_auto_create_skip.clear();
+            counter!(metric::SHALLOW_AUTO_CREATE_SKIP_OVERFLOW).increment(1);
+            warn!(
+                cap = SHALLOW_AUTO_CREATE_SKIP_SOFT_CAP,
+                "Shallow auto-create skip set exceeded soft cap; bulk-cleared. \
+                 Investigate whether the workload generates pathologically \
+                 unique queries."
+            );
+        }
+        gauge!(metric::SHALLOW_AUTO_CREATE_SKIP_SET_SIZE)
+            .set(self.shallow_auto_create_skip.len() as f64);
     }
 
     /// Sets [`Self::style`]
@@ -368,7 +519,7 @@ impl QueryStatusCache {
         let id = QueryId::from(&q);
         self.id_to_status.insert(id, status.clone());
         self.persistent_handle.insert_with_status(q, id, status);
-        gauge!(recorded::QUERY_STATUS_CACHE_SIZE).set(self.id_to_status.len() as f64);
+        gauge!(metric::QUERY_STATUS_CACHE_SIZE).set(self.id_to_status.len() as f64);
         id
     }
 
@@ -405,14 +556,22 @@ impl QueryStatusCache {
     /// This function returns the query status of a query. If the query does not exist
     /// within the query status cache, an entry is created and the query is set to
     /// PendingMigration.
-    pub fn query_status<Q>(&self, q: &Q) -> QueryStatus
+    ///
+    /// `schema_generation` is the generation the caller rewrote `q` under, and is recorded
+    /// alongside the entry. `CREATE CACHE FROM <query_id>` reads it back, so taking it as a
+    /// parameter here leaves no way to put a query into the cache without it.
+    pub fn query_status<Q>(&self, q: &Q, schema_generation: SchemaGeneration) -> QueryStatus
     where
         Q: QueryStatusKey,
     {
-        match q.with_status(self, |s| s.cloned()) {
+        let mut status = match q.with_status(self, |s| s.cloned()) {
             Some(s) => s,
             None => QueryStatus::with_migration_state(self.insert(q.clone()).1),
-        }
+        };
+        self.set_schema_generation(q, schema_generation);
+        // Callers write whole statuses back, so the returned copy carries the generation too.
+        status.schema_generation = Some(schema_generation);
+        status
     }
 
     /// Try to return the query status of a query.  Does not modify the query status cache.
@@ -539,18 +698,38 @@ impl QueryStatusCache {
                 QueryStatus {
                     migration_state: MigrationState::Pending,
                     execution_info: None,
-                    always: false,
+                    trx_cache_policy: TrxCachePolicy::default(),
+                    schema_generation: None,
                 },
             );
         }
     }
 
+    /// Updates the stored schema generation for a query that already exists in the cache.
+    ///
+    /// Private so that the generation cannot be stamped independently of the insert that
+    /// [`Self::query_status`] pairs it with.
+    fn set_schema_generation<Q>(&self, q: &Q, schema_generation: SchemaGeneration)
+    where
+        Q: QueryStatusKey,
+    {
+        q.with_mut_status(self, |status| {
+            if let Some(status) = status {
+                status.schema_generation = Some(schema_generation);
+            }
+        });
+    }
+
     /// Updates a query's migration state to `m` unless the query's migration state was
     /// `MigrationState::Inlined`. An Inlined query can only transition to the Unsupported state.
     ///
-    /// If provided, also updates this query's ALWAYS status.
-    pub fn update_query_migration_state<Q>(&self, q: &Q, m: MigrationState, always: Option<bool>)
-    where
+    /// If provided, also updates this query's transaction cache policy.
+    pub fn update_query_migration_state<Q>(
+        &self,
+        q: &Q,
+        m: MigrationState,
+        trx_cache_policy: Option<TrxCachePolicy>,
+    ) where
         Q: QueryStatusKey,
     {
         let should_insert = q.with_mut_status(self, |s| {
@@ -566,8 +745,8 @@ impl QueryStatusCache {
                         // All other state transitions are allowed.
                         _ => s.migration_state = m.clone(),
                     }
-                    if let Some(always) = always {
-                        s.always = always;
+                    if let Some(policy) = trx_cache_policy {
+                        s.trx_cache_policy = policy;
                     }
                     false
                 }
@@ -580,7 +759,8 @@ impl QueryStatusCache {
                 QueryStatus {
                     migration_state: m,
                     execution_info: None,
-                    always: always.unwrap_or(false),
+                    trx_cache_policy: trx_cache_policy.unwrap_or_default(),
+                    schema_generation: None,
                 },
             );
         }
@@ -623,23 +803,24 @@ impl QueryStatusCache {
                         "Inlined migration not supported".to_string(),
                     ),
                     execution_info: None,
-                    always: false,
+                    trx_cache_policy: TrxCachePolicy::default(),
+                    schema_generation: None,
                 },
             );
         }
         self.persistent_handle.pending_inlined_migrations.remove(q);
     }
 
-    /// Updates the query's always flag, indicating whether the query should be served from
-    /// ReadySet regardless of autocommit state.
+    /// Updates the query's transaction cache policy, controlling how the cached query is
+    /// served when the connection is inside a transaction.
     /// Will not try to insert a query if it has not already been registered.
-    pub fn always_attempt_readyset<Q>(&self, q: &Q, always: bool)
+    pub fn set_trx_cache_policy<Q>(&self, q: &Q, trx_cache_policy: TrxCachePolicy)
     where
         Q: QueryStatusKey,
     {
         q.with_mut_status(self, |s| {
             if let Some(s) = s {
-                s.always = always;
+                s.trx_cache_policy = trx_cache_policy;
             }
         })
     }
@@ -653,6 +834,7 @@ impl QueryStatusCache {
             Some(s) => {
                 s.migration_state.clone_from(&status.migration_state);
                 s.execution_info.clone_from(&status.execution_info);
+                s.schema_generation = status.schema_generation;
                 false
             }
             None => true,
@@ -666,30 +848,30 @@ impl QueryStatusCache {
     pub fn clear(&self, cache_type: Option<CacheType>) {
         self.id_to_status
             .iter_mut()
-            .filter(|v| v.is_successful(cache_type))
+            .filter(|v| v.is_cached(cache_type))
             .for_each(|mut v| {
                 v.migration_state = MigrationState::Pending;
-                v.always = false;
+                v.trx_cache_policy = TrxCachePolicy::default();
             });
         let mut statuses = self.persistent_handle.statuses.write();
         statuses
             .iter_mut()
-            .filter(|(_query_id, (_query, status))| status.is_successful(cache_type))
+            .filter(|(_query_id, (_query, status))| status.is_cached(cache_type))
             .for_each(|(_query_id, (_query, status))| {
                 status.migration_state = MigrationState::Pending;
-                status.always = false;
+                status.trx_cache_policy = TrxCachePolicy::default();
             });
     }
 
     /// Clear all queries not marked as successful from the cache.
     pub fn clear_proxied_queries(&self) {
         self.id_to_status
-            .retain(|_query_id, status| status.is_successful(None));
+            .retain(|_query_id, status| status.is_cached(None));
 
         let mut statuses = self.persistent_handle.statuses.write();
         let keys_to_remove: Vec<QueryId> = statuses
             .iter()
-            .filter(|(_, (_, status))| !status.is_successful(None))
+            .filter(|(_, (_, status))| !status.is_cached(None))
             .map(|(query_id, _)| *query_id)
             .collect();
 
@@ -817,7 +999,8 @@ impl QueryStatusCache {
 
     /// Returns a list of queries that are proxied.
     pub fn proxied_list(&self, cache_type: CacheType) -> Vec<ProxiedQuery> {
-        self.persistent_handle.proxied_list(self.style, cache_type)
+        self.persistent_handle
+            .proxied_list(self.style, cache_type, &self.shallow_auto_create_skip)
     }
 
     /// Returns a query given a query hash
@@ -827,43 +1010,98 @@ impl QueryStatusCache {
         statuses.peek(&id).map(|(query, _status)| query.clone())
     }
 
-    /// Removes cache entries for queries that reference any of the specified tables
+    /// Returns a query and its stored schema generation given a query hash.
+    /// The schema generation reflects when the query was last rewritten by the adapter.
+    pub fn query_with_schema_generation(
+        &self,
+        id: &str,
+    ) -> Option<(Query, Option<SchemaGeneration>)> {
+        let id = id.parse::<QueryId>().ok()?;
+        let statuses = self.persistent_handle.statuses.read();
+        statuses
+            .peek(&id)
+            .map(|(query, status)| (query.clone(), status.schema_generation))
+    }
+
+    /// Removes cache entries for queries that reference any of the specified tables.
+    ///
+    /// Uses a two-phase approach: read lock to collect query IDs to remove, then write lock to
+    /// perform the removals. This minimizes write-lock hold time.
     pub fn invalidate_queries_referencing_tables(&self, dropped_tables: &[Relation]) {
         if dropped_tables.is_empty() {
             return;
         }
 
-        let mut statuses = self.persistent_handle.statuses.write();
-        let mut to_remove = Vec::new();
+        // Build a name-based HashSet for O(1) lookup on the common path.
+        let dropped_names: HashSet<&SqlIdentifier> =
+            dropped_tables.iter().map(|r| &r.name).collect();
 
-        for (query_id, (query, _status)) in statuses.iter() {
-            if let Some(referenced_tables) = extract_referenced_tables(query)
-                && referenced_tables.iter().any(|table| {
-                    dropped_tables.iter().any(|dropped| {
-                        match (&table.schema, &dropped.schema) {
-                            (Some(t_schema), Some(d_schema)) => {
-                                t_schema == d_schema && table.name == dropped.name
+        // Phase 1: Read lock — collect IDs to remove
+        let to_remove: Vec<QueryId> = {
+            let statuses = self.persistent_handle.statuses.read();
+            statuses
+                .iter()
+                .filter_map(|(query_id, (query, status))| {
+                    // Shallow caches are TTL-governed; never invalidate them on
+                    // a table change, whether replicator-driven or a client
+                    // `DROP TABLE` (REA-6692).
+                    if is_shallow_successful(status) {
+                        return None;
+                    }
+                    if let Some(referenced_tables) = extract_referenced_tables(query)
+                        && referenced_tables.iter().any(|table| {
+                            if !dropped_names.contains(&table.name) {
+                                return false;
                             }
-                            (None, None) => table.name == dropped.name,
-                            // If one has schema and other doesn't, do nothing to avoid
-                            // deleting queries that we shouldn't
-                            //
-                            // TODO (REA-5970): ideally, the queries stored in the cache should have
-                            // the tables resolved. However, that is a bit difficult given
-                            // that the search path can be a list of schemas.
-                            _ => false,
-                        }
-                    })
+                            // Name matches; verify schema qualification if both present.
+                            dropped_tables.iter().any(|dropped| {
+                                match (&table.schema, &dropped.schema) {
+                                    (Some(t_schema), Some(d_schema)) => {
+                                        t_schema == d_schema && table.name == dropped.name
+                                    }
+                                    // When one side has schema and the other doesn't, fall back
+                                    // to name-only matching. Over-invalidation is acceptable;
+                                    // under-invalidation causes stale EXPLAIN results.
+                                    //
+                                    // TODO (REA-5970): ideally, the queries stored in the cache
+                                    // should have the tables resolved. However, that is a bit
+                                    // difficult given that the search path can be a list of
+                                    // schemas.
+                                    _ => table.name == dropped.name,
+                                }
+                            })
+                        })
+                    {
+                        Some(*query_id)
+                    } else {
+                        None
+                    }
                 })
-            {
-                to_remove.push(*query_id);
+                .collect()
+        };
+
+        // Phase 2: Write lock — best-effort removal
+        if !to_remove.is_empty() {
+            let mut statuses = self.persistent_handle.statuses.write();
+            for query_id in to_remove {
+                statuses.pop(&query_id);
+                self.id_to_status.remove(&query_id);
             }
         }
+    }
 
-        for query_id in to_remove {
-            statuses.pop(&query_id);
-            self.id_to_status.remove(&query_id);
-        }
+    /// Remove a single query's status by id, unconditionally -- including a
+    /// `Successful(Shallow)` entry that [`Self::invalidate_queries_referencing_tables`]
+    /// deliberately preserves. Used by the RLS catalog poller when a table's RLS
+    /// state makes an existing cache unsafe (e.g. a table turning RLS-active): a
+    /// reliable, security-driven signal that must reset the query so it
+    /// re-migrates instead of routing to the dropped cache. Distinct from the
+    /// schema-catalog path, whose shallow-preservation (REA-6692) assumes an
+    /// unreliable detector.
+    pub fn invalidate_query(&self, query_id: &QueryId) {
+        let mut statuses = self.persistent_handle.statuses.write();
+        statuses.pop(query_id);
+        self.id_to_status.remove(query_id);
     }
 
     pub fn reportable_metrics(&self) -> ReportableMetrics {
@@ -873,6 +1111,69 @@ impl QueryStatusCache {
             pending_inlined_migrations_size: self.persistent_handle.pending_inlined_migrations.len()
                 as u64,
         }
+    }
+}
+
+impl SchemaChangeHandler for QueryStatusCache {
+    fn invalidate_for_tables(&self, tables: &[Relation]) {
+        self.invalidate_queries_referencing_tables(tables);
+    }
+
+    fn invalidate_all(&self) {
+        // Acquire the statuses write lock before clearing to prevent a concurrent reader from
+        // re-inserting between clears. Clear pending_inlined_migrations inside the lock too,
+        // so a concurrent inlined_cache_miss can't re-populate it for a query we just removed.
+        //
+        // Shallow caches are excluded: they proxy to upstream and refresh on
+        // their own TTL, so schema-catalog invalidation must leave them intact
+        // (REA-6692). Dropping their status would orphan the cache -- it stays
+        // in the shallow manager but `should_query_shallow` no longer routes to
+        // it -- which breaks recovered caches after a restart.
+        let mut statuses = self.persistent_handle.statuses.write();
+        self.id_to_status
+            .retain(|_, status| is_shallow_successful(status));
+        let drop_ids: Vec<QueryId> = statuses
+            .iter()
+            .filter(|(_, (_, status))| !is_shallow_successful(status))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in drop_ids {
+            statuses.pop(&id);
+        }
+        self.persistent_handle.pending_inlined_migrations.clear();
+    }
+}
+
+/// Whether a query's state is a successful shallow cache. Shallow caches proxy
+/// to upstream and refresh on their own TTL, so they are excluded from all
+/// schema-catalog-driven invalidation; their freshness is governed solely by
+/// TTL/refresh (REA-6692).
+fn is_shallow_successful(status: &QueryStatus) -> bool {
+    matches!(
+        status.migration_state,
+        MigrationState::Successful(CacheType::Shallow)
+    )
+}
+
+/// Bridges `&'static QueryStatusCache` to `Arc<dyn SchemaChangeHandler>`.
+///
+/// The QSC is `Box::leak`'d for `&'static` usage throughout the adapter, but the synchronizer
+/// uses `Arc<dyn SchemaChangeHandler>`. This adapter bridges the two.
+pub struct QscSchemaChangeAdapter(&'static QueryStatusCache);
+
+impl QscSchemaChangeAdapter {
+    pub fn new(qsc: &'static QueryStatusCache) -> Self {
+        Self(qsc)
+    }
+}
+
+impl SchemaChangeHandler for QscSchemaChangeAdapter {
+    fn invalidate_for_tables(&self, tables: &[Relation]) {
+        self.0.invalidate_for_tables(tables)
+    }
+
+    fn invalidate_all(&self) {
+        self.0.invalidate_all()
     }
 }
 
@@ -916,6 +1217,48 @@ mod tests {
             Ok(SqlQuery::Select(s)) => Ok(s),
             Ok(q) => Err(anyhow::anyhow!("Not a SELECT statement: {q:?}")),
             Err(e) => Err(anyhow::anyhow!("Parsing error: {e}")),
+        }
+    }
+
+    mod manual_caches {
+        use readyset_sql::ast::Literal;
+
+        use super::*;
+
+        fn entry(name: &str, stmt: &str) -> ManualCacheEntry {
+            ManualCacheEntry {
+                name: name.into(),
+                manual: ViewCreateRequest::new(select_statement(stmt).unwrap(), vec![]),
+                frozen: vec![(1, Literal::String("frozen".into()))],
+            }
+        }
+
+        #[test]
+        fn insert_lookup_collision_and_removal() {
+            let cache = QueryStatusCache::new();
+            let lookup = ViewCreateRequest::new(
+                select_statement("SELECT * FROM t WHERE a = ? AND b = ?").unwrap(),
+                vec![],
+            );
+            let id = QueryId::from(&lookup);
+            assert!(cache.manual_cache(&id).is_none());
+
+            let e = entry("m1", "SELECT * FROM t WHERE a = ? AND b = 'frozen'");
+            cache.insert_manual_cache(id, e.clone()).unwrap();
+            assert_eq!(cache.manual_cache(&id), Some(e.clone()));
+
+            // Re-registering the same manual form is idempotent.
+            cache.insert_manual_cache(id, e.clone()).unwrap();
+
+            // A different manual form colliding on the shape is rejected and names the
+            // existing cache.
+            let other = entry("m2", "SELECT * FROM t WHERE a = ? AND b = 'other'");
+            let existing = cache.insert_manual_cache(id, other).unwrap_err();
+            assert_eq!(existing.name, e.name);
+
+            // Removal by name clears the registration.
+            cache.remove_manual_cache_by_name(&"m1".into());
+            assert!(cache.manual_cache(&id).is_none());
         }
     }
 
@@ -982,6 +1325,51 @@ mod tests {
         assert!(statuses.put(id, (q1.into(), status.clone())).is_some());
 
         assert_eq!(statuses.get(&id).unwrap().1, status);
+    }
+
+    #[test]
+    fn shallow_auto_create_skip_is_proxied_with_reason() {
+        let cache = QueryStatusCache::new().style(MigrationStyle::InRequestPath);
+        let query = ShallowViewRequest::new(
+            readyset_sql::ast::ShallowCacheQuery::default(),
+            vec![],
+            None,
+        );
+
+        let (id, state) = cache.query_migration_state(&query);
+        assert_eq!(state, MigrationState::Pending);
+        assert!(cache.proxied_list(CacheType::Shallow).is_empty());
+
+        cache.record_shallow_auto_create_skip(id, "non-deterministic function: now".into());
+
+        // A decline leaves the query pending, and pending queries stay out of the
+        // listing whether or not they were declined. Running it upstream is what
+        // moves it to Supported, and only then does the decline surface.
+        assert!(cache.proxied_list(CacheType::Shallow).is_empty());
+        cache.update_query_migration_state(&query, MigrationState::Supported, None);
+
+        let proxied = cache.proxied_list(CacheType::Shallow);
+        assert_eq!(proxied.len(), 1, "declined query should be listed");
+        assert_eq!(proxied[0].id, id);
+        assert_eq!(
+            cache.shallow_auto_create_skip_reason(id).as_deref(),
+            Some("non-deterministic function: now")
+        );
+
+        // Creating the cache manually removes the listing.
+        cache.update_query_migration_state(
+            &query,
+            MigrationState::Successful(CacheType::Shallow),
+            None,
+        );
+        assert!(cache.proxied_list(CacheType::Shallow).is_empty());
+
+        // Re-allowing functions clears the decline, and the listing with it.
+        cache.update_query_migration_state(&query, MigrationState::Supported, None);
+        assert_eq!(cache.proxied_list(CacheType::Shallow).len(), 1);
+        cache.clear_shallow_auto_create_skips();
+        assert!(cache.proxied_list(CacheType::Shallow).is_empty());
+        assert_eq!(cache.shallow_auto_create_skip_reason(id), None);
     }
 
     #[test]
@@ -1297,7 +1685,9 @@ mod tests {
             epoch: 1,
         });
         cache.update_query_migration_state(&q, inlined_state.clone(), None);
-        let state = cache.query_status(&q).migration_state;
+        let state = cache
+            .query_status(&q, SchemaGeneration::INITIAL)
+            .migration_state;
         assert_eq!(state, inlined_state);
         assert_eq!(
             cache
@@ -1507,5 +1897,257 @@ mod tests {
             .collect();
         assert!(final_table_names.contains(&"t2"));
         assert!(final_table_names.contains(&"t4"));
+    }
+
+    #[test]
+    fn invalidate_all_clears_both_caches() {
+        use schema_catalog::SchemaChangeHandler;
+
+        let cache = QueryStatusCache::new().style(MigrationStyle::Explicit);
+
+        // Populate the cache with some queries
+        cache.update_query_migration_state(
+            &ViewCreateRequest::new(select_statement("SELECT * FROM t1").unwrap(), vec![]),
+            MigrationState::Successful(CacheType::Deep),
+            None,
+        );
+        cache.update_query_migration_state(
+            &ViewCreateRequest::new(
+                select_statement("SELECT * FROM t1 WHERE id = ?").unwrap(),
+                vec![],
+            ),
+            MigrationState::Pending,
+            None,
+        );
+        cache.update_query_migration_state(
+            &ViewCreateRequest::new(select_statement("SELECT * FROM t2").unwrap(), vec![]),
+            MigrationState::Unsupported("nope".into()),
+            None,
+        );
+
+        assert_eq!(cache.id_to_status.len(), 3);
+        assert_eq!(cache.persistent_handle.statuses.read().len(), 3);
+
+        // invalidate_all should clear everything
+        cache.invalidate_all();
+
+        assert_eq!(cache.id_to_status.len(), 0);
+        assert_eq!(cache.persistent_handle.statuses.read().len(), 0);
+        assert!(cache.cached_list().is_empty());
+        assert!(cache.proxied_list(CacheType::Deep).is_empty());
+    }
+
+    #[test]
+    fn invalidate_all_clears_pending_inlined_migrations() {
+        use schema_catalog::SchemaChangeHandler;
+
+        let cache = QueryStatusCache::new()
+            .style(MigrationStyle::Explicit)
+            .set_placeholder_inlining(true);
+        let q = ViewCreateRequest::new(select_statement("SELECT * FROM t1").unwrap(), vec![]);
+        let inlined_state = MigrationState::Inlined(InlinedState {
+            inlined_placeholders: Vec1::try_from(vec![1]).unwrap(),
+            epoch: 0,
+        });
+
+        cache.update_query_migration_state(&q, inlined_state, None);
+        cache.inlined_cache_miss(&q, vec![DfValue::None]);
+        cache.inlined_cache_miss(&q, vec![DfValue::Max]);
+
+        // Verify pending_inlined_migrations is populated
+        assert!(
+            !cache
+                .persistent_handle
+                .pending_inlined_migrations
+                .is_empty()
+        );
+
+        cache.invalidate_all();
+
+        // Everything should be cleared
+        assert_eq!(cache.id_to_status.len(), 0);
+        assert_eq!(cache.persistent_handle.statuses.read().len(), 0);
+        assert!(
+            cache
+                .persistent_handle
+                .pending_inlined_migrations
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalidate_all_then_queries_return_default() {
+        use schema_catalog::SchemaChangeHandler;
+
+        let cache = QueryStatusCache::new();
+        let q = ViewCreateRequest::new(select_statement("SELECT * FROM t1").unwrap(), vec![]);
+
+        cache.update_query_migration_state(&q, MigrationState::Successful(CacheType::Deep), None);
+        assert!(matches!(
+            cache.query_migration_state(&q).1,
+            MigrationState::Successful(_)
+        ));
+
+        cache.invalidate_all();
+
+        // After invalidation, the query is no longer in the cache; querying it re-inserts with
+        // default Pending state.
+        assert_eq!(cache.query_migration_state(&q).1, MigrationState::Pending);
+    }
+
+    #[test]
+    fn schema_catalog_invalidation_preserves_shallow_caches() {
+        use schema_catalog::SchemaChangeHandler;
+
+        let cache = QueryStatusCache::new().style(MigrationStyle::Explicit);
+
+        let deep = ViewCreateRequest::new(select_statement("SELECT * FROM t1").unwrap(), vec![]);
+        let shallow = ViewCreateRequest::new(select_statement("SELECT * FROM t2").unwrap(), vec![]);
+        cache.update_query_migration_state(
+            &deep,
+            MigrationState::Successful(CacheType::Deep),
+            None,
+        );
+        cache.update_query_migration_state(
+            &shallow,
+            MigrationState::Successful(CacheType::Shallow),
+            None,
+        );
+
+        // A full invalidation (SchemaChanges::All) clears deep state but leaves
+        // the shallow cache routable.
+        cache.invalidate_all();
+        assert_eq!(
+            cache.query_migration_state(&deep).1,
+            MigrationState::Pending
+        );
+        assert_eq!(
+            cache.query_migration_state(&shallow).1,
+            MigrationState::Successful(CacheType::Shallow)
+        );
+
+        // A targeted invalidation referencing t2 must also leave the shallow
+        // cache intact -- it is governed by its own TTL, not the schema catalog.
+        cache.invalidate_queries_referencing_tables(&[Relation::from("t2")]);
+        assert_eq!(
+            cache.query_migration_state(&shallow).1,
+            MigrationState::Successful(CacheType::Shallow)
+        );
+    }
+
+    #[test]
+    fn schema_generation_stored_and_retrieved() {
+        let cache = QueryStatusCache::new();
+        let q = ViewCreateRequest::new(select_statement("SELECT * FROM t1").unwrap(), vec![]);
+        let generation = SchemaGeneration::INITIAL.next(); // generation 2
+
+        // Insert via query_migration_state, then update generation separately
+        cache.query_migration_state(&q);
+        cache.set_schema_generation(&q, generation);
+
+        // Retrieve via query_with_schema_generation
+        let id = QueryId::from(&q);
+        let result = cache.query_with_schema_generation(&id.to_string());
+        assert!(result.is_some());
+        let (_query, stored_gen) = result.unwrap();
+        assert_eq!(stored_gen, Some(generation));
+    }
+
+    /// Every query `query_status` puts into the cache carries the generation it was rewritten
+    /// under, so `CREATE CACHE FROM <query_id>` can read it back.
+    #[test]
+    fn query_status_records_the_generation() {
+        let cache = QueryStatusCache::new();
+        let q = ViewCreateRequest::new(select_statement("SELECT * FROM t1").unwrap(), vec![]);
+        let generation = SchemaGeneration::INITIAL.next();
+
+        let status = cache.query_status(&q, generation);
+        assert_eq!(status.schema_generation, Some(generation));
+
+        let id = QueryId::from(&q);
+        let (_, stored) = cache
+            .query_with_schema_generation(&id.to_string())
+            .expect("query_status must insert the query");
+        assert_eq!(stored, Some(generation));
+    }
+
+    #[test]
+    fn schema_generation_none_for_queries_without_generation() {
+        let cache = QueryStatusCache::new();
+        let q = ViewCreateRequest::new(select_statement("SELECT * FROM t1").unwrap(), vec![]);
+
+        // Insert via update_query_migration_state (does not set schema_generation)
+        cache.update_query_migration_state(&q, MigrationState::Pending, None);
+
+        let id = QueryId::from(&q);
+        let result = cache.query_with_schema_generation(&id.to_string());
+        assert!(result.is_some());
+        let (_query, stored_gen) = result.unwrap();
+        assert_eq!(stored_gen, None);
+    }
+
+    #[test]
+    fn try_query_migration_state_does_not_overwrite_generation() {
+        let cache = QueryStatusCache::new();
+        let q = ViewCreateRequest::new(select_statement("SELECT * FROM t1").unwrap(), vec![]);
+        let generation = SchemaGeneration::INITIAL.next(); // generation 2
+
+        // Store with generation 2
+        cache.query_migration_state(&q);
+        cache.set_schema_generation(&q, generation);
+
+        // Read with try_query_migration_state (should not mutate)
+        let (_, state) = cache.try_query_migration_state(&q);
+        assert_eq!(state, Some(MigrationState::Pending));
+
+        // Verify generation is still 2 (not overwritten)
+        let id = QueryId::from(&q);
+        let (_, stored_gen) = cache.query_with_schema_generation(&id.to_string()).unwrap();
+        assert_eq!(stored_gen, Some(generation));
+    }
+
+    #[test]
+    fn shallow_auto_create_skip_records_and_recalls() {
+        let cache = QueryStatusCache::new();
+        let q = ViewCreateRequest::new(select_statement("SELECT 1").unwrap(), vec![]);
+        let id = QueryId::from(&q);
+
+        assert!(!cache.is_shallow_auto_create_skipped(id));
+        cache.record_shallow_auto_create_skip(id, "non-deterministic function".into());
+        assert!(cache.is_shallow_auto_create_skipped(id));
+        assert_eq!(
+            cache.shallow_auto_create_skip_reason(id).as_deref(),
+            Some("non-deterministic function")
+        );
+
+        // Distinct queries are tracked independently.
+        let q2 = ViewCreateRequest::new(select_statement("SELECT * FROM users").unwrap(), vec![]);
+        let id2 = QueryId::from(&q2);
+        assert!(!cache.is_shallow_auto_create_skipped(id2));
+    }
+
+    #[test]
+    fn shallow_auto_create_skip_bulk_clears_at_soft_cap() {
+        let cache = QueryStatusCache::new();
+        // QueryId has no `From<u64>`, so synthesize ids via FromStr (`q_<hex>`).
+        // Insert directly into the DashMap to avoid driving each one through
+        // `record_shallow_auto_create_skip` and tripping the cap mid-fill.
+        for i in 0..SHALLOW_AUTO_CREATE_SKIP_SOFT_CAP as u64 - 1 {
+            let id = QueryId::from_str(&format!("q_{i:x}")).unwrap();
+            cache.shallow_auto_create_skip.insert(id, String::new());
+        }
+        assert_eq!(
+            cache.shallow_auto_create_skip.len(),
+            SHALLOW_AUTO_CREATE_SKIP_SOFT_CAP - 1
+        );
+
+        // Crossing the cap via the public API triggers a bulk clear.
+        let trip = QueryId::from_str("q_ffffffffffffffff").unwrap();
+        cache.record_shallow_auto_create_skip(trip, String::new());
+        assert_eq!(
+            cache.shallow_auto_create_skip.len(),
+            0,
+            "skip map should be bulk-cleared after crossing the soft cap"
+        );
     }
 }

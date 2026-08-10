@@ -31,15 +31,14 @@
 //!
 //! Beware, Here be slightly smaller dragons™
 
-use std::collections::{hash_map, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{hash_map, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use array2::Array2;
 use dataflow::node::Column;
 use dataflow::prelude::*;
 use dataflow::{node, DomainRequest, ReaderProcessing};
+use dataflow_state::IndexBuildStatus;
 use metrics::{counter, histogram};
-use readyset_client::metrics::recorded;
 use readyset_client::{KeyColumnIdx, ViewPlaceholder};
 use readyset_data::{DfType, Dialect};
 use readyset_sql::ast::Relation;
@@ -49,7 +48,7 @@ use tracing::{debug, debug_span, error, info, info_span, trace};
 
 use crate::controller::migrate::materialization::InvalidEdge;
 use crate::controller::migrate::node_changes::{MigrationNodeChanges, NodeChanges};
-use crate::controller::migrate::scheduling::Scheduler;
+use crate::controller::migrate::scheduling::schedule_domain;
 use crate::controller::state::DfState;
 use crate::controller::WorkerIdentifier;
 
@@ -59,7 +58,6 @@ pub(crate) mod materialization;
 pub(in crate::controller) mod node_changes;
 pub(in crate::controller) mod routing;
 pub(in crate::controller) mod scheduling;
-mod sharding;
 
 /// The base delay used when sending follow up requests to a domain, for the exponential backoff
 /// strategy
@@ -67,19 +65,17 @@ const DOMAIN_REQUEST_DELAY_BASE_BACKOFF_MS: u64 = 2;
 /// The multiplication factor used when sending follow up requests to a domain, for the exponential
 /// backoff strategy
 const DOMAIN_REQUEST_DELAY_BACKOFF_FACTOR: u64 = 2;
-/// The max possible delay used when sending follow up requests to a domain, for the exponential
-/// backoff strategy
-const DOMAIN_REQUEST_MAX_DELAY_IN_MS: u64 = 1000 * 60; // 1 min
+/// Max backoff for domain request retries during migrations. Reduced from 60s
+/// to 2s so the polling loop converges quickly on async operations.
+const DOMAIN_REQUEST_MAX_DELAY_MS: u64 = 2000; // 2 sec
 
-/// A [`DomainRequest`] with associated domain/shard information describing which domain it's for.
+/// A [`DomainRequest`] paired with the domain it should be sent to.
 ///
 /// Used as part of [`DomainMigrationPlan`].
 #[derive(Debug)]
 pub struct StoredDomainRequest {
     /// The index of the destination domain.
     pub domain: DomainIndex,
-    /// A specific shard to send the request to. If `None`, sends to all shards.
-    pub shard: Option<usize>,
     /// The request to send.
     pub req: DomainRequest,
 }
@@ -90,9 +86,9 @@ impl StoredDomainRequest {
     /// Optionally returns another request to be sent afterwards as a follow up (up to the caller to
     /// decide when to send it).
     pub async fn apply(
-        mut self,
+        self,
         mainline: &DfState,
-        just_placed_shard_replicas: &HashMap<DomainIndex, Array2<bool>>,
+        just_placed: &HashMap<DomainIndex, bool>,
     ) -> ReadySetResult<Option<StoredDomainRequest>> {
         trace!(req=?self, "Applying domain request");
         let dom =
@@ -103,81 +99,22 @@ impl StoredDomainRequest {
                     domain_index: self.domain.index(),
                 })?;
 
-        let placed_replicas = |domain: DomainIndex| -> ReadySetResult<Option<Vec<usize>>> {
-            just_placed_shard_replicas
-                .get(&domain)
-                .map(|placed| match self.shard {
-                    Some(shard) => Ok(placed
-                        .get_column(shard)
-                        .ok_or_else(|| ReadySetError::ShardIndexOutOfBounds {
-                            shard,
-                            domain_index: domain.into(),
-                            num_shards: placed.row_size(),
-                        })?
-                        .enumerate()
-                        .filter_map(|(replica, placed)| (*placed).then_some(replica))
-                        .collect()),
-                    None => Ok(placed
-                        .columns()
-                        .enumerate()
-                        .filter_map(|(replica, mut shards)| {
-                            shards.all(|placed| *placed).then_some(replica)
-                        })
-                        .collect()),
-                })
-                .transpose()
-        };
-
         match self.req {
             DomainRequest::QueryReplayDone { node } => {
                 debug!("waiting for a done message");
 
-                invariant!(self.shard.is_none()); // QueryReplayDone isn't ever sent to just one shard
-
                 let mut spins = 0;
-                let mut non_completed_replicas: BTreeSet<_> = match placed_replicas(self.domain)? {
-                    Some(replicas) => replicas.into_iter().collect(),
-                    None => {
-                        let dh = mainline.domains.get(&self.domain).ok_or_else(|| {
-                            ReadySetError::UnknownDomain {
-                                domain_index: self.domain.into(),
-                            }
-                        })?;
-                        (0..dh.num_replicas()).collect()
-                    }
-                };
-
                 // FIXME(eta): this is a bit of a hack... (also, timeouts?)
                 loop {
-                    if non_completed_replicas.is_empty() {
-                        break;
-                    }
-
-                    let res = dom
-                        .send_to_healthy_replicas::<bool, _>(
+                    let done = dom
+                        .try_send::<bool>(
                             DomainRequest::QueryReplayDone { node },
-                            non_completed_replicas.iter().copied(),
                             &mainline.workers,
                         )
-                        .await?;
-
-                    for replicas_done in res.rows() {
-                        for (replica, done) in non_completed_replicas
-                            .clone()
-                            .into_iter()
-                            .zip(replicas_done)
-                        {
-                            if done.unwrap_or(true) {
-                                non_completed_replicas.remove(&replica);
-                            }
-                        }
-                    }
-
-                    if res.into_cells().into_iter().all(|done| {
-                        done.unwrap_or(
-                            true, /* If the domain isn't running, we don't care if it's done */
-                        )
-                    }) {
+                        .await?
+                        // If the domain isn't running, we don't care if it's done
+                        .unwrap_or(true);
+                    if done {
                         break;
                     }
 
@@ -193,7 +130,7 @@ impl StoredDomainRequest {
                 }
             }
             DomainRequest::RemoveNodes { .. } => {
-                match dom.send_to_healthy::<()>(self.req, &mainline.workers).await {
+                match dom.try_send::<()>(self.req, &mainline.workers).await {
                     // The worker failing is an even more efficient way to remove nodes.
                     Ok(_) | Err(ReadySetError::WorkerFailed { .. }) => {}
                     Err(e) => return Err(e),
@@ -203,26 +140,11 @@ impl StoredDomainRequest {
             DomainRequest::IsReady { node } => {
                 trace!(request = ?self.req.clone(), node = node.id(), "sending domain ready/is_ready request");
                 let req = self.req.clone();
-                let is_ready = if let Some(shard) = self.shard {
-                    dom.send_to_healthy_shard::<bool>(shard, req, &mainline.workers)
-                        .await?
-                        .into_iter()
-                        .all(|t| {
-                            t.unwrap_or(
-                                true, /* If the domain isn't running, we don't care if it's ready */
-                            )
-                        })
-                } else {
-                    dom.send_to_healthy::<bool>(req, &mainline.workers)
-                        .await?
-                        .into_cells()
-                        .into_iter()
-                        .all(|t| {
-                            t.unwrap_or(
-                                true, /* If the domain isn't running, we don't care if it's ready */
-                            )
-                        })
-                };
+                let is_ready = dom
+                    .try_send::<bool>(req, &mainline.workers)
+                    .await?
+                    // If the domain isn't running, we don't care if it's ready
+                    .unwrap_or(true);
                 trace!(
                     request = ?self.req,
                     node = node.id(),
@@ -233,42 +155,77 @@ impl StoredDomainRequest {
                     trace!(node = node.id(), "node is not ready yet");
                     return Ok(Some(StoredDomainRequest {
                         domain: self.domain,
-                        shard: self.shard,
                         req: DomainRequest::IsReady { node },
                     }));
                 }
             }
             DomainRequest::StartReplay {
-                ref mut replicas,
-                targeting_domain,
-                ..
+                targeting_domain, ..
             } => {
-                let target_domain = just_placed_shard_replicas
-                    .get(&targeting_domain)
-                    .ok_or_else(|| ReadySetError::UnknownDomain {
+                if !just_placed.contains_key(&targeting_domain) {
+                    return Err(ReadySetError::UnknownDomain {
                         domain_index: targeting_domain.into(),
-                    })?;
-
-                if !target_domain.cells().iter().all(|x| *x) {
-                    *replicas = placed_replicas(targeting_domain)?;
+                    });
                 }
 
-                if let Some(shard) = self.shard {
-                    dom.send_to_healthy_shard::<()>(shard, self.req, &mainline.workers)
-                        .await?;
+                dom.try_send::<()>(self.req, &mainline.workers).await?;
+            }
+            DomainRequest::PrepareStateNonBlocking { node, .. } => {
+                trace!(request = ?self.req, node = node.id(), "sending prepare state non-blocking request");
+
+                let req = self.req.clone();
+                dom.try_send::<()>(req, &mainline.workers).await?;
+
+                return Ok(Some(StoredDomainRequest {
+                    domain: self.domain,
+                    req: DomainRequest::PrepareStateStatus { node },
+                }));
+            }
+            // Poll for PrepareStateNonBlocking completion
+            DomainRequest::PrepareStateStatus { node } => {
+                trace!(request = ?self.req, node = node.id(), "polling prepare state status");
+
+                let req = self.req.clone();
+                let status = dom
+                    .try_send::<IndexBuildStatus>(req, &mainline.workers)
+                    .await?
+                    // If the domain isn't running, treat as succeeded
+                    .unwrap_or(IndexBuildStatus::Succeeded);
+
+                if status == IndexBuildStatus::Failed {
+                    return Err(ReadySetError::Internal(format!(
+                        "background index build failed for node {} in domain {}",
+                        node.id(),
+                        self.domain
+                    )));
+                }
+
+                trace!(
+                    request = ?self.req,
+                    node = node.id(),
+                    ?status,
+                    "received prepare state status response"
+                );
+
+                if status != IndexBuildStatus::Succeeded {
+                    trace!(
+                        node = node.id(),
+                        "state preparation not complete, will retry"
+                    );
+                    return Ok(Some(StoredDomainRequest {
+                        domain: self.domain,
+                        req: DomainRequest::PrepareStateStatus { node },
+                    }));
                 } else {
-                    dom.send_to_healthy::<()>(self.req, &mainline.workers)
-                        .await?;
+                    info!(
+                        domain = %self.domain,
+                        node = node.id(),
+                        "state preparation complete"
+                    );
                 }
             }
             _ => {
-                if let Some(shard) = self.shard {
-                    dom.send_to_healthy_shard::<()>(shard, self.req, &mainline.workers)
-                        .await?;
-                } else {
-                    dom.send_to_healthy::<()>(self.req, &mainline.workers)
-                        .await?;
-                }
+                dom.try_send::<()>(self.req, &mainline.workers).await?;
             }
         }
         Ok(None)
@@ -283,19 +240,10 @@ impl StoredDomainRequest {
 pub struct PlaceRequest {
     /// The index the new domain will have.
     idx: DomainIndex,
-    /// A map from domain shard, to replica index, to the worker to schedule the domain shard onto.
-    shard_replica_workers: Array2<Option<WorkerIdentifier>>,
+    /// The worker to schedule the domain onto, or [`None`] if no worker is available.
+    worker: Option<WorkerIdentifier>,
     /// Indices of new nodes to add.
     nodes: Vec<NodeIndex>,
-}
-
-/// Runtime configuration for a domain
-#[derive(Debug, Clone, Copy)]
-pub struct DomainSettings {
-    /// The number of times the domain is sharded
-    pub num_shards: usize,
-    /// The number of times each shard of the domain is replicated
-    pub num_replicas: usize,
 }
 
 /// Mode for constructing and executing a [`DomainMigrationPlan`]
@@ -331,9 +279,9 @@ pub struct DomainMigrationPlan {
     place: Vec<PlaceRequest>,
     /// A list of replicas which could not be placed, because no worker was available for them to
     /// run on
-    failed_placement: Vec<ReplicaAddress>,
-    /// A map of valid domain indices to the settings for that domain.
-    domains: HashMap<DomainIndex, DomainSettings>,
+    failed_placement: Vec<DomainIndex>,
+    /// The set of valid domain indices known to the plan.
+    domains: HashSet<DomainIndex>,
 }
 
 /// A set of stored data sufficient to apply a migration.
@@ -378,8 +326,8 @@ impl MigrationPlan<'_> {
 }
 
 impl DomainMigrationPlan {
-    /// Make a new `DomainMigrationPlan` with the given mode and domains
-    pub fn new(mode: DomainMigrationMode, domains: HashMap<DomainIndex, DomainSettings>) -> Self {
+    /// Make a new `DomainMigrationPlan` with the given mode and known domains.
+    pub fn new(mode: DomainMigrationMode, domains: HashSet<DomainIndex>) -> Self {
         Self {
             stored: VecDeque::new(),
             place: vec![],
@@ -389,83 +337,64 @@ impl DomainMigrationPlan {
         }
     }
 
-    pub fn set_domain_settings(&mut self, idx: DomainIndex, settings: DomainSettings) {
-        self.domains.insert(idx, settings);
+    pub fn register_domain(&mut self, idx: DomainIndex) {
+        self.domains.insert(idx);
     }
 
-    /// Enqueues a request to add a new domain `idx` with `nodes`, running on a worker per-shard
-    /// given by `shard_replica_workers`
+    /// Enqueues a request to add a new domain `idx` with `nodes`, running on the given `worker`
+    /// (or unscheduled if `worker` is [`None`]).
     ///
     /// Arguments are passed to [`Leader::place_domain`] when the plan is applied.
     pub fn place_domain(
         &mut self,
         idx: DomainIndex,
-        shard_replica_workers: Array2<Option<WorkerIdentifier>>,
+        worker: Option<WorkerIdentifier>,
         nodes: Vec<NodeIndex>,
     ) {
-        self.place.push(PlaceRequest {
-            idx,
-            shard_replica_workers,
-            nodes,
-        });
+        self.place.push(PlaceRequest { idx, worker, nodes });
     }
 
-    /// Mark that a given replica could not be placed because because no worker was available for it
+    /// Mark that a given domain could not be placed because no worker was available for it
     /// to run on
-    pub fn replica_failed_placement(&mut self, replica: ReplicaAddress) {
-        self.failed_placement.push(replica);
+    pub fn domain_failed_placement(&mut self, domain: DomainIndex) {
+        self.failed_placement.push(domain);
     }
 
-    /// Return the number of shards a given domain has.
-    pub fn num_shards(&self, domain: DomainIndex) -> ReadySetResult<usize> {
-        Ok(self
-            .domains
-            .get(&domain)
-            .copied()
-            .ok_or_else(|| ReadySetError::UnknownDomain {
+    /// Return whether the given domain is known to this plan. Errors if not.
+    pub fn check_domain(&self, domain: DomainIndex) -> ReadySetResult<()> {
+        if self.domains.contains(&domain) {
+            Ok(())
+        } else {
+            Err(ReadySetError::UnknownDomain {
                 domain_index: domain.index(),
-            })?
-            .num_shards)
-    }
-
-    /// Returns the number of times each shard of a given domain is replicated
-    pub fn num_replicas(&self, domain: DomainIndex) -> ReadySetResult<usize> {
-        Ok(self
-            .domains
-            .get(&domain)
-            .ok_or_else(|| ReadySetError::UnknownDomain {
-                domain_index: domain.index(),
-            })?
-            .num_replicas)
+            })
+        }
     }
 
     /// Apply all stored changes using the given controller object, placing new domains and sending
     /// messages added since the last time this method was called.
     pub async fn apply(self, mainline: &mut DfState) -> ReadySetResult<()> {
-        // First, tell all the workers to run the domains
-        //
-        // While we're doing this, we also maintain a map of all the domains' shard replicas which
-        // have *just* been placed, so that we know what (if not all) replicas to send messages to
-        let mut just_placed_shard_replicas = mainline
+        // Tell the worker to run each newly placed domain. Track which domains became newly
+        // placed in this migration (vs already running) so that follow-up requests can target
+        // just the new ones.
+        let mut just_placed = mainline
             .domains
             .iter()
-            .map(|(di, dh)| (*di, dh.placed_shard_replicas()))
+            .map(|(di, dh)| (*di, dh.is_placed()))
             .collect::<HashMap<_, _>>();
         for place in self.place {
-            match just_placed_shard_replicas.entry(place.idx) {
+            match just_placed.entry(place.idx) {
                 hash_map::Entry::Occupied(mut e) => {
-                    for (pos, addr) in place.shard_replica_workers.entries() {
-                        // Only true if the replica was *not* placed before, and is now
-                        e.get_mut()[pos] ^= addr.is_some();
-                    }
+                    // Only true if the domain was *not* placed before, and is now.
+                    *e.get_mut() ^= place.worker.is_some();
                 }
                 hash_map::Entry::Vacant(e) => {
-                    e.insert(place.shard_replica_workers.map(|addr| addr.is_some()));
+                    e.insert(place.worker.is_some());
                 }
             }
 
             let handle = mainline
-                .place_domain(place.idx, place.shard_replica_workers, place.nodes)
+                .place_domain(place.idx, place.worker, place.nodes)
                 .await?;
 
             match mainline.domains.entry(place.idx) {
@@ -486,11 +415,11 @@ impl DomainMigrationPlan {
         let create_exponential_backoff = || {
             ExponentialBackoff::from_millis(DOMAIN_REQUEST_DELAY_BASE_BACKOFF_MS)
                 .factor(DOMAIN_REQUEST_DELAY_BACKOFF_FACTOR)
-                .max_delay(Duration::from_millis(DOMAIN_REQUEST_MAX_DELAY_IN_MS))
+                .max_delay(Duration::from_millis(DOMAIN_REQUEST_MAX_DELAY_MS))
         };
         let mut retry_strategy = create_exponential_backoff();
         while let Some(req) = stored.pop_front() {
-            if let Some(req) = req.apply(mainline, &just_placed_shard_replicas).await? {
+            if let Some(req) = req.apply(mainline, &just_placed).await? {
                 // Initializing base table nodes might take a lot of time, so we try to wait using
                 // an exponential backoff strategy.
                 stored.push_front(req);
@@ -507,51 +436,13 @@ impl DomainMigrationPlan {
         Ok(())
     }
 
-    /// Enqueue a message to be sent to all replicas of a specific shard of a domain on plan
-    /// application.
-    ///
-    /// Like [`DomainHandle::send_to_healthy_shard_blocking`], but includes the `domain` to which
-    /// the command should apply.
-    pub fn add_message_for_shard(
-        &mut self,
-        domain: DomainIndex,
-        shard: usize,
-        req: DomainRequest,
-    ) -> ReadySetResult<()> {
-        let domain_settings =
-            self.domains
-                .get(&domain)
-                .ok_or_else(|| ReadySetError::UnknownDomain {
-                    domain_index: domain.index(),
-                })?;
-
-        if shard > domain_settings.num_shards {
-            return Err(ReadySetError::ShardIndexOutOfBounds {
-                shard,
-                domain_index: domain.index(),
-                num_shards: domain_settings.num_shards,
-            });
-        }
-
-        self.stored.push_back(StoredDomainRequest {
-            domain,
-            shard: Some(shard),
-            req,
-        });
-        Ok(())
-    }
-
     /// Enqueue a message to be sent to all replicas of all shards of a domain on plan application.
     ///
     /// Like [`DomainHandle::send_to_healthy_blocking`], but includes the `domain` to which the
     /// command should apply.
     pub fn add_message(&mut self, domain: DomainIndex, req: DomainRequest) -> ReadySetResult<()> {
-        if self.domains.contains_key(&domain) {
-            self.stored.push_back(StoredDomainRequest {
-                domain,
-                shard: None,
-                req,
-            });
+        if self.domains.contains(&domain) {
+            self.stored.push_back(StoredDomainRequest { domain, req });
             Ok(())
         } else {
             Err(ReadySetError::UnknownDomain {
@@ -570,7 +461,7 @@ impl DomainMigrationPlan {
 
     /// Returns list of domains which could not be placed because no worker was available for them
     /// to run on
-    pub fn failed_placement(&self) -> &[ReplicaAddress] {
+    pub fn failed_placement(&self) -> &[DomainIndex] {
         &self.failed_placement
     }
 
@@ -739,6 +630,36 @@ impl<'df> Migration<'df> {
             .ingredients
             .add_node(node::Node::new(name, columns, b));
         debug!(node = ni.index(), "adding new base");
+
+        // keep track of the fact that it's new
+        self.changes.add_node(ni);
+        // insert it into the graph
+        self.dataflow_state
+            .ingredients
+            .add_edge(self.dataflow_state.source, ni, ());
+        // and tell the caller its id
+        ni
+    }
+
+    /// Add a constant node (for VALUES clauses) to the graph.
+    /// Like base tables, constant nodes are special source nodes.
+    pub fn add_constant<N, C, CS>(
+        &mut self,
+        name: N,
+        columns: CS,
+        c: node::special::Constant,
+    ) -> NodeIndex
+    where
+        N: Into<Relation>,
+        C: Into<Column>,
+        CS: IntoIterator<Item = C>,
+    {
+        // add to the graph
+        let ni = self
+            .dataflow_state
+            .ingredients
+            .add_node(node::Node::new(name, columns, c));
+        debug!(node = ni.index(), "adding new constant");
 
         // keep track of the fact that it's new
         self.changes.add_node(ni);
@@ -962,7 +883,7 @@ impl<'df> Migration<'df> {
             "migration planning completed"
         );
 
-        histogram!(recorded::CONTROLLER_MIGRATION_TIME,).record(start.elapsed().as_micros() as f64);
+        histogram!(metric::CONTROLLER_MIGRATION_TIME,).record(start.elapsed().as_micros() as f64);
 
         Ok(())
     }
@@ -978,10 +899,8 @@ impl<'df> Migration<'df> {
 
         let start = self.start;
         let dataflow_state = self.dataflow_state;
-        let mut dmp = DomainMigrationPlan::new(
-            DomainMigrationMode::Extend,
-            dataflow_state.domain_settings(),
-        );
+        let mut dmp =
+            DomainMigrationPlan::new(DomainMigrationMode::Extend, dataflow_state.known_domains());
 
         let mut added = 0;
         let mut dropped = 0;
@@ -1027,26 +946,13 @@ fn plan_add_nodes(
     mut new_nodes: HashSet<NodeIndex>,
     worker: &Option<WorkerIdentifier>,
 ) -> ReadySetResult<DomainMigrationPlan> {
-    let mut topo = topo_order(dataflow_state, &new_nodes);
+    let topo = topo_order(dataflow_state, &new_nodes);
 
     // Tracks partially materialized nodes that were duplicated as fully materialized in this
     // planning stage.
     let mut local_redundant_partial: HashMap<NodeIndex, NodeIndex> = Default::default();
 
-    // Shard the graph as desired
-    let mut swapped0 = if let Some(shards) = dataflow_state.sharding {
-        let (t, swapped) = sharding::shard(
-            &mut dataflow_state.ingredients,
-            &mut new_nodes,
-            &topo,
-            shards,
-        )?;
-        topo = t;
-
-        swapped
-    } else {
-        HashMap::default()
-    };
+    let mut swapped0: HashMap<(NodeIndex, NodeIndex), NodeIndex> = HashMap::default();
 
     // Assign domains
     assignment::assign(dataflow_state, &topo)?;
@@ -1060,15 +966,10 @@ fn plan_add_nodes(
         match swapped0.entry((dst, src)) {
             Entry::Occupied(mut instead0) => {
                 if &instead != instead0.get() {
-                    // This can happen if sharding decides to add a Sharder *under* a node,
-                    // and routing decides to add an ingress/egress pair between that node
-                    // and the Sharder. It's perfectly okay, but we should prefer the
-                    // "bottommost" swap to take place (i.e., the node that is *now*
-                    // closest to the dst node). This *should* be the sharding node, unless
-                    // routing added an ingress *under* the Sharder. We resolve the
-                    // collision by looking at which translation currently has an adge from
-                    // `src`, and then picking the *other*, since that must then be node
-                    // below.
+                    // We prefer the "bottommost" swap (i.e., the node that is *now* closest
+                    // to the dst node). We resolve the collision by looking at which
+                    // translation currently has an edge from `src`, and then picking the
+                    // *other*, since that must then be the node below.
                     if dataflow_state.ingredients.find_edge(src, instead).is_some() {
                         // src -> instead -> instead0 -> [children]
                         // from [children]'s perspective, we should use instead0 for from, so
@@ -1089,7 +990,7 @@ fn plan_add_nodes(
         // we may also already have swapped the parents of some node *to* `src`. in
         // swapped0. we want to change that mapping as well, since lookups in swapped
         // aren't recursive.
-        for (_, instead0) in swapped0.iter_mut() {
+        for instead0 in swapped0.values_mut() {
             if *instead0 == src {
                 *instead0 = instead;
             }
@@ -1144,7 +1045,7 @@ fn plan_add_nodes(
                     "assigning local index"
                 );
                 counter!(
-                    recorded::NODE_ADDED,
+                    metric::NODE_ADDED,
                     "ntype" => dataflow_state.ingredients[ni].node_type_string(),
                 )
                 .increment(1);
@@ -1174,8 +1075,7 @@ fn plan_add_nodes(
                 if dataflow_state.ingredients[ni].is_internal() {
                     // Figure out all the remappings that have happened
                     // NOTE: this has to be *per node*, since a shared parent may be remapped
-                    // differently to different children (due to sharding for example). we just
-                    // allocate it once though.
+                    // differently to different children. we just allocate it once though.
                     let mut node_index_mappings =
                         dataflow_state.domain_node_index_pairs[domain].clone();
 
@@ -1202,12 +1102,6 @@ fn plan_add_nodes(
                 }
             }
         }
-
-        topo = topo_order(dataflow_state, &new_nodes);
-
-        if let Some(shards) = dataflow_state.sharding {
-            sharding::validate(&dataflow_state.ingredients, &topo, shards)?
-        };
 
         // at this point, we've hooked up the graph such that, for any given domain, the graph
         // looks like this:
@@ -1257,12 +1151,8 @@ fn plan_add_nodes(
 
         // Boot up new domains (they'll ignore all updates for now)
         debug!("booting new domains");
-        let mut dmp = DomainMigrationPlan::new(
-            DomainMigrationMode::Extend,
-            dataflow_state.domain_settings(),
-        );
-        let mut scheduler = Scheduler::new(dataflow_state, worker)?;
-
+        let mut dmp =
+            DomainMigrationPlan::new(DomainMigrationMode::Extend, dataflow_state.known_domains());
         for domain in changed_domains {
             if dataflow_state.domains.contains_key(&domain) {
                 // this is not a new domain
@@ -1272,28 +1162,14 @@ fn plan_add_nodes(
             // uninformed_domain_nodes is built from changed_domains
             #[allow(clippy::unwrap_used)]
             let nodes = uninformed_domain_nodes.remove(&domain).unwrap();
-            let worker_shards = scheduler.schedule_domain(domain, &nodes)?;
+            let worker_shards = schedule_domain(dataflow_state, worker, domain, &nodes)?;
 
-            for ((shard, replica), worker) in worker_shards.entries() {
-                if worker.is_none() {
-                    dmp.replica_failed_placement(ReplicaAddress {
-                        domain_index: domain,
-                        shard,
-                        replica,
-                    });
-                }
+            if worker_shards.is_none() {
+                dmp.domain_failed_placement(domain);
             }
 
-            let num_shards = worker_shards.num_rows();
-            let num_replicas = worker_shards.row_size();
             dmp.place_domain(domain, worker_shards, nodes);
-            dmp.domains.insert(
-                domain,
-                DomainSettings {
-                    num_shards,
-                    num_replicas,
-                },
-            );
+            dmp.register_domain(domain);
         }
 
         // And now, the last piece of the puzzle -- set up materializations
@@ -1397,10 +1273,8 @@ fn plan_drop_nodes(
     dataflow_state: &mut DfState,
     removals: HashSet<NodeIndex>,
 ) -> ReadySetResult<DomainMigrationPlan> {
-    let mut dmp = DomainMigrationPlan::new(
-        DomainMigrationMode::Extend,
-        dataflow_state.domain_settings(),
-    );
+    let mut dmp =
+        DomainMigrationPlan::new(DomainMigrationMode::Extend, dataflow_state.known_domains());
     remove_nodes(dataflow_state, &mut dmp, &removals)?;
     Ok(dmp)
 }
@@ -1434,7 +1308,6 @@ fn remove_nodes(
 
         dmp.stored.push_back(StoredDomainRequest {
             domain,
-            shard: None,
             req: DomainRequest::RemoveNodes { nodes },
         });
     }

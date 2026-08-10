@@ -1,0 +1,1058 @@
+use std::assert_matches;
+
+use mysql_async::prelude::Queryable;
+use mysql_async::Row;
+use tokio::test;
+use tokio_postgres::SimpleQueryMessage;
+
+use readyset_adapter::backend::{BackendBuilder, MigrationMode};
+use readyset_client_metrics::QueryDestination;
+use readyset_client_test_helpers::{
+    Adapter, TestBuilder, derive_test_name,
+    mysql_helpers::{self, MySQLAdapter, last_query_info},
+    psql_helpers::{self, PostgreSQLAdapter},
+};
+use readyset_server::CacheMode;
+use readyset_sql_parsing::ParsingPreset;
+use readyset_sql_passes::shallow::ShallowCacheEligibility;
+use readyset_tracing::init_test_logging;
+use readyset_util::eventually;
+use test_utils::{tags, upstream};
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn cache_mode_shallow() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO foo VALUES (42)")
+        .await
+        .unwrap();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::Shallow);
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    readyset
+        .query_drop("CREATE CACHE FROM SELECT a FROM foo")
+        .await
+        .unwrap();
+
+    readyset
+        .query_drop("SELECT a FROM foo")
+        .await
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetThenUpstream(_)
+    );
+
+    readyset
+        .query_drop("SELECT a FROM foo")
+        .await
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn cache_mode_deep() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO foo VALUES (42)")
+        .await
+        .unwrap();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::Deep);
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .replicate_db(&test_name)
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    eventually! {
+        readyset
+            .query_drop("CREATE CACHE FROM SELECT a FROM foo")
+            .await
+            .is_ok()
+    };
+
+    readyset
+        .query_drop("SELECT a FROM foo")
+        .await
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::Readyset(..)
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn cache_mode_deep_then_shallow() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO foo VALUES (42)")
+        .await
+        .unwrap();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::DeepThenShallow);
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .replicate_db(&test_name)
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    eventually! {
+        readyset
+            .query_drop("CREATE CACHE FROM SELECT a, RAND() FROM foo")
+            .await
+            .is_ok()
+    };
+
+    readyset
+        .query_drop("SELECT a, RAND() FROM foo")
+        .await
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetThenUpstream(_)
+    );
+
+    readyset
+        .query_drop("SELECT a, RAND() FROM foo")
+        .await
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+// In-request-path + cache_mode=shallow should auto-create a shallow cache on
+// first SELECT, without an explicit CREATE CACHE statement or hint.
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn cache_mode_shallow_auto_create_in_request_path() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO foo VALUES (42)")
+        .await
+        .unwrap();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::Shallow);
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .migration_mode(MigrationMode::InRequestPath)
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    // No CREATE CACHE, no hint — the adapter should auto-create a shallow
+    // cache because we are in MigrationMode::InRequestPath with
+    // CacheMode::Shallow. First execution is a miss and populates the
+    // cache via upstream.
+    readyset
+        .query_drop("SELECT a FROM foo")
+        .await
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetThenUpstream(_)
+    );
+
+    // Second execution should be served from the auto-created shallow cache.
+    readyset
+        .query_drop("SELECT a FROM foo")
+        .await
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    // Auto-created caches use adaptive refresh.
+    let adaptive: Vec<bool> = readyset
+        .query("SELECT adaptive FROM readyset.shallow_caches")
+        .await
+        .unwrap();
+    assert_eq!(adaptive, vec![true]);
+
+    shutdown_tx.shutdown().await;
+}
+
+// In-request-path shallow auto-create must SKIP queries that are not safe to
+// reuse. A plain SELECT auto-caches, but queries calling non-deterministic
+// (RAND, NOW) functions or ones with side effects (SLEEP) stay on the upstream
+// path no matter how many times they are seen.
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn cache_mode_shallow_auto_create_skips_ineligible() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    upstream
+        .query_drop("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO foo VALUES (42)")
+        .await
+        .unwrap();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::Shallow);
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .migration_mode(MigrationMode::InRequestPath)
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    // Control: a plain SELECT is eligible, so the second execution is served
+    // from an auto-created shallow cache.
+    readyset.query_drop("SELECT a FROM foo").await.unwrap();
+    readyset.query_drop("SELECT a FROM foo").await.unwrap();
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_),
+        "a plain SELECT should auto-create a shallow cache"
+    );
+
+    // Ineligible queries are never auto-cached: every execution proxies to
+    // upstream, even after the query has been seen before.
+    for q in ["SELECT RAND()", "SELECT NOW()", "SELECT SLEEP(0)"] {
+        for _ in 0..3 {
+            readyset.query_drop(q).await.unwrap();
+            assert_eq!(
+                last_query_info(&mut readyset).await.destination,
+                QueryDestination::Upstream,
+                "ineligible query should never be auto-cached: {q}"
+            );
+        }
+    }
+
+    // Each decline is visible over SQL, naming the reason it was declined.
+    let proxied: Vec<(String, String)> = readyset
+        .query::<Row, _>("SHOW PROXIED QUERIES")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get(1).unwrap(), row.get(2).unwrap()))
+        .collect();
+    for (needle, reason) in [
+        ("rand", "skipped: non-deterministic function"),
+        ("now", "skipped: non-deterministic function"),
+        ("sleep", "skipped: function with side effects"),
+    ] {
+        let status = proxied
+            .iter()
+            .find(|(query, _)| query.to_lowercase().contains(needle))
+            .map(|(_, status)| status.as_str())
+            .unwrap_or_else(|| panic!("no proxied query matching {needle}, got: {proxied:?}"));
+        assert!(
+            status.starts_with(reason),
+            "expected {needle} decline to report {reason}, got: {status}"
+        );
+    }
+    assert!(
+        !proxied
+            .iter()
+            .any(|(query, _)| query.to_lowercase().contains("foo")),
+        "the eligible query auto-cached, so it is not proxied: {proxied:?}"
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+// PostgreSQL counterpart: random()/now() (non-deterministic) and pg_sleep()
+// (side effects) must not be auto-cached in-request-path.
+#[test]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn cache_mode_shallow_auto_create_skips_ineligible_pg() {
+    init_test_logging();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::Shallow);
+    // The adapter proxies to (and the harness recreates) the `noria` database,
+    // so seed the table there through Readyset rather than side-channelling into
+    // a per-test database the fallback connection never sees.
+    let (rs_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .migration_mode(MigrationMode::InRequestPath)
+        .fallback_without_replication("noria")
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let rs = psql_helpers::connect(rs_opts).await;
+
+    rs.simple_query("CREATE TABLE foo (a INT)").await.unwrap();
+    rs.simple_query("INSERT INTO foo VALUES (42)").await.unwrap();
+
+    // Control: a plain SELECT auto-caches on the second execution.
+    rs.simple_query("SELECT a FROM foo").await.unwrap();
+    rs.simple_query("SELECT a FROM foo").await.unwrap();
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow(_),
+        "a plain SELECT should auto-create a shallow cache"
+    );
+
+    // Ineligible queries always proxy to upstream.
+    for q in ["SELECT random()", "SELECT now()", "SELECT pg_sleep(0)"] {
+        for _ in 0..3 {
+            rs.simple_query(q).await.unwrap();
+            assert_eq!(
+                psql_helpers::last_query_info(&rs).await.destination,
+                QueryDestination::Upstream,
+                "ineligible query should never be auto-cached: {q}"
+            );
+        }
+    }
+
+    // Each decline is visible over SQL, naming the reason it was declined.
+    let proxied: Vec<(String, String)> = rs
+        .simple_query("SHOW PROXIED QUERIES")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|message| match message {
+            SimpleQueryMessage::Row(row) => Some((row.get(1)?.to_string(), row.get(2)?.to_string())),
+            _ => None,
+        })
+        .collect();
+    for (needle, reason) in [
+        ("random", "skipped: non-deterministic function"),
+        ("now", "skipped: non-deterministic function"),
+        ("pg_sleep", "skipped: function with side effects"),
+    ] {
+        let status = proxied
+            .iter()
+            .find(|(query, _)| query.to_lowercase().contains(needle))
+            .map(|(_, status)| status.as_str())
+            .unwrap_or_else(|| panic!("no proxied query matching {needle}, got: {proxied:?}"));
+        assert!(
+            status.starts_with(reason),
+            "expected {needle} decline to report {reason}, got: {status}"
+        );
+    }
+
+    shutdown_tx.shutdown().await;
+}
+
+// A runtime `ALTER READYSET ADD SHALLOW CACHE ALLOWED FUNCTION` makes a
+// previously-ineligible query auto-cacheable without a restart, while every
+// other non-deterministic function stays blocked. This is the front-door proof
+// that the allowlist is a per-function exception, applied dynamically.
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn cache_mode_shallow_allowlist_alter_takes_effect() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    upstream
+        .query_drop("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO foo VALUES (42)")
+        .await
+        .unwrap();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::Shallow);
+    // `ALTER READYSET ... SHALLOW CACHE ALLOWED FUNCTION` and `SHOW SHALLOW CACHE
+    // ALLOWED FUNCTIONS` parse only under sqlparser, which is the preset shallow
+    // mode selects in production; mirror that here so the extension is recognized
+    // rather than proxied to upstream.
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .migration_mode(MigrationMode::InRequestPath)
+        .recreate_database(false)
+        .fallback(true)
+        .parsing_preset(ParsingPreset::OnlySqlparser)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    // now() is non-deterministic, so the query is ineligible and always proxies,
+    // even after being seen (the rejection is memoized in the skip set).
+    for _ in 0..2 {
+        readyset
+            .query_drop("SELECT a, NOW() FROM foo")
+            .await
+            .unwrap();
+        assert_eq!(
+            last_query_info(&mut readyset).await.destination,
+            QueryDestination::Upstream,
+            "now() should be ineligible before it is allowlisted"
+        );
+    }
+
+    // Allowlist now() at runtime. No restart.
+    readyset
+        .query_drop("ALTER READYSET ADD SHALLOW CACHE ALLOWED FUNCTION now")
+        .await
+        .unwrap();
+
+    // The query is now eligible: the ADD cleared the skip memo, so a fresh
+    // attempt auto-creates a shallow cache (first execution populates from
+    // upstream, subsequent ones serve from the cache).
+    let mut cached = false;
+    for _ in 0..5 {
+        readyset
+            .query_drop("SELECT a, NOW() FROM foo")
+            .await
+            .unwrap();
+        if matches!(last_query_info(&mut readyset).await.destination, QueryDestination::ReadysetShallow(_)) {
+            cached = true;
+            break;
+        }
+    }
+    assert!(
+        cached,
+        "now() should become auto-cacheable after ALTER ... ADD, without a restart"
+    );
+
+    // Allowlisting now() does not open the whole category: rand() stays blocked.
+    for _ in 0..3 {
+        readyset
+            .query_drop("SELECT a, RAND() FROM foo")
+            .await
+            .unwrap();
+        assert_eq!(
+            last_query_info(&mut readyset).await.destination,
+            QueryDestination::Upstream,
+            "rand() must stay ineligible: the allowlist is per-function"
+        );
+    }
+
+    // SHOW reflects the single allowlisted function.
+    let funcs: Vec<(String,)> = readyset
+        .query("SHOW SHALLOW CACHE ALLOWED FUNCTIONS")
+        .await
+        .unwrap();
+    assert_eq!(funcs, vec![("now".to_string(),)]);
+
+    // DROP removes the exception. SHOW empties, and a now()-calling query that
+    // was never cached is ineligible again: DROP re-blocks eligibility, it does
+    // not merely edit the SHOW output. A distinct query text is used so the
+    // shallow cache created above (which survives the DROP) does not serve it.
+    readyset
+        .query_drop("ALTER READYSET DROP SHALLOW CACHE ALLOWED FUNCTION now")
+        .await
+        .unwrap();
+    let funcs: Vec<(String,)> = readyset
+        .query("SHOW SHALLOW CACHE ALLOWED FUNCTIONS")
+        .await
+        .unwrap();
+    assert!(funcs.is_empty(), "SHOW should be empty after DROP: {funcs:?}");
+
+    for _ in 0..3 {
+        readyset
+            .query_drop("SELECT NOW() AS t, a FROM foo")
+            .await
+            .unwrap();
+        assert_eq!(
+            last_query_info(&mut readyset).await.destination,
+            QueryDestination::Upstream,
+            "now() should be ineligible again after ALTER ... DROP"
+        );
+    }
+
+    // The allowlist keys on bare function names: a schema-qualified argument is
+    // rejected rather than silently stored, so it can never match a call.
+    readyset
+        .query_drop("ALTER READYSET ADD SHALLOW CACHE ALLOWED FUNCTION mysql.now")
+        .await
+        .unwrap_err();
+    // A malformed statement with no function name is likewise rejected instead
+    // of mutating the allowlist.
+    readyset
+        .query_drop("ALTER READYSET ADD SHALLOW CACHE ALLOWED FUNCTION")
+        .await
+        .unwrap_err();
+
+    // The VARIABLE and SCHEMA kinds share this statement family. A system-schema
+    // query is ineligible by default and always proxies, even after being seen
+    // (the rejection is memoized in the skip set).
+    let schema_query =
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'mysql'";
+    for _ in 0..2 {
+        readyset.query_drop(schema_query).await.unwrap();
+        assert_eq!(
+            last_query_info(&mut readyset).await.destination,
+            QueryDestination::Upstream,
+            "a system-schema query is ineligible before its schema is allowlisted"
+        );
+    }
+
+    // Allowlisting the schema at runtime clears the skip memo, so a fresh
+    // attempt auto-creates a shallow cache.
+    readyset
+        .query_drop("ALTER READYSET ADD SHALLOW CACHE ALLOWED SCHEMA information_schema")
+        .await
+        .unwrap();
+    let mut cached = false;
+    for _ in 0..5 {
+        readyset.query_drop(schema_query).await.unwrap();
+        if matches!(
+            last_query_info(&mut readyset).await.destination,
+            QueryDestination::ReadysetShallow(_)
+        ) {
+            cached = true;
+            break;
+        }
+    }
+    assert!(
+        cached,
+        "a system-schema query becomes auto-cacheable after ALTER ... ADD SCHEMA"
+    );
+
+    // The VARIABLE kind persists through its own path, and each kind keeps an
+    // independent list: the variable and schema report only under their own
+    // SHOW, and the function added earlier was already dropped.
+    readyset
+        .query_drop("ALTER READYSET ADD SHALLOW CACHE ALLOWED VARIABLE version_comment")
+        .await
+        .unwrap();
+    let schemas: Vec<(String,)> = readyset
+        .query("SHOW SHALLOW CACHE ALLOWED SCHEMAS")
+        .await
+        .unwrap();
+    assert_eq!(schemas, vec![("information_schema".to_string(),)]);
+    let vars: Vec<(String,)> = readyset
+        .query("SHOW SHALLOW CACHE ALLOWED VARIABLES")
+        .await
+        .unwrap();
+    assert_eq!(vars, vec![("version_comment".to_string(),)]);
+    let funcs: Vec<(String,)> = readyset
+        .query("SHOW SHALLOW CACHE ALLOWED FUNCTIONS")
+        .await
+        .unwrap();
+    assert!(funcs.is_empty(), "the function list stays empty: {funcs:?}");
+
+    // DROP removes an entry from its own list without touching the others.
+    readyset
+        .query_drop("ALTER READYSET DROP SHALLOW CACHE ALLOWED VARIABLE version_comment")
+        .await
+        .unwrap();
+    let vars: Vec<(String,)> = readyset
+        .query("SHOW SHALLOW CACHE ALLOWED VARIABLES")
+        .await
+        .unwrap();
+    assert!(
+        vars.is_empty(),
+        "SHOW VARIABLES should be empty after DROP: {vars:?}"
+    );
+    let schemas: Vec<(String,)> = readyset
+        .query("SHOW SHALLOW CACHE ALLOWED SCHEMAS")
+        .await
+        .unwrap();
+    assert_eq!(
+        schemas,
+        vec![("information_schema".to_string(),)],
+        "dropping the variable must not touch the schema list"
+    );
+
+    // A statement with no name is rejected for the new kinds too.
+    readyset
+        .query_drop("ALTER READYSET ADD SHALLOW CACHE ALLOWED VARIABLE")
+        .await
+        .unwrap_err();
+    readyset
+        .query_drop("ALTER READYSET ADD SHALLOW CACHE ALLOWED SCHEMA")
+        .await
+        .unwrap_err();
+
+    shutdown_tx.shutdown().await;
+}
+
+// PostgreSQL counterpart of the runtime-allowlist scenario.
+#[test]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn cache_mode_shallow_allowlist_alter_takes_effect_pg() {
+    init_test_logging();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::Shallow);
+    // The adapter proxies to (and the harness recreates) the `noria` database,
+    // so seed the table there through Readyset rather than side-channelling into
+    // a per-test database the fallback connection never sees.
+    let (rs_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .migration_mode(MigrationMode::InRequestPath)
+        .fallback_without_replication("noria")
+        .parsing_preset(ParsingPreset::OnlySqlparser)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let rs = psql_helpers::connect(rs_opts).await;
+
+    rs.simple_query("CREATE TABLE foo (a INT)").await.unwrap();
+    rs.simple_query("INSERT INTO foo VALUES (42)").await.unwrap();
+
+    // now() is ineligible until allowlisted.
+    for _ in 0..2 {
+        rs.simple_query("SELECT a, now() FROM foo").await.unwrap();
+        assert_eq!(
+            psql_helpers::last_query_info(&rs).await.destination,
+            QueryDestination::Upstream,
+            "now() should be ineligible before it is allowlisted"
+        );
+    }
+
+    rs.simple_query("ALTER READYSET ADD SHALLOW CACHE ALLOWED FUNCTION now")
+        .await
+        .unwrap();
+
+    let mut cached = false;
+    for _ in 0..5 {
+        rs.simple_query("SELECT a, now() FROM foo").await.unwrap();
+        if matches!(psql_helpers::last_query_info(&rs).await.destination, QueryDestination::ReadysetShallow(_)) {
+            cached = true;
+            break;
+        }
+    }
+    assert!(
+        cached,
+        "now() should become auto-cacheable after ALTER ... ADD, without a restart"
+    );
+
+    // random() stays blocked: the allowlist is per-function, not per-category.
+    for _ in 0..3 {
+        rs.simple_query("SELECT a, random() FROM foo").await.unwrap();
+        assert_eq!(
+            psql_helpers::last_query_info(&rs).await.destination,
+            QueryDestination::Upstream,
+            "random() must stay ineligible: the allowlist is per-function"
+        );
+    }
+
+    // The allowlist keys on bare function names: a schema-qualified argument is
+    // rejected rather than silently stored, so it can never match a call.
+    rs.simple_query("ALTER READYSET ADD SHALLOW CACHE ALLOWED FUNCTION pg_catalog.now")
+        .await
+        .unwrap_err();
+    // A malformed statement with no function name is likewise rejected instead
+    // of mutating the allowlist.
+    rs.simple_query("ALTER READYSET ADD SHALLOW CACHE ALLOWED FUNCTION")
+        .await
+        .unwrap_err();
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn create_cache_returns_deep_type() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::Deep);
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .replicate_db(&test_name)
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    let row: Row = eventually! {
+        run_test: {
+            readyset
+                .query_first("CREATE CACHE my_deep FROM SELECT a FROM foo WHERE a = ?")
+                .await
+                .unwrap()
+        },
+        then_assert: |result| {
+            assert!(result.is_some(), "expected a result row");
+            result.unwrap()
+        }
+    };
+
+    let query_id: String = row.get("query_id").unwrap();
+    let cache_name: String = row.get("name").unwrap();
+    let query: String = row.get("query").unwrap();
+    let cache_type: String = row.get("cache_type").unwrap();
+
+    assert!(query_id.starts_with("q_"), "query id should start with q_");
+    assert_eq!(cache_name, "my_deep");
+    assert!(!query.is_empty());
+    assert_eq!(cache_type, "deep");
+
+    let row: Row = readyset
+        .query_first("SELECT query_id, name, always FROM readyset.deep_caches WHERE name = 'my_deep'")
+        .await
+        .unwrap()
+        .expect("expected one row in readyset.deep_caches");
+    let vrel_query_id: String = row.get("query_id").unwrap();
+    let vrel_name: String = row.get("name").unwrap();
+    let vrel_always: bool = row.get("always").unwrap();
+    assert_eq!(vrel_query_id, query_id);
+    assert_eq!(vrel_name, "my_deep");
+    assert!(!vrel_always);
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn create_cache_returns_shallow_type() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::Shallow);
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    let row: Row = readyset
+        .query_first("CREATE CACHE my_shallow FROM SELECT a FROM foo")
+        .await
+        .unwrap()
+        .expect("expected a result row");
+
+    let query_id: String = row.get("query_id").unwrap();
+    let cache_name: String = row.get("name").unwrap();
+    let query: String = row.get("query").unwrap();
+    let cache_type: String = row.get("cache_type").unwrap();
+
+    assert!(query_id.starts_with("q_"), "query id should start with q_");
+    assert_eq!(cache_name, "my_shallow");
+    assert!(!query.is_empty());
+    assert_eq!(cache_type, "shallow");
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn create_cache_returns_shallow_type_on_fallback() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::DeepThenShallow);
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .replicate_db(&test_name)
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    // RAND() is not supported by deep caching, so this will fall back to shallow.
+    let row: Row = eventually! {
+        run_test: {
+            readyset
+                .query_first("CREATE CACHE FROM SELECT a, RAND() FROM foo")
+                .await
+                .unwrap()
+        },
+        then_assert: |result| {
+            assert!(result.is_some(), "expected a result row");
+            result.unwrap()
+        }
+    };
+
+    let cache_type: String = row.get("cache_type").unwrap();
+    assert_eq!(cache_type, "shallow");
+
+    shutdown_tx.shutdown().await;
+}
+
+// With `--shallow-cache-allow-nondeterministic`, a non-deterministic call such
+// as NOW() becomes eligible and auto-caches, while a call with side effects such
+// as SLEEP() keeps proxying to upstream: the opt-in opens exactly one category, not
+// a blanket allow. This is the front-door counterpart to the per-flag unit
+// mapping test, proving a flag actually changes caching behavior.
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn cache_mode_shallow_allow_nondeterministic_makes_eligible() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    upstream
+        .query_drop("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO foo VALUES (42)")
+        .await
+        .unwrap();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::Shallow)
+        .shallow_cache_eligibility(ShallowCacheEligibility {
+            allow_nondeterministic: true,
+            ..Default::default()
+        });
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .migration_mode(MigrationMode::InRequestPath)
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    // NOW() is non-deterministic; the opt-in makes it eligible, so the second
+    // execution is served from an auto-created shallow cache.
+    readyset.query_drop("SELECT NOW()").await.unwrap();
+    readyset.query_drop("SELECT NOW()").await.unwrap();
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_),
+        "NOW() should auto-cache once non-deterministic calls are allowed"
+    );
+
+    // SLEEP() has side effects and blocks, which the non-determinism opt-in does
+    // not cover, so it keeps proxying to upstream.
+    for _ in 0..3 {
+        readyset.query_drop("SELECT SLEEP(0)").await.unwrap();
+        assert_eq!(
+            last_query_info(&mut readyset).await.destination,
+            QueryDestination::Upstream,
+            "SLEEP() must stay ineligible: allow-nondeterministic is not a blanket opt-in"
+        );
+    }
+
+    shutdown_tx.shutdown().await;
+}
+
+// PostgreSQL counterpart: allow-nondeterministic makes now() eligible, while a
+// non-immutable builtin outside the curated non-deterministic list, such as
+// pg_sleep(), stays ineligible (default-deny still applies to it).
+#[test]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn cache_mode_shallow_allow_nondeterministic_makes_eligible_pg() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    PostgreSQLAdapter::recreate_database(&test_name).await;
+
+    let mut cfg = psql_helpers::upstream_config();
+    cfg.dbname(&test_name);
+    let upstream = psql_helpers::connect(cfg).await;
+    upstream
+        .simple_query("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+    upstream
+        .simple_query("INSERT INTO foo VALUES (42)")
+        .await
+        .unwrap();
+
+    let backend = BackendBuilder::default()
+        .require_authentication(false)
+        .cache_mode(CacheMode::Shallow)
+        .shallow_cache_eligibility(ShallowCacheEligibility {
+            allow_nondeterministic: true,
+            ..Default::default()
+        });
+    let (rs_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend)
+        .migration_mode(MigrationMode::InRequestPath)
+        .recreate_database(false)
+        .fallback(true)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let mut cfg_rs = rs_opts.clone();
+    cfg_rs.dbname(&test_name);
+    let rs = psql_helpers::connect(cfg_rs).await;
+
+    // now() is in the curated non-deterministic list, so the opt-in makes it
+    // eligible and it auto-caches on the second execution.
+    rs.simple_query("SELECT now()").await.unwrap();
+    rs.simple_query("SELECT now()").await.unwrap();
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow(_),
+        "now() should auto-cache once non-deterministic calls are allowed"
+    );
+
+    // pg_sleep() is a non-immutable builtin outside the curated list, so it is
+    // denied regardless of the non-determinism opt-in.
+    for _ in 0..3 {
+        rs.simple_query("SELECT pg_sleep(0)").await.unwrap();
+        assert_eq!(
+            psql_helpers::last_query_info(&rs).await.destination,
+            QueryDestination::Upstream,
+            "pg_sleep() must stay ineligible under allow-nondeterministic"
+        );
+    }
+
+    shutdown_tx.shutdown().await;
+}

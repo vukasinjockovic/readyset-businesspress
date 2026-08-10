@@ -14,12 +14,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use readyset_sql::ast::CacheType;
+use readyset_sql::ast::{CacheType, TrxCachePolicy};
 use replication_offset::ReplicationOffset;
 
 // Consts for variable names.
 
 const STATUS_VARIABLE: &str = "Status";
+const REPLICATION_STATUS_VARIABLE: &str = "Replication Status";
 const MAX_REPLICATION_OFFSET: &str = "Maximum Replication Offset";
 const MIN_REPLICATION_OFFSET: &str = "Minimum Replication Offset";
 
@@ -33,6 +34,8 @@ const MIN_REPLICATION_OFFSET: &str = "Minimum Replication Offset";
 pub struct ReadySetControllerStatus {
     /// The status of the current leader.
     pub current_status: CurrentStatus,
+    /// The status of the replicator.
+    pub replication_status: ReplicationStatus,
     /// The current maximum replication offset known by the leader.
     pub max_replication_offset: Option<ReplicationOffset>,
     /// The current minimum replication offset known by the leader.
@@ -41,10 +44,16 @@ pub struct ReadySetControllerStatus {
 
 impl From<ReadySetControllerStatus> for Vec<(String, String)> {
     fn from(status: ReadySetControllerStatus) -> Vec<(String, String)> {
-        let mut res = vec![(
-            STATUS_VARIABLE.to_string(),
-            status.current_status.to_string(),
-        )];
+        let mut res = vec![
+            (
+                STATUS_VARIABLE.to_string(),
+                status.current_status.to_string(),
+            ),
+            (
+                REPLICATION_STATUS_VARIABLE.to_string(),
+                status.replication_status.to_string(),
+            ),
+        ];
 
         if let Some(replication_offset) = status.max_replication_offset {
             res.push((
@@ -86,22 +95,71 @@ impl Display for CurrentStatus {
     }
 }
 
+/// The status of the replicator.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+pub enum ReplicationStatus {
+    /// Replication is active.
+    Running,
+    /// Replication has been explicitly stopped via ALTER READYSET STOP REPLICATION.
+    Stopped,
+    /// Replicator was not started (e.g., shallow caching mode).
+    Disabled,
+}
+
+impl Display for ReplicationStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ReplicationStatus::Running => "Running",
+            ReplicationStatus::Stopped => "Stopped",
+            ReplicationStatus::Disabled => "Disabled",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Snapshot of replication lag, computed by the background polling task.
+///
+/// For Postgres and MySQL file-based modes, lag values are in bytes.
+/// For MySQL GTID mode, lag values are in transactions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationLagStatus {
+    /// The replication mode name (e.g. "postgres", "mysql_file", "mysql_gtid").
+    /// Derived from the `ReplicationOffset` variant via strum.
+    pub mode: String,
+    /// The upstream's current position, formatted for display.
+    pub upstream_offset: String,
+    /// The last event consumed from the replication stream, formatted for display.
+    pub replicator_offset: String,
+    /// The maximum persisted offset across all RocksDB tables, formatted for display.
+    /// This is the persistence frontier — the furthest any table has durably stored.
+    pub persisted_offset: String,
+    /// Lag between upstream and replicator stream position (bytes or transactions).
+    pub consume_lag: u64,
+    /// Lag between upstream and max persisted offset (bytes or transactions).
+    pub persist_lag: u64,
+    /// Time-based staleness in fractional seconds, measured via pt-heartbeat.
+    /// `None` when heartbeat is disabled.
+    pub staleness_seconds: Option<f64>,
+}
+
 #[derive(Debug)]
 pub struct CacheProperties {
     cache_type: CacheType,
     ttl_ms: Option<u64>,
     refresh_ms: Option<u64>,
     coalesce_ms: Option<u64>,
-    always: bool,
+    trx_cache_policy: TrxCachePolicy,
     schedule: bool,
+    adaptive: bool,
+    topk_buffer_multiplier: Option<usize>,
 }
 
 impl Display for CacheProperties {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // List the most important properties first.
         let mut properties = vec![Cow::Owned(format!("{}", self.cache_type))];
-        if self.always {
-            properties.push(Cow::Borrowed("always"));
+        if let Some(label) = self.trx_cache_policy.show_caches_label() {
+            properties.push(Cow::Borrowed(label));
         }
         if let Some(ttl_ms) = self.ttl_ms {
             properties.push(Cow::Owned(format!("ttl {ttl_ms} ms")));
@@ -116,6 +174,12 @@ impl Display for CacheProperties {
         if let Some(coalesce_ms) = self.coalesce_ms {
             properties.push(Cow::Owned(format!("coalesce {coalesce_ms} ms")));
         }
+        if self.adaptive {
+            properties.push(Cow::Borrowed("adaptive"));
+        }
+        if let Some(m) = self.topk_buffer_multiplier {
+            properties.push(Cow::Owned(format!("topk buffer ×{m}")));
+        }
         write!(f, "{}", properties.join(", "))
     }
 }
@@ -127,17 +191,23 @@ impl CacheProperties {
             ttl_ms: None,
             refresh_ms: None,
             coalesce_ms: None,
-            always: false,
+            trx_cache_policy: TrxCachePolicy::default(),
             schedule: false,
+            adaptive: false,
+            topk_buffer_multiplier: None,
         }
     }
 
-    pub fn set_always(&mut self, always: bool) {
-        self.always = always;
+    pub fn set_trx_cache_policy(&mut self, trx_cache_policy: TrxCachePolicy) {
+        self.trx_cache_policy = trx_cache_policy;
     }
 
     pub fn set_schedule(&mut self, schedule: bool) {
         self.schedule = schedule;
+    }
+
+    pub fn set_adaptive(&mut self, adaptive: bool) {
+        self.adaptive = adaptive;
     }
 
     pub fn set_ttl_ms(&mut self, ttl_ms: u64) {
@@ -150,5 +220,9 @@ impl CacheProperties {
 
     pub fn set_coalesce_ms(&mut self, coalesce_ms: u64) {
         self.coalesce_ms = Some(coalesce_ms);
+    }
+
+    pub fn set_topk_buffer_multiplier(&mut self, multiplier: usize) {
+        self.topk_buffer_multiplier = Some(multiplier);
     }
 }

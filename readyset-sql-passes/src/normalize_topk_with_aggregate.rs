@@ -15,8 +15,9 @@ pub trait NormalizeTopKWithAggregate: Sized {
     /// (since it's only ever going to return one row)
     ///
     /// If the query *has* a GROUP BY clause, this query checks that all the columns in the ORDER BY
-    /// clause either appear in the GROUP BY clause, or reference the results of aggregates, and
-    /// returns an error otherwise.
+    /// clause either appear in the GROUP BY clause, reference the results of aggregates, or
+    /// reference any aliased expression in the SELECT list (e.g. window functions, CASE
+    /// expressions), and returns an error otherwise.
     fn normalize_topk_with_aggregate<C: RewriteDialectContext>(
         &mut self,
         context: C,
@@ -72,7 +73,30 @@ impl NormalizeTopKWithAggregate for SelectStatement {
                                 }),
                             };
 
-                            if !in_group_by_clause && !references_aggregate {
+                            // ...or reference any aliased expression in the
+                            // SELECT list (window functions, CASE, regular
+                            // functions, etc. are valid ORDER BY targets when
+                            // they appear in SELECT).
+                            let references_select_alias = match order_field {
+                                FieldReference::Numeric(_) => false,
+                                FieldReference::Expr(Expr::Column(col)) => {
+                                    self.fields.iter().any(|f| {
+                                        matches!(
+                                            f,
+                                            FieldDefinitionExpr::Expr {
+                                                alias: Some(alias),
+                                                ..
+                                            } if *alias == col.name
+                                        )
+                                    })
+                                }
+                                _ => false,
+                            };
+
+                            if !in_group_by_clause
+                                && !references_aggregate
+                                && !references_select_alias
+                            {
                                 return Err(ReadySetError::ExprNotInGroupBy {
                                     expression: order_field
                                         .display(context.dialect().into())
@@ -309,5 +333,109 @@ mod tests {
             .normalize_topk_with_aggregate(Dialect::MySQL)
             .unwrap();
         assert_eq!(result, query);
+    }
+
+    #[test]
+    fn order_by_select_alias_does_nothing() {
+        let query = parse_query(
+            Dialect::MySQL,
+            "SELECT grp, sum(val) AS s, grp * 2 AS doubled
+             FROM t GROUP BY grp ORDER BY doubled LIMIT 2",
+        )
+        .unwrap();
+        let mut result = query.clone();
+        result
+            .normalize_topk_with_aggregate(Dialect::MySQL)
+            .unwrap();
+        assert_eq!(result, query);
+    }
+
+    #[test]
+    fn order_by_mixed_select_aliases_does_nothing() {
+        let query = parse_query(
+            Dialect::MySQL,
+            "SELECT grp, sum(val) AS s, grp * 2 AS doubled
+             FROM t GROUP BY grp ORDER BY doubled, s, grp",
+        )
+        .unwrap();
+        let mut result = query.clone();
+        result
+            .normalize_topk_with_aggregate(Dialect::MySQL)
+            .unwrap();
+        assert_eq!(result, query);
+    }
+
+    #[test]
+    fn order_by_non_select_alias_still_errors() {
+        let mut query = parse_query(
+            Dialect::MySQL,
+            "SELECT grp, sum(val) AS s, grp * 2 AS doubled
+             FROM t GROUP BY grp ORDER BY other_col",
+        )
+        .unwrap();
+        let result = query.normalize_topk_with_aggregate(Dialect::MySQL);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.err(),
+            Some(ReadySetError::ExprNotInGroupBy { .. })
+        ));
+    }
+
+    /// Regression for REA-6340: GROUP BY / ORDER BY mixing numeric ordinal
+    /// references with column references must not trigger `ExprNotInGroupBy`.
+    /// `lib.rs::Rewrite for SelectStatement` runs
+    /// `remove_numeric_field_references` before `normalize_topk_with_aggregate`,
+    /// so by the time the equality check below runs, every `Numeric(n)` has been
+    /// resolved to its underlying SELECT-list expression and both sides of the
+    /// check appear in the same `Expr` form.  These tests mirror that pipeline
+    /// ordering and lock in acceptance of the four shapes from the issue.
+    fn assert_pipeline_accepts(sql: &str) {
+        use crate::remove_numeric_field_references::RemoveNumericFieldReferences;
+        let mut query = parse_query(Dialect::PostgreSQL, sql).unwrap();
+        query.remove_numeric_field_references().unwrap();
+        query
+            .normalize_topk_with_aggregate(Dialect::PostgreSQL)
+            .expect("rewrite pipeline rejected query (REA-6340 regression)");
+    }
+
+    #[test]
+    fn rea_6340_group_by_col_order_by_ordinal() {
+        assert_pipeline_accepts("SELECT SUM(status), pn FROM t GROUP BY pn ORDER BY 2");
+    }
+
+    #[test]
+    fn rea_6340_group_by_col_order_by_col() {
+        assert_pipeline_accepts("SELECT SUM(status), pn FROM t GROUP BY pn ORDER BY pn");
+    }
+
+    #[test]
+    fn rea_6340_group_by_ordinal_order_by_ordinal() {
+        assert_pipeline_accepts("SELECT SUM(status), pn FROM t GROUP BY 2 ORDER BY 2");
+    }
+
+    #[test]
+    fn rea_6340_group_by_ordinal_order_by_col() {
+        assert_pipeline_accepts("SELECT SUM(status), pn FROM t GROUP BY 2 ORDER BY pn");
+    }
+
+    /// Companion to the `rea_6340_*` acceptance tests above: confirms
+    /// `normalize_topk_with_aggregate` *alone* rejects cross-form queries.
+    /// Locks in the pipeline-ordering invariant — if the lib.rs `Rewrite` impl
+    /// is ever changed to run `normalize_topk_with_aggregate` before
+    /// `remove_numeric_field_references`, REA-6340 reproduces.  This test
+    /// won't fire in that scenario, but documents the load-bearing dependency
+    /// for future maintainers reading the file.
+    #[test]
+    fn rea_6340_normalize_alone_rejects_cross_form() {
+        let mut query = parse_query(
+            Dialect::PostgreSQL,
+            "SELECT SUM(status), pn FROM t GROUP BY pn ORDER BY 2",
+        )
+        .unwrap();
+        let result = query.normalize_topk_with_aggregate(Dialect::PostgreSQL);
+        assert!(matches!(
+            result.err(),
+            Some(ReadySetError::ExprNotInGroupBy { .. })
+        ));
     }
 }

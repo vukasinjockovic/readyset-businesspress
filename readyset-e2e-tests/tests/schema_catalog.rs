@@ -10,7 +10,7 @@ use readyset_server::Handle;
 use readyset_util::failpoints;
 use readyset_util::{eventually, shutdown::ShutdownSender};
 use std::time::Duration;
-use test_utils::tags;
+use test_utils::{tags, upstream};
 use tokio::time::sleep;
 
 // Delay the next schema catalog update long enough to test behavior when the adapter is stale
@@ -18,6 +18,7 @@ const CATALOG_UPDATE_DELAY_MS: u64 = 15_000;
 const CATALOG_UPDATE_APPLY_WAIT: Duration = Duration::from_millis(CATALOG_UPDATE_DELAY_MS + 1_000);
 
 struct SchemaGenerationRace<'a> {
+    /// Kept alive for the duration of the test to prevent the Readyset server from shutting down.
     _handle: Handle,
     rs_conn: mysql_async::Conn,
     shutdown_tx: ShutdownSender,
@@ -112,7 +113,8 @@ macro_rules! assert_schema_generation_error {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn create_cache_errors_when_catalog_is_stale() {
     let mut harness = SchemaGenerationRace::new().await;
 
@@ -137,7 +139,8 @@ async fn create_cache_errors_when_catalog_is_stale() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn explain_create_cache_errors_when_catalog_is_stale() {
     let mut harness = SchemaGenerationRace::new().await;
 
@@ -182,7 +185,8 @@ async fn explain_create_cache_errors_when_catalog_is_stale() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn create_cache_concurrently_errors_when_catalog_is_stale() {
     let mut harness = SchemaGenerationRace::new().await;
 
@@ -254,7 +258,8 @@ async fn create_cache_concurrently_errors_when_catalog_is_stale() {
 /// the server's. During this window `CREATE CACHE` is rejected. After the delay expires, the
 /// adapter catches up and the same command succeeds.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn schema_generation_mismatch_recovered_after_delayed_sse_update() {
     readyset_tracing::init_test_logging();
     let failpoint_guard = FailScenario::setup();
@@ -345,7 +350,8 @@ async fn schema_generation_mismatch_recovered_after_delayed_sse_update() {
 /// 6. Wait for SSE reconnection (snapshot delivers latest catalog)
 /// 7. Verify CREATE CACHE succeeds
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn schema_catalog_recovers_after_sse_stream_disconnect() {
     readyset_tracing::init_test_logging();
     let failpoint_guard = FailScenario::setup();
@@ -356,6 +362,10 @@ async fn schema_catalog_recovers_after_sse_stream_disconnect() {
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
     let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
 
+    // Capture the generation before the CREATE TABLE so replication cannot race ahead
+    // and leave us waiting for an advance that has already happened.
+    let initial_generation = handle.schema_catalog().await.unwrap().generation;
+
     // Create a table and wait for the adapter to pick it up over the healthy SSE stream.
     upstream_conn
         .query_drop("CREATE TABLE sse_disconnect (id INT PRIMARY KEY, value INT)")
@@ -363,7 +373,6 @@ async fn schema_catalog_recovers_after_sse_stream_disconnect() {
         .unwrap();
 
     // Wait for the server to replicate the CREATE TABLE before checking the adapter.
-    let initial_generation = handle.schema_catalog().await.unwrap().generation;
     wait_for_schema_generation_change(&mut handle, initial_generation).await;
 
     // The adapter syncs its schema catalog from the server via SSE, which is asynchronous.
@@ -388,8 +397,11 @@ async fn schema_catalog_recovers_after_sse_stream_disconnect() {
     // 2. Delay the subsequent reconnection by 15s
     fail::cfg(failpoints::CONTROLLER_EVENTS_SSE_DISCONNECT, "1*return")
         .expect("failed to set SSE force-disconnect failpoint");
-    fail::cfg(failpoints::CONTROLLER_EVENTS_SSE_CONNECT_DELAY, "1*return(15000)")
-        .expect("failed to set SSE connect delay failpoint");
+    fail::cfg(
+        failpoints::CONTROLLER_EVENTS_SSE_CONNECT_DELAY,
+        "1*return(15000)",
+    )
+    .expect("failed to set SSE connect delay failpoint");
 
     // Give time for the force-disconnect to fire (~1s tick interval + processing).
     sleep(Duration::from_secs(3)).await;
@@ -441,4 +453,165 @@ async fn schema_catalog_recovers_after_sse_stream_disconnect() {
 
     shutdown_tx.shutdown().await;
     drop(failpoint_guard);
+}
+
+/// Regression test: CREATE CACHE FROM <query_id> must work for queries issued via the text
+/// protocol (COM_QUERY).
+///
+/// Before the fix, the adapter always used SchemaGeneration::INITIAL (1) for the
+/// CacheInner::Id path. When schema generation advanced past 1 (which happens during normal
+/// DDL replication), CREATE CACHE FROM <query_id> failed with "Schema generation mismatch".
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn create_cache_by_query_id_text_protocol() {
+    readyset_tracing::init_test_logging();
+
+    let (rs_opts, _handle, shutdown_tx) =
+        TestBuilder::default().build::<MySQLAdapter>().await;
+
+    let db_name = rs_opts.db_name().unwrap().to_string();
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    let mut rs_conn = mysql_async::Conn::new(rs_opts.clone()).await.unwrap();
+
+    // Create table on upstream — replication advances schema generation past INITIAL.
+    upstream_conn
+        .query_drop("CREATE TABLE cache_by_id_text (id INT PRIMARY KEY, value VARCHAR(255))")
+        .await
+        .unwrap();
+    upstream_conn
+        .query_drop("INSERT INTO cache_by_id_text VALUES (1, 'test')")
+        .await
+        .unwrap();
+
+    // Wait for table to be queryable through ReadySet. With InRequestPath (default),
+    // this SELECT will be auto-cached once the schema catalog is ready.
+    eventually!(
+        attempts: 100,
+        sleep: Duration::from_millis(200),
+        message: "adapter did not accept queries against cache_by_id_text".to_string(),
+        {
+            rs_conn
+                .query_drop("SELECT * FROM cache_by_id_text WHERE id = 1")
+                .await
+                .is_ok()
+        }
+    );
+
+    // The SELECT was auto-cached by InRequestPath. Extract the query ID from SHOW CACHES,
+    // then drop the cache so we can re-create it by ID.
+    let query_id: String = {
+        let rows: Vec<Row> = rs_conn.query("SHOW CACHES").await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| {
+                let q: String = r.get(2).unwrap();
+                q.contains("cache_by_id_text")
+            })
+            .expect("expected cached query for cache_by_id_text table");
+        row.get(0).unwrap()
+    };
+
+    // Drop the auto-created cache so we can exercise CREATE CACHE FROM <query_id>.
+    rs_conn.query_drop("DROP ALL CACHES").await.unwrap();
+
+    // Issue the SELECT again via text protocol so it re-enters the query status cache.
+    rs_conn
+        .query_drop("SELECT * FROM cache_by_id_text WHERE id = 1")
+        .await
+        .unwrap();
+
+    // CREATE CACHE FROM <query_id> — verifies that the CacheInner::Id path uses the
+    // current schema generation (not SchemaGeneration::INITIAL).
+    rs_conn
+        .query_drop(format!("CREATE CACHE FROM {query_id}"))
+        .await
+        .expect("CREATE CACHE FROM query_id should succeed (text protocol)");
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Regression test: CREATE CACHE FROM <query_id> must work for queries issued via the binary
+/// protocol (COM_STMT_PREPARE / COM_STMT_EXECUTE).
+///
+/// Same root cause as `create_cache_by_query_id_text_protocol` but exercises the prepared
+/// statement code path, which records the schema generation during prepare.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn create_cache_by_query_id_prepared() {
+    readyset_tracing::init_test_logging();
+
+    let (rs_opts, _handle, shutdown_tx) =
+        TestBuilder::default().build::<MySQLAdapter>().await;
+
+    let db_name = rs_opts.db_name().unwrap().to_string();
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    let mut rs_conn = mysql_async::Conn::new(rs_opts.clone()).await.unwrap();
+
+    // Create table on upstream — replication advances schema generation past INITIAL.
+    upstream_conn
+        .query_drop("CREATE TABLE cache_by_id_prep (id INT PRIMARY KEY, value VARCHAR(255))")
+        .await
+        .unwrap();
+    upstream_conn
+        .query_drop("INSERT INTO cache_by_id_prep VALUES (1, 'test')")
+        .await
+        .unwrap();
+
+    // Wait for table to be queryable through ReadySet using a prepared statement.
+    eventually!(
+        attempts: 100,
+        sleep: Duration::from_millis(200),
+        message: "adapter did not accept queries against cache_by_id_prep".to_string(),
+        {
+            rs_conn
+                .exec_drop(
+                    "SELECT * FROM cache_by_id_prep WHERE id = ?",
+                    (1,),
+                )
+                .await
+                .is_ok()
+        }
+    );
+
+    // The SELECT was auto-cached by InRequestPath. Extract the query ID from SHOW CACHES,
+    // then drop the cache so we can re-create it by ID.
+    let query_id: String = {
+        let rows: Vec<Row> = rs_conn.query("SHOW CACHES").await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| {
+                let q: String = r.get(2).unwrap();
+                q.contains("cache_by_id_prep")
+            })
+            .expect("expected cached query for cache_by_id_prep table");
+        row.get(0).unwrap()
+    };
+
+    // Drop the auto-created cache so we can exercise CREATE CACHE FROM <query_id>.
+    rs_conn.query_drop("DROP ALL CACHES").await.unwrap();
+
+    // Open a fresh connection so mysql_async issues a new COM_STMT_PREPARE (the old
+    // connection's statement cache would reuse the stale handle). The fresh prepare
+    // records the current schema generation.
+    let mut rs_conn2 = mysql_async::Conn::new(rs_opts).await.unwrap();
+    rs_conn2
+        .exec_drop(
+            "SELECT * FROM cache_by_id_prep WHERE id = ?",
+            (1,),
+        )
+        .await
+        .unwrap();
+
+    // CREATE CACHE FROM <query_id> — verifies that the CacheInner::Id path uses the
+    // current schema generation (not SchemaGeneration::INITIAL).
+    rs_conn2
+        .query_drop(format!("CREATE CACHE FROM {query_id}"))
+        .await
+        .expect("CREATE CACHE FROM query_id should succeed (prepared)");
+
+    shutdown_tx.shutdown().await;
 }

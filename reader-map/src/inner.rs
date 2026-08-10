@@ -12,9 +12,9 @@ use readyset_client::internal::IndexType;
 use readyset_util::ranges::{Bound, RangeBounds};
 
 use crate::eviction::{EvictionMeta, EvictionStrategy};
-use crate::recorded::{READER_MAP_LIFETIMES, READER_MAP_UPDATES};
 use crate::values::{Metrics, Values};
 use crate::InsertionOrder;
+use metric::{READER_MAP_LIFETIMES, READER_MAP_UPDATES};
 
 /// Represents a miss when looking up a range.
 ///
@@ -57,7 +57,7 @@ where
 }
 
 macro_rules! with_map {
-    ($data: expr, |$map: ident| $body: expr) => {
+    ($data: expr_2021, |$map: ident| $body: expr_2021) => {
         match $data {
             Data::BTreeMap($map) => $body,
             Data::HashMap($map) => $body,
@@ -148,7 +148,7 @@ where
         R: RangeBounds<K>,
         K: Ord + Clone,
     {
-        if let Self::BTreeMap(ref mut map, ..) = self {
+        if let Self::BTreeMap(map, ..) = self {
             map.insert_range(range);
         }
     }
@@ -157,7 +157,7 @@ where
     where
         K: Ord + Clone,
     {
-        if let Self::BTreeMap(ref mut map, ..) = self {
+        if let Self::BTreeMap(map, ..) = self {
             map.insert_full_range();
         }
     }

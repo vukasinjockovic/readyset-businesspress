@@ -1,8 +1,10 @@
 use std::time::Duration;
 
-use readyset_sql::ast::{CacheType, EvictionPolicy, ReadysetHintDirective};
+use readyset_sql::ast::{
+    CacheInner, CacheType, EvictionPolicy, ReadysetHintDirective, SqlQuery, TrxCachePolicy,
+};
 use readyset_sql::Dialect;
-use readyset_sql_parsing::{parse_hint_directive, parse_shallow_query};
+use readyset_sql_parsing::{parse_hint_directive, parse_query, parse_shallow_query};
 
 #[test]
 fn parse_hint_extracts_create_cache_directive() {
@@ -315,6 +317,34 @@ fn hint_on_right_side_of_union_stripped() {
     );
 }
 
+#[test]
+fn create_cache_select_hints_stripped() {
+    let create_sql =
+        "CREATE SHALLOW CACHE FROM SELECT /*rs+ CREATE SHALLOW CACHE */ id FROM t WHERE id = ?";
+    let query = parse_query(Dialect::MySQL, create_sql).expect("parse create cache");
+    let SqlQuery::CreateCache(stmt) = query else {
+        panic!("expected CreateCache")
+    };
+    let CacheInner::Statement {
+        shallow: Ok(shallow),
+        ..
+    } = stmt.inner
+    else {
+        panic!("expected shallow Ok")
+    };
+
+    let (via_parse_shallow, _) = parse_shallow_query(
+        Dialect::MySQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE */ id FROM t WHERE id = ?",
+    )
+    .expect("parse shallow");
+
+    assert_eq!(
+        *shallow, via_parse_shallow,
+        "CREATE CACHE path must produce the same hint-stripped ShallowCacheQuery as the query path"
+    );
+}
+
 // --- parse_hint_directive unit tests ---
 
 #[test]
@@ -325,8 +355,33 @@ fn parse_create_cache_hint_basic() {
         panic!("Expected CreateCache directive");
     };
     assert_eq!(opts.cache_type, Some(CacheType::Shallow));
-    assert!(!opts.always);
+    assert_eq!(opts.trx_cache_policy, TrxCachePolicy::Never);
     assert!(opts.policy.is_none());
+}
+
+#[test]
+fn parse_create_cache_hint_with_name() {
+    for text in [
+        "CREATE SHALLOW CACHE mycache",
+        "CREATE SHALLOW CACHE ALWAYS mycache",
+    ] {
+        let Some(ReadysetHintDirective::CreateCache(opts)) =
+            parse_hint_directive(Dialect::MySQL, text).expect("should parse")
+        else {
+            panic!("Expected CreateCache directive for {text:?}");
+        };
+        assert_eq!(opts.name, Some("mycache".into()), "for {text:?}");
+    }
+}
+
+#[test]
+fn parse_create_cache_hint_rejects_deep() {
+    let err = parse_hint_directive(Dialect::MySQL, "CREATE DEEP CACHE mycache")
+        .expect_err("DEEP hint should be rejected");
+    assert!(
+        err.to_string().contains("shallow caches only"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -369,7 +424,52 @@ fn parse_create_cache_hint_always() {
     let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
         panic!("Expected CreateCache directive");
     };
-    assert!(opts.always);
+    assert_eq!(opts.trx_cache_policy, TrxCachePolicy::Always);
+}
+
+#[test]
+fn parse_create_cache_hint_until_write() {
+    let result = parse_hint_directive(Dialect::MySQL, "CREATE SHALLOW CACHE UNTIL WRITE")
+        .expect("should parse");
+    let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+        panic!("Expected CreateCache directive");
+    };
+    assert_eq!(opts.trx_cache_policy, TrxCachePolicy::UntilWrite);
+
+    // CONCURRENTLY composes with UNTIL WRITE in either order.
+    let result = parse_hint_directive(
+        Dialect::MySQL,
+        "CREATE SHALLOW CACHE CONCURRENTLY UNTIL WRITE",
+    )
+    .expect("should parse");
+    let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+        panic!("Expected CreateCache directive");
+    };
+    assert_eq!(opts.trx_cache_policy, TrxCachePolicy::UntilWrite);
+    assert!(opts.concurrently);
+
+    let result = parse_hint_directive(
+        Dialect::MySQL,
+        "CREATE SHALLOW CACHE UNTIL WRITE CONCURRENTLY",
+    )
+    .expect("should parse");
+    let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+        panic!("Expected CreateCache directive");
+    };
+    assert_eq!(opts.trx_cache_policy, TrxCachePolicy::UntilWrite);
+    assert!(opts.concurrently);
+}
+
+#[test]
+fn parse_create_cache_hint_always_and_until_write_rejected() {
+    // ALWAYS and UNTIL WRITE occupy the same grammar slot; combining them in
+    // either order leaves trailing tokens that the hint parser rejects.
+    assert!(
+        parse_hint_directive(Dialect::MySQL, "CREATE SHALLOW CACHE ALWAYS UNTIL WRITE").is_err()
+    );
+    assert!(
+        parse_hint_directive(Dialect::MySQL, "CREATE SHALLOW CACHE UNTIL WRITE ALWAYS").is_err()
+    );
 }
 
 #[test]
@@ -390,8 +490,308 @@ fn parse_create_cache_hint_case_insensitive() {
 
 #[test]
 fn parse_unknown_directive() {
-    let result = parse_hint_directive(Dialect::MySQL, "SKIP CACHE").expect("should parse");
+    let result = parse_hint_directive(Dialect::MySQL, "FOO BAR").expect("should parse");
     assert!(result.is_none());
+}
+
+#[test]
+fn parse_create_cache_hint_with_clause_flags() {
+    let result = parse_hint_directive(
+        Dialect::MySQL,
+        "CREATE CACHE WITH (ALWAYS, CONCURRENTLY)",
+    )
+    .expect("should parse");
+    let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+        panic!("Expected CreateCache directive");
+    };
+    assert_eq!(opts.trx_cache_policy, TrxCachePolicy::Always);
+    assert!(opts.concurrently);
+}
+
+#[test]
+fn parse_create_cache_hint_with_clause_shallow_options() {
+    let result = parse_hint_directive(
+        Dialect::MySQL,
+        "CREATE SHALLOW CACHE WITH (POLICY TTL 5 SECONDS REFRESH 1 SECONDS, COALESCE 250 MS, ALWAYS)",
+    )
+    .expect("should parse");
+    let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+        panic!("Expected CreateCache directive");
+    };
+    assert_eq!(opts.trx_cache_policy, TrxCachePolicy::Always);
+    assert_eq!(opts.cache_type, Some(CacheType::Shallow));
+    assert_eq!(
+        opts.policy,
+        Some(EvictionPolicy::TtlAndPeriod {
+            ttl: Duration::from_secs(5),
+            refresh: Duration::from_secs(1),
+            schedule: false,
+        })
+    );
+    assert_eq!(opts.coalesce_ms, Some(Duration::from_millis(250)));
+}
+
+#[test]
+fn parse_create_cache_hint_with_clause_empty_allowed() {
+    // `WITH ()` parses as "no options", equivalent to the bare form (no clause), so SQL
+    // generators can emit `WITH (<options>)` without special-casing zero options.
+    let result = parse_hint_directive(Dialect::MySQL, "CREATE CACHE WITH ()").expect("should parse");
+    let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+        panic!("Expected CreateCache directive");
+    };
+    assert_eq!(opts.trx_cache_policy, TrxCachePolicy::Never);
+    assert!(!opts.concurrently);
+    assert_eq!(opts.policy, None);
+    assert_eq!(opts.coalesce_ms, None);
+}
+
+#[test]
+fn parse_create_cache_hint_with_clause_rejects_duplicates() {
+    let result = parse_hint_directive(Dialect::MySQL, "CREATE CACHE WITH (ALWAYS, ALWAYS)");
+    assert!(result.is_err());
+}
+
+#[test]
+fn parse_create_cache_hint_with_clause_rejects_policy_on_deep() {
+    let result = parse_hint_directive(
+        Dialect::MySQL,
+        "CREATE DEEP CACHE WITH (POLICY TTL 5 SECONDS)",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn parse_create_cache_hint_rejects_mixing_bare_and_with_clause() {
+    // A hint has no name, so a bare option and the WITH clause sit back to back; combining them
+    // is still rejected.
+    let result = parse_hint_directive(Dialect::MySQL, "CREATE CACHE ALWAYS WITH (CONCURRENTLY)");
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("combine bare options with a WITH"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn parse_create_cache_hint_adaptive() {
+    let result = parse_hint_directive(Dialect::MySQL, "CREATE SHALLOW CACHE WITH (ADAPTIVE)")
+        .expect("should parse");
+    let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+        panic!("Expected CreateCache directive");
+    };
+    assert!(opts.adaptive);
+    assert_eq!(opts.cache_type, Some(CacheType::Shallow));
+}
+
+#[test]
+fn parse_create_cache_hint_adaptive_on_deep_rejected() {
+    let result = parse_hint_directive(Dialect::MySQL, "CREATE DEEP CACHE WITH (ADAPTIVE)");
+    assert!(result.is_err());
+}
+
+#[test]
+fn parse_create_cache_hint_topk_buffer_multiplier() {
+    let result =
+        parse_hint_directive(Dialect::MySQL, "CREATE CACHE WITH (TOPK_BUFFER_MULTIPLIER = 4)")
+            .expect("should parse");
+    let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+        panic!("Expected CreateCache directive");
+    };
+    assert_eq!(opts.topk_buffer_multiplier, Some(4));
+}
+
+#[test]
+fn parse_create_cache_hint_topk_buffer_multiplier_zero_allowed() {
+    let result =
+        parse_hint_directive(Dialect::MySQL, "CREATE CACHE WITH (TOPK_BUFFER_MULTIPLIER = 0)")
+            .expect("should parse");
+    let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+        panic!("Expected CreateCache directive");
+    };
+    assert_eq!(opts.topk_buffer_multiplier, Some(0));
+}
+
+#[test]
+fn parse_create_cache_hint_topk_buffer_multiplier_outside_with_rejected() {
+    // Bare form must NOT accept the WITH-only knob — TOPK_BUFFER_MULTIPLIER is not a
+    // recognized hint outside the WITH clause.
+    let result = parse_hint_directive(Dialect::MySQL, "CREATE CACHE TOPK_BUFFER_MULTIPLIER = 4");
+    assert!(result.is_err());
+}
+
+#[test]
+fn parse_create_cache_hint_topk_buffer_multiplier_duplicate_rejected() {
+    let result = parse_hint_directive(
+        Dialect::MySQL,
+        "CREATE CACHE WITH (TOPK_BUFFER_MULTIPLIER = 1, TOPK_BUFFER_MULTIPLIER = 2)",
+    );
+    assert!(result.is_err());
+}
+
+// --- AUTOPARAM option tests (option is not part of the public SQL reference) ---
+
+fn parse_create_cache_statement(sql: &str) -> readyset_sql::ast::CreateCacheStatement {
+    let query = parse_query(Dialect::MySQL, sql).expect("should parse");
+    let SqlQuery::CreateCache(stmt) = query else {
+        panic!("expected CreateCache");
+    };
+    stmt
+}
+
+#[test]
+fn parse_create_cache_autoparam_off() {
+    let stmt = parse_create_cache_statement(
+        "CREATE CACHE c WITH (AUTOPARAM OFF) FROM SELECT id FROM t WHERE x = 1",
+    );
+    assert!(stmt.autoparam.off);
+    assert!(!stmt.autoparam.exclude_joins);
+    assert!(!stmt.autoparam.exclude_exists);
+    assert!(!stmt.autoparam.exclude_subqueries);
+}
+
+#[test]
+fn parse_create_cache_autoparam_on() {
+    // `AUTOPARAM ON` is the explicit default: accepted, with no exclusions set.
+    let stmt = parse_create_cache_statement(
+        "CREATE CACHE c WITH (AUTOPARAM ON) FROM SELECT id FROM t WHERE x = 1",
+    );
+    assert!(stmt.autoparam.is_default());
+}
+
+#[test]
+fn parse_create_cache_autoparam_excludes() {
+    let stmt = parse_create_cache_statement(
+        "CREATE CACHE c WITH (AUTOPARAM (EXCLUDE_JOINS, EXCLUDE_EXISTS, EXCLUDE_SUBQUERIES)) \
+         FROM SELECT id FROM t WHERE x = 1",
+    );
+    assert!(!stmt.autoparam.off);
+    assert!(stmt.autoparam.exclude_joins);
+    assert!(stmt.autoparam.exclude_exists);
+    assert!(stmt.autoparam.exclude_subqueries);
+}
+
+#[test]
+fn create_cache_autoparam_display_roundtrip() {
+    use readyset_sql::DialectDisplay;
+
+    for sql in [
+        "CREATE CACHE c WITH (AUTOPARAM OFF) FROM SELECT id FROM t WHERE x = 1",
+        "CREATE CACHE c WITH (AUTOPARAM (EXCLUDE_JOINS, EXCLUDE_EXISTS)) \
+         FROM SELECT id FROM t WHERE x = 1",
+    ] {
+        let stmt = parse_create_cache_statement(sql);
+        let displayed = stmt.display(Dialect::MySQL).to_string();
+        let reparsed = parse_create_cache_statement(&displayed);
+        assert_eq!(
+            stmt.autoparam, reparsed.autoparam,
+            "roundtrip failed for: {displayed}"
+        );
+    }
+}
+
+#[test]
+fn parse_create_cache_autoparam_duplicate_rejected() {
+    let result = parse_query(
+        Dialect::MySQL,
+        "CREATE CACHE c WITH (AUTOPARAM OFF, AUTOPARAM OFF) FROM SELECT id FROM t",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn parse_create_cache_autoparam_empty_list_rejected() {
+    let result = parse_query(
+        Dialect::MySQL,
+        "CREATE CACHE c WITH (AUTOPARAM ()) FROM SELECT id FROM t",
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn parse_create_cache_autoparam_unknown_scope_rejected() {
+    let result = parse_query(
+        Dialect::MySQL,
+        "CREATE CACHE c WITH (AUTOPARAM (EXCLUDE_EVERYTHING)) FROM SELECT id FROM t",
+    );
+    assert!(result.is_err());
+}
+
+// --- SKIP CACHE hint directive tests ---
+
+#[test]
+fn parse_skip_cache_hint_basic() {
+    let result = parse_hint_directive(Dialect::MySQL, "SKIP CACHE").expect("should parse");
+    assert_eq!(result, Some(ReadysetHintDirective::SkipCache));
+}
+
+#[test]
+fn parse_skip_cache_hint_case_insensitive() {
+    let result = parse_hint_directive(Dialect::MySQL, "skip cache").expect("should parse");
+    assert_eq!(result, Some(ReadysetHintDirective::SkipCache));
+
+    let result = parse_hint_directive(Dialect::MySQL, "Skip Cache").expect("should parse");
+    assert_eq!(result, Some(ReadysetHintDirective::SkipCache));
+}
+
+#[test]
+fn parse_skip_cache_hint_with_extra_spaces() {
+    let result =
+        parse_hint_directive(Dialect::MySQL, "  SKIP   CACHE  ").expect("should parse");
+    assert_eq!(result, Some(ReadysetHintDirective::SkipCache));
+}
+
+#[test]
+fn parse_skip_cache_hint_trailing_garbage() {
+    let result = parse_hint_directive(Dialect::MySQL, "SKIP CACHE SOMETHING");
+    assert!(result.is_err(), "SKIP CACHE with trailing tokens should error");
+}
+
+#[test]
+fn parse_create_skip_cache_is_not_skip_cache() {
+    // "CREATE SKIP CACHE" is invalid — it should not be parsed as SkipCache.
+    let result =
+        parse_hint_directive(Dialect::MySQL, "CREATE SKIP CACHE");
+    assert!(result.is_err(), "CREATE SKIP CACHE should be unrecognized, not SkipCache");
+}
+
+#[test]
+fn parse_skip_without_cache_is_unrecognized() {
+    let result =
+        parse_hint_directive(Dialect::MySQL, "SKIP SOMETHING").expect("should parse");
+    assert!(result.is_none(), "SKIP without CACHE should be unrecognized");
+}
+
+#[test]
+fn parse_skip_cache_in_select() {
+    let (query, directive) = parse_shallow_query(
+        Dialect::MySQL,
+        "SELECT /*rs+ SKIP CACHE */ * FROM users WHERE id = 1",
+    )
+    .expect("should parse");
+    assert_eq!(directive, Some(ReadysetHintDirective::SkipCache));
+
+    // The hint should be stripped, producing the same query as without the hint.
+    let (plain, _) = parse_shallow_query(
+        Dialect::MySQL,
+        "SELECT * FROM users WHERE id = 1",
+    )
+    .expect("should parse plain query");
+    assert_eq!(query, plain, "SKIP CACHE hint should be stripped from query");
+}
+
+#[test]
+fn parse_skip_cache_in_union() {
+    let (query, directive) = parse_shallow_query(
+        Dialect::MySQL,
+        "SELECT /*rs+ SKIP CACHE */ 1 UNION SELECT 2",
+    )
+    .expect("should parse");
+    assert_eq!(directive, Some(ReadysetHintDirective::SkipCache));
+
+    let (plain, _) = parse_shallow_query(Dialect::MySQL, "SELECT 1 UNION SELECT 2")
+        .expect("should parse plain UNION");
+    assert_eq!(query, plain, "SKIP CACHE hint in UNION should be stripped");
 }
 
 #[test]
@@ -445,5 +845,291 @@ fn parse_hint_ddl_syntax_also_works() {
             refresh: Duration::from_secs(60),
             schedule: false,
         })
+    );
+}
+
+#[test]
+fn parse_create_cache_hint_ttl_milliseconds() {
+    for text in [
+        "CREATE SHALLOW CACHE POLICY TTL 500 MILLISECONDS",
+        "CREATE SHALLOW CACHE POLICY TTL 500 MS",
+        "create shallow cache policy ttl 500 ms",
+    ] {
+        let result = parse_hint_directive(Dialect::MySQL, text).expect("should parse");
+        let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+            panic!("Expected CreateCache directive for {text}");
+        };
+        assert_eq!(
+            opts.policy,
+            Some(EvictionPolicy::Ttl {
+                ttl: Duration::from_millis(500)
+            }),
+            "for input {text}"
+        );
+    }
+}
+
+#[test]
+fn parse_create_cache_hint_mixed_units() {
+    // TTL in seconds, REFRESH in milliseconds.
+    let result = parse_hint_directive(
+        Dialect::MySQL,
+        "CREATE SHALLOW CACHE POLICY TTL 5 SECONDS REFRESH 500 MS",
+    )
+    .expect("should parse");
+    let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+        panic!("Expected CreateCache directive");
+    };
+    assert_eq!(
+        opts.policy,
+        Some(EvictionPolicy::TtlAndPeriod {
+            ttl: Duration::from_secs(5),
+            refresh: Duration::from_millis(500),
+            schedule: false,
+        })
+    );
+}
+
+#[test]
+fn parse_create_cache_hint_coalesce_milliseconds() {
+    let result =
+        parse_hint_directive(Dialect::MySQL, "CREATE SHALLOW CACHE COALESCE 250 MS")
+            .expect("should parse");
+    let Some(ReadysetHintDirective::CreateCache(opts)) = result else {
+        panic!("Expected CreateCache directive");
+    };
+    assert_eq!(opts.coalesce_ms, Some(Duration::from_millis(250)));
+}
+
+#[test]
+fn parse_refresh_not_less_than_ttl_with_mixed_units() {
+    // 1 SECOND >= 500 MS, so this should fail.
+    let result = parse_hint_directive(
+        Dialect::MySQL,
+        "CREATE SHALLOW CACHE POLICY TTL 500 MS REFRESH 1 SECONDS",
+    );
+    assert!(
+        result.is_err(),
+        "REFRESH >= TTL across mixed units should fail"
+    );
+}
+
+#[test]
+fn parse_unknown_duration_unit_fails() {
+    let result =
+        parse_hint_directive(Dialect::MySQL, "CREATE SHALLOW CACHE POLICY TTL 10 MINUTES");
+    assert!(result.is_err(), "unknown unit should fail");
+}
+
+// --- PostgreSQL dialect parity tests ---
+//
+// These exercise the same hint scenarios as above on the PostgreSQL dialect.
+// The Readyset hint logic itself is dialect-agnostic; these tests verify that
+// the upstream PostgreSQL dialect advertises `supports_comment_optimizer_hint`,
+// without which `/*rs+ ... */` comments would be discarded before ever
+// reaching our hint parser.
+
+/// Parse `hinted` and `plain` on `dialect`, assert the plain query produces no
+/// directive, and assert the hint-stripped query equals the plain one (both
+/// structurally and via Display). Returns the hinted-side directive so the
+/// caller can assert on its shape.
+fn parse_and_assert_stripped(
+    dialect: Dialect,
+    hinted: &str,
+    plain: &str,
+) -> Option<ReadysetHintDirective> {
+    let (with_hint, directive) =
+        parse_shallow_query(dialect, hinted).expect("should parse hinted query");
+    let (without_hint, plain_directive) =
+        parse_shallow_query(dialect, plain).expect("should parse plain query");
+
+    assert!(
+        plain_directive.is_none(),
+        "plain query must produce no directive"
+    );
+    assert_eq!(
+        with_hint, without_hint,
+        "hint-stripped query must equal plain query"
+    );
+    assert_eq!(
+        format!("{with_hint}"),
+        format!("{without_hint}"),
+        "Display must be identical with and without hint"
+    );
+    directive
+}
+
+#[test]
+fn pg_create_cache_directive_extracted() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE */ id FROM users WHERE id = $1",
+        "SELECT id FROM users WHERE id = $1",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_skip_cache_directive_extracted() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ SKIP CACHE */ id FROM users WHERE id = $1",
+        "SELECT id FROM users WHERE id = $1",
+    );
+    assert_eq!(directive, Some(ReadysetHintDirective::SkipCache));
+}
+
+#[test]
+fn pg_create_cache_with_ttl_policy() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE POLICY TTL 300 SECONDS REFRESH 60 SECONDS */ \
+         id FROM orders WHERE user_id = $1",
+        "SELECT id FROM orders WHERE user_id = $1",
+    );
+    let Some(ReadysetHintDirective::CreateCache(opts)) = directive else {
+        panic!("expected CreateCache directive");
+    };
+    assert_eq!(opts.cache_type, Some(CacheType::Shallow));
+    assert!(opts.policy.is_some());
+}
+
+#[test]
+fn pg_uppercase_hint_prefix_recognized() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*RS+ CREATE SHALLOW CACHE */ id FROM users WHERE id = $1",
+        "SELECT id FROM users WHERE id = $1",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_non_rs_hint_also_stripped() {
+    // A non-rs hint (e.g. `pg_hint_plan`-style `/*pg+ SeqScan(t) */`) must be
+    // stripped from the query so it does not affect the hash, but no
+    // Readyset directive is returned.
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*pg+ SeqScan(t) */ id FROM t WHERE id = $1",
+        "SELECT id FROM t WHERE id = $1",
+    );
+    assert!(
+        directive.is_none(),
+        "non-rs hint must not produce a directive"
+    );
+}
+
+#[test]
+fn pg_mixed_rs_and_non_rs_hints_all_stripped() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*pg+ SeqScan(t) */ /*rs+ CREATE SHALLOW CACHE */ id FROM t WHERE id = $1",
+        "SELECT id FROM t WHERE id = $1",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_multiple_rs_hints_first_wins_all_stripped() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE */ /*rs+ INVALID */ id FROM t WHERE id = $1",
+        "SELECT id FROM t WHERE id = $1",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_create_cache_hint_in_union() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE */ 1 UNION SELECT 2",
+        "SELECT 1 UNION SELECT 2",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_skip_cache_hint_in_union() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ SKIP CACHE */ 1 UNION SELECT 2",
+        "SELECT 1 UNION SELECT 2",
+    );
+    assert_eq!(directive, Some(ReadysetHintDirective::SkipCache));
+}
+
+#[test]
+fn pg_hint_on_right_side_of_union_stripped() {
+    let directive = parse_and_assert_stripped(
+        Dialect::PostgreSQL,
+        "SELECT 1 UNION SELECT /*rs+ CREATE SHALLOW CACHE */ 2",
+        "SELECT 1 UNION SELECT 2",
+    );
+    assert!(matches!(
+        directive,
+        Some(ReadysetHintDirective::CreateCache(_))
+    ));
+}
+
+#[test]
+fn pg_malformed_hint_still_returns_valid_shallow_query() {
+    // Malformed hint text (`POLICY TT` instead of `POLICY TTL`) must not
+    // prevent the plain query from being returned, and must produce
+    // directive = None.
+    let (query, directive) = parse_shallow_query(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE POLICY TT 300 SECONDS */ id FROM t WHERE id = $1",
+    )
+    .expect("should parse despite malformed hint");
+    assert!(directive.is_none());
+
+    let (plain, _) =
+        parse_shallow_query(Dialect::PostgreSQL, "SELECT id FROM t WHERE id = $1")
+            .expect("should parse plain query");
+    assert_eq!(query, plain);
+}
+
+#[test]
+fn pg_create_cache_from_select_with_hint_stripped() {
+    let create_sql = "CREATE SHALLOW CACHE FROM \
+                      SELECT /*rs+ CREATE SHALLOW CACHE */ id FROM t WHERE id = $1";
+    let query = parse_query(Dialect::PostgreSQL, create_sql).expect("parse create cache");
+    let SqlQuery::CreateCache(stmt) = query else {
+        panic!("expected CreateCache")
+    };
+    let CacheInner::Statement {
+        shallow: Ok(shallow),
+        ..
+    } = stmt.inner
+    else {
+        panic!("expected shallow Ok")
+    };
+
+    let (via_parse_shallow, _) = parse_shallow_query(
+        Dialect::PostgreSQL,
+        "SELECT /*rs+ CREATE SHALLOW CACHE */ id FROM t WHERE id = $1",
+    )
+    .expect("parse shallow");
+
+    assert_eq!(
+        *shallow, via_parse_shallow,
+        "CREATE CACHE path must produce the same hint-stripped ShallowCacheQuery as the query path"
     );
 }

@@ -7,6 +7,8 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Instant;
 
+use failpoint_macros::set_failpoint;
+
 use futures::future::TryFutureExt;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -21,12 +23,14 @@ use readyset_client::recipe::changelist::{Change, ChangeList};
 use readyset_client::TableStatus;
 use readyset_data::{DfValue, Dialect};
 use readyset_decimal::Decimal;
-use readyset_errors::{internal_err, ReadySetResult};
+use readyset_errors::{internal_err, ReadySetError, ReadySetResult};
 use readyset_sql::ast::{NonReplicatedRelation, NotReplicatedReason, Relation};
 use readyset_sql::DialectDisplay;
 use readyset_sql_parsing::ParsingPreset;
+#[cfg(feature = "failure_injection")]
+use readyset_util::failpoints;
 use replication_offset::mysql::MySqlPosition;
-use replication_offset::{ReplicationOffset, ReplicationOffsets};
+use replication_offset::{GtidSet, ReplicationOffset, ReplicationOffsets};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -36,6 +40,9 @@ use tracing_futures::Instrument;
 use super::utils::{get_mysql_version, mysql_pad_binary_column, mysql_pad_char_column};
 use crate::db_util::DatabaseSchemas;
 use crate::mysql_connector::snapshot_type::SnapshotType;
+use readyset_util::redacted::Sensitive;
+
+use crate::row_diagnostics;
 use crate::table_filter::TableFilter;
 use crate::{report_snapshot_progress, TablesSnapshottingGaugeGuard};
 use std::collections::HashSet;
@@ -58,6 +65,14 @@ pub enum TableKind {
     View,
 }
 
+/// Holds the result of querying SHOW MASTER STATUS / SHOW BINARY LOG STATUS
+struct MasterStatus {
+    /// The binlog file position
+    position: MySqlPosition,
+    /// The executed GTID set (column 5 of SHOW MASTER STATUS), if available
+    executed_gtid_set: Option<String>,
+}
+
 pub(crate) struct MySqlReplicator<'a> {
     /// This is the underlying (regular) MySQL connection
     pub(crate) pool: mysql::Pool,
@@ -69,6 +84,8 @@ pub(crate) struct MySqlReplicator<'a> {
     pub(crate) snapshot_query_comment: Option<String>,
     /// Any TableStatus updates sent here will update this controller's state machine.
     pub(crate) table_status_tx: UnboundedSender<(Relation, TableStatus)>,
+    /// Whether the upstream server has GTID mode enabled.
+    pub(crate) gtid_mode: bool,
 }
 
 /// Get the list of tables defined in the database
@@ -323,14 +340,14 @@ impl MySqlReplicator<'_> {
             }
         }
 
-        // Get the current binlog position, since at this point the tables are not locked, binlog
+        // Get the current replication offset, since at this point the tables are not locked, binlog
         // will advance while we are taking the snapshot. This is fine, we will catch up later.
-        // We prefer to take the binlog position *after* the recipe is loaded in order to make sure
+        // We prefer to take the replication offset *after* the recipe is loaded in order to make sure
         // no ddl changes took place between the binlog position and the schema that we loaded
-        let binlog_position = self.get_binlog_position().await?;
+        let schema_offset = self.current_replication_offset().await?;
 
         noria
-            .set_schema_replication_offset(Some(&binlog_position.into()))
+            .set_schema_replication_offset(Some(&schema_offset))
             .await?;
 
         let table_list = replicated_tables
@@ -369,17 +386,13 @@ impl MySqlReplicator<'_> {
         Ok(tx)
     }
 
-    /// Use the SHOW MASTER STATUS or SHOW BINARY LOG STATUS statement to determine
-    /// the current binary log file name and position.
-    async fn get_binlog_position(&self) -> mysql::Result<MySqlPosition> {
-        let mut conn = self.pool.get_conn().await?;
-        let query = match get_mysql_version(&mut conn).await {
+    /// Query the master status from a connection to determine the current replication offset
+    async fn master_status_from_conn(&self, conn: &mut mysql::Conn) -> mysql::Result<MasterStatus> {
+        let query = match get_mysql_version(conn).await {
             Ok(version) => {
                 if version >= 80400 {
-                    // MySQL 8.4.0 and above
                     "SHOW BINARY LOG STATUS"
                 } else {
-                    // MySQL 8.3.0 and below
                     "SHOW MASTER STATUS"
                 }
             }
@@ -388,7 +401,7 @@ impl MySqlReplicator<'_> {
             }
         };
 
-        let pos: mysql::Row = conn.query_first(query).await?.ok_or_else(|| {
+        let row: mysql::Row = conn.query_first(query).await?.ok_or_else(|| {
             mysql_async::Error::Other(Box::new(internal_err!(
                 "Empty response for SHOW MASTER STATUS. \
                  Ensure the binlog_format parameter is set to ROW and, if using RDS, backup \
@@ -396,11 +409,53 @@ impl MySqlReplicator<'_> {
             )))
         })?;
 
-        let file: String = pos.get(0).expect("Binlog file name");
-        let offset: u64 = pos.get(1).expect("Binlog offset");
+        let file: String = row.get(0).expect("Binlog file name");
+        let offset: u64 = row.get(1).expect("Binlog offset");
+        let executed_gtid_set = match row.get_opt::<String, _>(4) {
+            Some(Ok(value)) if !value.is_empty() => Some(value),
+            Some(Err(err)) => {
+                return Err(mysql_async::Error::Other(Box::new(err)));
+            }
+            _ => None,
+        };
 
-        MySqlPosition::from_file_name_and_position(file, offset)
-            .map_err(|err| mysql_async::Error::Other(Box::new(err)))
+        let position = MySqlPosition::from_file_name_and_position(file, offset)
+            .map_err(|err| mysql_async::Error::Other(Box::new(err)))?;
+
+        Ok(MasterStatus {
+            position,
+            executed_gtid_set,
+        })
+    }
+
+    /// Get the replication offset from master status, using GTID if enabled
+    async fn replication_offset_from_master_status(
+        &self,
+        conn: &mut mysql::Conn,
+    ) -> ReadySetResult<ReplicationOffset> {
+        let status = self
+            .master_status_from_conn(conn)
+            .await
+            .map_err(|err| ReadySetError::ReplicationFailed(format!("{err}")))?;
+
+        if self.gtid_mode {
+            let gtid_set = status.executed_gtid_set.ok_or_else(|| {
+                ReadySetError::ReplicationFailed(
+                    "Executed_Gtid_Set missing while GTID mode enabled".into(),
+                )
+            })?;
+            let parsed = GtidSet::parse(gtid_set.trim())?;
+            Ok(ReplicationOffset::Gtid(parsed))
+        } else {
+            Ok(status.position.into())
+        }
+    }
+
+    /// Use the SHOW MASTER STATUS or SHOW BINARY LOG STATUS statement to determine
+    /// the current replication offset (either a file position or a GTID set)
+    async fn current_replication_offset(&self) -> ReadySetResult<ReplicationOffset> {
+        let mut conn = self.pool.get_conn().await?;
+        self.replication_offset_from_master_status(&mut conn).await
     }
 
     /// Issue a `LOCK TABLES tbl_name READ` for the table name provided
@@ -438,8 +493,17 @@ impl MySqlReplicator<'_> {
         // in the table_mutator.schema().fields, but current version of mysql_common
         // don't have support to lookup a collation from its name. Temporally get the
         // collation ID from querying IS. Later we can avoid the extra query.
-        let (count_query, initial_query, bound_base_query, collation_query) =
-            snapshot_type.get_queries(table_mutator.table_name(), snapshot_query_comment);
+        // Build an explicit column list from the schema so that MySQL includes invisible
+        // columns (which are excluded from SELECT *).
+        let columns: Option<Vec<_>> = table_mutator
+            .schema()
+            .map(|s| s.fields.iter().map(|f| f.column.name.clone()).collect());
+        let (count_query, initial_query, bound_base_query, collation_query) = snapshot_type
+            .get_queries(
+                table_mutator.table_name(),
+                snapshot_query_comment,
+                columns.as_deref(),
+            );
 
         let collations = trx
             .query(collation_query)
@@ -505,15 +569,55 @@ impl MySqlReplicator<'_> {
                 row = row_stream.next().await.map_err(log_err)?;
             }
 
+            let mut df_row = Vec::with_capacity(collations.len());
             let df_row = match row
                 .as_ref()
-                .map(|r| mysql_row_to_noria_row(r, &collations))
+                .map(|r| mysql_row_to_noria_row(r, &collations, &mut df_row))
                 .transpose()
             {
-                Ok(Some(df_row)) => df_row,
+                Ok(Some(())) => df_row,
                 Ok(None) => break,
                 Err(err) => {
-                    return Err(log_err(err));
+                    let idx = df_row.len();
+                    let failed_row = row.as_ref().expect("conversion only runs on a row");
+                    let describe = |indices: &[usize]| {
+                        row_diagnostics::describe_columns(indices.iter().map(|&i| {
+                            let name = failed_row
+                                .columns_ref()
+                                .get(i)
+                                .map(|c| c.name_str().to_string())
+                                .unwrap_or_else(|| format!("index {i}"));
+                            let mut decoded = Vec::with_capacity(1);
+                            let value = mysql_value_to_noria_value(
+                                failed_row,
+                                i,
+                                collations[i],
+                                &mut decoded,
+                            )
+                            .ok()
+                            .and_then(|()| decoded.pop());
+                            (name, value)
+                        }))
+                    };
+                    let identifier = row_diagnostics::describe_identifier(
+                        snapshot_type.identifier_columns(),
+                        failed_row.len(),
+                        describe,
+                    );
+                    let column = failed_row
+                        .columns_ref()
+                        .get(idx)
+                        .map(|c| format!("{} {:?}", c.name_str(), c.column_type()))
+                        .unwrap_or_else(|| format!("index {idx}"));
+                    return Err(row_diagnostics::conversion_failed(
+                        table_mutator
+                            .table_name()
+                            .display(readyset_sql::Dialect::MySQL),
+                        progress,
+                        column,
+                        &identifier,
+                        &err,
+                    ));
                 }
             };
             prev_row = row;
@@ -656,6 +760,7 @@ impl MySqlReplicator<'_> {
         table: Relation,
         snapshot_report_interval_secs: u16,
     ) -> ReadySetResult<JoinHandle<(Relation, ReplicationOffset, ReadySetResult<()>)>> {
+        set_failpoint!(failpoints::MYSQL_SNAPSHOT_TABLE);
         let span = info_span!(
             "Snapshotting table",
             table = %table.display(readyset_sql::Dialect::MySQL)
@@ -664,7 +769,9 @@ impl MySqlReplicator<'_> {
         let mut read_lock = self.lock_table(&table).await?;
         // We acquire the position for each table individually, since it changes from
         // one lock to the other
-        let repl_offset = ReplicationOffset::from(self.get_binlog_position().await?);
+        let repl_offset = self
+            .replication_offset_from_master_status(&mut read_lock)
+            .await?;
         span.in_scope(|| info!("Snapshotting table"));
 
         let trx = self.get_one_transaction().instrument(span.clone()).await?;
@@ -865,12 +972,27 @@ impl MySqlReplicator<'_> {
 }
 
 /// Convert each entry in a row to a ReadySet type that can be inserted into the base tables
+/// Converts a row into `noria_row`. Converting one column at a time means that on failure the
+/// length of `noria_row` is the position of the column that failed, which callers use to name it.
 fn mysql_row_to_noria_row(
     row: &mysql::Row,
     collations: &[u16],
-) -> ReadySetResult<Vec<readyset_data::DfValue>> {
-    let mut noria_row = Vec::with_capacity(row.len());
+    noria_row: &mut Vec<readyset_data::DfValue>,
+) -> ReadySetResult<()> {
     for (idx, collation) in collations.iter().enumerate().take(row.len()) {
+        mysql_value_to_noria_value(row, idx, *collation, noria_row)?;
+    }
+    Ok(())
+}
+
+fn mysql_value_to_noria_value(
+    row: &mysql::Row,
+    idx: usize,
+    collation: u16,
+    noria_row: &mut Vec<readyset_data::DfValue>,
+) -> ReadySetResult<()> {
+    let collation = &collation;
+    {
         let val = value_to_value(row.as_ref(idx).unwrap());
         let col = row.columns_ref().get(idx).unwrap();
         let flags = col.flags();
@@ -892,12 +1014,12 @@ fn mysql_row_to_noria_row(
                     mysql_common::value::Value::Bytes(b) => b.clone(),
                     mysql_common::value::Value::NULL => {
                         noria_row.push(DfValue::None);
-                        continue;
+                        return Ok(());
                     }
                     _ => {
                         return Err(internal_err!(
                             "Expected MYSQL_TYPE_STRING column to be of value Bytes, got {:?}",
-                            val
+                            Sensitive(&val)
                         ));
                     }
                 };
@@ -952,7 +1074,7 @@ fn mysql_row_to_noria_row(
                         DfValue::None => Ok(DfValue::None), //NULL
                         _ => Err(internal_err!(
                             "Expected datetime/timestamp column to be of type TimestampTz, got {:?}",
-                            val
+                            Sensitive(&val)
                         )),
                     })?;
                 noria_row.push(df_val);
@@ -968,7 +1090,7 @@ fn mysql_row_to_noria_row(
                         DfValue::None => Ok(DfValue::None), //NULL
                         _ => Err(internal_err!(
                             "Expected date column to be of type TimestampTz, got {:?}",
-                            val
+                            Sensitive(&val)
                         )),
                     })?;
                 noria_row.push(df_val);
@@ -986,16 +1108,18 @@ fn mysql_row_to_noria_row(
             },
             ColumnType::MYSQL_TYPE_JSON => {
                 let df_val = match val {
-                    mysql_common::value::Value::Bytes(b) => str::from_utf8(&b)
-                        .ok()
-                        .and_then(|s: &str| serde_json::from_str(s).ok())
-                        .map(|j: Value| DfValue::from(j))
-                        .ok_or_else(|| internal_err!("Failed to parse JSON value"))?,
+                    mysql_common::value::Value::Bytes(b) => {
+                        let s = str::from_utf8(&b)
+                            .map_err(|e| internal_err!("Failed to parse JSON value: {e}"))?;
+                        let json: Value = serde_json::from_str(s)
+                            .map_err(|e| internal_err!("Failed to parse JSON value: {e}"))?;
+                        DfValue::from(json)
+                    }
                     mysql_common::value::Value::NULL => DfValue::None,
                     _ => {
                         return Err(internal_err!(
                             "Expected a bytes value for JSON column, got {:?}",
-                            val
+                            Sensitive(&val)
                         ));
                     }
                 };
@@ -1026,7 +1150,7 @@ fn mysql_row_to_noria_row(
                     _ => {
                         return Err(internal_err!(
                             "Expected a bytes value for VAR_STRING column, got {:?}",
-                            val
+                            Sensitive(&val)
                         ));
                     }
                 };
@@ -1038,7 +1162,7 @@ fn mysql_row_to_noria_row(
             _ => noria_row.push(readyset_data::DfValue::try_from(val)?),
         }
     }
-    Ok(noria_row)
+    Ok(())
 }
 
 /// Although both are of the exact same type, there is a conflict between reexported versions

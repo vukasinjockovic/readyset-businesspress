@@ -97,6 +97,15 @@ pub enum Literal {
     ByteArray(Vec<u8>),
     Placeholder(ItemPlaceholder),
     BitVector(#[strategy(arbitrary_bitvec(0..=64))] BitVec),
+    /// A literal tagged by the autoparameterization-exclusion machinery
+    /// (`CREATE CACHE ... WITH (AUTOPARAM (EXCLUDE_*))`) to be kept inline rather than
+    /// auto-parameterized. This variant is strictly transient: it is introduced by the
+    /// exclusion pre-pass before the Readyset rewrite and fully consumed (unwrapped) by the
+    /// sweep at the end of `rewrite_for_readyset`, so it must never reach hashing, Display,
+    /// dataflow lowering, or any persisted form. Code that encounters it outside the rewrite
+    /// pipeline should treat it as a bug.
+    #[weight(0)]
+    Preserved(Box<Literal>),
 }
 
 impl From<bool> for Literal {
@@ -246,14 +255,9 @@ impl DialectDisplay for Literal {
                     }
                 }
             },
-            Literal::Blob(bv) => write!(
-                f,
-                "{}",
-                bv.iter()
-                    .map(|v| format!("{v:x}"))
-                    .collect::<Vec<String>>()
-                    .join(" ")
-            ),
+            Literal::Blob(bv) => {
+                write!(f, "X'{}'", bv.iter().map(|v| format!("{v:02X}")).join(""))
+            }
             Literal::ByteArray(b) => {
                 // E'\x...' can produce invalid UTF-8 sequences.
                 write!(f, "X'{}'", b.iter().map(|v| format!("{v:02X}")).join(""))
@@ -266,6 +270,10 @@ impl DialectDisplay for Literal {
                     b.iter().map(|bit| if bit { "1" } else { "0" }).join("")
                 )
             }
+            // Transient marker that should be consumed by the end of the Readyset rewrite. If
+            // one ever reaches Display, render the wrapped literal transparently rather than
+            // panic.
+            Literal::Preserved(inner) => write!(f, "{}", inner.display(dialect)),
         })
     }
 }
@@ -322,8 +330,8 @@ impl Literal {
             SqlType::MediumIntUnsigned(_) => (0..(1u32 << 24))
                 .prop_map(|i| Self::UnsignedInteger(i as _))
                 .boxed(),
+            SqlType::ByteArray => any::<Vec<u8>>().prop_map(Self::ByteArray).boxed(),
             SqlType::Blob
-            | SqlType::ByteArray
             | SqlType::LongBlob
             | SqlType::MediumBlob
             | SqlType::TinyBlob
@@ -429,5 +437,42 @@ impl Literal {
     #[must_use]
     pub fn is_placeholder(&self) -> bool {
         matches!(self, Self::Placeholder(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Dialect;
+
+    #[test]
+    fn blob_display_produces_valid_hex_literal() {
+        let blob = Literal::Blob(vec![0x8d, 0x33, 0x4e, 0x00, 0x0a, 0xff]);
+        let mysql = blob.display(Dialect::MySQL).to_string();
+        let psql = blob.display(Dialect::PostgreSQL).to_string();
+
+        assert_eq!(mysql, "X'8D334E000AFF'");
+        assert_eq!(psql, "X'8D334E000AFF'");
+    }
+
+    #[test]
+    fn blob_display_empty() {
+        let blob = Literal::Blob(vec![]);
+        assert_eq!(blob.display(Dialect::MySQL).to_string(), "X''");
+        assert_eq!(blob.display(Dialect::PostgreSQL).to_string(), "X''");
+    }
+
+    #[test]
+    fn byte_array_display_matches_blob() {
+        let data = vec![0x01, 0xab, 0xcd, 0xef];
+        let blob = Literal::Blob(data.clone());
+        let byte_array = Literal::ByteArray(data);
+
+        for dialect in [Dialect::MySQL, Dialect::PostgreSQL] {
+            assert_eq!(
+                blob.display(dialect).to_string(),
+                byte_array.display(dialect).to_string(),
+            );
+        }
     }
 }

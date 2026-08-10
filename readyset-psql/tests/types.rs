@@ -1,8 +1,8 @@
-use readyset_client_test_helpers::TestBuilder;
 use readyset_client_test_helpers::psql_helpers::PostgreSQLAdapter;
+use readyset_client_test_helpers::TestBuilder;
 use readyset_server::{DurabilityMode, Handle};
 use readyset_util::shutdown::ShutdownSender;
-use test_utils::tags;
+use test_utils::{tags, upstream};
 
 async fn setup() -> (tokio_postgres::Config, Handle, ShutdownSender) {
     TestBuilder::default()
@@ -13,21 +13,23 @@ async fn setup() -> (tokio_postgres::Config, Handle, ShutdownSender) {
         .await
 }
 
-#[allow(clippy::module_inception, reason = "pre-existing structure; only triggers after test-discovery consolidation")]
+#[allow(
+    clippy::module_inception,
+    reason = "pre-existing structure; only triggers after test-discovery consolidation"
+)]
 mod types {
+    use std::assert_matches;
     use std::panic::{AssertUnwindSafe, RefUnwindSafe};
     use std::time::Duration;
 
-    use assert_matches::assert_matches;
     use cidr::IpInet;
     use eui48::MacAddress;
-    use pretty_assertions::assert_eq;
     use proptest::collection::vec;
     use proptest::prelude::*;
     use proptest::string::string_regex;
     use readyset_adapter::backend::QueryDestination;
     use readyset_client_test_helpers::psql_helpers::{connect, last_query_info, upstream_config};
-    use readyset_client_test_helpers::{Adapter, sleep};
+    use readyset_client_test_helpers::{sleep, Adapter};
     use readyset_data::DfValue;
     use readyset_decimal::Decimal;
     use readyset_util::arbitrary::{
@@ -47,6 +49,7 @@ mod types {
         V: ToSql + Sync + PartialEq + RefUnwindSafe,
         for<'a> V: FromSql<'a>,
     {
+        use pretty_assertions::assert_eq;
         let (config, _handle, shutdown_tx) = setup().await;
         let mut client = connect(config).await;
 
@@ -124,7 +127,8 @@ mod types {
         };
 
         (@impl, $(#[$meta:meta])* $test_name: ident, $pg_type_name: expr_2021, $rust_type: ty, $strategy: expr_2021) => {
-            #[tags(serial, slow, no_retry, postgres_upstream)]
+            #[tags(serial, slow, no_retry)]
+            #[upstream(postgres)]
             // these are pretty slow, so we only run a few cases at a time
             #[test_strategy::proptest(ProptestConfig {
                 cases: 5,
@@ -183,7 +187,8 @@ mod types {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     async fn regclass() {
         let (config, _handle, shutdown_tx) = setup().await;
         let client = connect(config).await;
@@ -203,7 +208,8 @@ mod types {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     async fn regproc() {
         let (upstream, upstream_conn) = upstream_config()
             .dbname("postgres")
@@ -242,7 +248,8 @@ mod types {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     async fn enums() {
         readyset_tracing::init_test_logging();
         let (config, _handle, shutdown_tx) = setup().await;
@@ -785,7 +792,8 @@ mod types {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     async fn enum_as_pk() {
         readyset_tracing::init_test_logging();
         let (config, _handle, shutdown_tx) = setup().await;
@@ -873,7 +881,8 @@ mod types {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     async fn alter_enum_complex_variant_changes() {
         readyset_tracing::init_test_logging();
         let (config, _handle, shutdown_tx) = setup().await;
@@ -959,7 +968,8 @@ mod types {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     async fn citext() {
         readyset_tracing::init_test_logging();
         let (config, _handle, shutdown_tx) = setup().await;
@@ -1014,7 +1024,8 @@ mod types {
     // Tests that even if a hole is filled in a reader node before we issue any writes, a
     // subsequent write for the same key still makes it to the reader
     #[tokio::test(flavor = "multi_thread")]
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     async fn citext_read_before_write() {
         readyset_tracing::init_test_logging();
         let (config, _handle, shutdown_tx) = setup().await;
@@ -1073,7 +1084,8 @@ mod types {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tags(serial, postgres_upstream)]
+    #[tags(serial)]
+    #[upstream(postgres)]
     async fn date_only() {
         readyset_tracing::init_test_logging();
         PostgreSQLAdapter::recreate_database("psql_date_only_test").await;
@@ -1091,7 +1103,7 @@ mod types {
             .unwrap();
 
         let (rs_config, _handle, shutdown_tx) = TestBuilder::default()
-            .replicate_db("psql_date_only_test".to_string())
+            .replicate_db("psql_date_only_test")
             .recreate_database(false)
             .build::<PostgreSQLAdapter>()
             .await;
@@ -1139,7 +1151,8 @@ mod types {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tags(serial, slow, postgres_upstream)]
+    #[tags(serial, slow)]
+    #[upstream(postgres)]
     async fn regression_text_array() {
         readyset_tracing::init_test_logging();
         let vals = vec![vec!["0.".to_string()]];
@@ -1147,11 +1160,63 @@ mod types {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[tags(serial, slow, postgres_upstream)]
+    #[tags(serial, slow)]
+    #[upstream(postgres)]
     #[ignore = "REA-5757"]
     async fn regression_large_text_array_multiple_matches() {
         readyset_tracing::init_test_logging();
         let vals = vec![vec!["1".to_string(); 1500]; 15];
         test_type_roundtrip("text[]", vals).await;
+    }
+
+    /// Tests that empty array literals passed as the string '{}' are correctly handled.
+    /// This is a regression test for the case where PostgreSQL receives empty arrays
+    /// as text literals rather than proper array values.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tags(serial, slow)]
+    #[upstream(postgres)]
+    async fn empty_array_literal_parameter() {
+        readyset_tracing::init_test_logging();
+        let (config, _handle, shutdown_tx) = setup().await;
+        let client = connect(config).await;
+
+        client
+            .simple_query("CREATE TABLE t_empty_arr (id int, arr text[])")
+            .await
+            .unwrap();
+
+        client
+            .simple_query("INSERT INTO t_empty_arr VALUES (1, '{}')")
+            .await
+            .unwrap();
+
+        client
+            .simple_query("INSERT INTO t_empty_arr VALUES (2, '{a,b}')")
+            .await
+            .unwrap();
+
+        // Test empty array roundtrip through ReadySet
+        eventually!(run_test: {
+            client
+                .query_one("SELECT arr FROM t_empty_arr WHERE id = 1", &[])
+                .await
+                .unwrap()
+                .get::<_, Vec<String>>(0)
+        }, then_assert: |result| {
+            assert!(result.is_empty(), "Expected empty array, got {:?}", result);
+        });
+
+        // Also verify non-empty arrays still work
+        eventually!(run_test: {
+            client
+                .query_one("SELECT arr FROM t_empty_arr WHERE id = 2", &[])
+                .await
+                .unwrap()
+                .get::<_, Vec<String>>(0)
+        }, then_assert: |result| {
+            assert_eq!(result, vec!["a".to_string(), "b".to_string()]);
+        });
+
+        shutdown_tx.shutdown().await;
     }
 }

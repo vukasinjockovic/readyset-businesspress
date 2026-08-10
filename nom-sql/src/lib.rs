@@ -33,6 +33,7 @@ mod insert;
 mod join;
 mod keywords;
 mod literal;
+mod mcp_token;
 mod order;
 mod rename;
 mod rls;

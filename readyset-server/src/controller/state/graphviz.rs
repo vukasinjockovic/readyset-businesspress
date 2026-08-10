@@ -1,10 +1,13 @@
-use std::collections::{HashMap, HashSet};
-use std::fmt::{self, Display};
+use std::collections::HashMap;
+use std::fmt::{self, Display, Write};
 
 use dataflow::prelude::{Graph, NodeIndex};
 use dataflow::{DomainIndex, NodeMap};
 use petgraph::Direction;
 use readyset_client::debug::info::NodeSize;
+use readyset_client::post_processing::{
+    PostLookup, PostLookupAggregateFunction, PostLookupDistinct,
+};
 
 use crate::controller::migrate::materialization::Materializations;
 
@@ -43,19 +46,7 @@ impl Display for Graphviz<'_> {
         out!(f, 1, "node [shape=none, fontsize=10]");
 
         let nodes = if let Some((ni, dir)) = self.reachable_from {
-            let mut nodes = HashSet::new();
-            let mut stack = vec![ni];
-            while let Some(node) = stack.pop() {
-                if nodes.insert(node) {
-                    for next in self.graph.neighbors_directed(node, dir) {
-                        if !nodes.contains(&next) {
-                            stack.push(next);
-                        }
-                    }
-                }
-            }
-
-            nodes
+            super::reachable_from(self.graph, ni, dir)
         } else {
             self.graph.node_indices().collect()
         };
@@ -83,7 +74,7 @@ impl Display for Graphviz<'_> {
             }
             for index in nodes {
                 let node = &self.graph[index];
-                if node.is_source() {
+                if node.is_graph_root() {
                     continue;
                 }
                 let materialization_status = self.materializations.get_status(index, node);
@@ -100,9 +91,56 @@ impl Display for Graphviz<'_> {
             }
         }
 
+        // Reader processing pseudo-nodes: rendered outside domain subgraphs so they
+        // don't clutter the dataflow layout.  Each pseudo-node is a dashed "note"
+        // shape linked to its reader with a gray dashed edge (no arrowhead).
+        for &index in &nodes {
+            let node = &self.graph[index];
+            if let Some(reader) = node.as_reader() {
+                let PostLookup {
+                    ref order_by,
+                    limit,
+                    ref aggregates,
+                    ref distinct,
+                    // Column projection and default rows are omitted from the
+                    // pseudo-node as they are less interesting for dataflow debugging.
+                    returned_cols: _,
+                    default_row: _,
+                } = reader.reader_processing().post_processing;
+                let has_aggregates = aggregates
+                    .as_ref()
+                    .is_some_and(|a| !a.group_by.is_empty() || !a.aggregates.is_empty());
+                let has_distinct = !matches!(distinct, PostLookupDistinct::None);
+                if order_by.is_none() && limit.is_none() && !has_aggregates && !has_distinct {
+                    continue;
+                }
+                let id = index.index();
+                let mut label = String::from("<b>ReaderProcessing</b>");
+                write_reader_processing(
+                    &mut label,
+                    order_by.as_deref(),
+                    limit,
+                    aggregates.as_ref(),
+                    distinct,
+                )
+                .expect("write to String is infallible");
+                out!(
+                    f,
+                    1,
+                    "n{id}_rp [label=< {label} >, shape=note, fontsize=9, \
+                     fillcolor=\"#f0f0f0\", style=\"dashed,filled\"]"
+                );
+                out!(
+                    f,
+                    1,
+                    "n{id} -> n{id}_rp [ style=dashed, arrowhead=none, color=gray ]"
+                );
+            }
+        }
+
         // edges.
         for edge in self.graph.raw_edges() {
-            if self.graph[edge.source()].is_source() {
+            if self.graph[edge.source()].is_graph_root() {
                 continue;
             }
             if !(nodes.contains(&edge.source()) && nodes.contains(&edge.target())) {
@@ -145,4 +183,68 @@ impl Display for Graphviz<'_> {
 
         Ok(())
     }
+}
+
+/// Write post-lookup processing info as HTML content for a graphviz pseudo-node label.
+fn write_reader_processing(
+    w: &mut impl Write,
+    order_by: Option<
+        &[(
+            usize,
+            readyset_sql::ast::OrderType,
+            readyset_sql::ast::NullOrder,
+        )],
+    >,
+    limit: Option<usize>,
+    aggregates: Option<&readyset_client::post_processing::PostLookupAggregates>,
+    distinct: &PostLookupDistinct,
+) -> fmt::Result {
+    match distinct {
+        PostLookupDistinct::None => {}
+        PostLookupDistinct::Sorted { .. } => write!(w, "<br/>DISTINCT (sorted)")?,
+        PostLookupDistinct::HashBased => write!(w, "<br/>DISTINCT (hash)")?,
+    }
+    if let Some(order_by) = order_by {
+        if !order_by.is_empty() {
+            write!(w, "<br/>ORDER BY ")?;
+            for (i, (col, order, null_order)) in order_by.iter().enumerate() {
+                if i > 0 {
+                    w.write_str(", ")?;
+                }
+                write!(w, "[{col}] {order} {null_order}")?;
+            }
+        }
+    }
+
+    if let Some(limit) = limit {
+        write!(w, "<br/>LIMIT {limit}")?;
+    }
+
+    if let Some(aggs) = aggregates {
+        if !aggs.group_by.is_empty() {
+            write!(w, "<br/>GROUP BY ")?;
+            for (i, col) in aggs.group_by.iter().enumerate() {
+                if i > 0 {
+                    w.write_str(", ")?;
+                }
+                write!(w, "[{col}]")?;
+            }
+        }
+        for agg in &aggs.aggregates {
+            // SQL-standard names for graphviz readability (vs. abbreviated
+            // names in PostLookupAggregate::description()).
+            let name = match &agg.function {
+                PostLookupAggregateFunction::Sum => "SUM",
+                PostLookupAggregateFunction::Max => "MAX",
+                PostLookupAggregateFunction::Min => "MIN",
+                PostLookupAggregateFunction::GroupConcat { .. } => "GROUP_CONCAT",
+                PostLookupAggregateFunction::ArrayAgg { .. } => "ARRAY_AGG",
+                PostLookupAggregateFunction::StringAgg { .. } => "STRING_AGG",
+                PostLookupAggregateFunction::JsonObjectAgg { .. } => "JSON_OBJECT_AGG",
+            };
+            write!(w, "<br/>{name}([{}])", agg.column)?;
+        }
+    }
+
+    Ok(())
 }

@@ -10,31 +10,39 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use database_utils::{DatabaseConnection, DatabaseURL, QueryableConnection, ReplicationServerId};
-use readyset_adapter::backend::noria_connector::{NoriaConnector, ReadBehavior};
-use readyset_adapter::backend::{BackendBuilder, MigrationMode, QueryDestination, QueryInfo};
-use readyset_adapter::metrics_handle::MetricsHandle;
-use readyset_adapter::query_status_cache::{MigrationStyle, QueryStatusCache};
+use mysql_srv::{AuthCache, AuthPlugin};
+use readyset_adapter::backend::noria_connector::NoriaConnector;
+use readyset_adapter::backend::{
+    BackendBuilder, MigrationMode, QueryDestination, QueryInfo, UnsupportedSetMode, UsersSync,
+};
+use readyset_adapter::query_status_cache::{
+    MigrationStyle, QscSchemaChangeAdapter, QueryStatusCache,
+};
+use readyset_adapter::rls_coordinator::RlsCoordinator;
 use readyset_adapter::shallow_refresh_pool::ShallowRefreshPool;
 use readyset_adapter::{
-    Backend, QueryHandler, ReadySetStatusReporter, UpstreamConfig, UpstreamDatabase,
-    ViewsSynchronizer,
+    recreate_shallow_caches, Backend, QueryHandler, ReadySetStatusReporter, UpstreamConfig,
+    UpstreamDatabase, ViewsSynchronizer,
 };
-use readyset_client::consensus::{Authority, LocalAuthorityStore};
+use readyset_client::consensus::{Authority, AuthorityControl, LocalAuthorityStore};
+use readyset_client_metrics::QueryLogMode;
 use readyset_data::upstream_system_props::{
     init_system_props, UpstreamSystemProperties, DEFAULT_TIMEZONE_NAME,
 };
 use readyset_data::Dialect;
 use readyset_errors::ReadySetError;
-use readyset_server::{
-    Builder, DurabilityMode, Handle, LocalAuthority, PrometheusBuilder, ReadySetHandle,
-};
+use readyset_metrics::init_global_recorder;
+use readyset_query_logger::QueryLogger;
+use readyset_schema::ReadysetSchema;
+use readyset_server::{Builder, DurabilityMode, Handle, LocalAuthority, ReadySetHandle};
 use readyset_shallow::CacheManager;
 use readyset_sql::ast::Relation;
 use readyset_sql_parsing::ParsingPreset;
-use readyset_util::eventually;
+use readyset_sql_passes::adapter_rewrites;
 use readyset_util::shared_cache::SharedCache;
 use readyset_util::shutdown::ShutdownSender;
-use schema_catalog::{SchemaCatalogSynchronizer, SchemaGeneration};
+use readyset_util::{eventually, scheduler_yield};
+use schema_catalog::{SchemaCatalogHandle, SchemaCatalogSynchronizer, SchemaGeneration};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
@@ -42,6 +50,8 @@ pub mod mysql_helpers;
 pub mod psql_helpers;
 
 pub use readyset_server::sleep;
+
+const MAX_DATABASE_NAME_LEN: usize = 63;
 
 static UNIQUE_SERVER_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -78,17 +88,17 @@ pub async fn wait_for_schema_generation_change(
     });
 }
 
-#[macro_export]
-macro_rules! derive_test_name {
-    () => {
-        std::thread::current()
-            .name()
-            .unwrap()
-            .split_once("::")
-            .unwrap()
-            .0
-            .to_owned()
-    };
+pub fn derive_test_name() -> String {
+    std::thread::current()
+        .name()
+        .unwrap()
+        .split("::")
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("_")
+        .chars()
+        .take(MAX_DATABASE_NAME_LEN)
+        .collect()
 }
 
 /// Wait for a table to be rebuilt (as indicated by a change in its dataflow node id), and for the
@@ -172,14 +182,27 @@ pub trait Adapter: Send {
     fn upstream_url(_db_name: &str) -> String;
 
     async fn make_upstream(addr: String) -> Self::Upstream {
-        Self::Upstream::connect(UpstreamConfig::from_url(addr), None, None)
+        Self::Upstream::connect(UpstreamConfig::from_url(addr), None, None, false)
             .await
             .unwrap()
     }
 
     async fn recreate_database(db_name: &str);
 
-    async fn run_backend(backend: Backend<Self::Upstream, Self::Handler>, s: TcpStream);
+    async fn run_backend(
+        backend: Backend<Self::Upstream, Self::Handler>,
+        s: TcpStream,
+        auth_plugin: AuthPlugin,
+        auth_cache: Arc<AuthCache>,
+    );
+
+    /// Return a [`UsersSync`] hook that keeps a protocol-level fast-auth cache in step with runtime
+    /// `ALTER READYSET ... USER` mutations, mirroring how the adapter binary wires its cache. The
+    /// default has no cache to sync; MySQL overrides it to sync the `caching_sha2_password`
+    /// [`AuthCache`].
+    fn users_sync(_auth_cache: &Arc<AuthCache>) -> Option<Arc<dyn UsersSync>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -196,6 +219,7 @@ enum FallbackBehavior {
     #[default]
     NoFallback,
     UseReplicationUpstream,
+    UpstreamWithoutReplication,
 }
 
 /// A builder for an adapter integration test case.
@@ -208,7 +232,7 @@ pub struct TestBuilder {
     fallback: FallbackBehavior,
     partial: bool,
     wait_for_backend: bool,
-    read_behavior: ReadBehavior,
+    upquery_timeout: Duration,
     migration_mode: MigrationMode,
     migration_style: MigrationStyle,
     recreate_database: bool,
@@ -221,6 +245,15 @@ pub struct TestBuilder {
     topk: bool,
     straddled_joins: bool,
     parsing_preset: ParsingPreset,
+    replication_tables: Option<String>,
+    require_gtid: bool,
+    replication_lag_interval: Option<u16>,
+    replication_heartbeat: bool,
+    auth_plugin: AuthPlugin,
+    upstream_only_db: Option<String>,
+    rls: bool,
+    rls_poll_interval: Option<Duration>,
+    shallow_adaptive_max_extra_load_percent: Option<u64>,
 }
 
 impl Default for TestBuilder {
@@ -231,22 +264,14 @@ impl Default for TestBuilder {
 
 impl TestBuilder {
     pub fn new(backend_builder: BackendBuilder) -> Self {
-        let backend_builder = backend_builder.metrics_handle(Some(MetricsHandle::new(
-            PrometheusBuilder::new()
-                .with_push_gateway("http://example.com", Duration::default(), None, None)
-                .unwrap()
-                .build()
-                .unwrap()
-                .0
-                .handle(),
-        )));
+        init_global_recorder(&[]);
         Self {
             backend_builder,
             replicate: Default::default(),
             fallback: Default::default(),
             partial: true,
             wait_for_backend: true,
-            read_behavior: ReadBehavior::Blocking,
+            upquery_timeout: Duration::from_secs(5),
             migration_mode: MigrationMode::InRequestPath,
             migration_style: MigrationStyle::InRequestPath,
             recreate_database: true,
@@ -259,7 +284,49 @@ impl TestBuilder {
             topk: false,
             straddled_joins: false,
             parsing_preset: ParsingPreset::for_tests(),
+            replication_tables: None,
+            require_gtid: false,
+            replication_lag_interval: None,
+            replication_heartbeat: false,
+            auth_plugin: AuthPlugin::default(),
+            upstream_only_db: None,
+            rls: false,
+            rls_poll_interval: None,
+            shallow_adaptive_max_extra_load_percent: None,
         }
+    }
+
+    /// Bootstrap the RLS policy registry from the (Postgres) upstream and wire
+    /// an [`RlsCoordinator`] into the backend, so shallow caches over
+    /// RLS-active tables partition per session. Mirrors the adapter binary's
+    /// bootstrap. No-op for non-Postgres upstreams.
+    pub fn rls(mut self, rls: bool) -> Self {
+        self.rls = rls;
+        self
+    }
+
+    /// Override the RLS catalog poll interval (default 60s). Tests that exercise
+    /// policy-change invalidation set this low (e.g. 1s) so the poller detects
+    /// the change within the test's timeout. Clamped to `[1s, 24h]`.
+    pub fn rls_poll_interval(mut self, interval: Duration) -> Self {
+        self.rls_poll_interval = Some(interval);
+        self
+    }
+
+    /// Set the cache mode (default `Deep`). RLS tests use `Shallow` to match the
+    /// `--auto-cache` deployment, where InRequestPath auto-migration creates
+    /// RLS-aware shallow scoped caches.
+    pub fn cache_mode(mut self, cache_mode: readyset_client::CacheMode) -> Self {
+        self.backend_builder = self.backend_builder.cache_mode(cache_mode);
+        self
+    }
+
+    /// Set the MySQL authentication plugin used by the adapter for client
+    /// handshakes. Only meaningful for MySQL adapters; PostgreSQL tests
+    /// ignore this value.
+    pub fn auth_plugin(mut self, auth_plugin: AuthPlugin) -> Self {
+        self.auth_plugin = auth_plugin;
+        self
     }
 
     pub fn replicate(mut self, default: bool) -> Self {
@@ -271,13 +338,13 @@ impl TestBuilder {
         self
     }
 
-    pub fn replicate_url(mut self, fallback_url: String) -> Self {
-        self.replicate = ReplicationBehavior::Url(fallback_url);
+    pub fn replicate_url(mut self, fallback_url: &str) -> Self {
+        self.replicate = ReplicationBehavior::Url(fallback_url.to_string());
         self
     }
 
-    pub fn replicate_db(mut self, db_name: String) -> Self {
-        self.replicate = ReplicationBehavior::DB(db_name);
+    pub fn replicate_db(mut self, db_name: &str) -> Self {
+        self.replicate = ReplicationBehavior::DB(db_name.to_string());
         self
     }
 
@@ -287,6 +354,18 @@ impl TestBuilder {
         } else {
             FallbackBehavior::NoFallback
         };
+        self
+    }
+
+    /// Configure the adapter to proxy to an upstream without the server replicating from it.
+    pub fn fallback_without_replication(mut self, db_name: &str) -> Self {
+        self.fallback = FallbackBehavior::UpstreamWithoutReplication;
+        self.upstream_only_db = Some(db_name.to_string());
+        self
+    }
+
+    pub fn unsupported_set_mode(mut self, mode: UnsupportedSetMode) -> Self {
+        self.backend_builder = self.backend_builder.unsupported_set_mode(mode);
         self
     }
 
@@ -305,8 +384,11 @@ impl TestBuilder {
         self
     }
 
-    pub fn read_behavior(mut self, read_behavior: ReadBehavior) -> Self {
-        self.read_behavior = read_behavior;
+    /// Set how long the server-side wait channel will wait for an upquery to complete before
+    /// returning `UpqueryTimeout`. Zero models the legacy non-blocking-reads behavior (immediate
+    /// fall-through on miss).
+    pub fn upquery_timeout(mut self, upquery_timeout: Duration) -> Self {
+        self.upquery_timeout = upquery_timeout;
         self
     }
 
@@ -360,7 +442,38 @@ impl TestBuilder {
         self
     }
 
-    pub async fn build<A>(self) -> (A::ConnectionOpts, Handle, ShutdownSender)
+    /// Set the replication tables allowlist filter. Only tables matching the given
+    /// comma-separated `schema.table` patterns will be replicated; all others are
+    /// marked as non-replicated.
+    pub fn replication_tables(mut self, tables: String) -> Self {
+        self.replication_tables = Some(tables);
+        self
+    }
+
+    pub fn require_gtid(mut self, require: bool) -> Self {
+        self.require_gtid = require;
+        self
+    }
+
+    pub fn replication_lag_interval(mut self, seconds: u16) -> Self {
+        self.replication_lag_interval = Some(seconds);
+        self
+    }
+
+    pub fn replication_heartbeat(mut self, heartbeat: bool) -> Self {
+        self.replication_heartbeat = heartbeat;
+        self
+    }
+
+    /// Set the maximum extra upstream load adaptive shallow caches may add, as a
+    /// percentage of their baseline refresh load. Mirrors the server's
+    /// `--shallow-adaptive-max-extra-load-percent` flag.
+    pub fn shallow_adaptive_max_extra_load_percent(mut self, percent: u64) -> Self {
+        self.shallow_adaptive_max_extra_load_percent = Some(percent);
+        self
+    }
+
+    pub async fn build<A>(mut self) -> (A::ConnectionOpts, Handle, ShutdownSender)
     where
         A: Adapter + 'static,
     {
@@ -368,6 +481,24 @@ impl TestBuilder {
         if env::var("VERBOSE").is_ok() {
             readyset_tracing::init_test_logging();
         }
+
+        let (query_log_tx, mut query_log_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut logger = QueryLogger::new(
+                QueryLogMode::Enabled,
+                adapter_rewrites::AdapterRewriteParams::new(A::DIALECT),
+                A::DIALECT,
+                vec![],
+                SchemaCatalogHandle::new(),
+            );
+            while let Some(event) = query_log_rx.recv().await {
+                logger.handle_event(&event).await;
+            }
+        });
+        self.backend_builder = self
+            .backend_builder
+            .query_log_sender(Some(query_log_tx))
+            .query_log_mode(Some(QueryLogMode::Enabled));
 
         let cdc_url_and_db_name = match self.replicate {
             ReplicationBehavior::None => None,
@@ -386,8 +517,22 @@ impl TestBuilder {
             }
         };
 
+        // Adapter upstream without server replication: derive an upstream URL but do not configure
+        // CDC, so the adapter can fall through to upstream (and serve shallow caches) while the
+        // server does not snapshot or stream.
+        let upstream_only_db = (self.fallback == FallbackBehavior::UpstreamWithoutReplication)
+            .then(|| {
+                self.upstream_only_db
+                    .as_deref()
+                    .unwrap_or("noria")
+                    .to_owned()
+            });
+        let upstream_only_url = upstream_only_db.as_deref().map(A::upstream_url);
+
         if self.recreate_database {
             if let Some((_, db_name)) = &cdc_url_and_db_name {
+                A::recreate_database(db_name).await;
+            } else if let Some(db_name) = &upstream_only_db {
                 A::recreate_database(db_name).await;
             }
         }
@@ -411,6 +556,7 @@ impl TestBuilder {
         builder.set_mixed_comparisons(self.mixed_comparisons);
         builder.set_parsing_preset(self.parsing_preset);
         builder.set_dialect(A::DIALECT);
+        builder.set_upquery_timeout(self.upquery_timeout);
 
         if !self.partial {
             builder.disable_partial();
@@ -431,25 +577,38 @@ impl TestBuilder {
             builder.set_replicator_server_id(unique_server_id());
         }
 
+        builder.set_replication_tables(self.replication_tables);
+        builder.set_require_gtid(self.require_gtid);
+        if let Some(interval) = self.replication_lag_interval {
+            builder.set_replication_lag_interval(interval);
+        }
+        builder.set_replication_heartbeat(self.replication_heartbeat);
+
         let (mut handle, shutdown_tx) = builder.start(authority.clone()).await.unwrap();
         if self.wait_for_backend {
             handle.backend_ready().await;
         }
-
-        let (schema_catalog_synchronizer, schema_catalog) =
-            SchemaCatalogSynchronizer::new(handle.clone());
-
-        let auto_increments: Arc<RwLock<HashMap<Relation, AtomicUsize>>> = Arc::default();
-        let view_name_cache = SharedCache::new();
-        let view_cache = SharedCache::new();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
 
         let query_status_cache = self.query_status_cache.unwrap_or_else(|| {
             Box::leak(Box::new(
                 QueryStatusCache::new().style(self.migration_style),
             ))
         });
+
+        let (schema_catalog_synchronizer, schema_catalog) =
+            SchemaCatalogSynchronizer::new(handle.clone());
+        let schema_catalog_synchronizer = schema_catalog_synchronizer
+            .with_change_handler(Arc::new(QscSchemaChangeAdapter::new(query_status_cache)));
+        tokio::spawn(schema_catalog_synchronizer.run(shutdown_tx.subscribe()));
+        // Give the synchronizer a chance to subscribe to controller events before tests start
+        // issuing DDL/DML against the upstream, otherwise early schema updates can be missed.
+        scheduler_yield!();
+
+        let auto_increments: Arc<RwLock<HashMap<Relation, AtomicUsize>>> = Arc::default();
+        let view_name_cache = SharedCache::new();
+        let view_cache = SharedCache::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
 
         if matches!(self.migration_style, MigrationStyle::Explicit) {
             let rh = handle.clone();
@@ -474,18 +633,50 @@ impl TestBuilder {
 
         // backend either has upstream or noria writer
         let cdc_url = cdc_url_and_db_name.as_ref().map(|(f, _)| f.clone());
-        let cdc_upstream_config = if let Some(f) = &cdc_url {
+        let mut cdc_upstream_config = if let Some(f) = &cdc_url {
             UpstreamConfig::from_url(f)
+        } else if let Some(url) = &upstream_only_url {
+            UpstreamConfig::from_url(url)
         } else {
             UpstreamConfig::default()
         };
-        let shallow = Arc::new(CacheManager::new(None));
+        cdc_upstream_config.replication_heartbeat = self.replication_heartbeat;
+        let mut shallow = CacheManager::new(None, None);
+        if let Some(percent) = self.shallow_adaptive_max_extra_load_percent {
+            shallow.set_adaptive_max_extra_load_percent(percent);
+        }
+        let shallow = Arc::new(shallow);
+
+        // Replay any persisted shallow caches, mirroring the production adapter startup.
+        let mut rh = ReadySetHandle::new(authority.clone()).await;
+        let rewrite_params = rh.adapter_rewrite_params().await.unwrap();
+        let shallow_ddl = authority
+            .shallow_cache_ddl_requests()
+            .await
+            .unwrap_or_default();
+        recreate_shallow_caches(
+            shallow.clone(),
+            query_status_cache,
+            shallow_ddl,
+            self.parsing_preset,
+            rewrite_params,
+            self.backend_builder.get_default_ttl_ms(),
+            self.backend_builder.get_default_coalesce_ms(),
+            self.backend_builder.get_cache_mode(),
+            // A freshly-started test authority has no persisted shallow DDL, so this
+            // replay is a no-op; no RLS registry or coordinator is needed here.
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
         let shared_upstream_config = self
             .backend_builder
             .get_upstream_config()
             .cloned()
             .unwrap_or_else(|| Arc::new(RwLock::new(cdc_upstream_config.clone())));
-        let shallow_refresh_pool = if cdc_url.is_some() {
+        let shallow_refresh_pool = if cdc_url.is_some() || upstream_only_url.is_some() {
             Some(ShallowRefreshPool::<A::Upstream>::new(
                 &tokio::runtime::Handle::current(),
                 Arc::clone(&shared_upstream_config),
@@ -496,12 +687,91 @@ impl TestBuilder {
         };
         let schema_catalog_clone = schema_catalog.clone();
 
+        // Bootstrap the RLS registry + coordinator from the upstream when
+        // requested, mirroring the adapter binary. `bootstrap_from_url`
+        // synchronously loads the catalog snapshot, so the registry is seeded
+        // (and `CREATE CACHE` will see policies) before any connection is
+        // served. No-op for non-Postgres upstreams (returns `Ok(None)`).
+        //
+        // The returned `BootstrapHandle` owns the poller's shutdown sender;
+        // dropping it closes the channel and stops the poller, so it is held
+        // alive for the adapter's lifetime (moved into the server task below) to
+        // keep catalog polling running.
+        let (rls_registry, rls_coordinator, rls_bootstrap_handle) = if self.rls {
+            match cdc_url.as_deref() {
+                Some(url) => {
+                    let sink = Arc::new(readyset_rls::DeferredSink::new());
+                    let rls_config = match self.rls_poll_interval {
+                        Some(interval) => {
+                            readyset_rls::RlsConfig::default().with_poll_interval(interval)
+                        }
+                        None => readyset_rls::RlsConfig::default(),
+                    };
+                    match readyset_rls::bootstrap_from_url(
+                        url,
+                        rls_config,
+                        Some(Arc::clone(&sink) as Arc<dyn readyset_rls::InvalidationSink>),
+                    )
+                    .await
+                    {
+                        Ok(Some(handle)) => {
+                            let registry = Arc::clone(&handle.registry);
+                            let coordinator = Arc::new(RlsCoordinator::new(
+                                Arc::clone(&registry),
+                                Arc::clone(&shallow),
+                                query_status_cache,
+                            ));
+                            sink.set(
+                                Arc::clone(&coordinator) as Arc<dyn readyset_rls::InvalidationSink>
+                            );
+                            (Some(registry), Some(coordinator), Some(handle))
+                        }
+                        Ok(None) => (None, None, None),
+                        Err(e) => panic!("RLS bootstrap failed in test harness: {e}"),
+                    }
+                }
+                None => (None, None, None),
+            }
+        } else {
+            (None, None, None)
+        };
+
+        let shallow_for_schema = Arc::clone(&shallow);
+
+        let auth_cache = AuthCache::new();
+        auth_cache.populate(&self.backend_builder.get_users().read());
+        // Wire the fast-auth cache to the allowed-users handle so runtime `ALTER READYSET ... USER`
+        // mutations refresh it, mirroring the adapter binary. The handle is shared, so this is the
+        // same map the backend authenticates against and the `readyset.users` vrel reads.
+        if let Some(sync) = A::users_sync(&auth_cache) {
+            self.backend_builder.get_users().set_users_sync(sync);
+        }
+        let users_for_schema = Arc::clone(self.backend_builder.get_users());
+
         tokio::spawn(async move {
+            // Keep the RLS bootstrap handle alive for the server's lifetime: it
+            // owns the poller's shutdown sender, so dropping it would stop catalog
+            // polling. It is released (poller stops) when this task ends.
+            let _rls_bootstrap_handle = rls_bootstrap_handle;
+            let controller = ReadySetHandle::new(authority.clone()).await;
+            let readyset_schema = ReadysetSchema::init(
+                "readyset",
+                A::DIALECT,
+                &shallow_for_schema,
+                controller,
+                &(),
+                users_for_schema,
+            )
+            .unwrap();
             let backend_shutdown_rx_connection = backend_shutdown_rx.clone();
             let connection_fut = async move {
                 loop {
                     let (s, _) = listener.accept().await.unwrap();
                     let backend_builder = self.backend_builder.clone();
+                    let backend_builder = match &rls_registry {
+                        Some(registry) => backend_builder.policy_registry(Arc::clone(registry)),
+                        None => backend_builder,
+                    };
                     let auto_increments = auto_increments.clone();
 
                     let upstream_url =
@@ -527,6 +797,10 @@ impl TestBuilder {
                                 .await
                                 .unwrap(),
                             db_version: cdc_upstream.version(),
+                            group_concat_max_len: cdc_upstream
+                                .group_concat_max_len()
+                                .await
+                                .unwrap(),
                         }
                     } else {
                         UpstreamSystemProperties {
@@ -538,7 +812,11 @@ impl TestBuilder {
 
                     let fallback_upstream = match self.fallback {
                         FallbackBehavior::NoFallback => None,
-                        FallbackBehavior::UseReplicationUpstream => cdc_upstream,
+                        FallbackBehavior::UseReplicationUpstream
+                        | FallbackBehavior::UpstreamWithoutReplication => match &upstream_url {
+                            Some(url) => Some(A::make_upstream(url.clone()).await),
+                            None => cdc_upstream,
+                        },
                     };
 
                     if init_system_props(&sys_props).is_err() {
@@ -553,7 +831,6 @@ impl TestBuilder {
                         auto_increments,
                         view_name_cache.new_local(),
                         view_cache.new_local(),
-                        self.read_behavior,
                         A::EXPR_DIALECT,
                         A::DIALECT,
                         sys_props.search_path,
@@ -567,11 +844,13 @@ impl TestBuilder {
                         Default::default(),
                         authority.clone(),
                         Vec::new(),
+                        std::path::Path::new("/"),
                     );
                     let backend = backend_builder
                         .dialect(A::DIALECT)
                         .migration_mode(self.migration_mode)
                         .parsing_preset(self.parsing_preset)
+                        .readyset_schema(Arc::clone(&readyset_schema))
                         .build(
                             noria,
                             fallback_upstream,
@@ -581,16 +860,19 @@ impl TestBuilder {
                             status_reporter,
                             adapter_start_time,
                             shallow.clone(),
+                            rls_coordinator.clone(),
                             shallow_refresh_pool.clone(),
                         )
                         .await;
 
+                    let auth_plugin = self.auth_plugin;
+                    let auth_cache = auth_cache.clone();
                     let mut backend_shutdown_rx_clone = backend_shutdown_rx_connection.clone();
                     tokio::spawn(async move {
                         tokio::select! {
                             biased;
                             _ = backend_shutdown_rx_clone.recv() => {},
-                            _ = A::run_backend(backend, s) => {},
+                            _ = A::run_backend(backend, s, auth_plugin, auth_cache) => {},
                         }
                     });
                 }
@@ -602,12 +884,6 @@ impl TestBuilder {
                 _ = connection_fut => {},
             }
         });
-
-        // TODO(mvzink): Move this spawn earlier after REA-6107.
-        tokio::spawn(schema_catalog_synchronizer.run(shutdown_tx.subscribe()));
-        // Give the synchronizer a chance to subscribe to controller events before tests start
-        // issuing DDL/DML against the upstream, otherwise early schema updates can be missed.
-        tokio::task::yield_now().await;
 
         (
             A::connection_opts_with_port(
@@ -658,6 +934,6 @@ pub async fn explain_last_statement(conn: &mut DatabaseConnection) -> QueryInfo 
 
     QueryInfo {
         destination,
-        noria_error: row.get(1).unwrap(),
+        reason: row.get(1).unwrap(),
     }
 }

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use mysql_common::collations::{Collation, CollationId};
 use readyset_errors::ReadySetError;
 use readyset_errors::ReadySetResult;
 
@@ -22,18 +23,95 @@ macro_rules! encoding_err {
     };
 }
 
+/// Conversion tables for one MySQL single-byte character set, generated from a live MySQL
+/// server by the `mysql_charset` binary in `database-utils`.
+#[derive(Debug)]
+pub struct SingleByteEncoding {
+    /// MySQL character set name, e.g. "latin1".
+    pub name: &'static str,
+    /// The char each byte decodes to, matching MySQL's conversion to utf8mb4. Undefined byte
+    /// positions hold MySQL's replacement char.
+    pub decode: &'static [char; 256],
+    /// MySQL's canonical byte for each encodable char, sorted by char for binary search.
+    /// Chars absent from the table encode to the lossy fallback `b'?'`.
+    pub encode: &'static [(char, u8)],
+    /// Whether bytes 0x00-0x7F decode to the identical ASCII chars and those chars encode
+    /// back to the identical bytes.
+    pub ascii_transparent: bool,
+}
+
+/// Registers each supported single-byte charset. Each entry lists the enum variant, the MySQL
+/// character set name, and the generated table module under `src/encoding/`.
+macro_rules! single_byte_charsets {
+    ($(($variant:ident, $name:literal, $module:ident),)*) => {
+        $(mod $module;)*
+
+        /// A MySQL single-byte character set with generated conversion tables.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum SingleByteCharset {
+            $($variant,)*
+        }
+
+        impl SingleByteCharset {
+            /// Every supported single-byte charset.
+            pub const ALL: &[Self] = &[$(Self::$variant,)*];
+
+            /// The generated conversion tables for this charset.
+            pub fn spec(self) -> &'static SingleByteEncoding {
+                match self {
+                    $(Self::$variant => &$module::SPEC,)*
+                }
+            }
+
+            /// Look up a charset by its lowercase MySQL character set name.
+            pub fn from_name(name: &str) -> Option<Self> {
+                match name {
+                    $($name => Some(Self::$variant),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+single_byte_charsets! {
+    (Armscii8, "armscii8", armscii8),
+    (Ascii, "ascii", ascii),
+    (Cp850, "cp850", cp850),
+    (Cp852, "cp852", cp852),
+    (Cp866, "cp866", cp866),
+    (Cp1250, "cp1250", cp1250),
+    (Cp1251, "cp1251", cp1251),
+    (Cp1256, "cp1256", cp1256),
+    (Cp1257, "cp1257", cp1257),
+    (Dec8, "dec8", dec8),
+    (Geostd8, "geostd8", geostd8),
+    (Greek, "greek", greek),
+    (Hebrew, "hebrew", hebrew),
+    (Hp8, "hp8", hp8),
+    (Keybcs2, "keybcs2", keybcs2),
+    (Koi8r, "koi8r", koi8r),
+    (Koi8u, "koi8u", koi8u),
+    (Latin1, "latin1", latin1),
+    (Latin2, "latin2", latin2),
+    (Latin5, "latin5", latin5),
+    (Latin7, "latin7", latin7),
+    (Macce, "macce", macce),
+    (Macroman, "macroman", macroman),
+    (Swe7, "swe7", swe7),
+    (Tis620, "tis620", tis620),
+}
+
 /// Supported character encodings for string data
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Encoding {
     /// UTF-8
     ///
     /// Note, we don't distinguish between MySQL's default utf8mb4 and deprecated utf8mb3 (which
     /// only supports the BMP).
     Utf8,
-    /// latin1 (CP1252/ISO-8859-1)
-    Latin1,
-    /// cp850
-    Cp850,
+    /// A MySQL single-byte character set, e.g. latin1 or koi8r.
+    SingleByte(SingleByteCharset),
     /// Binary data (not interpreted as text)
     Binary,
     /// Unsupported encoding
@@ -44,8 +122,7 @@ impl fmt::Display for Encoding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Encoding::Utf8 => write!(f, "utf8"),
-            Encoding::Latin1 => write!(f, "latin1"),
-            Encoding::Cp850 => write!(f, "cp850"),
+            Encoding::SingleByte(charset) => write!(f, "{}", charset.spec().name),
             Encoding::Binary => write!(f, "binary"),
             Encoding::OtherMySql(id) => write!(f, "unsupported MySQL collation {id}"),
         }
@@ -53,17 +130,23 @@ impl fmt::Display for Encoding {
 }
 
 impl Encoding {
-    /// For reference, see [`mysql_common::collations::CollationId`]
-    pub fn from_mysql_collation_id(collation_id: u16) -> Self {
-        match collation_id {
-            // ascii, utf8mb3, utf8mb4
-            11 | 33 | 45 | 46 | 65 | 76 | 83 | 192..=247 | 255..=323 => Self::Utf8,
-            5 | 8 | 15 | 31 | 47 | 48 | 49 | 94 => Self::Latin1,
-            4 | 80 => Self::Cp850,
-            63 => Self::Binary,
+    pub const LATIN1: Self = Self::SingleByte(SingleByteCharset::Latin1);
+    pub const CP850: Self = Self::SingleByte(SingleByteCharset::Cp850);
 
-            // Default to UTF-8 for other collations
-            _ => Self::OtherMySql(collation_id),
+    /// The encoding for a MySQL collation id, derived from the collation's character set as
+    /// known to `mysql_common`. Collation ids `mysql_common` doesn't know, and character sets
+    /// without a registered conversion table, are unsupported.
+    pub fn from_mysql_collation_id(collation_id: u16) -> Self {
+        let collation = Collation::resolve(CollationId::from(collation_id));
+        if collation.id() == CollationId::UNKNOWN_COLLATION_ID {
+            return Self::OtherMySql(collation_id);
+        }
+        match collation.charset() {
+            "utf8mb3" | "utf8mb4" => Self::Utf8,
+            "binary" => Self::Binary,
+            name => SingleByteCharset::from_name(name)
+                .map(Self::SingleByte)
+                .unwrap_or(Self::OtherMySql(collation_id)),
         }
     }
 
@@ -80,10 +163,19 @@ impl Encoding {
         );
         match character_set_name {
             "utf8" | "utf8mb3" | "utf8mb4" => Some(Self::Utf8),
-            "latin1" => Some(Self::Latin1),
-            "cp850" => Some(Self::Cp850),
             "binary" => Some(Self::Binary),
-            _ => None,
+            name => SingleByteCharset::from_name(name).map(Self::SingleByte),
+        }
+    }
+
+    /// The MySQL character set name for a supported encoding, used to mirror a session's charset
+    /// onto an upstream connection. A fixed mapping, never derived from client input.
+    pub fn mysql_character_set_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Utf8 => Some("utf8mb4"),
+            Self::SingleByte(charset) => Some(charset.spec().name),
+            Self::Binary => Some("binary"),
+            Self::OtherMySql(_) => None,
         }
     }
 
@@ -92,8 +184,10 @@ impl Encoding {
             Self::Utf8 => core::str::from_utf8(bytes)
                 .map(|s| s.to_string())
                 .map_err(|e| decoding_err!(self, "Invalid bytes: {e}")),
-            Self::Latin1 => Ok(yore::code_pages::CP1252.decode(bytes).into_owned()),
-            Self::Cp850 => Ok(yore::code_pages::CP850.decode(bytes).into_owned()),
+            Self::SingleByte(charset) => {
+                let table = charset.spec().decode;
+                Ok(bytes.iter().map(|&b| table[b as usize]).collect())
+            }
             Self::Binary | Self::OtherMySql(_) => Err(decoding_err!(self, "Unsupported encoding")),
         }
     }
@@ -101,8 +195,23 @@ impl Encoding {
     pub fn encode<'a>(&self, string: &'a str) -> ReadySetResult<Cow<'a, [u8]>> {
         match self {
             Self::Utf8 => Ok(string.as_bytes().into()),
-            Self::Latin1 => Ok(yore::code_pages::CP1252.encode_lossy(string, b"?"[0])),
-            Self::Cp850 => Ok(yore::code_pages::CP850.encode_lossy(string, b"?"[0])),
+            Self::SingleByte(charset) => {
+                let spec = charset.spec();
+                if spec.ascii_transparent && string.is_ascii() {
+                    return Ok(Cow::Borrowed(string.as_bytes()));
+                }
+                Ok(Cow::Owned(
+                    string
+                        .chars()
+                        .map(|c| {
+                            spec.encode
+                                .binary_search_by_key(&c, |&(ec, _)| ec)
+                                .map(|i| spec.encode[i].1)
+                                .unwrap_or(b'?')
+                        })
+                        .collect(),
+                ))
+            }
             Self::Binary | Self::OtherMySql(_) => Err(encoding_err!(self, "Unsupported encoding")),
         }
     }
@@ -165,20 +274,23 @@ pub fn mysql_character_set_name_to_collation_id(name: &str) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use yore::code_pages::{CP1252, CP850};
+    use yore::CodePage;
+
     use super::*;
 
     #[test]
     fn test_latin1_to_utf8() {
         // Test with ASCII characters (valid in both Latin1 and UTF-8)
         let latin1_bytes = b"Hello World";
-        let result = Encoding::Latin1.decode(latin1_bytes).unwrap();
+        let result = Encoding::LATIN1.decode(latin1_bytes).unwrap();
         assert_eq!(result, "Hello World");
 
         // Test with Latin1 characters that need conversion in UTF-8
         // Characters 0xA0-0xFF in Latin1 map to Unicode code points 0xA0-0xFF
         // For example, 0xE9 in Latin1 is 'é'
         let latin1_bytes = &[0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0xE9]; // "Hello é" in Latin1
-        let result = Encoding::Latin1.decode(latin1_bytes).unwrap();
+        let result = Encoding::LATIN1.decode(latin1_bytes).unwrap();
         assert_eq!(result, "Hello é");
 
         // Test with all high-bit Latin1 characters (0x80-0xFF)
@@ -187,7 +299,7 @@ mod tests {
             latin1_high_bytes.push(b);
         }
 
-        let result = Encoding::Latin1.decode(&latin1_high_bytes).unwrap();
+        let result = Encoding::LATIN1.decode(&latin1_high_bytes).unwrap();
         // Make sure all characters were decoded (should be 128 chars for bytes 0x80-0xFF)
         assert_eq!(result.chars().count(), 128);
     }
@@ -196,18 +308,172 @@ mod tests {
     fn test_utf8_to_latin1() {
         // Test with ASCII (should work fine)
         let utf8_str = "Hello World";
-        let result = Encoding::Latin1.encode(utf8_str).unwrap();
+        let result = Encoding::LATIN1.encode(utf8_str).unwrap();
         assert_eq!(result, &b"Hello World"[..]);
 
         // Test with Latin1 characters
         let utf8_str = "Hello é";
-        let result = Encoding::Latin1.encode(utf8_str).unwrap();
+        let result = Encoding::LATIN1.encode(utf8_str).unwrap();
         assert_eq!(result, &[0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0xE9][..]);
 
         // Test with characters outside Latin1 range (should fail)
         let utf8_str = "Hello 😊"; // Emoji is outside Latin1 range
-        let result = Encoding::Latin1.encode(utf8_str).unwrap();
+        let result = Encoding::LATIN1.encode(utf8_str).unwrap();
         assert_eq!(*result, b"Hello ?"[..]);
+    }
+
+    /// The encoding for each supported collation id, spelled out explicitly. Guards against a
+    /// `mysql_common` bump changing collation ids or charset naming.
+    #[test]
+    fn test_collation_id_mapping() {
+        for id in 0u16..=1023 {
+            let expected = match id {
+                // Holes in the utf8 id ranges below that MySQL 8.4 does not assign
+                216..=222 | 272 | 276 | 295 | 299 | 301 | 302 => Encoding::OtherMySql(id),
+                // utf8mb3, utf8mb4
+                33 | 45 | 46 | 76 | 83 | 192..=247 | 255..=323 => Encoding::Utf8,
+                // ascii_general_ci, ascii_bin
+                11 | 65 => Encoding::SingleByte(SingleByteCharset::Ascii),
+                5 | 8 | 15 | 31 | 47 | 48 | 49 | 94 => Encoding::LATIN1,
+                4 | 80 => Encoding::CP850,
+                63 => Encoding::Binary,
+                7 => Encoding::SingleByte(SingleByteCharset::Koi8r),
+                25 => Encoding::SingleByte(SingleByteCharset::Greek),
+                51 => Encoding::SingleByte(SingleByteCharset::Cp1251),
+                _ => continue,
+            };
+            assert_eq!(
+                Encoding::from_mysql_collation_id(id),
+                expected,
+                "collation id {id}"
+            );
+        }
+    }
+
+    /// Structural invariants of every generated charset table.
+    #[test]
+    fn test_single_byte_tables_consistent() {
+        for &charset in SingleByteCharset::ALL {
+            let spec = charset.spec();
+            // The encode table is strictly sorted by char, so binary search is valid.
+            for pair in spec.encode.windows(2) {
+                assert!(
+                    pair[0].0 < pair[1].0,
+                    "{} encode table out of order at {pair:?}",
+                    spec.name
+                );
+            }
+            // Every encode entry agrees with the decode table.
+            for &(c, b) in spec.encode {
+                assert_eq!(
+                    spec.decode[b as usize], c,
+                    "{} encode entry for byte {b:#04x}",
+                    spec.name
+                );
+            }
+            // The ascii_transparent flag matches the tables in both directions.
+            let transparent = (0u8..=127).all(|b| {
+                spec.decode[b as usize] == b as char
+                    && spec
+                        .encode
+                        .binary_search_by_key(&(b as char), |&(ec, _)| ec)
+                        .map(|i| spec.encode[i].1)
+                        == Ok(b)
+            });
+            assert_eq!(spec.ascii_transparent, transparent, "{}", spec.name);
+        }
+    }
+
+    /// Every encodable char roundtrips through its canonical byte.
+    #[test]
+    fn test_single_byte_roundtrip() {
+        for &charset in SingleByteCharset::ALL {
+            let encoding = Encoding::SingleByte(charset);
+            for &(c, b) in charset.spec().encode {
+                assert_eq!(
+                    *encoding.encode(&c.to_string()).unwrap(),
+                    [b],
+                    "{encoding} char {c:?}"
+                );
+                assert_eq!(
+                    encoding.decode(&[b]).unwrap(),
+                    c.to_string(),
+                    "{encoding} byte {b:#04x}"
+                );
+            }
+        }
+    }
+
+    /// Charset names agree across the generated spec, name lookup, Display, and the default
+    /// collation id registries.
+    #[test]
+    fn test_single_byte_names() {
+        for &charset in SingleByteCharset::ALL {
+            let name = charset.spec().name;
+            let encoding = Encoding::SingleByte(charset);
+            assert_eq!(SingleByteCharset::from_name(name), Some(charset));
+            assert_eq!(
+                Encoding::from_mysql_character_set_name(name),
+                Some(encoding)
+            );
+            assert_eq!(encoding.mysql_character_set_name(), Some(name));
+            assert_eq!(encoding.to_string(), name);
+            let id = mysql_character_set_name_to_collation_id(name);
+            assert_ne!(id, 0, "{name} has no default collation id");
+            assert_eq!(Encoding::from_mysql_collation_id(id), encoding, "{name}");
+        }
+    }
+
+    /// Known codepoints decode as expected.
+    #[test]
+    fn test_single_byte_spot_checks() {
+        for (charset, byte, expected) in [
+            // ascii replaces bytes past 0x7F with the replacement char
+            (SingleByteCharset::Ascii, 0x80, '?'),
+            // CYRILLIC SMALL LETTER A
+            (SingleByteCharset::Koi8r, 0xC1, '\u{0430}'),
+            // GREEK SMALL LETTER ALPHA
+            (SingleByteCharset::Greek, 0xE1, '\u{03b1}'),
+            // LATIN SMALL LETTER A WITH RING ABOVE
+            (SingleByteCharset::Swe7, 0x7D, '\u{00e5}'),
+            // HEBREW LETTER ALEF
+            (SingleByteCharset::Hebrew, 0xE0, '\u{05d0}'),
+            // THAI CHARACTER KO KAI
+            (SingleByteCharset::Tis620, 0xA1, '\u{0e01}'),
+            // CYRILLIC CAPITAL LETTER A
+            (SingleByteCharset::Cp866, 0x80, '\u{0410}'),
+        ] {
+            assert_eq!(
+                Encoding::SingleByte(charset).decode(&[byte]).unwrap(),
+                expected.to_string(),
+                "{} byte {byte:#04x}",
+                charset.spec().name
+            );
+        }
+    }
+
+    /// The generated latin1 and cp850 tables agree with the yore code pages that previously
+    /// implemented them, in both directions, for every byte.
+    #[test]
+    fn test_yore_equivalence() {
+        for (encoding, page) in [
+            (Encoding::LATIN1, &CP1252 as &dyn CodePage),
+            (Encoding::CP850, &CP850 as &dyn CodePage),
+        ] {
+            for b in 0u8..=255 {
+                let decoded = encoding.decode(&[b]).unwrap();
+                assert_eq!(
+                    decoded,
+                    page.decode_lossy(&[b]),
+                    "{encoding} decode differs from yore at byte {b:#04x}"
+                );
+                assert_eq!(
+                    *encoding.encode(&decoded).unwrap(),
+                    *page.encode_lossy(&decoded, b'?'),
+                    "{encoding} encode differs from yore for {decoded:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -6,24 +6,32 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Display};
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
 use clap::ValueEnum;
 use enum_dispatch::enum_dispatch;
-use readyset_data::Dialect;
+use readyset_data::{DfType, Dialect};
 use readyset_errors::{ReadySetError, ReadySetResult};
-use readyset_sql::ast::SqlIdentifier;
+use readyset_sql::ast::{
+    NonReplicatedRelation, Relation, ShallowCacheAllowlistKind, SqlIdentifier,
+};
 use replication_offset::ReplicationOffset;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::error;
 use url::Url;
 
+pub mod allowed_users;
 mod local;
+pub mod mcp_tokens;
 mod standalone;
 
+pub use self::allowed_users::UserStore;
 pub use self::local::{LocalAuthority, LocalAuthorityStore};
+pub use self::mcp_tokens::{McpToken, McpTokenScope, McpTokenStore};
 pub use self::standalone::StandaloneAuthority;
 use crate::debug::stats::PersistentStats;
 use crate::ControllerDescriptor;
@@ -34,19 +42,49 @@ use crate::ControllerDescriptor;
 // LeaderPayload must be Serialize + DeserializeOwned + PartialEq
 type LeaderPayload = ControllerDescriptor;
 
-pub type VolumeId = String;
 pub type WorkerId = String;
 
 const CACHE_DDL_REQUESTS_PATH: &str = "cache_ddl_requests";
 const SHALLOW_CACHE_DDL_REQUESTS_PATH: &str = "shallow_cache_ddl_requests";
+const SHALLOW_CACHE_ALLOWLIST_PATH: &str = "shallow_cache_allowlist";
+const SHALLOW_CACHE_VARIABLES_ALLOWLIST_PATH: &str = "shallow_cache_variables_allowlist";
+const SHALLOW_CACHE_SCHEMAS_ALLOWLIST_PATH: &str = "shallow_cache_schemas_allowlist";
 const PERSISTENT_STATS_PATH: &str = "persistent_stats";
 const SCHEMA_REPLICATION_OFFSET_PATH: &str = "schema_replication_offset";
+const SCHEMA_CATALOG_PATH: &str = "schema_catalog";
+const CUSTOM_TYPES_PATH: &str = "custom_types";
+const NON_REPLICATED_RELATIONS_PATH: &str = "non_replicated_relations";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CacheDDLRequest {
     pub unparsed_stmt: String,
     pub schema_search_path: Vec<SqlIdentifier>,
     pub dialect: Dialect,
+    #[serde(default)]
+    pub cache_name: Option<Relation>,
+}
+
+/// One entry in the persisted schema catalog: canonical DDL text for a table or view that
+/// Readyset has accepted from upstream.
+///
+/// At controller startup, each entry is re-parsed and replayed through `apply_changelist`
+/// to rebuild the table and view portions of the in-memory schema registry.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SchemaCatalogEntry {
+    /// Canonical SQL text (e.g. `CREATE TABLE "schema"."name" (...)`). Schema-qualified.
+    pub unparsed_stmt: String,
+    /// Schema search path under which `unparsed_stmt` should be re-parsed and resolved on replay.
+    pub schema_search_path: Vec<SqlIdentifier>,
+    /// Dialect under which `unparsed_stmt` should be re-parsed on replay.
+    pub dialect: Dialect,
+}
+
+/// A user-defined custom type persisted for replay at controller startup.  (`CREATE TYPE` is
+/// not handled by the parser.)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedCustomType {
+    pub name: Relation,
+    pub ty: DfType,
 }
 
 /// A response to a `worker_heartbeat`, to inform the worker of its
@@ -84,10 +122,6 @@ pub enum NodeTypeSchedulingRestriction {
 /// The [`Default`] value for this struct allows any domain to be scheduled onto any worker.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
 pub struct WorkerSchedulingConfig {
-    /// Identifier for the persistent volume associated with this worker, if any. This is used to
-    /// make sure that once a domain with a particular base table is scheduled onto a worker, that
-    /// domain will always be scheduled onto a worker with the same persistent volume.
-    pub volume_id: Option<VolumeId>,
     /// Configuration for how domains containing or not containing reader nodes may be scheduled
     /// onto this worker
     pub reader_nodes: NodeTypeSchedulingRestriction,
@@ -257,8 +291,12 @@ pub trait AuthorityControl: Send + Sync {
     /// These are stored separately from the controller state so that it's always available, using
     /// backwards-compatible serialization, for if the controller state can't be deserialized
     async fn add_cache_ddl_request(&self, cache_ddl_req: CacheDDLRequest) -> ReadySetResult<()> {
+        let name = cache_ddl_req.cache_name.clone();
         let cache_ddl_req = serde_json::ser::to_string(&cache_ddl_req)?;
         modify_cache_ddl_requests(self, move |stmts| {
+            if let Some(name) = &name {
+                stmts.retain(|stmt| cache_ddl_request_name(stmt).as_ref() != Some(name));
+            }
             stmts.push(cache_ddl_req.clone());
         })
         .await
@@ -268,8 +306,12 @@ pub trait AuthorityControl: Send + Sync {
         &self,
         cache_ddl_req: CacheDDLRequest,
     ) -> ReadySetResult<()> {
+        let name = cache_ddl_req.cache_name.clone();
         let cache_ddl_req = serde_json::ser::to_string(&cache_ddl_req)?;
         modify_shallow_cache_ddl_requests(self, move |stmts| {
+            if let Some(name) = &name {
+                stmts.retain(|stmt| cache_ddl_request_name(stmt).as_ref() != Some(name));
+            }
             stmts.push(cache_ddl_req.clone());
         })
         .await
@@ -295,6 +337,37 @@ pub trait AuthorityControl: Send + Sync {
         .await
     }
 
+    /// Removes `CREATE CACHE` request for `name`, returning whether any entry matched.
+    async fn remove_cache_ddl_requests_named(&self, name: &Relation) -> ReadySetResult<bool> {
+        let removed = Arc::new(AtomicBool::new(false));
+        let flag = removed.clone();
+        let name = name.clone();
+        modify_cache_ddl_requests(self, move |stmts| {
+            let before = stmts.len();
+            stmts.retain(|stmt| cache_ddl_request_name(stmt).as_ref() != Some(&name));
+            flag.store(stmts.len() != before, Ordering::Relaxed);
+        })
+        .await?;
+        Ok(removed.load(Ordering::Relaxed))
+    }
+
+    /// Shallow counterpart to [`AuthorityControl::remove_cache_ddl_requests_named`].
+    async fn remove_shallow_cache_ddl_requests_named(
+        &self,
+        name: &Relation,
+    ) -> ReadySetResult<bool> {
+        let removed = Arc::new(AtomicBool::new(false));
+        let flag = removed.clone();
+        let name = name.clone();
+        modify_shallow_cache_ddl_requests(self, move |stmts| {
+            let before = stmts.len();
+            stmts.retain(|stmt| cache_ddl_request_name(stmt).as_ref() != Some(&name));
+            flag.store(stmts.len() != before, Ordering::Relaxed);
+        })
+        .await?;
+        Ok(removed.load(Ordering::Relaxed))
+    }
+
     /// Removes all stored cache ddl requests
     async fn remove_all_cache_ddl_requests(&self) -> ReadySetResult<()> {
         modify_cache_ddl_requests(self, move |stmts| {
@@ -306,6 +379,75 @@ pub trait AuthorityControl: Send + Sync {
     async fn remove_all_shallow_cache_ddl_requests(&self) -> ReadySetResult<()> {
         modify_shallow_cache_ddl_requests(self, move |stmts| {
             stmts.clear();
+        })
+        .await
+    }
+
+    /// Returns one of the operator-managed shallow-cache allowlists (selected by
+    /// `kind`): names that are eligible for shallow-cache auto-creation even
+    /// though they would otherwise be denied (a builtin on a deny-list, a
+    /// session/user variable, or a system schema).
+    ///
+    /// Stored separately from the controller state, like the cache ddl requests
+    /// above, so it is always available even if the controller state can't be
+    /// deserialized.
+    async fn shallow_cache_allowlist(
+        &self,
+        kind: ShallowCacheAllowlistKind,
+    ) -> ReadySetResult<Vec<String>> {
+        Ok(self
+            .try_read::<Vec<String>>(shallow_cache_allowlist_path(kind))
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// Add a name to the given shallow-cache allowlist. Idempotent.
+    async fn add_shallow_cache_allowed(
+        &self,
+        kind: ShallowCacheAllowlistKind,
+        name: String,
+    ) -> ReadySetResult<()> {
+        modify_ddl_requests(self, shallow_cache_allowlist_path(kind), move |names| {
+            if !names.contains(&name) {
+                names.push(name.clone());
+            }
+        })
+        .await
+    }
+
+    /// Remove a name from the given shallow-cache allowlist.
+    async fn remove_shallow_cache_allowed(
+        &self,
+        kind: ShallowCacheAllowlistKind,
+        name: String,
+    ) -> ReadySetResult<()> {
+        modify_ddl_requests(self, shallow_cache_allowlist_path(kind), move |names| {
+            names.retain(|n| *n != name);
+        })
+        .await
+    }
+
+    /// Add or remove several names in a single authority round-trip, so a
+    /// multi-name `ALTER READYSET ... SHALLOW CACHE ALLOWED <kind> a, b, c` is
+    /// atomic: it either persists every change or none, rather than leaving a
+    /// prefix applied if a later write fails. `add` chooses the direction; adds
+    /// are idempotent and removes tolerate absent names.
+    async fn modify_shallow_cache_allowlist(
+        &self,
+        kind: ShallowCacheAllowlistKind,
+        add: bool,
+        names: Vec<String>,
+    ) -> ReadySetResult<()> {
+        modify_ddl_requests(self, shallow_cache_allowlist_path(kind), move |current| {
+            for name in &names {
+                if add {
+                    if !current.contains(name) {
+                        current.push(name.clone());
+                    }
+                } else {
+                    current.retain(|n| n != name);
+                }
+            }
         })
         .await
     }
@@ -329,6 +471,137 @@ pub trait AuthorityControl: Send + Sync {
     async fn schema_replication_offset(&self) -> ReadySetResult<Option<ReplicationOffset>> {
         self.try_read(SCHEMA_REPLICATION_OFFSET_PATH).await
     }
+
+    /// Persists the schema [`ReplicationOffset`] to its own Authority key so it survives a
+    /// controller restart and graph regeneration independently of any other state.
+    async fn overwrite_schema_replication_offset(
+        &self,
+        offset: ReplicationOffset,
+    ) -> ReadySetResult<()> {
+        self.read_modify_write::<_, ReplicationOffset, ReadySetError>(
+            SCHEMA_REPLICATION_OFFSET_PATH,
+            move |_| Ok(offset.clone()),
+        )
+        .await??;
+        Ok(())
+    }
+
+    /// Returns the persisted schema catalog: one entry per relation or type Readyset has
+    /// accepted from upstream. At controller startup, these are re-parsed and replayed to
+    /// rebuild the in-memory schema registry.
+    ///
+    /// Stored separately from the controller state so that an unreadable controller blob does
+    /// not lose the schema; an individual unparseable entry is logged and skipped without
+    /// blocking the rest of the catalog.
+    async fn schema_catalog_entries(&self) -> ReadySetResult<Vec<SchemaCatalogEntry>> {
+        Ok(self
+            .try_read::<Vec<String>>(SCHEMA_CATALOG_PATH)
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| match serde_json::from_slice(v.as_bytes()) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    error!(%err, "Failed to deserialize SchemaCatalogEntry; entry will not be replayed");
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// Replaces the persisted schema catalog with the given list.
+    ///
+    /// The catalog is rebuilt from the in-memory registry on every schema-mutating commit, so
+    /// this is a wholesale overwrite rather than an append/remove pair.
+    async fn overwrite_schema_catalog(
+        &self,
+        entries: Vec<SchemaCatalogEntry>,
+    ) -> ReadySetResult<()> {
+        let encoded: Vec<String> = entries
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()?;
+        self.read_modify_write::<_, Vec<String>, ReadySetError>(SCHEMA_CATALOG_PATH, move |_| {
+            Ok(encoded.clone())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Returns the persisted custom types Readyset has accepted from upstream.
+    async fn custom_types(&self) -> ReadySetResult<Vec<PersistedCustomType>> {
+        Ok(self
+            .try_read::<Vec<String>>(CUSTOM_TYPES_PATH)
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| match serde_json::from_slice(v.as_bytes()) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    error!(%err, "Failed to deserialize PersistedCustomType; entry will not be replayed");
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// Replaces the persisted custom types list.
+    async fn overwrite_custom_types(
+        &self,
+        entries: Vec<PersistedCustomType>,
+    ) -> ReadySetResult<()> {
+        let encoded: Vec<String> = entries
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()?;
+        self.read_modify_write::<_, Vec<String>, ReadySetError>(CUSTOM_TYPES_PATH, move |_| {
+            Ok(encoded.clone())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Returns the persisted non-replicated relation markers: upstream relations Readyset knows
+    /// about but does not replicate (excluded by configuration, partitioned, unsupported type,
+    /// etc.). Persisted separately because these markers have no SQL DDL form.
+    async fn non_replicated_relations(&self) -> ReadySetResult<Vec<NonReplicatedRelation>> {
+        Ok(self
+            .try_read::<Vec<String>>(NON_REPLICATED_RELATIONS_PATH)
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| match serde_json::from_slice(v.as_bytes()) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    error!(%err, "Failed to deserialize NonReplicatedRelation; entry will not be replayed");
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// Replaces the persisted non-replicated relations list.
+    async fn overwrite_non_replicated_relations(
+        &self,
+        entries: Vec<NonReplicatedRelation>,
+    ) -> ReadySetResult<()> {
+        let encoded: Vec<String> = entries
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()?;
+        self.read_modify_write::<_, Vec<String>, ReadySetError>(
+            NON_REPLICATED_RELATIONS_PATH,
+            move |_| Ok(encoded.clone()),
+        )
+        .await??;
+        Ok(())
+    }
+}
+
+fn cache_ddl_request_name(raw: &str) -> Option<Relation> {
+    serde_json::from_str::<CacheDDLRequest>(raw)
+        .ok()
+        .and_then(|req| req.cache_name)
 }
 
 async fn modify_ddl_requests<A, F>(authority: &A, path: &str, mut f: F) -> ReadySetResult<()>
@@ -361,6 +634,16 @@ where
     F: FnMut(&mut Vec<String>) + Send,
 {
     modify_ddl_requests(authority, SHALLOW_CACHE_DDL_REQUESTS_PATH, f).await
+}
+
+/// The authority key backing the shallow-cache allowlist for `kind`. Each kind
+/// is stored under its own key so their `ALTER`s stay independent and atomic.
+const fn shallow_cache_allowlist_path(kind: ShallowCacheAllowlistKind) -> &'static str {
+    match kind {
+        ShallowCacheAllowlistKind::Function => SHALLOW_CACHE_ALLOWLIST_PATH,
+        ShallowCacheAllowlistKind::Variable => SHALLOW_CACHE_VARIABLES_ALLOWLIST_PATH,
+        ShallowCacheAllowlistKind::Schema => SHALLOW_CACHE_SCHEMAS_ALLOWLIST_PATH,
+    }
 }
 
 /// Enum that dispatches calls to the `AuthorityControl` trait to
@@ -430,5 +713,90 @@ impl AuthorityType {
                 })?,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_ddl_tests {
+    use super::*;
+
+    fn req(stmt: &str, name: Option<&str>) -> CacheDDLRequest {
+        CacheDDLRequest {
+            unparsed_stmt: stmt.to_string(),
+            schema_search_path: vec![],
+            dialect: Dialect::DEFAULT_POSTGRESQL,
+            cache_name: name.map(Relation::from),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_cache_ddl_request_is_idempotent_by_name() {
+        let authority = LocalAuthority::new();
+        authority
+            .add_cache_ddl_request(req("CREATE CACHE foo FROM SELECT 1", Some("foo")))
+            .await
+            .unwrap();
+        authority
+            .add_cache_ddl_request(req("CREATE CACHE foo FROM SELECT 1", Some("foo")))
+            .await
+            .unwrap();
+        assert_eq!(authority.cache_ddl_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_cache_ddl_requests_named_removes_match() {
+        let authority = LocalAuthority::new();
+        authority
+            .add_cache_ddl_request(req("CREATE CACHE foo FROM SELECT 1", Some("foo")))
+            .await
+            .unwrap();
+        let removed = authority
+            .remove_cache_ddl_requests_named(&"foo".into())
+            .await
+            .unwrap();
+        assert!(removed);
+        assert!(authority.cache_ddl_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_cache_ddl_requests_named_reports_no_match() {
+        let authority = LocalAuthority::new();
+        authority
+            .add_cache_ddl_request(req("CREATE CACHE foo FROM SELECT 1", Some("foo")))
+            .await
+            .unwrap();
+        let removed = authority
+            .remove_cache_ddl_requests_named(&"bar".into())
+            .await
+            .unwrap();
+        assert!(!removed);
+        assert_eq!(authority.cache_ddl_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shallow_remove_named_is_independent() {
+        let authority = LocalAuthority::new();
+        authority
+            .add_shallow_cache_ddl_request(req("CREATE CACHE foo FROM SELECT 1", Some("foo")))
+            .await
+            .unwrap();
+        authority
+            .add_shallow_cache_ddl_request(req("CREATE CACHE foo FROM SELECT 1", Some("foo")))
+            .await
+            .unwrap();
+        assert_eq!(
+            authority.shallow_cache_ddl_requests().await.unwrap().len(),
+            1
+        );
+        let removed = authority
+            .remove_shallow_cache_ddl_requests_named(&"foo".into())
+            .await
+            .unwrap();
+        assert!(removed);
+        assert!(authority
+            .shallow_cache_ddl_requests()
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

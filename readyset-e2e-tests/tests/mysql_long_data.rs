@@ -3,9 +3,10 @@ use mysql_async::prelude::Queryable;
 use mysql_common::Value;
 use readyset_client_test_helpers::TestBuilder;
 use readyset_client_test_helpers::mysql_helpers::MySQLAdapter;
-use test_utils::tags;
+use test_utils::{tags, upstream};
 
-#[tags(serial, slow, mysql8_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql, modern)]
 #[test]
 fn mysql_send_long_data() {
     readyset_tracing::init_test_logging();
@@ -18,7 +19,7 @@ fn mysql_send_long_data() {
 
 async fn mysql_send_long_data_inner() {
     let (rs_opts, _rs_handle, shutdown_tx) = TestBuilder::default()
-        .replicate_db("mysql_long_data".to_string())
+        .replicate_db("mysql_long_data")
         .fallback(true)
         .migration_mode(readyset_adapter::backend::MigrationMode::OutOfBand)
         .build::<MySQLAdapter>()

@@ -3,7 +3,7 @@ use std::{cmp, iter};
 use chrono_tz::Tz;
 use readyset_data::dialect::SqlEngine;
 use readyset_data::upstream_system_props::get_system_timezone;
-use readyset_data::{Collation, DfType, DfValue};
+use readyset_data::{Array, ArrayD, CharsetFamily, Collation, DfType, DfValue, IxDyn};
 use readyset_errors::{
     internal, internal_err, invalid_query, invalid_query_err, unsupported, unsupported_err,
     ReadySetError, ReadySetResult,
@@ -31,10 +31,100 @@ pub trait LowerContext: Clone {
     fn resolve_type(&self, ty: Relation) -> Option<DfType>;
 }
 
+/// Resolve a single common collation across a set of expressions.
+///
+/// Column references have stronger affinity than literals or function results, so a column's
+/// collation wins over a literal's. When two args share the same affinity but differ in character
+/// set, UTF-8 wins as a superset. Non-text args are ignored; if no arg is text the dialect default
+/// is returned.
+///
+/// Used both for the result collation of string-producing functions (CONCAT, etc.) and to pick a
+/// target collation when coercing operands of a comparison or other binary op so they share a
+/// single collation at evaluation time.
+fn resolve_collation(args: &[&Expr], dialect: Dialect) -> Collation {
+    // Lower = stronger affinity. Columns beat everything else.
+    const COLUMN: u8 = 0;
+    const OTHER: u8 = 1;
+
+    let mut best_collation: Option<Collation> = None;
+    let mut best_affinity: u8 = u8::MAX;
+
+    for arg in args {
+        let collation = match arg.ty() {
+            DfType::Text(c) | DfType::Char(_, c) | DfType::VarChar(_, c) => *c,
+            _ => continue,
+        };
+
+        let affinity = match arg {
+            Expr::Column { .. } => COLUMN,
+            _ => OTHER,
+        };
+
+        if affinity < best_affinity {
+            best_affinity = affinity;
+            best_collation = Some(collation);
+        } else if affinity == best_affinity {
+            if let Some(current) = best_collation {
+                // Same affinity, different charset → prefer UTF-8 as superset of Latin-1.
+                if current.charset_family() != collation.charset_family()
+                    && collation.charset_family() == CharsetFamily::Utf8
+                {
+                    best_collation = Some(collation);
+                }
+            }
+        }
+    }
+
+    Collation::unwrap_or_default(best_collation, dialect)
+}
+
+/// Overlay a single resolved collation onto the type-coercion targets returned by
+/// [`BinaryOperator::argument_type_coercions`] when both sides of a binary op are or become
+/// text. Returns updated coercion targets that force a cast on either side whose collation
+/// differs from the resolved target.
+///
+/// This is what keeps the hash short-circuit in `DfValue`'s `PartialEq` for `Text` sound: both
+/// operands are guaranteed to share a single collation at evaluation time, so their
+/// `collation_hash` values agree on every pair that compares equal under that collation.
+fn apply_collation_coercion(
+    (left, left_coerce): (&Expr, Option<&DfType>),
+    (right, right_coerce): (&Expr, Option<&DfType>),
+    dialect: Dialect,
+) -> (Option<DfType>, Option<DfType>) {
+    let post_left = left_coerce.unwrap_or_else(|| left.ty());
+    let post_right = right_coerce.unwrap_or_else(|| right.ty());
+
+    if !post_left.is_any_text() || !post_right.is_any_text() {
+        return (left_coerce.cloned(), right_coerce.cloned());
+    }
+
+    let target = resolve_collation(&[left, right], dialect);
+
+    let adjust = |orig: Option<&DfType>, post: &DfType| -> Option<DfType> {
+        if post.collation() == Some(target) {
+            orig.cloned()
+        } else {
+            Some(post.with_collation(target))
+        }
+    };
+
+    (
+        adjust(left_coerce, post_left),
+        adjust(right_coerce, post_right),
+    )
+}
+
 /// Unify the given list of types according to PostgreSQL's [type unification rules][pg-docs]
 ///
 /// [pg-docs]: https://www.postgresql.org/docs/current/typeconv-union-case.html
 fn unify_postgres_types(types: Vec<&DfType>) -> ReadySetResult<DfType> {
+    // The empty-input branch follows PG's rule #3 (all-unknown -> text)
+    // vacuously: with no types to inspect, "all" inputs are unknown.  This is
+    // the correct contract for type unification.  PG's *array constructor*
+    // rule is different ("cannot determine type of empty array") and the bare
+    // `ARRAY[]` lowering rejects in the caller before it reaches this helper.
+    // Do not move the empty-array reject in here -- it would corrupt CASE /
+    // COALESCE / UNION callers that legitimately rely on the text fallback.
     let Some(first_ty) = types.first() else {
         return Ok(DfType::DEFAULT_TEXT);
     };
@@ -57,19 +147,17 @@ fn unify_postgres_types(types: Vec<&DfType>) -> ReadySetResult<DfType> {
     };
 
     // > 4. If the non-unknown inputs are not all of the same type category, fail.
-    if types
+    if let Some(mismatched) = types
         .iter()
         .skip(1)
         .filter(|t| t.is_known())
-        .any(|t| t.pg_category() != first_known_type.pg_category())
+        .find(|t| t.pg_category() != first_known_type.pg_category())
     {
-        invalid_query_err!(
+        return Err(invalid_query_err!(
             "Cannot coerce type {} to type {}",
-            first_ty,
-            types
-                .get(1)
-                .expect("can't get here unless we have at least 2 types")
-        );
+            first_known_type,
+            mismatched
+        ));
     }
 
     // > 5. Select the first non-unknown input type as the candidate type, then consider each other
@@ -169,6 +257,7 @@ impl BuiltinFunction {
                     expr: Box::new(expr),
                     ty,
                     null_on_failure: false,
+                    dialect,
                 }
             }
         };
@@ -176,6 +265,7 @@ impl BuiltinFunction {
             expr: Box::new(expr),
             ty,
             null_on_failure: true,
+            dialect,
         };
 
         let result = match name {
@@ -385,6 +475,30 @@ impl BuiltinFunction {
                     DfType::Json,
                 )
             }
+            "json_build_array" => {
+                antithesis_sdk::assert_reachable!(
+                    r#"{"id":"Built-in function","sub":"json_build_array","tags":["exclude-nightly"]}"#
+                );
+                (
+                    Self::JsonBuildArray {
+                        args: args.by_ref().collect(),
+                        dialect,
+                    },
+                    DfType::Json,
+                )
+            }
+            "jsonb_build_array" => {
+                antithesis_sdk::assert_reachable!(
+                    r#"{"id":"Built-in function","sub":"jsonb_build_array","tags":["exclude-nightly"]}"#
+                );
+                (
+                    Self::JsonBuildArray {
+                        args: args.by_ref().collect(),
+                        dialect,
+                    },
+                    DfType::Jsonb,
+                )
+            }
             "jsonb_object" => {
                 antithesis_sdk::assert_reachable!(
                     r#"{"id":"Built-in function","sub":"jsonb_object","tags":["exclude-nightly"]}"#
@@ -514,15 +628,8 @@ impl BuiltinFunction {
                 );
                 let arg1 = next_arg()?;
                 let rest_args = args.by_ref().collect::<Vec<_>>();
-                let collation = Collation::unwrap_or_default(
-                    iter::once(&arg1)
-                        .chain(&rest_args)
-                        .find_map(|expr| match expr.ty() {
-                            DfType::Text(c) => Some(*c),
-                            _ => None,
-                        }),
-                    dialect,
-                );
+                let all_args: Vec<&Expr> = iter::once(&arg1).chain(&rest_args).collect();
+                let collation = resolve_collation(&all_args, dialect);
                 let ty = DfType::Text(collation);
                 (
                     Self::Concat(
@@ -542,15 +649,11 @@ impl BuiltinFunction {
                 let arg1 = next_arg()?;
                 let arg2 = next_arg()?;
                 let rest_args = args.by_ref().collect::<Vec<_>>();
-                let collation = Collation::unwrap_or_default(
-                    iter::once(&arg1)
-                        .chain(&rest_args)
-                        .find_map(|expr| match expr.ty() {
-                            DfType::Text(c) => Some(*c),
-                            _ => None,
-                        }),
-                    dialect,
-                );
+                let all_args: Vec<&Expr> = iter::once(&arg1)
+                    .chain(iter::once(&arg2))
+                    .chain(&rest_args)
+                    .collect();
+                let collation = resolve_collation(&all_args, dialect);
                 let ty = DfType::Text(collation);
                 (
                     Self::ConcatWs(
@@ -588,13 +691,18 @@ impl BuiltinFunction {
                 antithesis_sdk::assert_reachable!(
                     r#"{"id":"Built-in function","sub":"split_part","tags":["exclude-nightly"]}"#
                 );
+                let string = next_arg()?;
+                let delimiter = next_arg()?;
+                let field = next_arg()?;
+                let collation = resolve_collation(&[&string, &delimiter], dialect);
+                let ty = DfType::Text(collation);
                 (
                     Self::SplitPart(
-                        cast(next_arg()?, DfType::DEFAULT_TEXT),
-                        cast(next_arg()?, DfType::DEFAULT_TEXT),
-                        cast(next_arg()?, DfType::Int),
+                        cast(string, ty.clone()),
+                        cast(delimiter, ty.clone()),
+                        cast(field, DfType::Int),
                     ),
-                    DfType::DEFAULT_TEXT,
+                    ty,
                 )
             }
             "greatest" | "least" => {
@@ -628,6 +736,11 @@ impl BuiltinFunction {
                     }
                 };
 
+                let arg_refs: Vec<&Expr> = iter::once(&arg1).chain(rest_args.iter()).collect();
+                let target_collation = resolve_collation(&arg_refs, dialect);
+                let compare_as = compare_as.with_collation(target_collation);
+                let ty = ty.with_collation(target_collation);
+
                 let mut args = Vec1::with_capacity(arg1, rest_args.len() + 1);
                 args.extend(rest_args);
 
@@ -645,17 +758,25 @@ impl BuiltinFunction {
                     r#"{"id":"Built-in function","sub":"array_to_string","tags":["exclude-nightly"]}"#
                 );
                 let array_arg = next_arg()?;
+                let delimiter = next_arg()?;
+                let null_string = next_arg().ok();
                 let elem_ty = match array_arg.ty() {
                     DfType::Array(t) => (**t).clone(),
                     _ => DfType::Unknown,
                 };
+                let mut collation_args: Vec<&Expr> = vec![&delimiter];
+                if let Some(ref n) = null_string {
+                    collation_args.push(n);
+                }
+                let collation = resolve_collation(&collation_args, dialect);
+                let ty = DfType::Text(collation);
                 (
                     Self::ArrayToString(
                         cast(array_arg, DfType::Array(Box::new(elem_ty))),
-                        next_arg()?,
-                        next_arg().ok(),
+                        cast(delimiter, ty.clone()),
+                        null_string.map(|n| cast(n, ty.clone())),
                     ),
-                    DfType::DEFAULT_TEXT,
+                    ty,
                 )
             }
             "date_trunc" => {
@@ -1042,17 +1163,24 @@ impl BinaryOperator {
                     Ok((Self::JsonContainedIn, false))
                 }
             }
+            DoubleAmpersand if dialect.engine() != SqlEngine::PostgreSQL => {
+                unsupported!("'&&' array overlap not available in {}", dialect.engine())
+            }
+            DoubleAmpersand => Ok((Self::ArrayOverlap, false)),
         }
     }
 
-    /// Given the types of the lhs and rhs expressions for this binary operator, if either side
-    /// needs to be coerced before evaluation, returns the type that it should be coerced to
+    /// Given the lhs and rhs expressions for this binary operator, if either side needs to be
+    /// coerced before evaluation, returns the type that it should be coerced to.
     pub(crate) fn argument_type_coercions(
         &self,
-        left_type: &DfType,
-        right_type: &DfType,
+        left: &Expr,
+        right: &Expr,
         dialect: Dialect,
     ) -> ReadySetResult<(Option<DfType>, Option<DfType>)> {
+        let left_type = left.ty();
+        let right_type = right.ty();
+
         enum Side {
             Left,
             Right,
@@ -1094,32 +1222,29 @@ impl BinaryOperator {
             };
 
         use BinaryOperator::*;
-        match self {
+        let (left_coerce, right_coerce) = match self {
             Add | Subtract | Multiply | Divide | Modulo | And | Or | Is => match dialect.engine() {
-                SqlEngine::PostgreSQL => Ok((None, None)),
+                SqlEngine::PostgreSQL => (None, None),
                 SqlEngine::MySQL => {
                     let ty = mysql_type_conversion(left_type, right_type);
-                    Ok((Some(ty.clone()), Some(ty)))
+                    (Some(ty.clone()), Some(ty))
                 }
             },
 
             Greater | GreaterOrEqual | Less | LessOrEqual => match dialect.engine() {
-                SqlEngine::PostgreSQL => {
-                    let (l, r) = pg_array_coercion(left_type, right_type);
-                    Ok((l, r))
-                }
+                SqlEngine::PostgreSQL => pg_array_coercion(left_type, right_type),
                 SqlEngine::MySQL => {
                     let ty = mysql_type_conversion(left_type, right_type);
-                    Ok((Some(ty.clone()), Some(ty)))
+                    (Some(ty.clone()), Some(ty))
                 }
             },
 
-            Like | ILike => Ok((
+            Like | ILike => (
                 coerce_to_text_type(left_type),
                 coerce_to_text_type(right_type),
-            )),
+            ),
 
-            AtTimeZone => Ok((
+            AtTimeZone => (
                 if left_type.is_date_and_time() {
                     None
                 } else if matches!(left_type, DfType::Unknown) || left_type.is_any_text() {
@@ -1132,23 +1257,23 @@ impl BinaryOperator {
                     return error(Left, "String literal, timestamp or timestamptz");
                 },
                 None,
-            )),
+            ),
 
             Equal => match dialect.engine() {
                 SqlEngine::PostgreSQL => {
                     let (l, r) = pg_array_coercion(left_type, right_type);
                     if l.is_some() || r.is_some() {
-                        Ok((l, r))
+                        (l, r)
                     } else {
                         // Non-array Equal: coerce right to left's type to handle
                         // cases like Unknown vs concrete type. Not needed for
                         // ordering comparisons which return (None, None) here.
-                        Ok((None, Some(left_type.clone())))
+                        (None, Some(left_type.clone()))
                     }
                 }
                 SqlEngine::MySQL => {
                     let ty = mysql_type_conversion(left_type, right_type);
-                    Ok((Some(ty.clone()), Some(ty)))
+                    (Some(ty.clone()), Some(ty))
                 }
             },
 
@@ -1156,7 +1281,7 @@ impl BinaryOperator {
                 if left_type.is_known() && !left_type.is_jsonb() {
                     return error(Left, "JSONB");
                 }
-                Ok((None, Some(DfType::DEFAULT_TEXT)))
+                (None, Some(DfType::DEFAULT_TEXT))
             }
             JsonAnyExists
             | JsonAllExists
@@ -1172,16 +1297,15 @@ impl BinaryOperator {
                 {
                     return error(Right, "TEXT[]");
                 }
-                Ok((
+                (
                     Some(DfType::DEFAULT_TEXT),
                     Some(DfType::Array(Box::new(DfType::DEFAULT_TEXT))),
-                ))
+                )
             }
-            ArrayContains | ArrayContainedIn | ArrayConcat => {
-                let (l, r) = pg_array_coercion(left_type, right_type);
-                Ok((l, r))
+            ArrayContains | ArrayContainedIn | ArrayConcat | ArrayOverlap => {
+                pg_array_coercion(left_type, right_type)
             }
-            StringConcat => Ok((Some(DfType::DEFAULT_TEXT), Some(DfType::DEFAULT_TEXT))),
+            StringConcat => (Some(DfType::DEFAULT_TEXT), Some(DfType::DEFAULT_TEXT)),
             JsonConcat | JsonContains | JsonContainedIn => {
                 if left_type.is_known() && !left_type.is_jsonb() {
                     return error(Left, "JSONB");
@@ -1191,22 +1315,28 @@ impl BinaryOperator {
                     return error(Right, "JSONB");
                 }
 
-                Ok((Some(DfType::DEFAULT_TEXT), Some(DfType::DEFAULT_TEXT)))
+                (Some(DfType::DEFAULT_TEXT), Some(DfType::DEFAULT_TEXT))
             }
-            JsonKeyExtract | JsonKeyExtractText => Ok((Some(DfType::DEFAULT_TEXT), None)),
+            JsonKeyExtract | JsonKeyExtractText => (Some(DfType::DEFAULT_TEXT), None),
 
             JsonSubtract => {
                 if left_type.is_known() && !left_type.is_jsonb() {
                     return error(Left, "JSONB");
                 }
 
-                Ok((None, None))
+                (None, None)
             }
 
             JsonPathExtract | JsonPathExtractUnquote => {
                 unsupported!("'{self}' operator not implemented yet for MySQL")
             }
-        }
+        };
+
+        Ok(apply_collation_coercion(
+            (left, left_coerce.as_ref()),
+            (right, right_coerce.as_ref()),
+            dialect,
+        ))
     }
 
     /// Returns this operator's output type given its input types, or
@@ -1257,7 +1387,8 @@ impl BinaryOperator {
             | Self::JsonContains
             | Self::JsonContainedIn
             | Self::ArrayContains
-            | Self::ArrayContainedIn => Ok(DfType::Bool),
+            | Self::ArrayContainedIn
+            | Self::ArrayOverlap => Ok(DfType::Bool),
 
             Self::AtTimeZone => {
                 if dialect.engine() == SqlEngine::PostgreSQL {
@@ -1333,9 +1464,10 @@ impl Expr {
             if let Some(ty) = then_types_it.next() {
                 ty
             } else {
-                //  At this point we don't have any not NULL expressions neither in THEN(s) nor in
-                // ELSE.  We can't handle this case.
-                return DfType::Unknown;
+                // All THEN and ELSE expressions are unknown (e.g. PostgreSQL string literals).
+                // Per PostgreSQL type resolution rule 3: "If all inputs are of type unknown,
+                // resolve as type text."
+                return DfType::DEFAULT_TEXT;
             }
         } else {
             else_type
@@ -1356,6 +1488,41 @@ impl Expr {
         result_type
     }
 
+    /// If `expr` is a bare `ARRAY[]` and `ty` is an array type, build the empty
+    /// array directly using the cast's element type as a constant `Expr::Literal`.
+    /// Returns `None` for non-array `ty` or non-empty inner; the caller handles
+    /// the rejection so the error message can name the cast target.
+    ///
+    /// PG treats all empty arrays as the same dimensionless `<elem>[]` value
+    /// regardless of how many bracket pairs the cast carries —
+    /// `pg_typeof(ARRAY[]::int[][])` is `integer[]` and `array_ndims` is NULL.
+    /// Match that: collapse to a single-layer `DfType::Array(elem)` and
+    /// `shape: [0]` no matter how deep `ty` nests.  Folding to `Literal` at
+    /// lower time also avoids per-row `ArrayD::from_shape_vec` reconstruction
+    /// on the eval hot path.
+    fn try_lower_empty_array_cast(expr: &AstExpr, ty: &DfType) -> Option<Self> {
+        let AstExpr::Array(ArrayArguments::List(exprs)) = expr else {
+            return None;
+        };
+        if !exprs.is_empty() {
+            return None;
+        }
+        let DfType::Array(_) = ty else {
+            return None;
+        };
+        let mut elem = ty;
+        while let DfType::Array(next) = elem {
+            elem = next;
+        }
+        let collapsed_ty = DfType::Array(Box::new(elem.clone()));
+        let empty =
+            ArrayD::<DfValue>::from_shape_vec(IxDyn(&[0]), vec![]).expect("0-shape always valid");
+        Some(Self::Literal {
+            val: DfValue::from(Array::from(empty)),
+            ty: collapsed_ty,
+        })
+    }
+
     /// Lower the given [`nom_sql`] AST expression to a dataflow expression
     ///
     /// Currently, this involves:
@@ -1374,23 +1541,81 @@ impl Expr {
         C: LowerContext,
     {
         match expr {
-            AstExpr::Call(FunctionExpr::Call {
-                name: fname,
-                arguments,
-            }) => {
-                let args = if let Some(arguments) = arguments {
-                    arguments
-                        .into_iter()
-                        .map(|arg| Self::lower(arg, dialect, context))
-                        .collect::<Result<Vec<_>, _>>()?
-                } else {
-                    vec![]
-                };
-                let (func, ty) = BuiltinFunction::from_name_and_args(&fname, args, dialect)?;
+            // Typed built-in variants: lower arguments then delegate to BuiltinFunction::from_name_and_args
+            AstExpr::Call(
+                func_expr @ (FunctionExpr::ConvertTz(..)
+                | FunctionExpr::DayOfWeek(..)
+                | FunctionExpr::Month(..)
+                | FunctionExpr::Timediff(..)
+                | FunctionExpr::Addtime(..)
+                | FunctionExpr::DateFormat(..)
+                | FunctionExpr::DateTrunc(..)
+                | FunctionExpr::IfNull(..)
+                | FunctionExpr::Coalesce(..)
+                | FunctionExpr::Round(..)
+                | FunctionExpr::Greatest(..)
+                | FunctionExpr::Least(..)
+                | FunctionExpr::Concat(..)
+                | FunctionExpr::ConcatWs(..)
+                | FunctionExpr::SplitPart(..)
+                | FunctionExpr::Length(..)
+                | FunctionExpr::OctetLength(..)
+                | FunctionExpr::CharLength(..)
+                | FunctionExpr::Ascii(..)
+                | FunctionExpr::Hex(..)
+                | FunctionExpr::JsonDepth(..)
+                | FunctionExpr::JsonValid(..)
+                | FunctionExpr::JsonOverlaps(..)
+                | FunctionExpr::JsonQuote(..)
+                | FunctionExpr::JsonTypeof(..)
+                | FunctionExpr::JsonArrayLength(..)
+                | FunctionExpr::JsonExtractPathText(..)
+                | FunctionExpr::JsonObject(..)
+                | FunctionExpr::JsonbObject(..)
+                | FunctionExpr::JsonBuildObject(..)
+                | FunctionExpr::JsonbBuildObject(..)
+                | FunctionExpr::JsonBuildArray(..)
+                | FunctionExpr::JsonbBuildArray(..)
+                | FunctionExpr::JsonStripNulls(..)
+                | FunctionExpr::JsonbStripNulls(..)
+                | FunctionExpr::JsonExtractPath(..)
+                | FunctionExpr::JsonbExtractPath(..)
+                | FunctionExpr::JsonbInsert(..)
+                | FunctionExpr::JsonbSet(..)
+                | FunctionExpr::JsonbSetLax(..)
+                | FunctionExpr::JsonbPretty(..)
+                | FunctionExpr::ArrayToString(..)
+                | FunctionExpr::StAsText(..)
+                | FunctionExpr::StAsWkt(..)
+                | FunctionExpr::StAsEwkt(..)),
+            ) => {
+                let fname = func_expr.builtin_name().ok_or_else(|| {
+                    internal_err!("FunctionExpr variant in builtin arm has no builtin_name")
+                })?;
+                let args: Vec<Expr> = func_expr
+                    .into_arguments()
+                    .into_iter()
+                    .map(|arg| Self::lower(arg, dialect, context))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let (func, ty) = BuiltinFunction::from_name_and_args(fname, args, dialect)?;
                 Ok(Self::Call {
                     func: Box::new(func),
                     ty,
                 })
+            }
+            // No-paren functions are not lowerable (they're kept for AST completeness)
+            AstExpr::Call(
+                FunctionExpr::CurrentDate
+                | FunctionExpr::CurrentTimestamp(_)
+                | FunctionExpr::CurrentTime
+                | FunctionExpr::LocalTimestamp
+                | FunctionExpr::LocalTime
+                | FunctionExpr::CurrentUser
+                | FunctionExpr::SessionUser
+                | FunctionExpr::CurrentCatalog
+                | FunctionExpr::SqlUser,
+            ) => {
+                unsupported!("No-parentheses functions are not supported in dataflow expressions")
             }
             AstExpr::Call(FunctionExpr::Udf { schema, name, .. }) => {
                 if let Some(schema) = schema {
@@ -1406,11 +1631,23 @@ impl Expr {
                 } else {
                     DfType::DEFAULT_TEXT
                 };
+                let cast_to_bigint = |expr: Expr| {
+                    if *expr.ty() == DfType::BigInt {
+                        expr
+                    } else {
+                        Expr::Cast {
+                            expr: Box::new(expr),
+                            ty: DfType::BigInt,
+                            null_on_failure: false,
+                            dialect,
+                        }
+                    }
+                };
                 let func = Box::new(BuiltinFunction::Substring(
                     string,
-                    pos.map(|expr| Self::lower(*expr, dialect, context))
+                    pos.map(|expr| Self::lower(*expr, dialect, context).map(cast_to_bigint))
                         .transpose()?,
-                    len.map(|expr| Self::lower(*expr, dialect, context))
+                    len.map(|expr| Self::lower(*expr, dialect, context).map(cast_to_bigint))
                         .transpose()?,
                 ));
 
@@ -1466,10 +1703,20 @@ impl Expr {
                 let is_string_literal = lit.is_string();
                 let val: DfValue = lit.try_into_dialect(dialect.into())?;
                 // TODO: Infer type from SQL
-                let ty = if is_string_literal && dialect.engine() == SqlEngine::PostgreSQL {
-                    DfType::Unknown
-                } else {
-                    val.infer_dataflow_type()
+                let ty = match (&val, dialect.engine()) {
+                    (_, SqlEngine::PostgreSQL) if is_string_literal => DfType::Unknown,
+                    // PostgreSQL treats unqualified integer literals as `integer` (INT4)
+                    // when the value fits in 32 bits, otherwise `bigint`. Without this,
+                    // all literals get BigInt (since DfValue::Int is i64), which causes
+                    // type promotion mismatches -- e.g. array_agg(int4_col + 5) produces
+                    // BigInt elements inside an Int4 array, breaking wire protocol
+                    // deserialization (REA-6243).
+                    (DfValue::Int(i), SqlEngine::PostgreSQL)
+                        if *i >= i64::from(i32::MIN) && *i <= i64::from(i32::MAX) =>
+                    {
+                        DfType::Int
+                    }
+                    _ => val.infer_dataflow_type(),
                 };
 
                 Ok(Self::Literal { val, ty })
@@ -1493,7 +1740,7 @@ impl Expr {
 
                 let out = op.output_type(dialect, left.ty(), right.ty())?;
                 let (left_coerce_target, right_coerce_target) =
-                    op.argument_type_coercions(left.ty(), right.ty(), dialect)?;
+                    op.argument_type_coercions(&left, &right, dialect)?;
 
                 if let Some(ty) = left_coerce_target {
                     if ty != out {
@@ -1501,6 +1748,7 @@ impl Expr {
                             expr: left,
                             ty,
                             null_on_failure: false,
+                            dialect,
                         });
                     }
                 }
@@ -1510,6 +1758,7 @@ impl Expr {
                             expr: right,
                             ty,
                             null_on_failure: false,
+                            dialect,
                         });
                     }
                 }
@@ -1589,10 +1838,18 @@ impl Expr {
             } => {
                 let ty =
                     DfType::from_sql_type(&to_type, dialect, |t| context.resolve_type(t), None)?;
+                if let Some(arr) = Self::try_lower_empty_array_cast(&expr, &ty) {
+                    return Ok(arr);
+                }
+                // A bare `ARRAY[]` with a non-array cast target falls through:
+                // the inner `Array([])` lowering will reject it with the same
+                // "cannot determine type of empty array" message PG emits,
+                // since PG does not differentiate the scalar-cast case.
                 Ok(Self::Cast {
                     expr: Box::new(Self::lower(*expr, dialect, context)?),
                     ty,
                     null_on_failure: false,
+                    dialect,
                 })
             }
             AstExpr::CaseWhen {
@@ -1618,6 +1875,9 @@ impl Expr {
                     branches.iter().map(|branch| branch.body.ty()),
                     else_expr.ty(),
                 );
+                let mut arg_refs: Vec<&Expr> = branches.iter().map(|b| &b.body).collect();
+                arg_refs.push(&else_expr);
+                let ty = ty.with_collation(resolve_collation(&arg_refs, dialect));
                 if let DfType::Unknown = ty {
                     Err(unsupported_err!(
                         "Can not infer result type for CASE expression"
@@ -1645,10 +1905,36 @@ impl Expr {
 
                     let lhs = Self::lower(*lhs, dialect, context)?;
                     let make_comparison = |rhs| -> ReadySetResult<_> {
+                        let mut left = Box::new(lhs.clone());
+                        let mut right = Box::new(Self::lower(rhs, dialect, context)?);
+
+                        // Apply the same type coercions that BinaryOp uses for
+                        // Equal, so that e.g. Int vs Numeric gets a Cast node
+                        // inserted rather than comparing mismatched types at
+                        // eval time.
+                        let (left_coerce, right_coerce) = BinaryOperator::Equal
+                            .argument_type_coercions(&left, &right, dialect)?;
+                        if let Some(ty) = left_coerce {
+                            left = Box::new(Self::Cast {
+                                expr: left,
+                                ty,
+                                null_on_failure: false,
+                                dialect,
+                            });
+                        }
+                        if let Some(ty) = right_coerce {
+                            right = Box::new(Self::Cast {
+                                expr: right,
+                                ty,
+                                null_on_failure: false,
+                                dialect,
+                            });
+                        }
+
                         let equal = Self::Op {
-                            left: Box::new(lhs.clone()),
+                            left,
                             op: BinaryOperator::Equal,
-                            right: Box::new(Self::lower(rhs, dialect, context)?),
+                            right,
                             ty: DfType::Bool, // type of = is always bool
                         };
                         if negated {
@@ -1750,9 +2036,16 @@ impl Expr {
                 find_shape(&expr, &mut shape)?;
                 flatten(expr, &mut elements, dialect, context)?;
 
+                if elements.is_empty() {
+                    return Err(invalid_query_err!("cannot determine type of empty array"));
+                }
+
                 let mut ty =
                     // Array exprs are only supported for postgresql
                     unify_postgres_types(elements.iter().map(|expr| expr.ty()).collect())?;
+
+                let elem_refs: Vec<&Expr> = elements.iter().collect();
+                ty = ty.with_collation(resolve_collation(&elem_refs, dialect));
 
                 for _ in &shape {
                     ty = DfType::Array(Box::new(ty));
@@ -1764,12 +2057,14 @@ impl Expr {
                     ty,
                 })
             }
-            AstExpr::Row { exprs, .. } => Ok(Self::Row {
-                elements: exprs
+            AstExpr::Row { exprs, .. } => {
+                let elements = exprs
                     .into_iter()
                     .map(|e| Self::lower(e, dialect, context))
-                    .collect::<ReadySetResult<Vec<_>>>()?,
-            }),
+                    .collect::<ReadySetResult<Vec<_>>>()?;
+                let ty = DfType::Row(elements.iter().map(|e| e.ty().clone()).collect());
+                Ok(Self::Row { elements, ty })
+            }
             AstExpr::Exists(_) => unsupported!("EXISTS not currently supported"),
             AstExpr::Variable(_) => unsupported!("Variables not currently supported"),
             AstExpr::ConvertUsing { .. } => {
@@ -1831,14 +2126,22 @@ impl Expr {
             invalid_query!("op ANY/ALL (array) requires the operator to yield a boolean")
         }
 
+        // ANY/ALL applies the operator between lhs and each array member, so feed a synthetic
+        // expr of the member type as the rhs for coercion purposes. A Literal makes it count as
+        // a non-column reference in collation-affinity resolution.
+        let right_member_expr = Expr::Literal {
+            val: DfValue::None,
+            ty: right_member_ty.clone(),
+        };
         let (left_coerce_target, right_coerce_target) =
-            op.argument_type_coercions(left.ty(), right_member_ty, dialect)?;
+            op.argument_type_coercions(&left, &right_member_expr, dialect)?;
 
         if let Some(ty) = left_coerce_target {
             left = Box::new(Self::Cast {
                 expr: left,
                 ty,
                 null_on_failure: false,
+                dialect,
             })
         }
         if let Some(ty) = right_coerce_target {
@@ -1847,6 +2150,7 @@ impl Expr {
                 ty: DfType::Array(Box::new(ty)),
 
                 null_on_failure: false,
+                dialect,
             })
         } else if !right.ty().is_array() {
             // Even if we don't need to cast the right member type to a target type, we still need
@@ -1858,6 +2162,7 @@ impl Expr {
                     right_coerce_target.unwrap_or_else(|| left.ty().clone()),
                 )),
                 null_on_failure: false,
+                dialect,
             });
         }
 
@@ -1897,6 +2202,14 @@ pub(crate) mod tests {
     use readyset_sql_parsing::parse_expr;
 
     use super::*;
+
+    /// MySQL default text type uses case-insensitive collation.
+    const MYSQL_TEXT: DfType = DfType::Text(Collation::Utf8AiCi);
+
+    /// Create a DfValue string with MySQL's default (case-insensitive) collation.
+    fn mysql_str(s: &str) -> DfValue {
+        DfValue::from_str_and_collation(s, Collation::Utf8AiCi)
+    }
 
     #[derive(Clone)]
     pub(crate) struct TestLowerContext<RC, RT> {
@@ -2015,7 +2328,8 @@ pub(crate) mod tests {
                     ty: DfType::Unknown
                 }),
                 ty: enum_ty,
-                null_on_failure: false
+                null_on_failure: false,
+                dialect: Dialect::DEFAULT_POSTGRESQL,
             }
         );
     }
@@ -2044,13 +2358,10 @@ pub(crate) mod tests {
 
     #[test]
     fn call_coalesce() {
-        let input = AstExpr::Call(FunctionExpr::Call {
-            name: "coalesce".into(),
-            arguments: Some(vec![
-                AstExpr::Column("t.x".into()),
-                AstExpr::Literal(2.into()),
-            ]),
-        });
+        let input = AstExpr::Call(FunctionExpr::Coalesce(vec![
+            AstExpr::Column("t.x".into()),
+            AstExpr::Literal(2.into()),
+        ]));
 
         let result = Expr::lower(
             input,
@@ -2092,21 +2403,21 @@ pub(crate) mod tests {
             Expr::Call {
                 func: Box::new(BuiltinFunction::Concat(
                     Expr::Literal {
-                        val: "My".into(),
-                        ty: DfType::DEFAULT_TEXT,
+                        val: mysql_str("My"),
+                        ty: MYSQL_TEXT,
                     },
                     vec![
                         Expr::Literal {
-                            val: "SQ".into(),
-                            ty: DfType::DEFAULT_TEXT,
+                            val: mysql_str("SQ"),
+                            ty: MYSQL_TEXT,
                         },
                         Expr::Literal {
-                            val: "L".into(),
-                            ty: DfType::DEFAULT_TEXT,
+                            val: mysql_str("L"),
+                            ty: MYSQL_TEXT,
                         },
                     ],
                 )),
-                ty: DfType::DEFAULT_TEXT,
+                ty: MYSQL_TEXT,
             }
         );
     }
@@ -2157,8 +2468,8 @@ pub(crate) mod tests {
             Expr::Call {
                 func: Box::new(BuiltinFunction::Substring(
                     Expr::Literal {
-                        val: "abcdefghi".into(),
-                        ty: DfType::DEFAULT_TEXT
+                        val: mysql_str("abcdefghi"),
+                        ty: MYSQL_TEXT
                     },
                     Some(Expr::Literal {
                         val: 1.into(),
@@ -2169,7 +2480,7 @@ pub(crate) mod tests {
                         ty: DfType::BigInt
                     }),
                 )),
-                ty: DfType::DEFAULT_TEXT
+                ty: MYSQL_TEXT
             }
         )
     }
@@ -2183,8 +2494,8 @@ pub(crate) mod tests {
             Expr::Call {
                 func: Box::new(BuiltinFunction::Substring(
                     Expr::Literal {
-                        val: "abcdefghi".into(),
-                        ty: DfType::DEFAULT_TEXT
+                        val: mysql_str("abcdefghi"),
+                        ty: MYSQL_TEXT
                     },
                     Some(Expr::Literal {
                         val: 1.into(),
@@ -2195,7 +2506,7 @@ pub(crate) mod tests {
                         ty: DfType::BigInt
                     }),
                 )),
-                ty: DfType::DEFAULT_TEXT
+                ty: MYSQL_TEXT
             }
         )
     }
@@ -2214,24 +2525,19 @@ pub(crate) mod tests {
             Expr::lower(input, Dialect::DEFAULT_MYSQL, &no_op_lower_context())
         }
 
-        const ERROR_EXPR: Expr = Expr::Literal {
-            val: DfValue::None,
-            ty: DfType::Unknown,
-        };
-
         // 1st THEN is NULL and ELSE is missing
         assert_eq!(
             get_case_result_type("case when 1=1 then NULL when 2=2 then 'BCD' end")
                 .unwrap()
                 .ty(),
-            &DfType::DEFAULT_TEXT
+            &MYSQL_TEXT
         );
         // 1st THEN is NULL and ELSE is NULL
         assert_eq!(
             get_case_result_type("case when 1=1 then NULL when 2=2 then 'BCD' else NULL end")
                 .unwrap()
                 .ty(),
-            &DfType::DEFAULT_TEXT
+            &MYSQL_TEXT
         );
         // The THEN(s) are not NULL and ELSE is missing
         assert_eq!(
@@ -2258,25 +2564,40 @@ pub(crate) mod tests {
                 .ty(),
             &DfType::BigInt
         );
-        // Negative test: The single THEN is NULL and ELSE is missing
+        // All-unknown branches resolve to text in the dialect's default collation.
         assert_eq!(
             get_case_result_type("case when 1=1 then NULL end")
-                .unwrap_or(ERROR_EXPR)
+                .unwrap()
                 .ty(),
-            &DfType::Unknown
+            &MYSQL_TEXT
         );
-        // Incompatible THEN expressions
+        // Incompatible THEN expressions — falls back to text in the dialect default.
         assert_eq!(
             get_case_result_type("case when 1=1 then 2 when 2=2 then 'ABC' end")
                 .unwrap()
                 .ty(),
-            &DfType::DEFAULT_TEXT
+            &MYSQL_TEXT
         );
-        // Incompatible THEN and ELSE expressions
+        // Incompatible THEN and ELSE expressions — same fallback.
         assert_eq!(
             get_case_result_type("case when 1=1 then 2 else 'ABC' end")
                 .unwrap()
                 .ty(),
+            &MYSQL_TEXT
+        );
+
+        // PostgreSQL: all-string-literal CASE branches resolve to text without
+        // requiring explicit ::text casts
+        fn get_case_result_type_pg(stmt: &str) -> ReadySetResult<Expr> {
+            let input = parse_expr(ParserDialect::PostgreSQL, stmt).unwrap();
+            Expr::lower(input, Dialect::DEFAULT_POSTGRESQL, &no_op_lower_context())
+        }
+        assert_eq!(
+            get_case_result_type_pg(
+                "case when 1=1 then '$0 - $15' when 2=2 then '$15 - $25' else '$50+' end"
+            )
+            .unwrap()
+            .ty(),
             &DfType::DEFAULT_TEXT
         );
     }
@@ -2287,10 +2608,9 @@ pub(crate) mod tests {
 
         #[track_caller]
         fn infers_type(args: Vec<Literal>, dialect: Dialect, expected_ty: DfType) {
-            let input = AstExpr::Call(FunctionExpr::Call {
-                name: "greatest".into(),
-                arguments: Some(args.into_iter().map(AstExpr::Literal).collect()),
-            });
+            let input = AstExpr::Call(FunctionExpr::Greatest(
+                args.into_iter().map(AstExpr::Literal).collect(),
+            ));
             let result = Expr::lower(input, dialect, &no_op_lower_context()).unwrap();
             assert_eq!(result.ty(), &expected_ty);
         }
@@ -2304,7 +2624,7 @@ pub(crate) mod tests {
         infers_type(
             vec!["123".into(), 23.into()],
             Dialect::DEFAULT_POSTGRESQL,
-            DfType::BigInt,
+            DfType::Int,
         );
 
         infers_type(
@@ -2335,7 +2655,7 @@ pub(crate) mod tests {
         infers_type(
             vec!["123".into(), Literal::Number("1.23".into())],
             Dialect::DEFAULT_MYSQL,
-            DfType::DEFAULT_TEXT,
+            MYSQL_TEXT,
         );
 
         // TODO(ENG-1911)
@@ -2352,16 +2672,32 @@ pub(crate) mod tests {
         // );
     }
 
+    /// PostgreSQL integer literal type narrowing at i32 boundaries.
+    #[test]
+    fn pg_integer_literal_boundary_types() {
+        fn literal_type(val: i64) -> DfType {
+            let lit = AstExpr::Literal(Literal::Integer(val));
+            let expr =
+                Expr::lower(lit, Dialect::DEFAULT_POSTGRESQL, &no_op_lower_context()).unwrap();
+            expr.ty().clone()
+        }
+
+        assert_eq!(literal_type(0), DfType::Int);
+        assert_eq!(literal_type(i64::from(i32::MAX)), DfType::Int);
+        assert_eq!(literal_type(i64::from(i32::MAX) + 1), DfType::BigInt);
+        assert_eq!(literal_type(i64::from(i32::MIN)), DfType::Int);
+        assert_eq!(literal_type(i64::from(i32::MIN) - 1), DfType::BigInt);
+    }
+
     #[test]
     fn greatest_compare_as() {
         use Literal::Null;
 
         #[track_caller]
         fn compares_as(args: Vec<Literal>, dialect: Dialect, expected_ty: DfType) {
-            let input = AstExpr::Call(FunctionExpr::Call {
-                name: "greatest".into(),
-                arguments: Some(args.into_iter().map(AstExpr::Literal).collect()),
-            });
+            let input = AstExpr::Call(FunctionExpr::Greatest(
+                args.into_iter().map(AstExpr::Literal).collect(),
+            ));
             let result = Expr::lower(input, dialect, &no_op_lower_context()).unwrap();
             let compare_as = match result {
                 Expr::Call { func, .. } => match *func {
@@ -2400,12 +2736,12 @@ pub(crate) mod tests {
         compares_as(
             vec![12u64.into(), "123".into()],
             Dialect::DEFAULT_MYSQL,
-            DfType::DEFAULT_TEXT,
+            MYSQL_TEXT,
         );
         compares_as(
             vec!["A".into(), "b".into(), 1.into()],
             Dialect::DEFAULT_MYSQL,
-            DfType::DEFAULT_TEXT,
+            MYSQL_TEXT,
         );
     }
 
@@ -2460,7 +2796,7 @@ pub(crate) mod tests {
                 elements: vec![
                     Expr::Literal {
                         val: 1u32.into(),
-                        ty: DfType::BigInt
+                        ty: DfType::Int
                     },
                     Expr::Cast {
                         expr: Box::new(Expr::Literal {
@@ -2468,19 +2804,20 @@ pub(crate) mod tests {
                             ty: DfType::Unknown
                         }),
                         ty: DfType::Int,
-                        null_on_failure: false
+                        null_on_failure: false,
+                        dialect: Dialect::DEFAULT_POSTGRESQL,
                     },
                     Expr::Literal {
                         val: 3u32.into(),
-                        ty: DfType::BigInt
+                        ty: DfType::Int
                     },
                     Expr::Literal {
                         val: 4u32.into(),
-                        ty: DfType::BigInt
+                        ty: DfType::Int
                     }
                 ],
                 shape: vec![2, 2],
-                ty: DfType::Array(Box::new(DfType::Array(Box::new(DfType::BigInt))))
+                ty: DfType::Array(Box::new(DfType::Array(Box::new(DfType::Int))))
             }
         )
     }
@@ -2496,15 +2833,16 @@ pub(crate) mod tests {
                 op: BinaryOperator::Equal,
                 left: Box::new(Expr::Literal {
                     val: 1u64.into(),
-                    ty: DfType::BigInt
+                    ty: DfType::Int
                 }),
                 right: Box::new(Expr::Cast {
                     expr: Box::new(Expr::Literal {
                         val: "{1,2}".into(),
                         ty: DfType::Unknown
                     }),
-                    ty: DfType::Array(Box::new(DfType::BigInt)),
-                    null_on_failure: false
+                    ty: DfType::Array(Box::new(DfType::Int)),
+                    null_on_failure: false,
+                    dialect: Dialect::DEFAULT_POSTGRESQL,
                 }),
                 ty: DfType::Bool
             }
@@ -2522,15 +2860,16 @@ pub(crate) mod tests {
                 op: BinaryOperator::Equal,
                 left: Box::new(Expr::Literal {
                     val: 1u64.into(),
-                    ty: DfType::BigInt
+                    ty: DfType::Int
                 }),
                 right: Box::new(Expr::Cast {
                     expr: Box::new(Expr::Literal {
                         val: "{1,1}".into(),
                         ty: DfType::Unknown
                     }),
-                    ty: DfType::Array(Box::new(DfType::BigInt)),
-                    null_on_failure: false
+                    ty: DfType::Array(Box::new(DfType::Int)),
+                    null_on_failure: false,
+                    dialect: Dialect::DEFAULT_POSTGRESQL,
                 }),
                 ty: DfType::Bool
             }
@@ -2553,19 +2892,29 @@ pub(crate) mod tests {
                     Expr::Array {
                         elements: vec![Expr::Literal {
                             val: 1u64.into(),
-                            ty: DfType::BigInt,
+                            ty: DfType::Int,
                         }],
                         shape: vec![1],
-                        ty: DfType::Array(Box::new(DfType::BigInt))
+                        ty: DfType::Array(Box::new(DfType::Int))
                     },
-                    Expr::Literal {
-                        val: ",".into(),
-                        ty: DfType::Unknown
+                    Expr::Cast {
+                        expr: Box::new(Expr::Literal {
+                            val: ",".into(),
+                            ty: DfType::Unknown,
+                        }),
+                        ty: DfType::DEFAULT_TEXT,
+                        null_on_failure: false,
+                        dialect: Dialect::DEFAULT_POSTGRESQL,
                     },
-                    Some(Expr::Literal {
-                        val: "*".into(),
-                        ty: DfType::Unknown
-                    })
+                    Some(Expr::Cast {
+                        expr: Box::new(Expr::Literal {
+                            val: "*".into(),
+                            ty: DfType::Unknown,
+                        }),
+                        ty: DfType::DEFAULT_TEXT,
+                        null_on_failure: false,
+                        dialect: Dialect::DEFAULT_POSTGRESQL,
+                    }),
                 )),
                 ty: DfType::DEFAULT_TEXT
             }
@@ -2739,12 +3088,19 @@ pub(crate) mod tests {
             DfType::Array(Box::new(DfType::Int))
         }
 
+        fn lit_expr(ty: DfType) -> Expr {
+            Expr::Literal {
+                val: DfValue::None,
+                ty,
+            }
+        }
+
         #[test]
         fn equal_coerces_right_text_to_array() {
             let (left, right) = BinaryOperator::Equal
                 .argument_type_coercions(
-                    &int_array_type(),
-                    &DfType::DEFAULT_TEXT,
+                    &lit_expr(int_array_type()),
+                    &lit_expr(DfType::DEFAULT_TEXT),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2756,8 +3112,8 @@ pub(crate) mod tests {
         fn equal_coerces_left_text_to_array() {
             let (left, right) = BinaryOperator::Equal
                 .argument_type_coercions(
-                    &DfType::DEFAULT_TEXT,
-                    &int_array_type(),
+                    &lit_expr(DfType::DEFAULT_TEXT),
+                    &lit_expr(int_array_type()),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2769,8 +3125,8 @@ pub(crate) mod tests {
         fn greater_coerces_right_text_to_array() {
             let (left, right) = BinaryOperator::Greater
                 .argument_type_coercions(
-                    &int_array_type(),
-                    &DfType::DEFAULT_TEXT,
+                    &lit_expr(int_array_type()),
+                    &lit_expr(DfType::DEFAULT_TEXT),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2782,8 +3138,8 @@ pub(crate) mod tests {
         fn less_coerces_left_text_to_array() {
             let (left, right) = BinaryOperator::Less
                 .argument_type_coercions(
-                    &DfType::DEFAULT_TEXT,
-                    &int_array_type(),
+                    &lit_expr(DfType::DEFAULT_TEXT),
+                    &lit_expr(int_array_type()),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2795,8 +3151,8 @@ pub(crate) mod tests {
         fn no_coercion_when_both_arrays() {
             let (left, right) = BinaryOperator::Greater
                 .argument_type_coercions(
-                    &int_array_type(),
-                    &int_array_type(),
+                    &lit_expr(int_array_type()),
+                    &lit_expr(int_array_type()),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2808,8 +3164,8 @@ pub(crate) mod tests {
         fn greater_coerces_right_unknown_to_array() {
             let (left, right) = BinaryOperator::Greater
                 .argument_type_coercions(
-                    &int_array_type(),
-                    &DfType::Unknown,
+                    &lit_expr(int_array_type()),
+                    &lit_expr(DfType::Unknown),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2821,8 +3177,8 @@ pub(crate) mod tests {
         fn equal_coerces_right_unknown_to_array() {
             let (left, right) = BinaryOperator::Equal
                 .argument_type_coercions(
-                    &int_array_type(),
-                    &DfType::Unknown,
+                    &lit_expr(int_array_type()),
+                    &lit_expr(DfType::Unknown),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2834,8 +3190,8 @@ pub(crate) mod tests {
         fn less_coerces_right_unknown_to_array() {
             let (left, right) = BinaryOperator::Less
                 .argument_type_coercions(
-                    &int_array_type(),
-                    &DfType::Unknown,
+                    &lit_expr(int_array_type()),
+                    &lit_expr(DfType::Unknown),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2847,8 +3203,8 @@ pub(crate) mod tests {
         fn greater_or_equal_coerces_left_text_to_array() {
             let (left, right) = BinaryOperator::GreaterOrEqual
                 .argument_type_coercions(
-                    &DfType::DEFAULT_TEXT,
-                    &int_array_type(),
+                    &lit_expr(DfType::DEFAULT_TEXT),
+                    &lit_expr(int_array_type()),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2860,8 +3216,8 @@ pub(crate) mod tests {
         fn less_or_equal_coerces_right_text_to_array() {
             let (left, right) = BinaryOperator::LessOrEqual
                 .argument_type_coercions(
-                    &int_array_type(),
-                    &DfType::DEFAULT_TEXT,
+                    &lit_expr(int_array_type()),
+                    &lit_expr(DfType::DEFAULT_TEXT),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2874,8 +3230,8 @@ pub(crate) mod tests {
             // Is (IS/IS NOT) should not trigger array coercion
             let (left, right) = BinaryOperator::Is
                 .argument_type_coercions(
-                    &int_array_type(),
-                    &DfType::DEFAULT_TEXT,
+                    &lit_expr(int_array_type()),
+                    &lit_expr(DfType::DEFAULT_TEXT),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2888,8 +3244,8 @@ pub(crate) mod tests {
             // For non-array Equal on PostgreSQL, right is coerced to left's type
             let (left, right) = BinaryOperator::Equal
                 .argument_type_coercions(
-                    &DfType::Int,
-                    &DfType::Unknown,
+                    &lit_expr(DfType::Int),
+                    &lit_expr(DfType::Unknown),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2902,8 +3258,8 @@ pub(crate) mod tests {
             // For non-array Greater on PostgreSQL, no coercion
             let (left, right) = BinaryOperator::Greater
                 .argument_type_coercions(
-                    &DfType::Int,
-                    &DfType::Unknown,
+                    &lit_expr(DfType::Int),
+                    &lit_expr(DfType::Unknown),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2915,8 +3271,8 @@ pub(crate) mod tests {
         fn array_contains_coerces_right_text_to_array() {
             let (left, right) = BinaryOperator::ArrayContains
                 .argument_type_coercions(
-                    &int_array_type(),
-                    &DfType::DEFAULT_TEXT,
+                    &lit_expr(int_array_type()),
+                    &lit_expr(DfType::DEFAULT_TEXT),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2928,8 +3284,8 @@ pub(crate) mod tests {
         fn array_contained_in_coerces_left_text_to_array() {
             let (left, right) = BinaryOperator::ArrayContainedIn
                 .argument_type_coercions(
-                    &DfType::DEFAULT_TEXT,
-                    &int_array_type(),
+                    &lit_expr(DfType::DEFAULT_TEXT),
+                    &lit_expr(int_array_type()),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2941,8 +3297,8 @@ pub(crate) mod tests {
         fn array_concat_coerces_right_text_to_array() {
             let (left, right) = BinaryOperator::ArrayConcat
                 .argument_type_coercions(
-                    &int_array_type(),
-                    &DfType::DEFAULT_TEXT,
+                    &lit_expr(int_array_type()),
+                    &lit_expr(DfType::DEFAULT_TEXT),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
@@ -2954,13 +3310,82 @@ pub(crate) mod tests {
         fn array_contains_no_coercion_when_both_arrays() {
             let (left, right) = BinaryOperator::ArrayContains
                 .argument_type_coercions(
-                    &int_array_type(),
-                    &int_array_type(),
+                    &lit_expr(int_array_type()),
+                    &lit_expr(int_array_type()),
                     Dialect::DEFAULT_POSTGRESQL,
                 )
                 .unwrap();
             assert_eq!(left, None);
             assert_eq!(right, None);
+        }
+    }
+
+    mod collation_coercions {
+        use pretty_assertions::assert_eq;
+        use readyset_data::Collation;
+
+        use super::*;
+
+        fn column_expr(ty: DfType) -> Expr {
+            Expr::Column { index: 0, ty }
+        }
+
+        fn text_lit_expr(collation: Collation) -> Expr {
+            Expr::Literal {
+                val: DfValue::None,
+                ty: DfType::Text(collation),
+            }
+        }
+
+        #[test]
+        fn equal_column_beats_literal_on_either_side() {
+            // MySQL: 'literal' (Utf8AiCi, OTHER) = col_binary (Binary, COLUMN).
+            // The column's collation wins regardless of which side it's on.
+            let lit = text_lit_expr(Collation::Utf8AiCi);
+            let col = column_expr(DfType::Text(Collation::Binary));
+            let expected = (
+                Some(DfType::Text(Collation::Binary)),
+                Some(DfType::Text(Collation::Binary)),
+            );
+            assert_eq!(
+                BinaryOperator::Equal
+                    .argument_type_coercions(&lit, &col, Dialect::DEFAULT_MYSQL)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                BinaryOperator::Equal
+                    .argument_type_coercions(&col, &lit, Dialect::DEFAULT_MYSQL)
+                    .unwrap(),
+                expected
+            );
+        }
+
+        #[test]
+        fn like_preserves_column_collation() {
+            // MySQL: col (Utf8AiCi) LIKE 'pattern' (Utf8). Without the overlay both
+            // sides would land in DEFAULT_TEXT (Utf8); with it the pattern picks up
+            // the column's collation and the column itself needs no further cast.
+            let left = column_expr(DfType::Text(Collation::Utf8AiCi));
+            let right = text_lit_expr(Collation::Utf8);
+            let (l, r) = BinaryOperator::Like
+                .argument_type_coercions(&left, &right, Dialect::DEFAULT_MYSQL)
+                .unwrap();
+            assert_eq!(l, None);
+            assert_eq!(r, Some(DfType::Text(Collation::Utf8AiCi)));
+        }
+
+        #[test]
+        fn greater_two_text_columns_picks_utf8() {
+            // Two columns of equal affinity but different charsets: UTF-8 wins as
+            // superset.
+            let left = column_expr(DfType::Text(Collation::Latin1SwedishCi));
+            let right = column_expr(DfType::Text(Collation::Utf8AiCi));
+            let (l, r) = BinaryOperator::Greater
+                .argument_type_coercions(&left, &right, Dialect::DEFAULT_MYSQL)
+                .unwrap();
+            assert_eq!(l, Some(DfType::Text(Collation::Utf8AiCi)));
+            assert_eq!(r, Some(DfType::Text(Collation::Utf8AiCi)));
         }
     }
 
@@ -2987,24 +3412,426 @@ pub(crate) mod tests {
                 elements: vec![
                     Expr::Literal {
                         val: 1u32.into(),
-                        ty: DfType::BigInt,
+                        ty: DfType::Int,
                     },
                     Expr::Literal {
                         val: 2u32.into(),
-                        ty: DfType::BigInt,
+                        ty: DfType::Int,
                     },
                     Expr::Literal {
                         val: 3u32.into(),
-                        ty: DfType::BigInt,
+                        ty: DfType::Int,
                     },
                     Expr::Literal {
                         val: 4u32.into(),
-                        ty: DfType::BigInt,
+                        ty: DfType::Int,
                     },
                 ],
                 shape: vec![2, 2],
-                ty: DfType::Array(Box::new(DfType::Array(Box::new(DfType::BigInt)))),
+                ty: DfType::Array(Box::new(DfType::Array(Box::new(DfType::Int)))),
             }
+        );
+    }
+
+    #[test]
+    fn array_incompatible_element_types_rejected() {
+        // Integer and date are in different type categories and cannot be coerced
+        let expr = parse_expr(ParserDialect::PostgreSQL, "ARRAY[1, DATE('1999-12-31')]").unwrap();
+        let result = Expr::lower(expr, Dialect::DEFAULT_POSTGRESQL, &no_op_lower_context());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Cannot coerce type Int to type Date"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn nested_array_incompatible_element_types_rejected() {
+        // The exact case from the ticket: nested arrays with mixed integer and date.
+        // The category mismatch is at index 3 of the inner array, so the error must
+        // name `Date`, not `types[1]` (REA-6624).
+        let expr = parse_expr(
+            ParserDialect::PostgreSQL,
+            "ARRAY[[1, 2, 3, 4], [1, 2, 3, DATE('1999-12-31')]]",
+        )
+        .unwrap();
+        let result = Expr::lower(expr, Dialect::DEFAULT_POSTGRESQL, &no_op_lower_context());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Cannot coerce type Int to type Date"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    /// REA-6624: when a `LEAST`/`GREATEST` call mixes type categories past
+    /// position 1, the error must name the actual offending type -- not blindly
+    /// echo `types[0]` and `types[1]`, which would produce "Int to Int" here.
+    #[test]
+    fn least_reports_actual_mismatched_type() {
+        let expr =
+            parse_expr(ParserDialect::PostgreSQL, "LEAST(1, 2, DATE('1999-12-31'))").unwrap();
+        let result = Expr::lower(expr, Dialect::DEFAULT_POSTGRESQL, &no_op_lower_context());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Cannot coerce type Int to type Date"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // REA-5955: IN expression lowering must apply type coercions
+    // ---------------------------------------------------------------
+
+    /// When an Int column is compared via IN against a Numeric column, the
+    /// lowered expression should contain Cast nodes to coerce types, just
+    /// like a plain `=` comparison would.
+    #[test]
+    fn in_list_applies_type_coercions_pg() {
+        // `col_int IN (col_num)` where col_int is Int and col_num is Numeric
+        let input = parse_expr(ParserDialect::PostgreSQL, "col_int IN (col_num)").unwrap();
+        let ctx = resolve_columns(|c| match c.name.as_str() {
+            "col_int" => Ok((0, DfType::Int)),
+            "col_num" => Ok((
+                1,
+                DfType::Numeric {
+                    prec: 65,
+                    scale: 30,
+                },
+            )),
+            _ => internal!("unexpected column"),
+        });
+        let lowered = Expr::lower(input, Dialect::DEFAULT_POSTGRESQL, &ctx).unwrap();
+
+        // The lowered tree should be an Equal with a Cast on the right-hand
+        // side (coercing Numeric to Int, since Equal coerces right to left's
+        // type in PG).
+        let repr = format!("{lowered:?}");
+        assert!(
+            repr.contains("Cast"),
+            "Expected a Cast node in the lowered IN expression, got: {lowered}"
+        );
+    }
+
+    /// End-to-end eval: `col_int IN (col_num)` where both hold value 1
+    /// but with different types (Int vs Numeric). Should return true.
+    #[test]
+    fn in_list_int_vs_numeric_eval_pg() {
+        use readyset_decimal::Decimal;
+
+        let input = parse_expr(ParserDialect::PostgreSQL, "col_int IN (col_num)").unwrap();
+        let ctx = resolve_columns(|c| match c.name.as_str() {
+            "col_int" => Ok((0, DfType::Int)),
+            "col_num" => Ok((
+                1,
+                DfType::Numeric {
+                    prec: 65,
+                    scale: 30,
+                },
+            )),
+            _ => internal!("unexpected column"),
+        });
+        let expr = Expr::lower(input, Dialect::DEFAULT_POSTGRESQL, &ctx).unwrap();
+
+        let row: Vec<DfValue> = vec![DfValue::Int(1), DfValue::from(Decimal::from(1))];
+        let result = expr.eval::<DfValue>(&row).unwrap();
+        assert_eq!(result, DfValue::from(true), "1 IN (1.0) should be true");
+    }
+
+    /// NOT IN variant: `col_int NOT IN (col_num)` where both hold value 1
+    /// should return false.
+    #[test]
+    fn not_in_list_int_vs_numeric_eval_pg() {
+        use readyset_decimal::Decimal;
+
+        let input = parse_expr(ParserDialect::PostgreSQL, "col_int NOT IN (col_num)").unwrap();
+        let ctx = resolve_columns(|c| match c.name.as_str() {
+            "col_int" => Ok((0, DfType::Int)),
+            "col_num" => Ok((
+                1,
+                DfType::Numeric {
+                    prec: 65,
+                    scale: 30,
+                },
+            )),
+            _ => internal!("unexpected column"),
+        });
+        let expr = Expr::lower(input, Dialect::DEFAULT_POSTGRESQL, &ctx).unwrap();
+
+        let row: Vec<DfValue> = vec![DfValue::Int(1), DfValue::from(Decimal::from(1))];
+        let result = expr.eval::<DfValue>(&row).unwrap();
+        assert_eq!(
+            result,
+            DfValue::from(false),
+            "1 NOT IN (1.0) should be false"
+        );
+    }
+
+    /// Multi-element IN list with mixed types.
+    #[test]
+    fn in_list_multi_element_mixed_types_pg() {
+        use readyset_decimal::Decimal;
+
+        let input =
+            parse_expr(ParserDialect::PostgreSQL, "col_int IN (col_num, col_num2)").unwrap();
+        let ctx = resolve_columns(|c| match c.name.as_str() {
+            "col_int" => Ok((0, DfType::Int)),
+            "col_num" => Ok((
+                1,
+                DfType::Numeric {
+                    prec: 65,
+                    scale: 30,
+                },
+            )),
+            "col_num2" => Ok((
+                2,
+                DfType::Numeric {
+                    prec: 65,
+                    scale: 30,
+                },
+            )),
+            _ => internal!("unexpected column"),
+        });
+        let expr = Expr::lower(input, Dialect::DEFAULT_POSTGRESQL, &ctx).unwrap();
+
+        // Match on second element: col_int=5, col_num=99, col_num2=5
+        let row: Vec<DfValue> = vec![
+            DfValue::Int(5),
+            DfValue::from(Decimal::from(99)),
+            DfValue::from(Decimal::from(5)),
+        ];
+        let result = expr.eval::<DfValue>(&row).unwrap();
+        assert_eq!(result, DfValue::from(true), "5 IN (99, 5) should be true");
+
+        // No match
+        let row2: Vec<DfValue> = vec![
+            DfValue::Int(5),
+            DfValue::from(Decimal::from(99)),
+            DfValue::from(Decimal::from(100)),
+        ];
+        let result2 = expr.eval::<DfValue>(&row2).unwrap();
+        assert_eq!(
+            result2,
+            DfValue::from(false),
+            "5 IN (99, 100) should be false"
+        );
+    }
+
+    #[test]
+    fn array_same_type_accepted() {
+        // Sanity check: all same type should work fine
+        let expr = parse_expr(ParserDialect::PostgreSQL, "ARRAY[1, 2, 3]").unwrap();
+        let result = Expr::lower(expr, Dialect::DEFAULT_POSTGRESQL, &no_op_lower_context());
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+    }
+
+    #[test]
+    fn array_compatible_numeric_types_accepted() {
+        // Integer and float are both in the Numeric category and should coerce
+        let expr = parse_expr(ParserDialect::PostgreSQL, "ARRAY[1, 1.5]").unwrap();
+        let result = Expr::lower(expr, Dialect::DEFAULT_POSTGRESQL, &no_op_lower_context());
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+    }
+
+    #[test]
+    fn empty_array_no_cast_rejected() {
+        let expr = parse_expr(ParserDialect::PostgreSQL, "ARRAY[]").unwrap();
+        let err = Expr::lower(expr, Dialect::DEFAULT_POSTGRESQL, &no_op_lower_context())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot determine type of empty array"),
+            "expected 'cannot determine type of empty array', got: {err}"
+        );
+    }
+
+    /// Lowers `expr_str` and asserts it produces a constant empty array literal
+    /// of `DfType::Array(<elem>)` with `num_dimensions() == 1`, regardless of
+    /// how many bracket pairs the cast target carries.  This mirrors PG's
+    /// behavior: empty arrays are dimensionless (`array_ndims = NULL`) and
+    /// `pg_typeof(ARRAY[]::int[][])` returns `integer[]`.
+    #[track_caller]
+    fn assert_lowered_to_empty_array(expr_str: &str, expected_elem_ty: DfType) {
+        let expr = parse_expr(ParserDialect::PostgreSQL, expr_str).unwrap();
+        let lowered = Expr::lower(expr, Dialect::DEFAULT_POSTGRESQL, &no_op_lower_context())
+            .unwrap_or_else(|e| panic!("{expr_str} should be accepted, got: {e}"));
+        assert_eq!(
+            lowered.ty(),
+            &DfType::Array(Box::new(expected_elem_ty)),
+            "{expr_str}: expected collapsed 1-D array type"
+        );
+        // Eval round-trip: the lowered Literal carries a pre-built ArrayD.
+        // Confirm it surfaces as an empty 1-D `DfValue::Array` regardless of
+        // cast nesting.
+        let value = lowered
+            .eval::<DfValue>(&[])
+            .unwrap_or_else(|e| panic!("eval of {expr_str} failed: {e}"));
+        let array = match value {
+            DfValue::Array(a) => a,
+            other => panic!("expected DfValue::Array, got {other:?}"),
+        };
+        assert!(array.is_empty(), "{expr_str}: expected empty, got {array}");
+        assert_eq!(
+            array.num_dimensions(),
+            1,
+            "{expr_str}: empty arrays should always be 1-D to match PG's dimensionless empty"
+        );
+    }
+
+    #[test]
+    fn empty_array_with_1d_array_cast_accepted() {
+        assert_lowered_to_empty_array("ARRAY[]::TEXT[]", DfType::DEFAULT_TEXT);
+    }
+
+    #[test]
+    fn empty_array_with_multidim_array_cast_accepted() {
+        // PG: pg_typeof(ARRAY[]::TEXT[][]) is `text[]` (single layer); the
+        // value collapses to a dimensionless empty array.  Match that — the
+        // lowered type is 1-D, not 2-D.
+        assert_lowered_to_empty_array("ARRAY[]::TEXT[][]", DfType::DEFAULT_TEXT);
+    }
+
+    #[test]
+    fn empty_array_with_cast_as_array_form_accepted() {
+        // The intercept must be cast-style-agnostic: `CAST(x AS T[])` has the
+        // same semantics as `x::T[]` and must hit the same empty-array path.
+        assert_lowered_to_empty_array("CAST(ARRAY[] AS INT[])", DfType::Int);
+    }
+
+    #[test]
+    fn empty_array_with_nested_cast_accepted() {
+        // `(ARRAY[]::INT[])::TEXT[]` -- inner intercept fires (INT[]); outer
+        // wraps the resulting Literal in a Cast(TEXT[]).  The outer Cast does
+        // not short-circuit because its inner expression is no longer a bare
+        // Array AST node.  Parens are required: PG's parser does not accept
+        // chained `::` casts without grouping.
+        let expr = parse_expr(ParserDialect::PostgreSQL, "(ARRAY[]::INT[])::TEXT[]").unwrap();
+        let lowered = Expr::lower(expr, Dialect::DEFAULT_POSTGRESQL, &no_op_lower_context())
+            .unwrap_or_else(|e| panic!("nested cast should be accepted, got: {e}"));
+        // Outer Cast: TEXT[] target; inner Literal: INT[].
+        match &lowered {
+            Expr::Cast { ty, expr, .. } => {
+                assert_eq!(ty, &DfType::Array(Box::new(DfType::DEFAULT_TEXT)));
+                assert!(matches!(expr.as_ref(), Expr::Literal { .. }));
+            }
+            other => panic!("expected Expr::Cast wrapping a Literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_array_with_scalar_cast_rejected() {
+        // ARRAY[]::TEXT (scalar target) falls through to the regular cast
+        // path; the inner empty Array lowers and rejects with PG's standard
+        // empty-array message.  PG itself does not differentiate the
+        // scalar-cast case -- it emits the same error -- so matching that
+        // message keeps wire-protocol fallback behavior consistent.
+        let expr = parse_expr(ParserDialect::PostgreSQL, "ARRAY[]::TEXT").unwrap();
+        let err = Expr::lower(expr, Dialect::DEFAULT_POSTGRESQL, &no_op_lower_context())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot determine type of empty array"),
+            "expected empty-array rejection, got: {err}"
+        );
+    }
+
+    /// REA-6500: CONCAT(int_col, utf8mb4_literal, latin1_col) should resolve to the latin1
+    /// column's collation (IMPLICIT beats COERCIBLE and NUMERIC).
+    #[test]
+    fn concat_mixed_collation_int_utf8_literal_latin1_col() {
+        let input = parse_expr(ParserDialect::MySQL, "concat(t1.id, 'sep', t1.name)").unwrap();
+        let res = Expr::lower(
+            input,
+            Dialect::DEFAULT_MYSQL,
+            &resolve_columns(|c| {
+                if c.name == "id" {
+                    Ok((0, DfType::Int))
+                } else if c.name == "name" {
+                    Ok((1, DfType::VarChar(50, Collation::Latin1SwedishCi)))
+                } else {
+                    internal!("unexpected column: {c:?}")
+                }
+            }),
+        )
+        .unwrap();
+        // The column's collation (Latin1SwedishCi, IMPLICIT) should win over the literal's
+        // collation (Utf8AiCi, COERCIBLE).
+        assert_eq!(
+            *res.ty(),
+            DfType::Text(Collation::Latin1SwedishCi),
+            "CONCAT result collation should be latin1_swedish_ci from the column, not utf8"
+        );
+    }
+
+    /// CONCAT(utf8_literal, latin1_col) should resolve to latin1 column's collation.
+    #[test]
+    fn concat_utf8_literal_latin1_col() {
+        let input = parse_expr(ParserDialect::MySQL, "concat('hello', t1.name)").unwrap();
+        let res = Expr::lower(
+            input,
+            Dialect::DEFAULT_MYSQL,
+            &resolve_columns(|c| {
+                if c.name == "name" {
+                    Ok((0, DfType::VarChar(50, Collation::Latin1SwedishCi)))
+                } else {
+                    internal!("unexpected column: {c:?}")
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            *res.ty(),
+            DfType::Text(Collation::Latin1SwedishCi),
+            "column collation (IMPLICIT) should beat literal collation (COERCIBLE)"
+        );
+    }
+
+    /// CONCAT(latin1_col, utf8_col) — both IMPLICIT, different charsets — should promote to UTF8.
+    #[test]
+    fn concat_latin1_col_utf8_col_promotes_to_utf8() {
+        let input = parse_expr(ParserDialect::MySQL, "concat(t1.a, t1.b)").unwrap();
+        let res = Expr::lower(
+            input,
+            Dialect::DEFAULT_MYSQL,
+            &resolve_columns(|c| {
+                if c.name == "a" {
+                    Ok((0, DfType::VarChar(50, Collation::Latin1SwedishCi)))
+                } else if c.name == "b" {
+                    Ok((1, DfType::VarChar(50, Collation::Utf8AiCi)))
+                } else {
+                    internal!("unexpected column: {c:?}")
+                }
+            }),
+        )
+        .unwrap();
+        // UTF8 is a superset of Latin1, so it should win when both are IMPLICIT.
+        // The result should be some UTF8 collation, not Latin1.
+        assert!(
+            !matches!(res.ty(), DfType::Text(Collation::Latin1SwedishCi)),
+            "when both columns are IMPLICIT but different charsets, UTF8 should win; got {:?}",
+            res.ty()
+        );
+    }
+
+    /// CONCAT(int_col) with no text args should use dialect default collation.
+    #[test]
+    fn concat_int_only_uses_dialect_default() {
+        let input = parse_expr(ParserDialect::MySQL, "concat(t1.id)").unwrap();
+        let res = Expr::lower(
+            input,
+            Dialect::DEFAULT_MYSQL,
+            &resolve_columns(|c| {
+                if c.name == "id" {
+                    Ok((0, DfType::Int))
+                } else {
+                    internal!("unexpected column: {c:?}")
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            *res.ty(),
+            MYSQL_TEXT,
+            "no text args should fall back to dialect default"
         );
     }
 }

@@ -14,11 +14,10 @@ env:
   ECR_PLUGIN_VERSION: "v2.10.0"
   DOCKER_PLUGIN_VERSION: "v5.13.0"
   DOCKER_LOGIN_PLUGIN_VERSION: "v3.0.0"
-  DOCKER_COMPOSE_PLUGIN_VERSION: "v5.10.0"
+  DOCKER_COMPOSE_PLUGIN_VERSION: "v5.12.1"
   BUILDKIT_PROGRESS: "plain"
 
 steps:
-
   # NOTE:  This entire pipeline has a dependency on the 'build-image' step.  Any step that uploads
   # it must have a "depends_on: build-image" set.  Putting "depends_on" on these steps won't do the
   # trick and may in fact interfere with correct buildkite step scheduling.
@@ -106,7 +105,7 @@ steps:
     agents: { queue: c7a-2xlarge-nospot }
     retry: *retry_on_agent_kill
 
-  - label: ":rust: Run tests (nextest, default upstreams, MRBR off): {{ matrix.arch }}"
+  - label: ":rust: Run tests: {{ matrix.arch }}"
     key: rust-tests
     command: |
       [ -d public ] && cd public
@@ -122,6 +121,7 @@ steps:
           tty: true           # nextest makes colored output if we use tty
           env:
             - BUILDKITE_PARALLEL_JOB
+            - BUILDKITE_JOB_ID
             - BUILDKITE_API_TOKEN             # buildkite vars needed to fetch regression artifacts
             - BUILDKITE_GRAPHQL_API_TOKEN
             - BUILDKITE_ORGANIZATION_SLUG
@@ -133,94 +133,40 @@ steps:
             - SCCACHE_REGION=us-east-2
             - CARGO_INCREMENTAL=0
             - RUST_BACKTRACE=full
-            - MYSQL_HOST=mysql
-            - MYSQL_PWD=noria
-            - MYSQL_DB=noria
             - CARGO_TERM_PROGRESS_WHEN=never     # disable progress bars if tty=true
+            - PROPTEST_CASES=5 # just smoke-test proptests, otherwise they get really slow
           volumes:
-            - 'target:/workdir/target'
+            - 'target:/workdir/public/target'
           config:
-            - "${GIT_PUBLIC_ROOT}build/docker-compose.yml"
-            - "${GIT_PUBLIC_ROOT}build/docker-compose.ci-default.yml"
+            - "${GIT_PUBLIC_ROOT}build/docker-compose.ci-tcv.yml"
           mount-buildkite-agent: true
           quiet-pull: true    # don't log all the image pulls
+          progress: plain     # more log reduction
           pull-retries: 3
+          upload-container-logs: always
       - ecr#${ECR_PLUGIN_VERSION}:
           login: true
           retries: 3
     agents: { queue: "{{ matrix.queue }}" }
-    retry: *retry_on_agent_kill
     matrix:
       setup:
         queue:
           - "c6a-4xlarge-nospot"
-          - "c7g-4xlarge-nospot"
         arch:
           - "x86"
-          - "arm"
       adjustments:
         - with:
-            queue: "c6a-4xlarge-nospot"
-            arch: "arm"
-          skip: true
-        - with:
             queue: "c7g-4xlarge-nospot"
-            arch: "x86"
-          skip: true
-
-  - label: ':rust: Run tests (upstream: mysql80, MRBR on, not including slow tests)'
-    key: rust-tests-mrbr
-    command: |
-      [ -d public ] && cd public
-      ../.buildkite/retrieve_last_artifact.sh '**/proptest-regressions/*.txt'
-      ../.buildkite/retrieve_last_artifact.sh '**/*.proptest-regressions'
-      TEST_CATEGORY=nextest UPSTREAM_CONFIG=mysql80 MYSQL_MRBR=on .buildkite/run-tests.sh
-      echo "~~~ Show sccache stats"
-      sccache --show-stats
-    timeout_in_minutes: 60
-    plugins:
-      - docker-compose#${DOCKER_COMPOSE_PLUGIN_VERSION}:
-          run: app
-          tty: true           # nextest makes colored output if we use tty
-          env:
-            - BUILDKITE_PARALLEL_JOB
-            - BUILDKITE_API_TOKEN             # buildkite vars needed to fetch regression artifacts
-            - BUILDKITE_GRAPHQL_API_TOKEN
-            - BUILDKITE_ORGANIZATION_SLUG
-            - BUILDKITE_PIPELINE_SLUG
-            - BUILDKITE_BRANCH
-            - BUILDKITE_STEP_KEY
-            - BUILDKITE_LABEL
-            - SCCACHE_BUCKET=readysettech-build-sccache-us-east-2
-            - SCCACHE_REGION=us-east-2
-            - CARGO_INCREMENTAL=0
-            - RUST_BACKTRACE=full
-            - MYSQL_HOST=mysql
-            - MYSQL_PWD=noria
-            - MYSQL_DB=noria
-            - CARGO_TERM_PROGRESS_WHEN=never     # disable progress bars if tty=true
-          volumes:
-            - 'target:/workdir/target'
-          config:
-            - "${GIT_PUBLIC_ROOT}build/docker-compose.yml"
-            - "${GIT_PUBLIC_ROOT}build/docker-compose.ci-default.yml"
-          mount-buildkite-agent: true
-          quiet-pull: true    # don't log all the image pulls
-          pull-retries: 3
-      - ecr#${ECR_PLUGIN_VERSION}:
-          login: true
-          retries: 3
-    agents: { queue: c6a-4xlarge-nospot }
+            arch: "arm"
     retry: *retry_on_agent_kill
 
   - label: ":junit: Annotate JUnit XML"
     depends_on:
       - rust-tests
-      - rust-tests-mrbr
     allow_dependency_failure: true
     plugins:
       - junit-annotate#v2.7.0:
-          artifacts: target/nextest/ci/junit-buildkite-job-*.xml
+          artifacts: target/nextest/**/junit-*.xml
           failed-download-exit-code: 0
           ruby-image: ${PUBLIC_REPO_BASE:-public.ecr.aws}/docker/library/ruby:3.1-alpine
     agents: { queue: t3a-small }
@@ -263,6 +209,7 @@ steps:
             - "${GIT_PUBLIC_ROOT}build/docker-compose.ci-default.yml"
           mount-buildkite-agent: true
           quiet-pull: true    # don't log all the image pulls
+          progress: plain  # more log reduction
           pull-retries: 3
       - ecr#${ECR_PLUGIN_VERSION}:
           login: true
@@ -293,15 +240,9 @@ steps:
             - "${GIT_PUBLIC_ROOT}build/docker-compose.ci-default.yml"
             - "${GIT_PUBLIC_ROOT}build/docker-compose.ci-postgis-15.yml"
           quiet-pull: true    # don't log all the image pulls
+          progress: plain     # more log reduction
           pull-retries: 3
-      - docker-login#${DOCKER_LOGIN_PLUGIN_VERSION}:
-          # Need to log in to avoid rate-limit while pulling postgis image. IMPORTANT: must run this
-          # docker-login plugin *before* the ECR plugin!  Otherwise, pulls from ECR fail.
-          server: "docker.io"
-          username: readysetservices
-          password-env: DOCKER_HUB_TOKEN
       - ecr#${ECR_PLUGIN_VERSION}:
-          login: true
           retries: 3
     agents: { queue: "c6a-4xlarge-nospot" }
     retry: *retry_on_agent_kill

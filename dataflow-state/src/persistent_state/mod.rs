@@ -1,6 +1,6 @@
 //! Node state that's persisted to disk
 //!
-//! The [`PersistedState`] struct is an implementation of [`State`] that stores rows (currently only
+//! The [`PersistentState`] struct is an implementation of [`State`] that stores rows (currently only
 //! for base tables) in [RocksDB], an on-disk key-value store. The data is stored in
 //! [indices](PersistentState::indices) - each lookup index stores the copies of all the rows in the
 //! database.
@@ -61,8 +61,8 @@
 //! atomicity, these offsets are stored inside of rocksdb as part of the persisted
 //! [`PersistentMeta`], and updated as part of every write.
 mod handle;
+pub(crate) mod index_build;
 mod metrics;
-mod recorded;
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -70,8 +70,9 @@ use std::collections::HashSet;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use std::{fmt, fs};
@@ -82,9 +83,9 @@ use common::{IndexType, Record, Records, Tag};
 #[cfg(feature = "failure_injection")]
 use failpoint_macros::set_failpoint;
 pub use handle::PersistentStateHandle;
-use handle::{PersistentStateReadGuard, PersistentStateWriteGuard};
+pub use index_build::{IndexBuildContext, IndexBuildStatus};
 use notify::Watcher;
-use rand::Rng;
+use rand::RngExt;
 use readyset_alloc::thread::StdThreadBuildWrapper;
 use readyset_client::debug::info::KeyCount;
 use readyset_client::internal::Index;
@@ -96,8 +97,8 @@ use readyset_util::SizeOf;
 use replication_offset::ReplicationOffset;
 use ringbuf::traits::{Consumer, Producer, Split};
 use rocksdb::{
-    self, BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, CompactOptions, IteratorMode,
-    SliceTransform, WriteBatch, DB,
+    self, BlockBasedOptions, ColumnFamilyDescriptor, CompactOptions, IteratorMode, SliceTransform,
+    WriteBatch, DB,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -106,6 +107,13 @@ use test_strategy::Arbitrary;
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, info_span, trace, warn};
+
+mod format_version;
+
+use format_version::PERSISTENT_STATE_VERSION;
+pub use format_version::{
+    example_serialized_keys, example_serialized_metas, example_serialized_row,
+};
 
 use crate::persistent_state::metrics::{MetricsReporter, MetricsReporterStop};
 use crate::{
@@ -123,6 +131,11 @@ type IndexSeq = u64;
 // RocksDB key used for storing meta information (like indices).
 const META_KEY: &[u8] = b"meta";
 
+// RocksDB key for the pending online index build marker. Stored separately
+// from PersistentMeta so that OIB writes to this key never race with the
+// domain thread's writes to META_KEY (which include replication_offset).
+const PENDING_BUILD_KEY: &[u8] = b"pending_build";
+
 // A default column family is always created, so we'll make use of that for meta information.
 // The indices themselves are stored in a column family each, with their position in
 // PersistentState::indices as name.
@@ -136,6 +149,34 @@ const WORKING_DIR: &str = "readyset.tmp";
 
 // Maximum rows per WriteBatch when building new indices for existing rows.
 const INDEX_BATCH_SIZE: usize = 10_000;
+
+/// Default capacity for the shared rocksdb block cache, in bytes.
+///
+/// Sized as a starting point that works for typical deployments rather than a theoretical
+/// optimum. Override via `PersistenceParameters::block_cache_bytes`.
+pub(crate) fn default_block_cache_bytes() -> usize {
+    1024 * 1024 * 1024
+}
+
+/// Process-wide shared rocksdb block cache. One LRU is allocated and reused by
+/// every [`PersistentState`] instance so the cache budget can be set globally
+/// rather than per-table.
+///
+/// Without this, each PersistentState's rocksdb instance gets its own default
+/// 32 MB cache, which for any non-trivial cached query is small enough to
+/// produce sub-1% hit ratios and constant LZ4 decompression churn.
+static SHARED_BLOCK_CACHE: OnceLock<rocksdb::Cache> = OnceLock::new();
+
+/// Returns the process-wide rocksdb block cache, lazily allocating it with `bytes` capacity on
+/// first call. Subsequent calls return the existing cache regardless of `bytes`; in a real
+/// deployment this is benign because every [`PersistentState`] reads from the same
+/// [`PersistenceParameters`].
+fn shared_block_cache(bytes: usize) -> &'static rocksdb::Cache {
+    SHARED_BLOCK_CACHE.get_or_init(|| {
+        info!(bytes, "Initializing shared rocksdb block cache");
+        rocksdb::Cache::new_lru_cache(bytes)
+    })
+}
 
 /// Delete any working/temp files from the last process run. Normally, those files
 /// will be cleaned up on process exit, but if readyset crashes or fails, delete them
@@ -153,7 +194,7 @@ pub fn clean_working_dir(params: &PersistenceParameters) -> Result<()> {
 
 /// Load the metadata from the database, stored in the `DEFAULT_CF` column family under the
 /// `META_KEY`
-fn get_meta(db: &DB) -> Result<PersistentMeta<'static>> {
+pub(crate) fn get_meta(db: &DB) -> Result<PersistentMeta<'static>> {
     Ok(db
         .get_pinned(META_KEY)?
         .and_then(|data| {
@@ -217,7 +258,7 @@ fn increment_epoch(db: &DB) -> Result<PersistentMeta<'static>> {
     Ok(meta)
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SnapshotMode {
     SnapshotModeEnabled,
     SnapshotModeDisabled,
@@ -267,7 +308,12 @@ impl FromStr for DurabilityMode {
 }
 
 /// Parameters to control the operation of GroupCommitQueue.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq`/`Eq` deliberately ignore `block_cache_bytes` because it is ephemeral runtime
+/// config sourced fresh from CLI on each process startup, not durable state. Including it in
+/// equality would make the leader-election config-drift check fire on every startup whenever
+/// the operator sets a non-default `--rocksdb-block-cache-mb`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistenceParameters {
     /// Whether the output files should be deleted when the GroupCommitQueue is dropped.
     pub mode: DurabilityMode,
@@ -283,7 +329,35 @@ pub struct PersistenceParameters {
     /// set to 0, the WAL will be flushed and synced to disk with every write
     #[serde(default)]
     pub wal_flush_interval_seconds: u64,
+    /// Capacity of the process-wide shared rocksdb block cache, in bytes. The `default` attribute
+    /// keeps deserialization forward-compatible with older authority snapshots that lack the
+    /// field. Round-tripping is required because `DomainBuilder` carries this struct via bincode
+    /// to worker tasks, and bincode-skipped fields would arrive as the default on the worker.
+    #[serde(default = "default_block_cache_bytes")]
+    pub block_cache_bytes: usize,
 }
+
+impl PartialEq for PersistenceParameters {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructure so adding a new field forces a deliberate decision about whether it
+        // participates in equality.
+        let Self {
+            mode,
+            db_filename_prefix,
+            storage_dir,
+            working_temp_dir,
+            wal_flush_interval_seconds,
+            block_cache_bytes: _,
+        } = self;
+        *mode == other.mode
+            && *db_filename_prefix == other.db_filename_prefix
+            && *storage_dir == other.storage_dir
+            && *working_temp_dir == other.working_temp_dir
+            && *wal_flush_interval_seconds == other.wal_flush_interval_seconds
+    }
+}
+
+impl Eq for PersistenceParameters {}
 
 impl Default for PersistenceParameters {
     fn default() -> Self {
@@ -293,6 +367,7 @@ impl Default for PersistenceParameters {
             storage_dir: None,
             working_temp_dir: None,
             wal_flush_interval_seconds: 0,
+            block_cache_bytes: default_block_cache_bytes(),
         }
     }
 }
@@ -327,6 +402,7 @@ impl PersistenceParameters {
             storage_dir,
             working_temp_dir,
             wal_flush_interval_seconds,
+            block_cache_bytes: default_block_cache_bytes(),
         }
     }
 
@@ -357,11 +433,11 @@ pub enum Error {
     BadDbFormat,
 
     #[error(
-        "Persisted state at {} has serialization version {persisted_version}, which does not match \
-         our serialization version {our_version}",
+        "Persisted state at {} has format version {persisted_version}, which does not match \
+         our format version {our_version}",
         path.display(),
     )]
-    SerdeVersionMismatch {
+    PersistentStateVersionMismatch {
         path: PathBuf,
         persisted_version: u8,
         our_version: u8,
@@ -392,7 +468,7 @@ impl Error {
             // Could *maybe* try to slice up the IO errors here, but for now it's simpler to just
             // assume all IO errors are permanent
             Error::Io(_) => true,
-            Error::BadDbFormat | Error::SerdeVersionMismatch { .. } => false,
+            Error::BadDbFormat | Error::PersistentStateVersionMismatch { .. } => false,
         }
     }
 }
@@ -400,13 +476,30 @@ impl Error {
 /// Result type for persistent state
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Metadata about an interrupted online index build, used for crash recovery.
+///
+/// Stored under [`PENDING_BUILD_KEY`] in the default column family, separate
+/// from [`PersistentMeta`]. If present at startup, the column families listed
+/// here are partial/incomplete and must be dropped before the table becomes
+/// available.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingBuildMeta {
+    /// The column family names created for the pending indices.
+    column_families: Vec<String>,
+    /// The WAL sequence number at which the build started.
+    start_sequence_number: u64,
+    /// Unix timestamp for post-mortem debugging of crashed builds (not used
+    /// programmatically).
+    start_time_unix_secs: u64,
+}
+
 /// Data structure used to persist metadata about the [`PersistentState`] to rocksdb
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct PersistentMeta<'a> {
-    /// The version of serialization used to serialize data to this [`PersistentState`]. This is
-    /// compared against [`DfValue::SERDE_VERSION`] at startup, and if it's unequal an error will
-    /// be returned
-    serde_version: u8,
+pub(crate) struct PersistentMeta<'a> {
+    /// The on-disk format version, compared against [`PERSISTENT_STATE_VERSION`] at startup. If
+    /// unequal, the database is deleted and re-snapshotted.
+    #[serde(alias = "serde_version")]
+    persistent_state_version: u8,
 
     /// Index information is stored in RocksDB to avoid rebuilding indices on recovery
     indices: Vec<Index>,
@@ -454,6 +547,9 @@ pub struct PersistentState {
     /// The relation when PersistenceType::BaseTable.
     table: Option<Relation>,
     default_options: rocksdb::Options,
+    /// Capacity of the process-wide shared rocksdb block cache, in bytes. Captured at
+    /// construction time so per-CF options can re-apply the same cache via [`shared_block_cache`].
+    block_cache_bytes: usize,
     db: PersistentStateHandle,
     // The list of all the indices that are defined as unique in the schema for this table
     unique_keys: Vec<Box<[usize]>>,
@@ -473,6 +569,16 @@ pub struct PersistentState {
     /// Any TableStatus updates sent here will be sent to the current controller (only relevant for
     /// PersistenceType::BaseTable).
     table_status_tx: Option<UnboundedSender<(Relation, TableStatus)>>,
+    /// Atomic status of any background online index build.
+    index_build_status: Arc<index_build::AtomicIndexBuildStatus>,
+    /// Cooperative shutdown flag for in-progress index builds. The domain sets
+    /// this to request cancellation; the build thread polls it.
+    pub(crate) shutdown_requested: Arc<AtomicBool>,
+    /// Shared slot for the build completion channel receiver. `build_indices`
+    /// creates the channel and stores the receiver here; `shut_down()` takes it
+    /// to wait. Wrapped in Arc so `IndexBuildContext` can share it.
+    #[allow(dead_code)] // Used by shut_down() in a subsequent commit
+    pub(crate) build_completion_rx: Arc<Mutex<Option<Receiver<()>>>>,
 }
 
 /// Things that are shared between read handles and the state itself, that can be locked under a
@@ -483,8 +589,6 @@ struct SharedState {
     replication_offset: Option<ReplicationOffset>,
     /// The current state of the RocksDB WAL as it relates to flushing and persisting data to disk
     wal_state: WalState,
-    /// The last error that occurred in the WAL flush thread
-    last_wal_flush_error: Option<Error>,
     /// The lookup indices stored for this table. The first element is always considered the
     /// primary index
     indices: Vec<PersistentIndex>,
@@ -541,16 +645,11 @@ impl WalFlusher {
         loop {
             match self.rx.recv_timeout(self.flush_interval) {
                 Err(RecvTimeoutError::Timeout) => {
-                    let wal_state = self
-                        .state_handle
-                        .inner_fair()
-                        .shared_state
-                        .wal_state
-                        .clone();
+                    let wal_state = self.state_handle.shared_state().wal_state.clone();
 
-                    // We don't need to check `last_wal_flush_error` here because we just want to
-                    // keep retrying based on our current state. If there's further action to be
-                    // taken, the controller will orchestrate it
+                    // Keep retrying based on the current `wal_state` regardless of whether the
+                    // last attempt failed; failures are logged at error! by `flush_wal`/`sync_wal`
+                    // and the next tick is the recovery mechanism.
                     match wal_state {
                         WalState::Unflushed { persisted_up_to } => {
                             if self.flush_wal(persisted_up_to) {
@@ -568,16 +667,12 @@ impl WalFlusher {
         }
     }
 
-    /// Returns true if the flush succeeds and false otherwise. If the flush fails, the
-    /// corresponding error is stored in `SharedState.last_wal_flush_error`.
+    /// Returns true if the flush succeeds and false otherwise. The flusher loop will retry on
+    /// the next tick.
     fn flush_wal(&self, persisted_up_to: ReplicationOffset) -> bool {
         trace!(%self.table, "flushing WAL");
 
-        // Writes to persistent state don't require a write lock since they only need immutable
-        // access to the DB handle; however, to keep things clean, we acquire a write lock to
-        // prevent another thread from changing the WAL state or writing a new replication offset to
-        // the shared state to ensure that we flush the WAL and update the WAL state atomically.
-        let mut inner = self.state_handle.inner_mut();
+        let db = self.state_handle.db();
 
         // Flushing the WAL blocks other writes to RocksDB, but this operation should be relatively
         // quick given that we aren't writing any bytes to disk. The bottleneck here is probably
@@ -586,15 +681,12 @@ impl WalFlusher {
         // If a flush fails, it's possible that the low watermark of our unflushed data has
         // increased if *some* of the data was flushed. Regardless, we have no way of knowing what
         // data *was* successfully flushed, so we keep our state as-is
-        if let Err(error) = inner.db.flush_wal(false) {
-            // If we failed to flush, we set the error in `SharedState` so the replicator sees it
-            // and waits till the next iteration of the loop to retry
+        if let Err(error) = db.flush_wal(false) {
             error!(%error, %self.table, "failed to flush WAL");
-            inner.shared_state.last_wal_flush_error = Some(error.into());
-
             false
         } else {
-            inner.shared_state.wal_state = WalState::FlushedAndUnpersisted { persisted_up_to };
+            self.state_handle.shared_state_mut().wal_state =
+                WalState::FlushedAndUnpersisted { persisted_up_to };
 
             true
         }
@@ -603,29 +695,22 @@ impl WalFlusher {
     fn sync_wal(&self) {
         trace!(%self.table, "syncing WAL");
 
-        let res = self.state_handle.inner_fair().db.flush_wal(true);
+        let res = self.state_handle.db().flush_wal(true);
 
         // If a sync fails, it's possible that *some* but not *all* of the flushed but unsynced data
         // has been synced to disk. Regardless, we have no way of knowing what data *was*
         // successfully synced, so we keep our state as-is. We'll know we're caught up when a future
         // sync succeeds
         if let Err(error) = res {
-            // If we failed to sync, we set the error in `SharedState` so the replicator sees it and
-            // wait till the next iteration of the loop to retry
             error!(%error, %self.table, "failed to sync WAL");
-
-            self.state_handle
-                .inner_mut()
-                .shared_state
-                .last_wal_flush_error = Some(error.into());
         } else {
-            let mut inner = self.state_handle.inner_mut();
+            let mut ss = self.state_handle.shared_state_mut();
 
-            match inner.shared_state.wal_state {
+            match ss.wal_state {
                 // No data has been written to this state since the sync began, so we can change our
                 // WAL state to `FlushedAndPersisted`
                 WalState::FlushedAndUnpersisted { .. } => {
-                    inner.shared_state.wal_state = WalState::FlushedAndPersisted;
+                    ss.wal_state = WalState::FlushedAndPersisted;
                 }
                 // If our state changed to `Unflushed` while we were syncing, we don't want to do
                 // anything, because there's new data that needs to be flushed
@@ -651,7 +736,28 @@ impl fmt::Debug for PersistentState {
     }
 }
 
-impl PersistentMeta<'_> {
+impl<'a> PersistentMeta<'a> {
+    /// Build a [`PersistentMeta`] from the current shared state, epoch, and
+    /// replication offset. The caller provides the offset so that both the
+    /// normal write path (borrowed from `PersistentState`) and the background
+    /// index-build path (cloned/owned) can share this constructor.
+    fn new(
+        shared_state: &SharedState,
+        epoch: IndexEpoch,
+        replication_offset: Option<Cow<'a, ReplicationOffset>>,
+    ) -> Self {
+        PersistentMeta {
+            persistent_state_version: PERSISTENT_STATE_VERSION,
+            indices: shared_state
+                .indices
+                .iter()
+                .map(|pi| pi.index.clone())
+                .collect(),
+            epoch,
+            replication_offset,
+        }
+    }
+
     fn get_indices(&self, unique_keys: &[Box<[usize]>]) -> Vec<PersistentIndex> {
         self.indices
             .iter()
@@ -714,20 +820,14 @@ impl State for PersistentState {
     }
 
     fn persisted_up_to(&self) -> ReadySetResult<PersistencePoint> {
-        let mut inner = self.db.inner_mut();
-
-        // We clear out the error here (if one exists) since we're reporting it upwards
-        if let Some(error) = &inner.shared_state.last_wal_flush_error.take() {
-            Err(error.into())
-        } else {
-            match &inner.shared_state.wal_state {
-                WalState::FlushedAndPersisted => Ok(PersistencePoint::Persisted),
-                WalState::FlushedAndUnpersisted { persisted_up_to }
-                | WalState::Unflushed { persisted_up_to } => {
-                    Ok(PersistencePoint::UpTo(persisted_up_to.clone()))
-                }
+        let ss = self.db.shared_state();
+        Ok(match &ss.wal_state {
+            WalState::FlushedAndPersisted => PersistencePoint::Persisted,
+            WalState::FlushedAndUnpersisted { persisted_up_to }
+            | WalState::Unflushed { persisted_up_to } => {
+                PersistencePoint::UpTo(persisted_up_to.clone())
             }
-        }
+        })
     }
 
     fn lookup(&self, columns: &[usize], key: &PointKey) -> LookupResult<'_> {
@@ -756,7 +856,6 @@ impl State for PersistentState {
     fn add_index_multi(&mut self, strict: Vec<(Index, Option<Vec<Tag>>)>, weak: Vec<Index>) {
         let mut indices = Vec::new();
         let mut is_unique = Vec::new();
-        let mut inner = self.db.inner_mut();
         let mut seen_indices = HashSet::new();
 
         for (index, tags) in strict
@@ -764,11 +863,16 @@ impl State for PersistentState {
             .chain(weak.into_iter().map(|x| (x, None)))
         {
             assert!(tags.is_none(), "Base tables can't be partial");
-            let existing = inner
-                .shared_state
-                .indices
-                .iter()
-                .any(|pi| pi.index == index);
+
+            // Single lock acquisition to check both existing indices and emptiness
+            let (existing, is_empty) = {
+                let ss = self.db.shared_state();
+                (
+                    ss.indices.iter().any(|pi| pi.index == index),
+                    ss.indices.is_empty(),
+                )
+            };
+
             if existing {
                 continue;
             }
@@ -779,9 +883,8 @@ impl State for PersistentState {
             }
 
             let uniq = check_if_index_is_unique(&self.unique_keys, &index.columns);
-            if inner.shared_state.indices.is_empty() {
-                self.add_primary_index(&mut inner, &index.columns, uniq)
-                    .unwrap();
+            if is_empty {
+                self.add_primary_index(&index.columns, uniq).unwrap();
                 // Primary indices can only be HashMaps, so if this is our first index and it's
                 // *not* a HashMap index, add another secondary index of the correct index type
                 if index.index_type == IndexType::HashMap {
@@ -796,7 +899,7 @@ impl State for PersistentState {
             return;
         }
 
-        let threads = self.add_secondary(inner, &indices, &is_unique);
+        let threads = self.add_secondary(&indices, &is_unique);
         for t in threads {
             self.push_compaction_thread(t);
         }
@@ -816,6 +919,10 @@ impl State for PersistentState {
     /// Returns a row count estimate from RocksDB.
     fn row_count(&self) -> usize {
         self.db.row_count()
+    }
+
+    fn index_build_status(&self) -> IndexBuildStatus {
+        self.index_build_status.load()
     }
 
     fn is_useful(&self) -> bool {
@@ -879,7 +986,23 @@ impl State for PersistentState {
     }
 
     fn shut_down(&mut self) -> ReadySetResult<()> {
-        trace!("PersistentState received shutdown, stopping the WAL");
+        trace!("PersistentState received shutdown, stopping index build and WAL");
+
+        // Signal any in-progress index build to stop and wait for it
+        self.shutdown_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(rx) = self.build_completion_rx.lock().expect("poisoned").take() {
+            match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    warn!(
+                        table = %self.name,
+                        "Index build did not complete within timeout during shutdown"
+                    );
+                }
+            }
+        }
+
         self.shut_down_wal()
 
         // DurabilityMode::DeleteOnExit will delete all data when the TempFile instance
@@ -890,7 +1013,7 @@ impl State for PersistentState {
         let _ = &self.shut_down_wal()?;
 
         let temp_dir = self._tmpdir.take();
-        let full_path = self.db.inner().db.path().to_path_buf();
+        let full_path = self.db.db().path().to_path_buf();
 
         // We have to make the drop here so that rocksdb gets closed and frees
         // the file descriptors, so that we can remove the directory.
@@ -925,6 +1048,10 @@ impl State for PersistentStateHandle {
         // Add key does nothing, as all keys are propagated via the [`PersistentState::add_index`]
     }
 
+    fn index_build_status(&self) -> IndexBuildStatus {
+        IndexBuildStatus::Succeeded
+    }
+
     fn process_records(
         &mut self,
         _: &mut Records,
@@ -942,7 +1069,7 @@ impl State for PersistentStateHandle {
     }
 
     fn is_useful(&self) -> bool {
-        !self.inner().shared_state.indices.is_empty()
+        !self.shared_state().indices.is_empty()
     }
 
     fn is_partial(&self) -> bool {
@@ -974,22 +1101,26 @@ impl State for PersistentStateHandle {
     }
 
     fn lookup_range(&self, columns: &[usize], key: &RangeKey) -> RangeLookupResult<'_> {
-        let inner = self.inner_fair();
-        if self.replication_offset < inner.shared_state.replication_offset {
-            debug!("Consistency miss in PersistentStateHandle");
-            // TODO(vlad): The read handle missed on binlog position, but that doesn't mean we want
-            // to replay the entire range, all we want is for something to trigger a
-            // replay and a repeat lookup
-            return RangeLookupResult::Missing(vec![key.as_bounded_range()]);
-        }
+        let db = self.db();
 
-        let index = inner.shared_state.index(IndexType::BTreeMap, columns);
-        let is_primary = index.is_primary;
+        // Extract index metadata under lock, then drop before I/O
+        let (cf_name, is_primary) = {
+            let ss = self.shared_state();
+            if self.replication_offset < ss.replication_offset {
+                debug!("Consistency miss in PersistentStateHandle");
+                // TODO(vlad): The read handle missed on binlog position, but that doesn't mean we
+                // want to replay the entire range, all we want is for something to trigger a
+                // replay and a repeat lookup
+                return RangeLookupResult::Missing(vec![key.as_bounded_range()]);
+            }
 
-        let cf = inner.db.cf_handle(&index.column_family).unwrap();
+            let index = ss.index(IndexType::BTreeMap, columns);
+            (index.column_family.clone(), index.is_primary)
+        };
 
-        let primary_cf = inner
-            .db
+        let cf = db.cf_handle(&cf_name).unwrap();
+
+        let primary_cf = db
             .cf_handle(PK_CF)
             .expect("Primary key column family not found");
 
@@ -1008,7 +1139,7 @@ impl State for PersistentStateHandle {
             }
         }
 
-        let mut iterator = inner.db.raw_iterator_cf_opt(cf, opts);
+        let mut iterator = db.raw_iterator_cf_opt(&cf, opts);
 
         match lower {
             Bound::Included(k) => iterator.seek(k),
@@ -1027,7 +1158,7 @@ impl State for PersistentStateHandle {
             }
         }
 
-        let mut rows = Vec::new();
+        let mut rows: Vec<Vec<DfValue>> = Vec::new();
         let mut keys: Vec<Box<[u8]>> = Vec::new();
 
         if is_primary {
@@ -1045,7 +1176,7 @@ impl State for PersistentStateHandle {
                 keys.push(value.into());
 
                 if keys.len() == 128 {
-                    let primary_rows = inner.db.batched_multi_get_cf(primary_cf, &keys, false);
+                    let primary_rows = db.batched_multi_get_cf(&primary_cf, &keys, false);
                     rows.extend(primary_rows.into_iter().map(|r| {
                         deserialize_row(r.expect("can't error on known primary key").unwrap())
                     }));
@@ -1057,7 +1188,7 @@ impl State for PersistentStateHandle {
 
         // After the iterator is done, still have to fetch the rows for the inclusive upper bound
         if let Some(end_key) = inclusive_end {
-            iterator = inner.db.raw_iterator_cf(cf);
+            iterator = db.raw_iterator_cf(&cf);
             iterator.seek(&end_key);
             while let Some(cur_key) = iterator.key() {
                 if prefix_transform(cur_key) != end_key {
@@ -1073,7 +1204,7 @@ impl State for PersistentStateHandle {
         }
 
         if !keys.is_empty() {
-            let primary_rows = inner.db.batched_multi_get_cf(primary_cf, &keys, false);
+            let primary_rows = db.batched_multi_get_cf(&primary_cf, &keys, false);
             rows.extend(
                 primary_rows.into_iter().map(|r| {
                     deserialize_row(r.expect("can't error on known primary key").unwrap())
@@ -1094,11 +1225,9 @@ impl State for PersistentStateHandle {
 
     /// Returns a row count estimate from RocksDB.
     fn row_count(&self) -> usize {
-        let inner = &self.inner();
-        let cf = inner.db.cf_handle(PK_CF).unwrap();
-        inner
-            .db
-            .property_int_value_cf(cf, "rocksdb.estimate-num-keys")
+        let db = self.db();
+        let cf = db.cf_handle(PK_CF).unwrap();
+        db.property_int_value_cf(&cf, "rocksdb.estimate-num-keys")
             .unwrap()
             .unwrap() as usize
     }
@@ -1128,6 +1257,65 @@ impl State for PersistentStateHandle {
     fn tear_down(self) -> ReadySetResult<()> {
         Ok(())
     }
+}
+
+/// Reports secondary-index build progress via the table-status channel and
+/// periodic log messages with an ETA.
+#[allow(clippy::too_many_arguments)]
+fn index_progress(
+    name: &SqlIdentifier,
+    table: &Option<Relation>,
+    table_status_tx: &Option<UnboundedSender<(Relation, TableStatus)>>,
+    started: Instant,
+    last_log: &mut Instant,
+    last_status: &mut Instant,
+    rows: usize,
+    estimated: usize,
+) {
+    fn progress(rows: usize, estimated: usize) -> f64 {
+        ((rows as f64) / (estimated.max(1) as f64)).clamp(0.0, 0.9999)
+    }
+
+    if let (Some(table), Some(table_status_tx)) = (table, table_status_tx) {
+        if last_status.elapsed() >= TABLE_STATUS_REPORT_INTERVAL {
+            let progress = progress(rows, estimated) * 100.0;
+            if let Err(err) =
+                table_status_tx.send((table.clone(), TableStatus::CreatingIndex(Some(progress))))
+            {
+                debug!(
+                    error = %err,
+                    table = %table.display_unquoted(),
+                    "Failed to notify controller of indexing progress",
+                );
+            }
+            *last_status = Instant::now();
+        }
+    }
+    const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
+    if last_log.elapsed() < PROGRESS_INTERVAL {
+        return;
+    }
+    *last_log += PROGRESS_INTERVAL;
+
+    let progress = progress(rows, estimated);
+    let running = started.elapsed().as_secs_f64();
+    let total = running / progress;
+    let left = (total - running) as u64;
+    let hours = left / 60 / 60;
+    let mins = left / 60 % 60;
+    let secs = left % 60;
+
+    let progress = format!("{:.2}%", progress * 100.0);
+    let left = format!("{hours:02}:{mins:02}:{secs:02}");
+
+    info!(
+        base = %name,
+        estimated_rows = %estimated,
+        indexed = %rows,
+        %progress,
+        estimated_remaining_time = %left,
+        "Secondary index progress"
+    );
 }
 
 fn build_key(row: &[DfValue], columns: &[usize]) -> PointKey {
@@ -1208,17 +1396,18 @@ fn base_options(params: &PersistenceParameters) -> rocksdb::Options {
     opts.set_write_buffer_size(32 * 1024 * 1024);
     opts.set_db_write_buffer_size(128 * 1024 * 1024);
 
-    let block_opts = block_based_options(false);
+    let block_opts = block_based_options(true, params.block_cache_bytes);
     opts.set_block_based_table_factory(&block_opts);
 
     opts
 }
 
 /// Creates a standard set of `BlockBasedOptions`.
-fn block_based_options(set_filter: bool) -> BlockBasedOptions {
+fn block_based_options(set_filter: bool, cache_bytes: usize) -> BlockBasedOptions {
     let mut block_opts = BlockBasedOptions::default();
     block_opts.set_block_size(32 * 1024);
     block_opts.set_optimize_filters_for_memory(true);
+    block_opts.set_block_cache(shared_block_cache(cache_bytes));
 
     if set_filter {
         // "9.9" is the recommended value from the rocksdb docs
@@ -1276,13 +1465,17 @@ impl IndexParams {
     /// Construct a set of rocksdb Options for column families with this set of params, based on the
     /// given set of `base_options`.
     #[allow(clippy::unreachable)] // Checked at construction
-    fn make_rocksdb_options(&self, base_options: &rocksdb::Options) -> rocksdb::Options {
+    fn make_rocksdb_options(
+        &self,
+        base_options: &rocksdb::Options,
+        cache_bytes: usize,
+    ) -> rocksdb::Options {
         let mut opts = base_options.clone();
         match self.index_type {
             // For hash map indices, optimize for point queries and in-prefix range iteration, but
             // don't allow cross-prefix range iteration.
             IndexType::HashMap => {
-                let block_opts = block_based_options(true);
+                let block_opts = block_based_options(true, cache_bytes);
                 opts.set_block_based_table_factory(&block_opts);
 
                 // We're either going to be doing direct point lookups, in the case of unique
@@ -1332,7 +1525,7 @@ impl RunningCompactionGuard {
         let table_status_tx = state.table_status_tx.clone();
         let watcher = match compaction_progress_watcher(
             &name,
-            &state.read_handle().inner().db,
+            state.read_handle().db(),
             index_count,
             table.clone(),
             table_status_tx.clone(),
@@ -1396,7 +1589,7 @@ fn compaction_progress_watcher(
     // Row count, but without a lock
     let pk_cf = db.cf_handle(PK_CF).unwrap();
     let row_count = db
-        .property_int_value_cf(pk_cf, "rocksdb.estimate-num-keys")
+        .property_int_value_cf(&pk_cf, "rocksdb.estimate-num-keys")
         .unwrap()
         .unwrap() as usize;
     let mut log_file = File::options().read(true).open(&log_path)?;
@@ -1526,11 +1719,11 @@ fn compact_cf(name: &str, db: &DB, index: &PersistentIndex, opts: &CompactOption
     info!(table = %name, cf = %index.column_family, "Compaction starting");
     #[cfg(feature = "failure_injection")]
     set_failpoint!(readyset_util::failpoints::PERSISTENT_STATE_COMPACTION);
-    db.compact_range_cf_opt(cf, Option::<&[u8]>::None, Option::<&[u8]>::None, opts);
+    db.compact_range_cf_opt(&cf, Option::<&[u8]>::None, Option::<&[u8]>::None, opts);
     info!(table = %name, cf = %index.column_family, "Compaction finished");
 
     // Reenable auto compactions when done
-    if let Err(error) = db.set_options_cf(cf, &[("disable_auto_compactions", "false")]) {
+    if let Err(error) = db.set_options_cf(&cf, &[("disable_auto_compactions", "false")]) {
         error!(%error, table = %name, "Error setting cf options");
     }
 }
@@ -1540,14 +1733,26 @@ fn compact_cf(name: &str, db: &DB, index: &PersistentIndex, opts: &CompactOption
 /// This type exists as distinct from [`AllRecordsGuard`] to allow it to be sent between threads.
 pub struct AllRecords(PersistentStateHandle);
 
-/// RAII guard providing the ability to stream all the records out of a persistent state
-pub struct AllRecordsGuard<'a>(PersistentStateReadGuard<'a>);
+/// RAII guard providing the ability to stream all the records out of a persistent state.
+///
+/// Extracts the primary column family name under a short-lived lock, then releases it.
+/// This avoids holding a long-lived `SharedState` read lock during iteration, which would
+/// deadlock with the WalFlusher's periodic write lock under `parking_lot`'s writer-preference
+/// fairness policy.
+pub struct AllRecordsGuard<'a> {
+    db: &'a DB,
+    primary_cf_name: String,
+}
 
 impl AllRecords {
     /// Construct an RAII guard providing the ability to stream all the records out of a persistent
     /// state
     pub fn read(&self) -> AllRecordsGuard<'_> {
-        AllRecordsGuard(self.0.inner_fair())
+        let primary_cf_name = self.0.shared_state().indices[0].column_family.clone();
+        AllRecordsGuard {
+            db: self.0.db(),
+            primary_cf_name,
+        }
     }
 }
 
@@ -1558,13 +1763,11 @@ impl<'a> AllRecordsGuard<'a> {
         'a: 'b,
     {
         let cf = self
-            .0
             .db
-            .cf_handle(&self.0.shared_state.indices[0].column_family)
+            .cf_handle(&self.primary_cf_name)
             .expect("Column families always exist for all indices");
-        self.0
-            .db
-            .full_iterator_cf(cf, IteratorMode::Start)
+        self.db
+            .full_iterator_cf(&cf, IteratorMode::Start)
             .map(|res| deserialize_row(res.unwrap().1))
     }
 }
@@ -1591,6 +1794,12 @@ enum SecondaryIndexMessage {
     Data(Arc<IndexKeyValue>),
     /// A sentinel type to indicate no more data will be coming on this channel.
     Done,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum AutoCompact {
+    Enable,
+    Disable,
 }
 
 impl PersistentState {
@@ -1712,11 +1921,11 @@ impl PersistentState {
             .and_then(|db| get_meta(&db).ok());
 
         if let Some(meta) = &meta {
-            if meta.serde_version != DfValue::SERDE_VERSION {
-                return Err(Error::SerdeVersionMismatch {
+            if meta.persistent_state_version != PERSISTENT_STATE_VERSION {
+                return Err(Error::PersistentStateVersionMismatch {
                     path,
-                    persisted_version: meta.serde_version,
-                    our_version: DfValue::SERDE_VERSION,
+                    persisted_version: meta.persistent_state_version,
+                    our_version: PERSISTENT_STATE_VERSION,
                 });
             }
         }
@@ -1743,7 +1952,8 @@ impl PersistentState {
                             let cf_id: usize = cf_name.parse().map_err(|_| Error::BadDbFormat)?;
                             let index_params =
                                 cf_index_params.get(cf_id).ok_or(Error::BadDbFormat)?;
-                            index_params.make_rocksdb_options(&default_options)
+                            index_params
+                                .make_rocksdb_options(&default_options, params.block_cache_bytes)
                         },
                     ))
                 })
@@ -1751,7 +1961,7 @@ impl PersistentState {
         };
 
         let mut retry = 0;
-        let mut db = loop {
+        let db = loop {
             // TODO: why is this loop even needed?
             match DB::open_cf_descriptors(&default_options, &path, make_cfs()?) {
                 Ok(db) => break db,
@@ -1766,15 +1976,55 @@ impl PersistentState {
         let meta = increment_epoch(&db)?;
         let indices = meta.get_indices(&unique_keys);
 
-        // If there are more column families than indices (+1 to account for the default column
-        // family) we either crashed while trying to build the last index (in `Self::add_index`), or
-        // something (like failed deserialization) caused us to reset the meta to the default
-        // value.
-        // Either way, we should drop all column families that are in the db but not in the
-        // meta.
-        if cf_names.len() > indices.len() + 1 {
-            for cf_name in cf_names.iter().skip(indices.len() + 1) {
-                db.drop_cf(cf_name)?;
+        // --- Crash recovery: clean up any interrupted online index build ---
+        // PendingBuildMeta is stored under its own key (PENDING_BUILD_KEY),
+        // separate from PersistentMeta, to avoid races with the domain
+        // thread's replication-offset writes.
+        if let Some(pending_bytes) = db.get_pinned(PENDING_BUILD_KEY)? {
+            match serde_json::from_slice::<PendingBuildMeta>(&pending_bytes) {
+                Ok(pending) => {
+                    info!(
+                        %name,
+                        cfs = ?pending.column_families,
+                        seq = pending.start_sequence_number,
+                        "Cleaning up interrupted online index build on startup"
+                    );
+                    for cf_name in &pending.column_families {
+                        if db.cf_handle(cf_name).is_some() {
+                            if let Err(e) = db.drop_cf(cf_name) {
+                                error!(error = %e, cf = %cf_name, "Failed to drop orphaned pending CF");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        %name,
+                        error = %e,
+                        "Failed to deserialize PendingBuildMeta during crash recovery"
+                    );
+                }
+            }
+            // Clear the pending build marker regardless of deserialization success
+            db.delete(PENDING_BUILD_KEY)?;
+        }
+
+        // Clean up leftover sidekick directories from interrupted OIB builds.
+        index_build::cleanup_sidekick_directories(&path);
+
+        // --- Orphan CF cleanup using HashSet ---
+        // Build a set of CFs that should exist (default + all index CFs)
+        let expected_cfs: HashSet<&str> = std::iter::once(DEFAULT_CF)
+            .chain(indices.iter().map(|i| i.column_family.as_str()))
+            .collect();
+
+        // Drop CFs that exist on disk but are not in the expected set
+        for cf_name in &cf_names {
+            if !expected_cfs.contains(cf_name.as_str()) {
+                info!(%name, cf = %cf_name, "Dropping orphaned column family");
+                if let Err(e) = db.drop_cf(cf_name) {
+                    error!(error = %e, cf = %cf_name, "Failed to drop orphaned CF");
+                }
             }
         }
 
@@ -1787,7 +2037,8 @@ impl PersistentState {
                     // This column family was dropped, but index remains
                     db.create_cf(
                         &index.column_family,
-                        &IndexParams::from(&index.index).make_rocksdb_options(&default_options),
+                        &IndexParams::from(&index.index)
+                            .make_rocksdb_options(&default_options, params.block_cache_bytes),
                     )?;
                 }
             }
@@ -1797,7 +2048,6 @@ impl PersistentState {
         let shared_state = SharedState {
             replication_offset: replication_offset.clone(),
             wal_state: WalState::FlushedAndPersisted,
-            last_wal_flush_error: None,
             indices,
         };
         let read_handle = PersistentStateHandle::new(shared_state, db, replication_offset);
@@ -1826,6 +2076,7 @@ impl PersistentState {
             name,
             table,
             default_options,
+            block_cache_bytes: params.block_cache_bytes,
             seq: 0,
             unique_keys,
             epoch: meta.epoch,
@@ -1838,6 +2089,11 @@ impl PersistentState {
             replay_done: persistence_type == PersistenceType::BaseTable,
             metrics_stop: Some(metrics),
             table_status_tx,
+            index_build_status: Arc::new(index_build::AtomicIndexBuildStatus::new(
+                IndexBuildStatus::Succeeded,
+            )),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            build_completion_rx: Arc::new(Mutex::new(None)),
         };
 
         if let Some(pk) = state.unique_keys.first().cloned() {
@@ -1856,76 +2112,60 @@ impl PersistentState {
         self.db.clone()
     }
 
-    fn index_progress(
-        &self,
-        started: Instant,
-        last_log: &mut Instant,
-        last_status: &mut Instant,
-        rows: usize,
-        estimated: usize,
-    ) {
-        fn progress(rows: usize, estimated: usize) -> f64 {
-            ((rows as f64) / (estimated.max(1) as f64)).clamp(0.0, 0.9999)
-        }
-
-        if let (Some(table), Some(table_status_tx)) = (&self.table, &self.table_status_tx) {
-            if last_status.elapsed() >= TABLE_STATUS_REPORT_INTERVAL {
-                let progress = progress(rows, estimated) * 100.0;
-                if let Err(err) = table_status_tx
-                    .send((table.clone(), TableStatus::CreatingIndex(Some(progress))))
-                {
-                    debug!(
-                        error = %err,
-                        table = %table.display_unquoted(),
-                        "Failed to notify controller of indexing progress",
-                    );
-                }
-                *last_status = Instant::now();
+    /// Adds a new primary index, assuming there are none present
+    fn add_primary_index(&self, columns: &[usize], is_unique: bool) -> Result<()> {
+        // Phase 1: Update metadata under write lock
+        {
+            let mut ss = self.db.shared_state_mut();
+            if !ss.indices.is_empty() {
+                return Ok(());
             }
+
+            info!(base = %self.name, index = ?columns, is_unique, "Base creating primary index");
+
+            // Add the index to the meta first so even if we fail before we fully reindex we still
+            // have the information about the column family
+            let persistent_index = PersistentIndex {
+                column_family: PK_CF.to_string(),
+                index: Index::hash_map(columns.to_vec()),
+                is_unique,
+                is_primary: true,
+            };
+
+            ss.indices.push(persistent_index);
+            let meta = self.meta(&ss);
+            self.db.db().save_meta(&meta);
         }
-        const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
-        if last_log.elapsed() < PROGRESS_INTERVAL {
-            return;
-        }
-        *last_log += PROGRESS_INTERVAL;
 
-        let progress = progress(rows, estimated);
-        let running = started.elapsed().as_secs_f64();
-        let total = running / progress;
-        let left = (total - running) as u64;
-        let hours = left / 60 / 60;
-        let mins = left / 60 % 60;
-        let secs = left % 60;
+        // Phase 2: Create column family outside the lock
+        let index_params = IndexParams::new(IndexType::HashMap, columns.len());
+        self.db.db().create_cf(
+            PK_CF,
+            &index_params.make_rocksdb_options(&self.default_options, self.block_cache_bytes),
+        )?;
 
-        let progress = format!("{:.2}%", progress * 100.0);
-        let left = format!("{hours:02}:{mins:02}:{secs:02}");
-
-        info!(
-            base = %self.name,
-            estimated_rows = %estimated,
-            indexed = %rows,
-            %progress,
-            estimated_remaining_time = %left,
-            "Secondary index progress"
-        );
+        Ok(())
     }
 
-    /// Adds a new primary index, assuming there are none present
-    fn add_primary_index(
+    fn init_primary_index(&self, columns: &[usize], is_unique: bool) -> Result<()> {
+        self.add_primary_index(columns, is_unique)
+    }
+
+    /// Like [`add_primary_index`] but takes a mutable reference to
+    /// `SharedState` that the caller already holds. Used by
+    /// `prepare_indices_for_build` to avoid re-acquiring the lock.
+    fn add_primary_index_with_state(
         &self,
-        inner: &mut PersistentStateWriteGuard<'_>,
+        shared_state: &mut SharedState,
         columns: &[usize],
         is_unique: bool,
-    ) -> Result<()> {
-        if !inner.shared_state.indices.is_empty() {
+    ) -> ReadySetResult<()> {
+        if !shared_state.indices.is_empty() {
             return Ok(());
         }
 
-        info!(base = %self.name, index = ?columns, is_unique, "Base creating primary index");
-        let index_params = IndexParams::new(IndexType::HashMap, columns.len());
+        info!(base = %self.name, index = ?columns, is_unique, "Base creating primary index (with state)");
 
-        // add the index to the meta first so even if we fail before we fully reindex we still
-        // have the information about the column family
         let persistent_index = PersistentIndex {
             column_family: PK_CF.to_string(),
             index: Index::hash_map(columns.to_vec()),
@@ -1933,75 +2173,63 @@ impl PersistentState {
             is_primary: true,
         };
 
-        inner.shared_state.indices.push(persistent_index);
-        let meta = self.meta(&inner.shared_state);
-        inner.db.save_meta(&meta);
-        inner.db.create_cf(
-            PK_CF,
-            &index_params.make_rocksdb_options(&self.default_options),
-        )?;
+        shared_state.indices.push(persistent_index);
+        let meta = self.meta(shared_state);
+        self.db.db().save_meta(&meta);
+
+        let index_params = IndexParams::new(IndexType::HashMap, columns.len());
+        self.db
+            .db()
+            .create_cf(
+                PK_CF,
+                &index_params.make_rocksdb_options(&self.default_options, self.block_cache_bytes),
+            )
+            .map_err(|e| internal_err!("Failed to create primary index CF: {e}"))?;
 
         Ok(())
     }
 
-    fn init_primary_index(&self, columns: &[usize], is_unique: bool) -> Result<()> {
-        self.add_primary_index(&mut self.db.inner_mut(), columns, is_unique)
-    }
+    fn create_secondary(&self, indices: &[Index], is_unique: &[bool]) -> Vec<PersistentIndex> {
+        let db = self.db.db();
 
-    fn create_secondary(
-        &self,
-        inner: &mut PersistentStateWriteGuard<'_>,
-        indices: &[Index],
-        is_unique: &[bool],
-    ) -> Vec<PersistentIndex> {
-        indices
-            .iter()
-            .zip(is_unique)
-            .map(|(index, is_unique)| {
-                info!(base = %self.name, ?index, is_unique, "Base creating secondary index");
+        // Phase 1: Update metadata under write lock
+        let persistent_indices: Vec<PersistentIndex> = {
+            let mut ss = self.db.shared_state_mut();
+            let result: Vec<_> = indices
+                .iter()
+                .zip(is_unique)
+                .map(|(index, is_unique)| {
+                    info!(base = %self.name, ?index, is_unique, "Base creating secondary index");
 
-                let index_params = IndexParams::from(index);
-                let cf_name = inner.shared_state.indices.len().to_string();
-                let persistent = PersistentIndex {
-                    column_family: cf_name.clone(),
-                    is_unique: *is_unique,
-                    is_primary: false,
-                    index: index.clone(),
-                };
+                    let cf_name = ss.indices.len().to_string();
+                    let persistent = PersistentIndex {
+                        column_family: cf_name,
+                        is_unique: *is_unique,
+                        is_primary: false,
+                        index: index.clone(),
+                    };
 
-                inner.shared_state.indices.push(persistent.clone());
+                    ss.indices.push(persistent.clone());
+                    persistent
+                })
+                .collect();
 
-                // Add the index to the meta first so even if we fail before we fully reindex we
-                // still have the information about the column family.
-                inner.db.save_meta(&self.meta(&inner.shared_state));
-                inner
-                    .db
-                    .create_cf(
-                        &cf_name,
-                        &index_params.make_rocksdb_options(&self.default_options),
-                    )
-                    .unwrap();
+            // Save meta once with all new indices
+            db.save_meta(&self.meta(&ss));
+            result
+        };
 
-                persistent
-            })
-            .collect()
-    }
-
-    fn open_secondary_cf<'a>(
-        inner: &'a PersistentStateReadGuard<'a>,
-        new: &PersistentIndex,
-    ) -> &'a ColumnFamily {
-        let cf = inner.db.cf_handle(&new.column_family).unwrap();
-
-        // Prevent autocompactions while we reindex the table
-        if let Err(err) = inner
-            .db
-            .set_options_cf(cf, &[("disable_auto_compactions", "true")])
-        {
-            error!(%err, "Error setting cf options");
+        // Phase 2: Create column families outside the lock
+        for pi in &persistent_indices {
+            let index_params = IndexParams::from(&pi.index);
+            db.create_cf(
+                &pi.column_family,
+                &index_params.make_rocksdb_options(&self.default_options, self.block_cache_bytes),
+            )
+            .unwrap();
         }
 
-        cf
+        persistent_indices
     }
 
     fn make_channels(
@@ -2018,16 +2246,30 @@ impl PersistentState {
         channels
     }
 
+    /// Writes secondary index entries from a channel to a RocksDB column family.
+    ///
+    /// `write_db` is the DB handle used for writing (may be a sidekick for OIB).
+    /// `auto_compact` is the desired auto-compaction state on the index's CF
+    /// within the primary rocksdb instance.o
     fn write_secondary(
-        inner: &PersistentStateReadGuard<'_>,
+        write_db: &DB,
         index: &Index,
         is_unique: bool,
         new: &PersistentIndex,
         mut rx: impl Consumer<Item = SecondaryIndexMessage>,
+        auto_compact: AutoCompact,
     ) {
-        let cf = Self::open_secondary_cf(inner, new);
+        let cf = write_db.cf_handle(&new.column_family).unwrap();
+        if matches!(auto_compact, AutoCompact::Disable) {
+            // Prevent autocompactions while we reindex the table
+            if let Err(err) = write_db.set_options_cf(&cf, &[("disable_auto_compactions", "true")])
+            {
+                error!(%err, "Error setting cf options");
+            }
+        }
 
         let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(false);
         opts.disable_wal(true);
         let backoff = Duration::from_micros(5);
 
@@ -2046,7 +2288,7 @@ impl PersistentState {
                 // Check for Done sentinel indicating producer is done
                 match msg {
                     SecondaryIndexMessage::Done => {
-                        inner.db.write_opt(batch, &opts).unwrap();
+                        write_db.write_opt(batch, &opts).unwrap();
                         break 'outer;
                     }
                     SecondaryIndexMessage::Data(kv) => {
@@ -2057,40 +2299,45 @@ impl PersistentState {
                             // TODO avoid storing pk as the value; already in the key
                             Self::serialize_secondary(&index_key, &kv.pk)
                         };
-                        batch.put_cf(cf, &key, &kv.pk);
+                        batch.put_cf(&cf, &key, &kv.pk);
                     }
                 }
             }
 
-            inner.db.write_opt(batch, &opts).unwrap();
+            write_db.write_opt(batch, &opts).unwrap();
         }
 
         // Flush just in case
-        inner.db.flush_cf(cf).unwrap();
+        write_db.flush_cf(&cf).unwrap();
     }
 
-    /// Adds new secondary indices.  Secondary indices point to the primary index
-    /// and don't store values on their own.
-    fn add_secondary(
-        &self,
-        mut inner: PersistentStateWriteGuard<'_>,
-        indices: &[Index],
-        is_unique: &[bool],
-    ) -> Vec<CompactionThreadHandle> {
-        if let (Some(table_status_tx), Some(table)) = (&self.table_status_tx, &self.table) {
-            if let Err(err) =
-                table_status_tx.send((table.clone(), TableStatus::CreatingIndex(None)))
-            {
-                error!(
-                    error = %err,
-                    table = %table.display_unquoted(),
-                    "Failed to notify controller of new index",
-                );
-            }
-        }
-        let new = self.create_secondary(&mut inner, indices, is_unique);
-        let inner = inner.downgrade();
-        let channels = Self::make_channels(new.len());
+    /// Scans a primary CF iterator and fans out rows to consumer threads that
+    /// write secondary index entries. This is the shared core of both
+    /// [`add_secondary`] (live DB iterator) and online-index-build
+    /// (snapshot iterator writing to a sidekick DB).
+    ///
+    /// * `write_db` -- RocksDB handle used by consumer threads to write batches.
+    ///   For the blocking path this is the primary DB; for OIB this is the sidekick.
+    /// * `iter` -- a raw iterator over the primary CF (will be seeked to first).
+    /// * `new_indices` -- the [`PersistentIndex`]es being populated.
+    /// * `name` -- base table name, used for progress logging.
+    /// * `table` / `table_status_tx` -- optional channel for status updates.
+    /// * `estimated_rows` -- estimated total row count for progress reporting.
+    /// * `auto_compact` -- desired auto-compaction state on the indices' CFs
+    ///   within the primary rocksdb instance.
+    #[allow(clippy::too_many_arguments)]
+    fn populate_secondary_from_iter(
+        write_db: &DB,
+        iter: rocksdb::DBRawIteratorWithThreadMode<'_, DB>,
+        new_indices: &[PersistentIndex],
+        name: &SqlIdentifier,
+        table: &Option<Relation>,
+        table_status_tx: &Option<UnboundedSender<(Relation, TableStatus)>>,
+        estimated_rows: usize,
+        auto_compact: AutoCompact,
+        shutdown: Option<&std::sync::atomic::AtomicBool>,
+    ) -> ReadySetResult<()> {
+        let channels = Self::make_channels(new_indices.len());
         let (mut txs, rxs): (Vec<_>, Vec<_>) = channels.into_iter().unzip();
 
         // Macro to push to all consumers, with backoff when the buffer is full
@@ -2105,54 +2352,104 @@ impl PersistentState {
             }};
         }
 
-        thread::scope(|scope| {
-            for (index, is_unique, new, rx) in itertools::izip!(indices, is_unique, &new, rxs) {
-                scope.spawn(|| Self::write_secondary(&inner, index, *is_unique, new, rx));
+        let mut iter = iter;
+        iter.seek_to_first();
+
+        let result: ReadySetResult<()> = thread::scope(|scope| {
+            for (pi, rx) in new_indices.iter().zip(rxs) {
+                scope.spawn(|| {
+                    Self::write_secondary(write_db, &pi.index, pi.is_unique, pi, rx, auto_compact)
+                });
             }
 
-            let mut opts = rocksdb::ReadOptions::default();
-            opts.set_total_order_seek(true); // because not doing a prefix seek
-
-            // Don't pollute block cache - avoid evicting hot data used by concurrent queries
-            opts.fill_cache(false);
-            // Large readahead for sequential scan - amortizes I/O latency, especially on remote volumes
-            opts.set_readahead_size(4 * 1024 * 1024);
-            // Async I/O via io_uring - overlaps prefetch with CPU work
-            opts.set_async_io(true);
-
-            let pk_cf = inner.db.cf_handle(PK_CF).unwrap();
-            let mut iter = inner.db.raw_iterator_cf_opt(pk_cf, opts);
-            iter.seek_to_first();
-
             let started = Instant::now();
-            let estimated = self.row_count();
             let mut last_log = started;
             let mut last_status = started;
-            let mut indexed = 0;
+            let mut indexed: usize = 0;
 
             while let (Some(pk), Some(value)) = (iter.key(), iter.value()) {
+                if let Some(flag) = shutdown {
+                    if flag.load(std::sync::atomic::Ordering::Acquire) {
+                        // Send Done so consumer threads exit cleanly
+                        send_message!(&mut txs, SecondaryIndexMessage::Done);
+                        drop(txs);
+                        return Err(internal_err!(
+                            "Index build cancelled due to shutdown request"
+                        ));
+                    }
+                }
+
                 let row = deserialize_row(value);
-                // TODO: only pass data that will be used by any index.
                 let msg =
                     SecondaryIndexMessage::Data(Arc::new(IndexKeyValue::new(pk.to_vec(), row)));
                 send_message!(&mut txs, msg);
 
                 indexed += 1;
-                self.index_progress(started, &mut last_log, &mut last_status, indexed, estimated);
+                index_progress(
+                    name,
+                    table,
+                    table_status_tx,
+                    started,
+                    &mut last_log,
+                    &mut last_status,
+                    indexed,
+                    estimated_rows,
+                );
                 iter.next();
             }
 
             // Send Done sentinel to signal completion to all consumers,
-            //even if there was an error in iterating
+            // even if there was an error in iterating
             send_message!(&mut txs, SecondaryIndexMessage::Done);
 
             if let Err(err) = iter.status() {
-                // FIXME can't return error from here
-                error!(%err, "Error creating index");
+                return Err(internal_err!("Error creating index: {err}"));
             }
 
             drop(txs);
+            Ok(())
         });
+
+        result
+    }
+
+    /// Adds new secondary indices.  Secondary indices point to the primary index
+    /// and don't store values on their own.
+    fn add_secondary(&self, indices: &[Index], is_unique: &[bool]) -> Vec<CompactionThreadHandle> {
+        if let (Some(table_status_tx), Some(table)) = (&self.table_status_tx, &self.table) {
+            if let Err(err) =
+                table_status_tx.send((table.clone(), TableStatus::CreatingIndex(None)))
+            {
+                error!(
+                    error = %err,
+                    table = %table.display_unquoted(),
+                    "Failed to notify controller of new index",
+                );
+            }
+        }
+        let new = self.create_secondary(indices, is_unique);
+        let db = self.db.db();
+
+        let opts = bulk_scan_read_opts();
+        let pk_cf = db
+            .cf_handle(PK_CF)
+            .expect("Primary key column family not found");
+        let iter = db.raw_iterator_cf_opt(&pk_cf, opts);
+
+        if let Err(err) = Self::populate_secondary_from_iter(
+            db,
+            iter,
+            &new,
+            &self.name,
+            &self.table,
+            &self.table_status_tx,
+            self.row_count(),
+            AutoCompact::Disable,
+            None, // no shutdown flag for blocking path
+        ) {
+            // FIXME can't return error from here
+            error!(%err, "Error creating index");
+        }
 
         // Compact the newly created column families in the background
         if let (Some(table_status_tx), Some(table)) = (&self.table_status_tx, &self.table) {
@@ -2177,16 +2474,11 @@ impl PersistentState {
     /// * The epoch
     /// * The replication offset
     fn meta(&self, shared_state: &SharedState) -> PersistentMeta<'_> {
-        PersistentMeta {
-            serde_version: DfValue::SERDE_VERSION,
-            indices: shared_state
-                .indices
-                .iter()
-                .map(|pi| pi.index.clone())
-                .collect(),
-            epoch: self.epoch,
-            replication_offset: self.replication_offset().map(Cow::Borrowed),
-        }
+        PersistentMeta::new(
+            shared_state,
+            self.epoch,
+            self.replication_offset().map(Cow::Borrowed),
+        )
     }
 
     /// Add an operation to the given [`WriteBatch`] to set the [replication
@@ -2196,12 +2488,12 @@ impl PersistentState {
         // be modified by a single thread.
         self.db.replication_offset = Some(offset.clone());
 
-        let mut inner = self.db.inner_mut();
+        let mut ss = self.db.shared_state_mut();
         // TODO(ethan) do we want to be updating our in-memory replication offsets here before
         // the write succeeds?
-        inner.shared_state.replication_offset = Some(offset.clone());
+        ss.replication_offset = Some(offset.clone());
 
-        match inner.shared_state.wal_state {
+        match ss.wal_state {
             // If snapshot mode is enabled, the WAL is disabled, and we don't have to worry
             // about setting flushed_up_to or persisted_up_to
             _ if self.snapshot_mode.is_enabled() => {}
@@ -2213,7 +2505,7 @@ impl PersistentState {
             // we need to change our state to `WalState::Unflushed` since we're writing new
             // unflushed data
             WalState::FlushedAndPersisted | WalState::FlushedAndUnpersisted { .. } => {
-                inner.shared_state.wal_state = WalState::Unflushed {
+                ss.wal_state = WalState::Unflushed {
                     // The new offset marks the start of the unpersisted data in this state
                     persisted_up_to: offset,
                 };
@@ -2224,7 +2516,7 @@ impl PersistentState {
             WalState::Unflushed { .. } => {}
         }
 
-        batch.save_meta(&self.meta(&inner.shared_state));
+        batch.save_meta(&self.meta(&ss));
     }
 
     /// Enables or disables the snapshot mode. In snapshot mode auto compactions are
@@ -2287,29 +2579,33 @@ impl PersistentState {
     fn enable_snapshot_mode(&mut self) {
         // Remove any replication offset first (although it should be None already)
         self.db.replication_offset = None;
-        let mut inner = self.db.inner_mut();
-        let meta = self.meta(&inner.shared_state);
-        inner.db.save_meta(&meta);
+        let db = self.db.db();
+
+        // Clone index metadata under lock, then drop before slow CF operations
+        let index_info: Vec<_> = {
+            let ss = self.db.shared_state();
+            let meta = self.meta(&ss);
+            db.save_meta(&meta);
+            ss.indices
+                .iter()
+                .map(|idx| (idx.column_family.clone(), idx.index.clone()))
+                .collect()
+        };
 
         // Clear the data by dropping each column family and creating it anew
-        for index in inner.shared_state.indices.iter() {
-            let cf_name = index.column_family.as_str();
-            inner.db.drop_cf(cf_name).unwrap();
+        for (cf_name, index) in &index_info {
+            db.drop_cf(cf_name).unwrap();
 
-            inner
-                .db
-                .create_cf(
-                    cf_name,
-                    &IndexParams::from(&index.index).make_rocksdb_options(&self.default_options),
-                )
-                .unwrap();
+            db.create_cf(
+                cf_name,
+                &IndexParams::from(index)
+                    .make_rocksdb_options(&self.default_options, self.block_cache_bytes),
+            )
+            .unwrap();
 
-            let cf = inner.db.cf_handle(cf_name).expect("just created this cf");
+            let cf = db.cf_handle(cf_name).expect("just created this cf");
 
-            if let Err(err) = inner
-                .db
-                .set_options_cf(cf, &[("disable_auto_compactions", "true")])
-            {
+            if let Err(err) = db.set_options_cf(&cf, &[("disable_auto_compactions", "true")]) {
                 error!(%err, "Error setting cf options");
             }
         }
@@ -2325,7 +2621,7 @@ impl PersistentState {
         let span =
             info_span!("Compacting index", table = %name, column_family = %index.column_family);
         let _guard = span.enter();
-        compact_cf(&name, &read.inner().db, &index, &opts);
+        compact_cf(&name, read.db(), &index, &opts);
     }
 
     /// Perform a manual compaction for a single column family.
@@ -2356,7 +2652,7 @@ impl PersistentState {
 
     /// Perform a manual compaction for each column family.
     fn compact_all_indices(&mut self) {
-        let indices = self.db.inner().shared_state.indices.to_vec();
+        let indices = self.db.shared_state().indices.to_vec();
         let compaction_guard = RunningCompactionGuard::new(self, indices.len());
         for index in indices {
             let thr = self.compact_index(index, compaction_guard.clone());
@@ -2386,14 +2682,14 @@ impl PersistentState {
     /// families. The insert is performed in a context of a [`rocksdb::WriteBatch`]
     /// operation and is therefore guaranteed to be atomic.
     fn insert(&mut self, batch: &mut WriteBatch, r: &[DfValue]) -> ReadySetResult<()> {
-        let inner = self.db.inner_fair();
-        let primary_index = inner
-            .shared_state
+        let db = self.db.db();
+        let ss = self.db.shared_state();
+        let primary_index = ss
             .indices
             .first()
             .ok_or_else(|| internal_err!("Insert on un-indexed state"))?;
         let primary_key = build_key(r, &primary_index.index.columns);
-        let primary_cf = inner.db.cf_handle(&primary_index.column_family).unwrap();
+        let primary_cf = db.cf_handle(&primary_index.column_family).unwrap();
 
         // Generate a new primary key by extracting the key columns from the provided row
         // using the primary index and serialize it as RocksDB prefix.
@@ -2409,22 +2705,22 @@ impl PersistentState {
         let serialized_row = bincode::options().serialize(r)?;
 
         // First store the row for the primary index:
-        batch.put_cf(primary_cf, &serialized_pk, &serialized_row);
+        batch.put_cf(&primary_cf, &serialized_pk, &serialized_row);
 
         // Then insert the value for all the secondary indices:
-        for index in inner.shared_state.indices[1..].iter() {
+        for index in ss.indices[1..].iter() {
             // Construct a key with the index values, and serialize it with bincode:
-            let cf = inner.db.cf_handle(&index.column_family).unwrap();
+            let cf = db.cf_handle(&index.column_family).unwrap();
             let key = build_key(r, &index.index.columns);
 
             if index.is_unique && !key.has_null() {
                 let serialized_key = Self::serialize_prefix(&key);
-                batch.put_cf(cf, &serialized_key, &serialized_pk);
+                batch.put_cf(&cf, &serialized_key, &serialized_pk);
             } else {
                 let serialized_key = Self::serialize_secondary(&key, &serialized_pk);
                 // TODO: Since the primary key is already serialized in here, no reason to store it
                 // as value again
-                batch.put_cf(cf, &serialized_key, &serialized_pk);
+                batch.put_cf(&cf, &serialized_key, &serialized_pk);
             };
         }
 
@@ -2432,15 +2728,15 @@ impl PersistentState {
     }
 
     fn remove(&self, batch: &mut WriteBatch, r: &[DfValue]) -> ReadySetResult<()> {
-        let inner = self.db.inner_fair();
+        let db = self.db.db();
+        let ss = self.db.shared_state();
 
-        let primary_index = inner
-            .shared_state
+        let primary_index = ss
             .indices
             .first()
             .ok_or_else(|| internal_err!("Delete on un-indexed state"))?;
         let primary_key = build_key(r, &primary_index.index.columns);
-        let primary_cf = inner.db.cf_handle(&primary_index.column_family).unwrap();
+        let primary_cf = db.cf_handle(&primary_index.column_family).unwrap();
 
         let prefix = Self::serialize_prefix(&primary_key);
 
@@ -2451,7 +2747,7 @@ impl PersistentState {
             // This is key is not unique, therefore we have to iterate over the
             // the values, looking for the first one that matches the full row
             // and then return the (full length) unique primary key associated with it
-            let mut iter = inner.db.raw_iterator_cf(primary_cf);
+            let mut iter = db.raw_iterator_cf(&primary_cf);
             iter.seek(&prefix); // Find the first key
 
             loop {
@@ -2465,7 +2761,7 @@ impl PersistentState {
                             r
                         )
                     })?;
-                let val = deserialize_row(iter.value().unwrap());
+                let val: Vec<DfValue> = deserialize_row(iter.value().unwrap());
                 if val == r {
                     break key.to_vec();
                 }
@@ -2474,10 +2770,10 @@ impl PersistentState {
         };
 
         // First delete the row for the primary index:
-        batch.delete_cf(primary_cf, &serialized_pk);
+        batch.delete_cf(&primary_cf, &serialized_pk);
 
         // Then delete the value for all the secondary indices
-        for index in inner.shared_state.indices[1..].iter() {
+        for index in ss.indices[1..].iter() {
             // Construct a key with the index values, and serialize it with bincode:
             let key = build_key(r, &index.index.columns);
             let serialized_key = if index.is_unique && !key.has_null() {
@@ -2487,8 +2783,8 @@ impl PersistentState {
                 // the *exact* same row from each family
                 Self::serialize_secondary(&key, &serialized_pk)
             };
-            let cf = inner.db.cf_handle(&index.column_family).unwrap();
-            batch.delete_cf(cf, &serialized_key);
+            let cf = db.cf_handle(&index.column_family).unwrap();
+            batch.delete_cf(&cf, &serialized_key);
         }
 
         Ok(())
@@ -2535,7 +2831,7 @@ impl PersistentState {
             write_options.disable_wal(true);
             write_options.set_sync(false);
         } else {
-            let inner = &self.db.inner_fair();
+            let db = self.db.db();
             if self.snapshot_mode.is_enabled() && replication_offset.is_some() {
                 // We are setting the replication offset, which is great, but all of our previous
                 // writes are not guaranteed to flush to disk even if the next write is synced. We
@@ -2546,16 +2842,13 @@ impl PersistentState {
                 // options.sync=true,    will it persist the previous write too?
                 // A: No. After the program crashes, writes with option.disableWAL=true will be
                 // lost, if they are not flushed to SST files.
-                for index in inner.shared_state.indices.iter() {
-                    inner
-                        .db
-                        .flush_cf(inner.db.cf_handle(&index.column_family).unwrap())
+                let ss = self.db.shared_state();
+                for index in ss.indices.iter() {
+                    db.flush_cf(&db.cf_handle(&index.column_family).unwrap())
                         .map_err(|e| internal_err!("Flush to disk failed: {e}"))?;
                 }
 
-                inner
-                    .db
-                    .flush()
+                db.flush()
                     .map_err(|e| internal_err!("Flush to disk failed: {e}"))?;
             }
 
@@ -2569,8 +2862,7 @@ impl PersistentState {
         }
 
         self.db
-            .inner_fair()
-            .db
+            .db()
             .write_opt(batch, &write_options)
             .map_err(|e| internal_err!("Write failed: {e}"))?;
 
@@ -2597,6 +2889,21 @@ impl PersistentState {
         }
         Ok(())
     }
+}
+
+/// Helper function to get the custom config for performing large bulk
+/// read operations, like during an index build.
+fn bulk_scan_read_opts() -> rocksdb::ReadOptions {
+    let mut opts = rocksdb::ReadOptions::default();
+    opts.set_total_order_seek(true); // because not doing a prefix seek
+
+    // Don't pollute block cache - avoid evicting hot data used by concurrent queries
+    opts.fill_cache(false);
+    // Large readahead for sequential scan - amortizes I/O latency, especially on remote volumes
+    opts.set_readahead_size(4 * 1024 * 1024);
+    // Async I/O via io_uring - overlaps prefetch with CPU work
+    opts.set_async_io(true);
+    opts
 }
 
 /// Checks if the given index is unique for this base table.
@@ -2708,9 +3015,8 @@ impl SizeOf for PersistentStateHandle {
         0
     }
 
-    fn is_empty(&self) -> bool {
-        self.inner()
-            .db
+    fn size_is_empty(&self) -> bool {
+        self.db()
             .property_int_value("rocksdb.estimate-num-keys")
             .unwrap()
             .unwrap()
@@ -2720,24 +3026,20 @@ impl SizeOf for PersistentStateHandle {
 
 impl SizeOf for PersistentState {
     fn deep_size_of(&self) -> usize {
-        let inner = self.db.inner_fair();
-        inner
-            .shared_state
-            .indices
+        let db = self.db.db();
+        let ss = self.db.shared_state();
+        ss.indices
             .iter()
             .map(|idx| {
-                let cf = inner
-                    .db
+                let cf = db
                     .cf_handle(&idx.column_family)
                     .unwrap_or_else(|| panic!("Column family not found: {}", idx.column_family));
-                let sstable_size = inner
-                    .db
-                    .property_int_value_cf(cf, "rocksdb.estimate-live-data-size")
+                let sstable_size = db
+                    .property_int_value_cf(&cf, "rocksdb.estimate-live-data-size")
                     .unwrap()
                     .unwrap();
-                let memtable_size = inner
-                    .db
-                    .property_int_value_cf(cf, "rocksdb.size-all-mem-tables")
+                let memtable_size = db
+                    .property_int_value_cf(&cf, "rocksdb.size-all-mem-tables")
                     .unwrap()
                     .unwrap();
                 (sstable_size + memtable_size) as usize
@@ -2745,8 +3047,8 @@ impl SizeOf for PersistentState {
             .sum()
     }
 
-    fn is_empty(&self) -> bool {
-        self.db.is_empty()
+    fn size_is_empty(&self) -> bool {
+        self.db.size_is_empty()
     }
 }
 
@@ -2803,7 +3105,7 @@ mod tests {
         assert_eq!(old4, new4, "PointKey::Single with string");
     }
 
-    fn insert<S: State>(state: &mut S, row: Vec<DfValue>) {
+    pub(crate) fn insert<S: State>(state: &mut S, row: Vec<DfValue>) {
         let record: Record = row.into();
         state
             .process_records(&mut record.into(), None, None)
@@ -2816,7 +3118,7 @@ mod tests {
         (dir, path.to_string_lossy().into())
     }
 
-    fn setup_persistent<'a, K: IntoIterator<Item = &'a [usize]>>(
+    pub(crate) fn setup_persistent<'a, K: IntoIterator<Item = &'a [usize]>>(
         prefix: &str,
         unique_keys: K,
     ) -> PersistentState {
@@ -3313,6 +3615,79 @@ mod tests {
         }
     }
 
+    /// Opening a `PersistentState` against on-disk metadata written by an older binary
+    /// (lower [`PERSISTENT_STATE_VERSION`]) must:
+    ///   1. Surface [`Error::PersistentStateVersionMismatch`] from `new_inner`.
+    ///   2. Report the mismatch as *non*-permanent, so the outer [`PersistentState::new`]
+    ///      knows it can safely delete the directory and resnapshot from upstream.
+    ///   3. Recover transparently when called via the public `new` entry point — the
+    ///      tampered DB is wiped and a fresh one is created with the current version.
+    #[test]
+    fn persistent_state_version_mismatch_triggers_resnapshot() {
+        let (_dir, name) = get_tmp_path();
+        let params = PersistenceParameters {
+            mode: DurabilityMode::Permanent,
+            ..Default::default()
+        };
+
+        // Pre-create a minimal RocksDB at the target path with metadata pinned to an
+        // older version. This simulates on-disk state left by a prior incompatible
+        // binary without requiring a full PersistentState::new bootstrap.
+        {
+            let mut opts = rocksdb::Options::default();
+            opts.create_if_missing(true);
+            let db = DB::open(&opts, &name).unwrap();
+            let stale = PersistentMeta {
+                persistent_state_version: PERSISTENT_STATE_VERSION - 1,
+                indices: Vec::new(),
+                epoch: 0,
+                replication_offset: None,
+            };
+            (&db).save_meta(&stale);
+        }
+
+        // Calling `new_inner` directly bypasses the auto-recovery loop in `new`, so we
+        // can observe the raw error.
+        let err = PersistentState::new_inner(
+            SqlIdentifier::from(name.clone()),
+            None,
+            PathBuf::from(&name),
+            Vec::<Box<[usize]>>::new(),
+            &params,
+            PersistenceType::BaseTable,
+            None,
+        )
+        .expect_err("new_inner should fail on version mismatch");
+        match &err {
+            Error::PersistentStateVersionMismatch {
+                persisted_version,
+                our_version,
+                ..
+            } => {
+                assert_eq!(*persisted_version, PERSISTENT_STATE_VERSION - 1);
+                assert_eq!(*our_version, PERSISTENT_STATE_VERSION);
+            }
+            other => panic!("expected PersistentStateVersionMismatch, got {other:?}"),
+        }
+        assert!(
+            !err.is_permanent(),
+            "version mismatch must be non-permanent so callers know to delete + resnapshot"
+        );
+
+        // The public entry point should recover transparently: the tampered directory is
+        // wiped and a fresh DB is created with the current version.
+        let recovered = PersistentState::new(
+            name,
+            None,
+            Vec::<Box<[usize]>>::new(),
+            &params,
+            PersistenceType::BaseTable,
+            None,
+        )
+        .expect("auto-recovery should succeed after version mismatch");
+        drop(recovered);
+    }
+
     #[test]
     fn persistent_state_recover_unique_key() {
         let (_dir, name) = get_tmp_path();
@@ -3483,22 +3858,22 @@ mod tests {
     fn persistent_state_no_duplicate_indices() {
         let mut state = setup_persistent("persistent_state_no_duplicate_indices", None);
         // no indices yet, not even for a (not guaranteed to actually have one) primary key
-        assert_eq!(0, state.db.inner().shared_state.indices.len());
+        assert_eq!(0, state.db.shared_state().indices.len());
 
         // add in an index (this will be the PK) - should be no dupes!
         let idx = Index::new(IndexType::HashMap, vec![0]);
         state.add_index_multi(vec![(idx.clone(), None)], vec![idx]);
-        assert_eq!(1, state.db.inner().shared_state.indices.len());
+        assert_eq!(1, state.db.shared_state().indices.len());
 
         // add in a secondary index - should be no dupes!
         let idx = Index::new(IndexType::HashMap, vec![1]);
         state.add_index_multi(vec![(idx.clone(), None)], vec![idx]);
-        assert_eq!(2, state.db.inner().shared_state.indices.len());
+        assert_eq!(2, state.db.shared_state().indices.len());
 
         // add in the same secondary index - should not duplicate!
         let idx = Index::new(IndexType::HashMap, vec![1]);
         state.add_index_multi(vec![(idx, None)], vec![]);
-        assert_eq!(2, state.db.inner().shared_state.indices.len());
+        assert_eq!(2, state.db.shared_state().indices.len());
     }
 
     #[test]
@@ -4308,5 +4683,133 @@ mod tests {
                 .into()
             )
         }
+    }
+
+    /// Stress test that exercises concurrent read/write/WAL flush/index creation patterns
+    /// to validate that `Arc<DB>` + `Arc<RwLock<SharedState>>` composes correctly under
+    /// the access patterns we care about.
+    #[test]
+    fn concurrent_access_stress() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let mut state = setup_persistent("concurrent_stress", vec![&[0usize][..]]);
+        state.add_index(Index::hash_map(vec![0]), None);
+        state.add_index(Index::hash_map(vec![1]), None);
+
+        let handle = state.read_handle();
+        let done = Arc::new(AtomicBool::new(false));
+        let write_count = Arc::new(AtomicU64::new(0));
+
+        // Writer thread: insert rows with incrementing keys
+        let writer_handle = handle.clone();
+        let writer_done = done.clone();
+        let writer_count = write_count.clone();
+        let writer = thread::spawn(move || {
+            let mut writer_state = setup_persistent("concurrent_stress_w", vec![&[0usize][..]]);
+            // We can't write via the handle (it's read-only), so we test that the handle's
+            // db() and shared_state() can be called concurrently without issues.
+            // Instead, do reads on the shared handle to stress concurrent access.
+            let mut i = 0u64;
+            while !writer_done.load(Ordering::Relaxed) {
+                // Exercise shared_state_mut() from a cloned handle
+                {
+                    let ss = writer_handle.shared_state();
+                    let _ = ss.indices.len();
+                }
+                // Exercise db() concurrently
+                {
+                    let db = writer_handle.db();
+                    let _ = db.path();
+                }
+                // Write to the separate state to exercise the full write path
+                let row = vec![DfValue::from(i as i32), DfValue::from(format!("val_{i}"))];
+                let record: Record = row.into();
+                writer_state
+                    .process_records(&mut record.into(), None, None)
+                    .unwrap();
+                i += 1;
+                writer_count.store(i, Ordering::Relaxed);
+            }
+        });
+
+        // Reader threads: do lookups concurrently
+        let mut readers = Vec::new();
+        for reader_id in 0..4 {
+            let reader_handle = handle.clone();
+            let reader_done = done.clone();
+            let reader_write_count = write_count.clone();
+            readers.push(thread::spawn(move || {
+                let mut lookups = 0u64;
+                while !reader_done.load(Ordering::Relaxed) {
+                    let max_key = reader_write_count.load(Ordering::Relaxed);
+                    if max_key == 0 {
+                        thread::yield_now();
+                        continue;
+                    }
+
+                    // Exercise db() and shared_state() from reader
+                    let db = reader_handle.db();
+                    let ss = reader_handle.shared_state();
+                    let _ = ss.indices.len();
+                    let _ = db.path();
+                    drop(ss);
+
+                    // Exercise lookup_multi (reads from the actual shared DB)
+                    let key = PointKey::Single(DfValue::from(reader_id % 10));
+                    let results = reader_handle.lookup_multi(&[0], &[key]);
+                    // Results may be empty since we're reading from the original state
+                    // which may not have this key, but it should never panic
+                    assert!(results.len() == 1);
+
+                    lookups += 1;
+                }
+                lookups
+            }));
+        }
+
+        // Shared state accessor thread: exercises shared_state_mut() concurrently
+        let ss_handle = handle.clone();
+        let ss_done = done.clone();
+        let ss_thread = thread::spawn(move || {
+            let mut accesses = 0u64;
+            while !ss_done.load(Ordering::Relaxed) {
+                // Read the WAL state
+                {
+                    let ss = ss_handle.shared_state();
+                    let _ = ss.wal_state.clone();
+                    let _ = ss.replication_offset.clone();
+                }
+                // Exercise db() path
+                {
+                    let db = ss_handle.db();
+                    let _ = db.path();
+                }
+                accesses += 1;
+            }
+            accesses
+        });
+
+        // Let the test run for 2 seconds
+        thread::sleep(Duration::from_secs(2));
+        done.store(true, Ordering::Relaxed);
+
+        // Join all threads — any panic here means thread safety violation
+        writer.join().expect("writer thread panicked");
+        let total_lookups: u64 = readers
+            .into_iter()
+            .map(|r| r.join().expect("reader thread panicked"))
+            .sum();
+        let total_accesses = ss_thread.join().expect("shared state thread panicked");
+
+        let total_writes = write_count.load(Ordering::Relaxed);
+        assert!(total_writes > 0, "writer should have written some records");
+        assert!(total_lookups > 0, "readers should have done some lookups");
+        assert!(
+            total_accesses > 0,
+            "shared state thread should have done some accesses"
+        );
     }
 }

@@ -2,7 +2,6 @@ extern crate chrono;
 extern crate mysql_async as mysql;
 extern crate mysql_common as myc;
 extern crate mysql_srv;
-extern crate nom;
 extern crate tokio;
 
 use core::iter;
@@ -10,6 +9,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::{io, net};
 
 use database_utils::TlsMode;
@@ -18,15 +18,20 @@ use mysql::consts::Command;
 use mysql::prelude::Queryable;
 use mysql::{Row, ServerError};
 use mysql_srv::{
-    CachedSchema, Column, ErrorKind, InitWriter, MySqlIntermediary, MySqlShim, ParamParser,
-    QueryResultWriter, QueryResultsResponse, StatementMetaWriter,
+    AuthCache, AuthKeys, AuthPlugin, CachedSchema, CachingSha2Password, Column, ErrorKind,
+    MySqlIntermediary, MySqlShim, ParamParser, QueryResultWriter, QueryResultsResponse,
+    StatementMetaWriter,
 };
 use readyset_adapter_types::DeallocateId;
+use readyset_data::encoding::{Encoding, SingleByteCharset};
 use readyset_util::redacted::RedactedString;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
 static DEFAULT_CHARACTER_SET: u16 = myc::constants::UTF8_GENERAL_CI;
+
+const TEST_USER: &str = "user";
+const TEST_PASSWORD: &str = "password";
 
 struct TestingShim<Q, P, E, I, CU, W> {
     columns: Vec<Column>,
@@ -36,6 +41,9 @@ struct TestingShim<Q, P, E, I, CU, W> {
     on_e: E,
     on_i: I,
     on_cu: CU,
+    #[allow(clippy::type_complexity)]
+    password_fn: Option<Box<dyn Fn(&str) -> Option<Vec<u8>> + Send>>,
+    client_encoding: Encoding,
     _phantom: PhantomData<W>,
 }
 
@@ -53,11 +61,7 @@ where
             QueryResultWriter<'a, W>,
         ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a + Send>>
         + Send,
-    I: for<'a> FnMut(
-            &'a str,
-            InitWriter<'a, W>,
-        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a + Send>>
-        + Send,
+    I: for<'a> FnMut(&'a str) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a + Send>> + Send,
     CU: for<'a> FnMut(
             &'a str,
             &'a str,
@@ -115,8 +119,8 @@ where
         Ok(())
     }
 
-    async fn on_init(&mut self, schema: &str, writer: Option<InitWriter<'_, W>>) -> io::Result<()> {
-        (self.on_i)(schema, writer.unwrap()).await
+    async fn on_init(&mut self, schema: &str) -> io::Result<()> {
+        (self.on_i)(schema).await
     }
 
     async fn on_change_user(
@@ -132,13 +136,22 @@ where
         query: &str,
         results: QueryResultWriter<'_, W>,
     ) -> QueryResultsResponse {
-        if query.starts_with("SELECT @@") || query.starts_with("select @@") {
+        // The test client probes server variables at connection setup. Under a client encoding
+        // that remaps ASCII (e.g. swe7) the '@' bytes decode to other chars, so as a bit of a
+        // hack, also detect the probe by a variable name that survives the mangling.
+        if query.starts_with("SELECT @@")
+            || query.starts_with("select @@")
+            || query.contains("max_allowed_packet")
+        {
             let var = &query.get(b"SELECT @@".len()..);
             match var {
                 Some("max_allowed_packet") => {
                     let cols = &[Column {
+                        schema: String::new(),
                         table: String::new(),
+                        org_table: String::new(),
                         column: "@@max_allowed_packet".to_owned(),
+                        org_name: String::new(),
                         coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
                         column_length: 11,
                         colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
@@ -157,8 +170,11 @@ where
     }
 
     fn password_for_username(&self, username: &str) -> Option<Vec<u8>> {
-        if username == "user" {
-            Some(b"password".to_vec())
+        if let Some(f) = &self.password_fn {
+            return f(username);
+        }
+        if username == TEST_USER {
+            Some(TEST_PASSWORD.as_bytes().to_vec())
         } else {
             None
         }
@@ -166,6 +182,10 @@ where
 
     fn version(&self) -> String {
         "8.0.26-readyset\0".to_string()
+    }
+
+    fn client_encoding(&self) -> Encoding {
+        self.client_encoding
     }
 }
 
@@ -185,10 +205,7 @@ where
         ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a + Send>>
         + Send
         + 'static,
-    I: for<'a> FnMut(
-            &'a str,
-            InitWriter<'a, TcpStream>,
-        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a + Send>>
+    I: for<'a> FnMut(&'a str) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a + Send>>
         + Send
         + 'static,
     CU: for<'a> FnMut(
@@ -208,8 +225,15 @@ where
             on_e,
             on_i,
             on_cu,
+            password_fn: None,
+            client_encoding: Encoding::Utf8,
             _phantom: PhantomData,
         }
+    }
+
+    fn with_client_encoding(mut self, encoding: Encoding) -> Self {
+        self.client_encoding = encoding;
+        self
     }
 
     fn with_params(mut self, p: Vec<Column>) -> Self {
@@ -222,10 +246,34 @@ where
         self
     }
 
+    fn with_password_fn(mut self, f: impl Fn(&str) -> Option<Vec<u8>> + Send + 'static) -> Self {
+        self.password_fn = Some(Box::new(f));
+        self
+    }
+
     async fn test<C>(self, c: C)
     where
         C: for<'a> FnOnce(&'a mut mysql::Conn) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
     {
+        self.test_with_opts(c, "").await;
+    }
+
+    async fn test_with_opts<C>(self, c: C, extra_opts: &str)
+    where
+        C: for<'a> FnOnce(&'a mut mysql::Conn) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+    {
+        self.test_with_opts_server_result(c, extra_opts)
+            .await
+            .unwrap();
+    }
+
+    /// Like [`TestingShim::test_with_opts`], but returns the server's result instead of
+    /// unwrapping it, for tests that expect the server to tear down the connection.
+    async fn test_with_opts_server_result<C>(self, c: C, extra_opts: &str) -> io::Result<()>
+    where
+        C: for<'a> FnOnce(&'a mut mysql::Conn) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+    {
+        let _ = AuthKeys::initialize(None);
         let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -237,25 +285,43 @@ where
             TcpListener::from_std(listener).unwrap()
         };
 
+        // Pre-populate the auth cache with the default test user so that
+        // every caching_sha2_password client hits fast-auth without needing
+        // the RSA full-auth exchange (gated off by default).
+        let auth_cache = AuthCache::new();
+        auth_cache.insert(TEST_USER, TEST_PASSWORD.as_bytes());
+
         // Spawn the server task
         let server_handle = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            MySqlIntermediary::run_on_tcp(self, socket, false, None, TlsMode::Optional).await
+            MySqlIntermediary::run_on_tcp(
+                self,
+                socket,
+                false,
+                None,
+                TlsMode::Optional,
+                auth_cache,
+                AuthPlugin::default(),
+            )
+            .await
         });
 
         // Connect to the server
-        let mut db = mysql::Conn::new(
-            mysql::Opts::from_url(&format!("mysql://user:password@127.0.0.1:{port}")).unwrap(),
-        )
-        .await
-        .unwrap();
+        let mut url = format!("mysql://{TEST_USER}:{TEST_PASSWORD}@127.0.0.1:{port}");
+        if !extra_opts.is_empty() {
+            url.push('?');
+            url.push_str(extra_opts);
+        }
+        let mut db = mysql::Conn::new(mysql::Opts::from_url(&url).unwrap())
+            .await
+            .unwrap();
 
         // Run the test closure
         c(&mut db).await;
 
         // Clean up
         drop(db);
-        server_handle.await.unwrap().unwrap();
+        server_handle.await.unwrap()
     }
 }
 
@@ -265,7 +331,7 @@ async fn it_connects() {
         move |_, _| unreachable!(),
         move |_| unreachable!(),
         move |_, _, _| unreachable!(),
-        move |_, _| unreachable!(),
+        move |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|_| Box::pin(async move {}))
@@ -279,7 +345,7 @@ fn failed_authentication() {
         |_, _| unreachable!(),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
     );
     let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -307,9 +373,9 @@ async fn it_inits_ok() {
         |_, _| unreachable!(),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |schema, writer| {
+        |schema| {
             assert_eq!(schema, "test");
-            Box::pin(async move { writer.ok().await })
+            Box::pin(async move { Ok(()) })
         },
         |_, _, _| unreachable!(),
     )
@@ -318,8 +384,17 @@ async fn it_inits_ok() {
             db.write_command_data(Command::COM_INIT_DB, "test")
                 .await
                 .unwrap();
-            let res = db.read_packet().await;
-            assert!(res.is_ok());
+            let packet = db.read_packet().await.unwrap();
+            // OK packet: [0x00, affected_rows(0), last_insert_id(0), status_flags(2), warnings(2)]
+            assert_eq!(packet[0], 0x00, "expected OK packet");
+            let status_flags =
+                myc::constants::StatusFlags::from_bits_truncate(u16::from_le_bytes([
+                    packet[3], packet[4],
+                ]));
+            assert!(
+                status_flags.contains(myc::constants::StatusFlags::SERVER_STATUS_AUTOCOMMIT),
+                "COM_INIT_DB OK should include SERVER_STATUS_AUTOCOMMIT, got {status_flags:?}"
+            );
         })
     })
     .await;
@@ -331,16 +406,9 @@ async fn it_inits_error() {
         |_, _| unreachable!(),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |schema, writer| {
+        |schema| {
             assert_eq!(schema, "test");
-            Box::pin(async move {
-                writer
-                    .error(
-                        ErrorKind::ER_BAD_DB_ERROR,
-                        format!("Database {schema} not found").as_bytes(),
-                    )
-                    .await
-            })
+            Box::pin(async move { Err(io::Error::other(format!("Database {schema} not found"))) })
         },
         |_, _, _| unreachable!(),
     )
@@ -356,13 +424,179 @@ async fn it_inits_error() {
     .await;
 }
 
+/// Pick a byte whose decoded char is non-ASCII and encodes back to the same byte, proving a
+/// transcoding pass happened for this charset. Charsets whose decoded chars are all ASCII
+/// (ascii itself) have no such byte.
+fn non_ascii_roundtrip_probe(charset: SingleByteCharset) -> Option<char> {
+    let encoding = Encoding::SingleByte(charset);
+    (0u8..=255).find_map(|b| {
+        let s = encoding.decode(&[b]).unwrap();
+        let c = s.chars().next().unwrap();
+        (!c.is_ascii() && *encoding.encode(&s).unwrap() == [b]).then_some(c)
+    })
+}
+
+#[tokio::test]
+async fn single_byte_query_is_decoded() {
+    for &charset in SingleByteCharset::ALL {
+        let encoding = Encoding::SingleByte(charset);
+        let Some(probe) = non_ascii_roundtrip_probe(charset) else {
+            continue;
+        };
+        let expected = format!("SELECT '{probe}'");
+        let wire = encoding.encode(&expected).unwrap().into_owned();
+        let expected_query = expected.clone();
+        TestingShim::new(
+            move |query, w| {
+                assert_eq!(query, expected_query);
+                Box::pin(async move { w.completed(0, 0, None).await })
+            },
+            |_| unreachable!(),
+            |_, _, _| unreachable!(),
+            |_| unreachable!(),
+            |_, _, _| unreachable!(),
+        )
+        .with_client_encoding(encoding)
+        .test(move |db| {
+            Box::pin(async move {
+                db.write_command_data(Command::COM_QUERY, &wire)
+                    .await
+                    .unwrap();
+                let packet = db.read_packet().await.unwrap();
+                assert_eq!(packet[0], 0x00, "expected OK packet for {encoding}");
+            })
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn utf8_query_with_invalid_bytes_errors() {
+    let res = TestingShim::new(
+        |_, _| unreachable!(),
+        |_| unreachable!(),
+        |_, _, _| unreachable!(),
+        |_| unreachable!(),
+        |_, _, _| unreachable!(),
+    )
+    .test_with_opts_server_result(
+        |db| {
+            Box::pin(async move {
+                db.write_command_data(Command::COM_QUERY, b"SELECT 'N\xE3o'")
+                    .await
+                    .unwrap();
+                let res = db.read_packet().await;
+                assert!(res.is_err());
+            })
+        },
+        "",
+    )
+    .await;
+    assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn single_byte_prepare_is_decoded() {
+    for &charset in SingleByteCharset::ALL {
+        let encoding = Encoding::SingleByte(charset);
+        let Some(probe) = non_ascii_roundtrip_probe(charset) else {
+            continue;
+        };
+        let expected = format!("SELECT '{probe}'");
+        let wire = encoding.encode(&expected).unwrap().into_owned();
+        let expected_query = expected.clone();
+        TestingShim::new(
+            |_, _| unreachable!(),
+            move |query| {
+                assert_eq!(query, expected_query);
+                41
+            },
+            |_, _, _| unreachable!(),
+            |_| unreachable!(),
+            |_, _, _| unreachable!(),
+        )
+        .with_client_encoding(encoding)
+        .test(move |db| {
+            Box::pin(async move {
+                db.write_command_data(Command::COM_STMT_PREPARE, &wire)
+                    .await
+                    .unwrap();
+                let packet = db.read_packet().await.unwrap();
+                assert_eq!(packet[0], 0x00, "expected prepare OK packet for {encoding}");
+            })
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn single_byte_init_db_is_decoded() {
+    for &charset in SingleByteCharset::ALL {
+        let encoding = Encoding::SingleByte(charset);
+        let Some(probe) = non_ascii_roundtrip_probe(charset) else {
+            continue;
+        };
+        let expected = probe.to_string();
+        let wire = encoding.encode(&expected).unwrap().into_owned();
+        let expected_schema = expected.clone();
+        TestingShim::new(
+            |_, _| unreachable!(),
+            |_| unreachable!(),
+            |_, _, _| unreachable!(),
+            move |schema| {
+                assert_eq!(schema, expected_schema);
+                Box::pin(async move { Ok(()) })
+            },
+            |_, _, _| unreachable!(),
+        )
+        .with_client_encoding(encoding)
+        .test(move |db| {
+            Box::pin(async move {
+                db.write_command_data(Command::COM_INIT_DB, &wire)
+                    .await
+                    .unwrap();
+                let packet = db.read_packet().await.unwrap();
+                assert_eq!(packet[0], 0x00, "expected OK packet for {encoding}");
+            })
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn unsupported_encoding_query_falls_back_to_utf8() {
+    for encoding in [Encoding::Binary, Encoding::OtherMySql(999)] {
+        TestingShim::new(
+            |query, w| {
+                assert_eq!(query, "SELECT 'Não'");
+                Box::pin(async move { w.completed(0, 0, None).await })
+            },
+            |_| unreachable!(),
+            |_, _, _| unreachable!(),
+            |_| unreachable!(),
+            |_, _, _| unreachable!(),
+        )
+        .with_client_encoding(encoding)
+        .test(|db| {
+            Box::pin(async move {
+                db.write_command_data(Command::COM_QUERY, "SELECT 'Não'")
+                    .await
+                    .unwrap();
+                let packet = db.read_packet().await.unwrap();
+                assert_eq!(packet[0], 0x00, "expected OK packet");
+            })
+        })
+        .await;
+    }
+}
+
 #[tokio::test]
 async fn it_pings() {
     TestingShim::new(
         |_, _| unreachable!(),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|db| Box::pin(async move { assert!(db.ping().await.is_ok()) }))
@@ -375,7 +609,7 @@ async fn empty_response() {
         |_, w| Box::pin(async move { w.completed(0, 0, None).await }),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|db| {
@@ -398,7 +632,7 @@ async fn no_columns() {
         move |_, w| Box::pin(async move { w.start(&[]).await?.finish().await }),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|db| {
@@ -427,7 +661,7 @@ async fn no_columns_but_rows() {
         },
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|db| {
@@ -451,7 +685,7 @@ async fn error_response() {
         move |_, w| Box::pin(async move { w.error(err.0, err.1.as_bytes()).await }),
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|db| {
@@ -482,8 +716,11 @@ async fn it_queries_nulls() {
     TestingShim::new(
         |_, w| {
             let cols = [Column {
+                schema: String::new(),
                 table: String::new(),
+                org_table: String::new(),
                 column: "a".to_owned(),
+                org_name: String::new(),
                 coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                 column_length: 6,
                 colflags: myc::constants::ColumnFlags::empty(),
@@ -498,7 +735,7 @@ async fn it_queries_nulls() {
         },
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|db| {
@@ -516,8 +753,11 @@ async fn it_queries() {
     TestingShim::new(
         |_, w| {
             let cols = [Column {
+                schema: String::new(),
                 table: String::new(),
+                org_table: String::new(),
                 column: "a".to_owned(),
+                org_name: String::new(),
                 coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                 column_length: 6,
                 colflags: myc::constants::ColumnFlags::empty(),
@@ -532,7 +772,7 @@ async fn it_queries() {
         },
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|db| {
@@ -550,8 +790,11 @@ async fn multi_result() {
     TestingShim::new(
         |_, w| {
             let cols = [Column {
+                schema: String::new(),
                 table: String::new(),
+                org_table: String::new(),
                 column: "a".to_owned(),
+                org_name: String::new(),
                 coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                 column_length: 6,
                 colflags: myc::constants::ColumnFlags::empty(),
@@ -569,7 +812,7 @@ async fn multi_result() {
         },
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|db| {
@@ -598,8 +841,11 @@ async fn it_queries_many_rows() {
         |_, w| {
             let cols = [
                 Column {
+                    schema: String::new(),
                     table: String::new(),
+                    org_table: String::new(),
                     column: "a".to_owned(),
+                    org_name: String::new(),
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                     column_length: 6,
                     colflags: myc::constants::ColumnFlags::empty(),
@@ -607,8 +853,11 @@ async fn it_queries_many_rows() {
                     decimals: 0,
                 },
                 Column {
+                    schema: String::new(),
                     table: String::new(),
+                    org_table: String::new(),
                     column: "b".to_owned(),
+                    org_name: String::new(),
                     coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
                     column_length: 6,
                     colflags: myc::constants::ColumnFlags::empty(),
@@ -627,7 +876,7 @@ async fn it_queries_many_rows() {
         },
         |_| unreachable!(),
         |_, _, _| unreachable!(),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|db| {
@@ -648,8 +897,11 @@ async fn it_queries_many_rows() {
 #[tokio::test]
 async fn it_prepares() {
     let cols = vec![Column {
+        schema: String::new(),
         table: String::new(),
+        org_table: String::new(),
         column: "a".to_owned(),
+        org_name: String::new(),
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         column_length: 6,
         colflags: myc::constants::ColumnFlags::empty(),
@@ -658,8 +910,11 @@ async fn it_prepares() {
     }];
     let cols2 = cols.clone();
     let params = vec![Column {
+        schema: String::new(),
         table: String::new(),
+        org_table: String::new(),
         column: "c".to_owned(),
+        org_name: String::new(),
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         column_length: 6,
         colflags: myc::constants::ColumnFlags::empty(),
@@ -694,7 +949,7 @@ async fn it_prepares() {
                 w.finish().await
             })
         },
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .with_params(params)
@@ -716,8 +971,11 @@ async fn it_prepares() {
 async fn insert_exec() {
     let params = vec![
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "username".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -725,8 +983,11 @@ async fn insert_exec() {
             decimals: 0,
         },
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "email".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -734,8 +995,11 @@ async fn insert_exec() {
             decimals: 0,
         },
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "pw".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -743,8 +1007,11 @@ async fn insert_exec() {
             decimals: 0,
         },
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "created".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_DATETIME,
             column_length: 19,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -752,8 +1019,11 @@ async fn insert_exec() {
             decimals: 0,
         },
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "session".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -761,8 +1031,11 @@ async fn insert_exec() {
             decimals: 0,
         },
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "rss".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -770,8 +1043,11 @@ async fn insert_exec() {
             decimals: 0,
         },
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "mail".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_VARCHAR,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -854,7 +1130,7 @@ async fn insert_exec() {
 
             Box::pin(async move { w.completed(42, 1, None).await })
         },
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .with_params(params)
@@ -887,8 +1163,11 @@ async fn insert_exec() {
 #[tokio::test]
 async fn send_long() {
     let cols = vec![Column {
+        schema: String::new(),
         table: String::new(),
+        org_table: String::new(),
         column: "a".to_owned(),
+        org_name: String::new(),
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         column_length: 6,
         colflags: myc::constants::ColumnFlags::empty(),
@@ -897,8 +1176,11 @@ async fn send_long() {
     }];
     let cols2 = cols.clone();
     let params = vec![Column {
+        schema: String::new(),
         table: String::new(),
+        org_table: String::new(),
         column: "c".to_owned(),
+        org_name: String::new(),
         coltype: myc::constants::ColumnType::MYSQL_TYPE_BLOB,
         column_length: 65535,
         colflags: myc::constants::ColumnFlags::empty(),
@@ -933,7 +1215,7 @@ async fn send_long() {
                 w.finish().await
             })
         },
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .with_params(params)
@@ -955,8 +1237,11 @@ async fn send_long() {
 async fn it_prepares_many() {
     let cols = vec![
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "a".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -964,8 +1249,11 @@ async fn it_prepares_many() {
             decimals: 0,
         },
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "b".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -995,7 +1283,7 @@ async fn it_prepares_many() {
                 w.finish().await
             })
         },
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .with_params(Vec::new())
@@ -1021,8 +1309,11 @@ async fn it_prepares_many() {
 #[tokio::test]
 async fn prepared_empty() {
     let cols = vec![Column {
+        schema: String::new(),
         table: String::new(),
+        org_table: String::new(),
         column: "a".to_owned(),
+        org_name: String::new(),
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         column_length: 6,
         colflags: myc::constants::ColumnFlags::empty(),
@@ -1031,8 +1322,11 @@ async fn prepared_empty() {
     }];
     let cols2 = cols;
     let params = vec![Column {
+        schema: String::new(),
         table: String::new(),
+        org_table: String::new(),
         column: "c".to_owned(),
+        org_name: String::new(),
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         column_length: 6,
         colflags: myc::constants::ColumnFlags::empty(),
@@ -1047,7 +1341,7 @@ async fn prepared_empty() {
             assert!(!params.is_empty());
             Box::pin(async move { w.completed(0, 0, None).await })
         },
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .with_params(params)
@@ -1069,8 +1363,11 @@ async fn prepared_empty() {
 #[tokio::test]
 async fn prepared_no_params() {
     let cols = vec![Column {
+        schema: String::new(),
         table: String::new(),
+        org_table: String::new(),
         column: "a".to_owned(),
+        org_name: String::new(),
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         column_length: 6,
         colflags: myc::constants::ColumnFlags::empty(),
@@ -1092,7 +1389,7 @@ async fn prepared_no_params() {
                 w.finish().await
             })
         },
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .with_params(params)
@@ -1111,8 +1408,11 @@ async fn prepared_no_params() {
 async fn prepared_nulls() {
     let cols = vec![
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "a".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -1120,8 +1420,11 @@ async fn prepared_nulls() {
             decimals: 0,
         },
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "b".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -1132,8 +1435,11 @@ async fn prepared_nulls() {
     let cols2 = cols.clone();
     let params = vec![
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "c".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -1141,8 +1447,11 @@ async fn prepared_nulls() {
             decimals: 0,
         },
         Column {
+            schema: String::new(),
             table: String::new(),
+            org_table: String::new(),
             column: "d".to_owned(),
+            org_name: String::new(),
             coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
             column_length: 6,
             colflags: myc::constants::ColumnFlags::empty(),
@@ -1180,7 +1489,7 @@ async fn prepared_nulls() {
                 w.finish().await
             })
         },
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .with_params(params)
@@ -1205,8 +1514,11 @@ async fn prepared_nulls() {
 #[tokio::test]
 async fn prepared_no_rows() {
     let cols = vec![Column {
+        schema: String::new(),
         table: String::new(),
+        org_table: String::new(),
         column: "a".to_owned(),
+        org_name: String::new(),
         coltype: myc::constants::ColumnType::MYSQL_TYPE_SHORT,
         column_length: 6,
         colflags: myc::constants::ColumnFlags::empty(),
@@ -1221,7 +1533,7 @@ async fn prepared_no_rows() {
             let cols = cols.clone();
             Box::pin(async move { w.start(&cols[..]).await?.finish().await })
         },
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .with_columns(cols2)
@@ -1251,7 +1563,7 @@ async fn prepared_no_cols_but_rows() {
                 w.finish().await
             })
         },
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|db| {
@@ -1274,7 +1586,7 @@ async fn prepared_no_cols() {
         |_, _| unreachable!(),
         |_| 0,
         move |_, _, w| Box::pin(async move { w.start(&[]).await?.finish().await }),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(|db| {
@@ -1301,7 +1613,7 @@ async fn really_long_query() {
         },
         |_| 0,
         |_, _, _| unreachable!(),
-        |_, _| unreachable!(),
+        |_| unreachable!(),
         move |_, _, _| unreachable!(),
     )
     .test(move |db| {
@@ -1310,4 +1622,247 @@ async fn really_long_query() {
         })
     })
     .await;
+}
+
+/// Regression test for REA-6058: queries larger than MAX_PACKET_CHUNK_SIZE (16MB) are split into
+/// multiple MySQL protocol segments. The server must use the correct sequence number (accounting
+/// for all segments) when sending the response. Previously, the server used `first_seq + 1`
+/// instead of `first_seq + num_segments`, causing "packet out of order" on the client.
+#[tokio::test]
+async fn large_packet_query_response_seq() {
+    // Build a query that exceeds 16MB (MAX_PACKET_CHUNK_SIZE = 16_777_215).
+    // We use a simple SELECT with a huge comment to avoid any parsing complexity.
+    let padding = "x".repeat(17_000_000);
+    let query = format!("SELECT 1 /* {padding} */");
+    let expected_len = query.len();
+
+    TestingShim::new(
+        move |q, w| {
+            // Verify the server received the full query
+            assert_eq!(q.len(), expected_len);
+            Box::pin(async move { w.completed(0, 0, None).await })
+        },
+        |_| 0,
+        |_, _, _| unreachable!(),
+        |_| unreachable!(),
+        move |_, _, _| unreachable!(),
+    )
+    .test_with_opts(
+        move |db| {
+            Box::pin(async move {
+                // This would fail with "packet out of order" before the fix because the server
+                // response had seq=1 (based on first chunk) instead of seq=2 (after both chunks).
+                db.query_drop(&query).await.unwrap();
+            })
+        },
+        "max_allowed_packet=67108864",
+    )
+    .await;
+}
+
+fn ensure_auth_keys() {
+    let _ = AuthKeys::initialize(None);
+}
+
+/// Helper: spin up a server that uses `caching_sha2_password` and accepts
+/// `num_connections` sequential connections, then connect with `mysql_async`.
+///
+/// The closure receives a list of connection URLs for each accepted
+/// connection. For single-connection tests pass `num_connections = 1`.
+async fn sha2_test_server<F, Fut>(
+    user: &str,
+    password: &str,
+    auth_cache: Arc<AuthCache>,
+    num_connections: usize,
+    test_fn: F,
+) where
+    F: FnOnce(u16, Arc<AuthCache>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    ensure_auth_keys();
+
+    let listener = net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+
+    listener
+        .set_nonblocking(true)
+        .expect("couldn't set nonblocking");
+    let listener = TcpListener::from_std(listener).expect("from_std");
+
+    let stored_user = user.to_string();
+    let stored_password = password.to_string();
+    let server_cache = Arc::clone(&auth_cache);
+
+    let server_handle = tokio::spawn(async move {
+        for _ in 0..num_connections {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let user = stored_user.clone();
+            let pass = stored_password.clone();
+            let cache = Arc::clone(&server_cache);
+
+            let shim = TestingShim::new(
+                move |_, w| Box::pin(async move { w.completed(0, 0, None).await }),
+                |_| 0,
+                |_, _, _| unreachable!(),
+                |_| Box::pin(async move { Ok(()) }),
+                |_, _, _| Box::pin(async move { Ok(()) }),
+            )
+            .with_password_fn(move |username| {
+                if username == user {
+                    Some(pass.as_bytes().to_vec())
+                } else {
+                    None
+                }
+            });
+
+            MySqlIntermediary::run_on_tcp(
+                shim,
+                socket,
+                false,
+                None,
+                TlsMode::Optional,
+                cache,
+                AuthPlugin::Sha2(CachingSha2Password),
+            )
+            .await
+            .expect("server run");
+        }
+    });
+
+    let test_handle = tokio::spawn(test_fn(port, auth_cache));
+    test_handle.await.expect("test_fn");
+    server_handle.await.expect("server");
+}
+
+/// T1: Connect with caching_sha2_password over non-TLS (RSA key exchange).
+#[tokio::test]
+#[ignore = "full-auth path disabled to avoid RUSTSEC-2023-0071; see mysql-srv/src/authentication.rs"]
+async fn sha2_rsa_key_exchange() {
+    let cache = AuthCache::new();
+    sha2_test_server("user", "password", cache, 1, |port, _cache| async move {
+        let url = format!("mysql://user:password@127.0.0.1:{port}?prefer_socket=false");
+        let mut db = mysql::Conn::new(mysql::Opts::from_url(&url).expect("url"))
+            .await
+            .expect("connect");
+        assert!(db.ping().await.is_ok());
+        drop(db);
+    })
+    .await;
+}
+
+/// T5: Wrong password is rejected.
+#[tokio::test]
+async fn sha2_wrong_password_rejected() {
+    let cache = AuthCache::new();
+    sha2_test_server("user", "password", cache, 1, |port, _cache| async move {
+        let url = format!("mysql://user:wrong@127.0.0.1:{port}?prefer_socket=false");
+        let res = mysql::Conn::new(mysql::Opts::from_url(&url).expect("url")).await;
+        assert!(res.is_err(), "connection with wrong password should fail");
+    })
+    .await;
+}
+
+/// T3: First connection populates the cache, second uses fast-auth.
+#[tokio::test]
+#[ignore = "full-auth path disabled to avoid RUSTSEC-2023-0071; see mysql-srv/src/authentication.rs"]
+async fn sha2_cache_population_then_fast_auth() {
+    let cache = AuthCache::new();
+    sha2_test_server("user", "password", cache, 2, |port, _cache| async move {
+        let url = format!("mysql://user:password@127.0.0.1:{port}?prefer_socket=false");
+
+        // First connection: full auth (cache miss -> RSA exchange)
+        let mut db1 = mysql::Conn::new(mysql::Opts::from_url(&url).expect("url"))
+            .await
+            .expect("first connect");
+        assert!(db1.ping().await.is_ok());
+        drop(db1);
+
+        // Second connection: fast auth (cache hit)
+        let mut db2 = mysql::Conn::new(mysql::Opts::from_url(&url).expect("url"))
+            .await
+            .expect("second connect (fast auth)");
+        assert!(db2.ping().await.is_ok());
+        drop(db2);
+    })
+    .await;
+}
+
+/// T6: Empty password allowed when server has no stored password.
+#[tokio::test]
+async fn sha2_empty_password_allowed() {
+    let cache = AuthCache::new();
+    // Server stores no password for "nopass" (password_for_username
+    // returns None).
+    sha2_test_server("nopass", "", cache, 1, |port, _cache| async move {
+        let url = format!("mysql://nopass@127.0.0.1:{port}?prefer_socket=false");
+        let mut db = mysql::Conn::new(mysql::Opts::from_url(&url).expect("url"))
+            .await
+            .expect("connect with empty password");
+        assert!(db.ping().await.is_ok());
+        drop(db);
+    })
+    .await;
+}
+
+/// T7: Empty password rejected when server has a stored password.
+#[tokio::test]
+async fn sha2_empty_password_rejected_when_stored_exists() {
+    let cache = AuthCache::new();
+    sha2_test_server("user", "password", cache, 1, |port, _cache| async move {
+        let url = format!("mysql://user@127.0.0.1:{port}?prefer_socket=false");
+        let res = mysql::Conn::new(mysql::Opts::from_url(&url).expect("url")).await;
+        assert!(
+            res.is_err(),
+            "empty password should be rejected when server has stored password"
+        );
+    })
+    .await;
+}
+
+/// T13: Failed authentication returns the correct error code (was
+/// previously commented out).
+#[tokio::test]
+async fn failed_authentication() {
+    let _ = AuthKeys::initialize(None);
+    let listener = net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    listener
+        .set_nonblocking(true)
+        .expect("couldn't set nonblocking");
+    let listener = TcpListener::from_std(listener).expect("from_std");
+
+    let server_handle = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.expect("accept");
+        let shim = TestingShim::new(
+            move |_, _| unreachable!(),
+            move |_| unreachable!(),
+            move |_, _, _| unreachable!(),
+            move |_| unreachable!(),
+            move |_, _, _| unreachable!(),
+        );
+        // Server ignores the result; the test validates the client error.
+        let _ = MySqlIntermediary::run_on_tcp(
+            shim,
+            socket,
+            false,
+            None,
+            TlsMode::Optional,
+            AuthCache::new(),
+            AuthPlugin::default(),
+        )
+        .await;
+    });
+
+    let url = format!("mysql://user:bad_password@127.0.0.1:{port}");
+    let res = mysql::Conn::new(mysql::Opts::from_url(&url).expect("url")).await;
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        mysql::Error::Server(err) => {
+            assert_eq!(err.code, ErrorKind::ER_ACCESS_DENIED_ERROR as u16);
+            assert_eq!(err.message, "Access denied for user user");
+        }
+        err => panic!("Expected mysql server error, got: {err:?}"),
+    }
+
+    server_handle.await.expect("server");
 }

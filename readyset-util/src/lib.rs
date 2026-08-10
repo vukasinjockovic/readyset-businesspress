@@ -4,7 +4,7 @@
 #![deny(missing_docs, rustdoc::missing_crate_level_docs)]
 
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::mem::size_of_val;
 use std::sync::Arc;
@@ -29,6 +29,7 @@ pub mod redacted;
 pub mod reverb_http;
 pub mod shared_cache;
 pub mod shutdown;
+pub mod timestamp;
 
 mod time_scope;
 pub use time_scope::time_scope;
@@ -173,7 +174,11 @@ pub trait SizeOf {
     fn deep_size_of(&self) -> usize;
 
     /// Returns whether this value should be considered empty for memory tracking purposes.
-    fn is_empty(&self) -> bool;
+    ///
+    /// Named `size_is_empty` to avoid colliding with inherent `is_empty()` methods on
+    /// standard types (e.g., `Vec::is_empty`, `[T]::is_empty`), which can be shadowed
+    /// through blanket impls on wrapper types like `Arc<Vec<T>>`.
+    fn size_is_empty(&self) -> bool;
 }
 
 impl<T> SizeOf for Vec<T>
@@ -184,7 +189,7 @@ where
         size_of_val(self) + self.iter().map(|x| x.deep_size_of()).sum::<usize>()
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         false
     }
 }
@@ -197,7 +202,7 @@ where
         size_of_val(self) + self.iter().map(|x| x.deep_size_of()).sum::<usize>() + 8
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         false
     }
 }
@@ -210,8 +215,8 @@ where
         (**self).deep_size_of()
     }
 
-    fn is_empty(&self) -> bool {
-        (**self).is_empty()
+    fn size_is_empty(&self) -> bool {
+        (**self).size_is_empty()
     }
 }
 
@@ -220,7 +225,7 @@ impl<H, T> SizeOf for triomphe::ThinArc<H, T> {
         size_of::<Self>() + size_of_val(&self.slice)
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         self.slice.is_empty()
     }
 }
@@ -230,7 +235,7 @@ impl SizeOf for &str {
         self.len()
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         false
     }
 }
@@ -240,7 +245,7 @@ impl SizeOf for String {
         self.len()
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         false
     }
 }
@@ -252,7 +257,7 @@ macro_rules! sizeof_integer {
                 size_of::<$t>()
             }
 
-            fn is_empty(&self) -> bool {
+            fn size_is_empty(&self) -> bool {
                 false
             }
         }
@@ -269,6 +274,57 @@ sizeof_integer!(i16);
 sizeof_integer!(i32);
 sizeof_integer!(i64);
 sizeof_integer!(i128);
+sizeof_integer!(usize);
+sizeof_integer!(isize);
+
+impl<K, V, S> SizeOf for HashMap<K, V, S>
+where
+    K: SizeOf,
+    V: SizeOf,
+{
+    fn deep_size_of(&self) -> usize {
+        size_of_val(self)
+            + self
+                .iter()
+                .map(|(k, v)| k.deep_size_of() + v.deep_size_of())
+                .sum::<usize>()
+    }
+
+    fn size_is_empty(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl<K, V> SizeOf for BTreeMap<K, V>
+where
+    K: SizeOf,
+    V: SizeOf,
+{
+    fn deep_size_of(&self) -> usize {
+        size_of_val(self)
+            + self
+                .iter()
+                .map(|(k, v)| k.deep_size_of() + v.deep_size_of())
+                .sum::<usize>()
+    }
+
+    fn size_is_empty(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl<T, S> SizeOf for HashSet<T, S>
+where
+    T: SizeOf,
+{
+    fn deep_size_of(&self) -> usize {
+        size_of_val(self) + self.iter().map(|v| v.deep_size_of()).sum::<usize>()
+    }
+
+    fn size_is_empty(&self) -> bool {
+        self.is_empty()
+    }
+}
 
 impl<A, B> SizeOf for (A, B)
 where
@@ -279,7 +335,7 @@ where
         size_of::<A>() + size_of::<B>()
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         false
     }
 }
@@ -292,7 +348,7 @@ where
         size_of::<Self>() + self.as_ref().map_or(0, |v| v.deep_size_of())
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         self.is_none()
     }
 }

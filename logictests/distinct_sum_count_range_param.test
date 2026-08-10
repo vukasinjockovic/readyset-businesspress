@@ -1,0 +1,95 @@
+statement ok
+CREATE TABLE t (id INT PRIMARY KEY, cat INT, v INT)
+
+statement ok
+INSERT INTO t (id, cat, v) VALUES
+  (1, 1, 10),
+  (2, 1, 20),
+  (3, 1, 20),
+  (4, 2, 30),
+  (5, 2, 30),
+  (6, 2, 30),
+  (7, 3, 40),
+  (8, 3, 50),
+  (9, 3, 50)
+
+# DISTINCT SUM ungrouped: one row, DISTINCT is a no-op.
+# id > 2 → 7 rows: 20+30+30+30+40+50+50 = 250
+query I nosort
+SELECT DISTINCT SUM(v) FROM t WHERE id > ?
+? = 2
+----
+250
+
+# DISTINCT COUNT ungrouped: one row.
+query I nosort
+SELECT DISTINCT COUNT(v) FROM t WHERE id > ?
+? = 2
+----
+7
+
+# DISTINCT MIN / MAX ungrouped.
+query I nosort
+SELECT DISTINCT MIN(v) FROM t WHERE id > ?
+? = 2
+----
+20
+
+query I nosort
+SELECT DISTINCT MAX(v) FROM t WHERE id > ?
+? = 2
+----
+50
+
+# DISTINCT SUM grouped.
+# id > 2 by cat: cat 1: 20, cat 2: 90, cat 3: 140 → {20, 90, 140}
+query I rowsort
+SELECT DISTINCT SUM(v) FROM t WHERE id > ? GROUP BY cat
+? = 2
+----
+140
+20
+90
+
+# DISTINCT COUNT grouped: cat 1: 1, cat 2: 3, cat 3: 3 → {1, 3}
+query I rowsort
+SELECT DISTINCT COUNT(v) FROM t WHERE id > ? GROUP BY cat
+? = 2
+----
+1
+3
+
+# DISTINCT MIN grouped: cat 1: 20, cat 2: 30, cat 3: 40 → {20, 30, 40}
+query I rowsort
+SELECT DISTINCT MIN(v) FROM t WHERE id > ? GROUP BY cat
+? = 2
+----
+20
+30
+40
+
+# DISTINCT MAX grouped: cat 1: 20, cat 2: 30, cat 3: 50 → {20, 30, 50}
+query I rowsort
+SELECT DISTINCT MAX(v) FROM t WHERE id > ? GROUP BY cat
+? = 2
+----
+20
+30
+50
+
+# DISTINCT + ORDER BY + LIMIT over grouped aggregate.
+query I nosort
+SELECT DISTINCT SUM(v) AS s FROM t WHERE id > ? GROUP BY cat ORDER BY s LIMIT 2
+? = 2
+----
+20
+90
+
+# DISTINCT AVG with post-lookup aggregation (REA-6581):
+# id > 2 -> v in {20, 30, 30, 30, 40, 50, 50}, sum=250, count=7 -> AVG ~= 35.7143.
+# DISTINCT over a single-row aggregate collapses to that one row.
+query R rowsort
+SELECT DISTINCT AVG(v) FROM t WHERE id > ?
+? = 2
+----
+35.7143

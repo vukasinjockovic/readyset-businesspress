@@ -7,9 +7,10 @@ pub use database_utils::UpstreamConfig;
 use readyset_adapter_types::{DeallocateId, PreparedStatementType};
 use readyset_client_metrics::QueryDestination;
 use readyset_data::DfValue;
+use readyset_data::encoding::Encoding;
 use readyset_errors::ReadySetError;
-use readyset_shallow::CacheInsertGuard;
-use readyset_sql::ast::{SqlIdentifier, StartTransactionStatement};
+use readyset_shallow::{CacheInsertGuard, ContentHash};
+use readyset_sql::ast::SqlIdentifier;
 use readyset_util::SizeOf;
 use readyset_util::redacted::RedactedString;
 use tracing::debug;
@@ -22,10 +23,13 @@ pub trait Refresh {
     /// The type of value in the shallow cache.
     type Entry: Send + Sync + 'static;
 
-    /// Populate the cache with data from this query result
+    /// Populate the cache with data from this query result. `encoding` is the results charset
+    /// of the entry being refreshed, which the connection that produced this result had mirrored
+    /// upstream. Upstreams without a results charset concept ignore it.
     async fn refresh(
         self,
-        cache: CacheInsertGuard<Vec<DfValue>, Self::Entry>,
+        cache: CacheInsertGuard<crate::shallow_key::ShallowKey, Self::Entry>,
+        encoding: Encoding,
     ) -> std::io::Result<()>;
 }
 
@@ -103,7 +107,7 @@ pub trait UpstreamDatabase: Sized + Send {
     type ShallowExecMeta: Borrow<Self::ExecMeta> + Debug + Clone + Send + Sync + 'static;
 
     /// The type of data this protocol stores into an entry in a shallow cache.
-    type CacheEntry: Debug + Send + Sync + SizeOf + 'static;
+    type CacheEntry: Debug + Send + Sync + SizeOf + ContentHash + 'static;
 
     /// Errors that can be returned from operations on this database
     ///
@@ -126,10 +130,16 @@ pub trait UpstreamDatabase: Sized + Send {
         upstream_config: UpstreamConfig,
         username: Option<String>,
         password: Option<String>,
+        interactive: bool,
     ) -> Result<Self, Self::Error>;
 
     /// Set the user for the upstream connection
     async fn set_user(&mut self, user: &str, password: RedactedString) -> Result<(), Self::Error>;
+
+    /// Mark whether the client session this upstream serves is interactive (the MySQL
+    /// `CLIENT_INTERACTIVE` capability). Applied when the upstream connection is established.
+    /// Default implementation is a no-op for upstreams without an interactive concept.
+    fn set_interactive(&mut self, _interactive: bool) {}
 
     /// Test the connection with the upstream database
     async fn is_connected(&mut self) -> Result<bool, Self::Error>;
@@ -229,9 +239,12 @@ pub trait UpstreamDatabase: Sized + Send {
     ) -> Result<Self::QueryResult<'a>, Self::Error>;
 
     /// Handle starting a transaction with the upstream database.
+    ///
+    /// Takes the client's original query text rather than a reconstructed statement so that
+    /// modifiers the AST does not model (isolation level, read-only, deferrable) reach upstream.
     async fn start_tx<'a>(
         &'a mut self,
-        stmt: &StartTransactionStatement,
+        query: &'a str,
     ) -> Result<Self::QueryResult<'a>, Self::Error>;
 
     /// Handle committing a transaction to the upstream database.
@@ -250,10 +263,23 @@ pub trait UpstreamDatabase: Sized + Send {
     /// Set the schema search path for future queries on the upstream database.
     async fn set_schema_search_path(&mut self, path: &[SqlIdentifier]) -> Result<(), Self::Error>;
 
+    /// Set the session's `character_set_results` on the upstream connection so proxied result
+    /// rows come back in the client's charset. The default implementation is a no-op for
+    /// upstreams without that concept (PostgreSQL).
+    async fn set_results_character_set(&mut self, _charset: &str) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     async fn timezone_name(&mut self) -> Result<SqlIdentifier, Self::Error>;
 
     async fn lower_case_database_names(&mut self) -> Result<bool, Self::Error>;
     async fn lower_case_table_names(&mut self) -> Result<bool, Self::Error>;
+
+    /// Query the upstream database for its configured `group_concat_max_len` value.
+    /// Defaults to MySQL's default of 1024.
+    async fn group_concat_max_len(&mut self) -> Result<usize, Self::Error> {
+        Ok(readyset_data::upstream_system_props::DEFAULT_GROUP_CONCAT_MAX_LEN)
+    }
 
     /// Convert the supplied metadata into temporary metadata during a shallow cache insertion.
     async fn shallow_exec_meta(
@@ -270,6 +296,10 @@ pub struct LazyUpstream<U> {
     upstream_config: UpstreamConfig,
     username: Option<String>,
     password: Option<String>,
+    interactive: bool,
+    /// The session's results charset, replayed onto the underlying connection whenever one is
+    /// established so reconnects keep returning proxied results in the client's charset.
+    pending_results_charset: Option<String>,
 }
 
 impl<U> From<UpstreamConfig> for LazyUpstream<U> {
@@ -279,6 +309,8 @@ impl<U> From<UpstreamConfig> for LazyUpstream<U> {
             upstream_config,
             username: None,
             password: None,
+            interactive: false,
+            pending_results_charset: None,
         }
     }
 }
@@ -289,14 +321,17 @@ where
 {
     pub async fn connect(&mut self) -> Result<(), U::Error> {
         debug!("LazyUpstream connecting to upstream");
-        self.upstream = Some(
-            U::connect(
-                self.upstream_config.clone(),
-                self.username.clone(),
-                self.password.clone(),
-            )
-            .await?,
-        );
+        let mut upstream = U::connect(
+            self.upstream_config.clone(),
+            self.username.clone(),
+            self.password.clone(),
+            self.interactive,
+        )
+        .await?;
+        if let Some(charset) = &self.pending_results_charset {
+            upstream.set_results_character_set(charset).await?;
+        }
+        self.upstream = Some(upstream);
         Ok(())
     }
 
@@ -332,12 +367,15 @@ where
         upstream_config: UpstreamConfig,
         username: Option<String>,
         password: Option<String>,
+        interactive: bool,
     ) -> Result<Self, Self::Error> {
         Ok(Self {
             upstream: None,
             upstream_config,
             username,
             password,
+            interactive,
+            pending_results_charset: None,
         })
     }
 
@@ -345,6 +383,10 @@ where
         self.username = Some(user.to_string());
         self.password = Some(password.to_string());
         Ok(())
+    }
+
+    fn set_interactive(&mut self, interactive: bool) {
+        self.interactive = interactive;
     }
 
     async fn is_connected(&mut self) -> Result<bool, Self::Error> {
@@ -433,6 +475,14 @@ where
         self.upstream().await?.remove_statement(statement_id).await
     }
 
+    async fn set_results_character_set(&mut self, charset: &str) -> Result<(), Self::Error> {
+        self.pending_results_charset = Some(charset.to_string());
+        if let Some(u) = &mut self.upstream {
+            u.set_results_character_set(charset).await?;
+        }
+        Ok(())
+    }
+
     async fn query<'a>(&'a mut self, query: &'a str) -> Result<Self::QueryResult<'a>, Self::Error> {
         self.upstream().await?.query(query).await
     }
@@ -454,9 +504,9 @@ where
 
     async fn start_tx<'a>(
         &'a mut self,
-        stmt: &StartTransactionStatement,
+        query: &'a str,
     ) -> Result<Self::QueryResult<'a>, Self::Error> {
-        self.upstream().await?.start_tx(stmt).await
+        self.upstream().await?.start_tx(query).await
     }
 
     async fn commit<'a>(&'a mut self) -> Result<Self::QueryResult<'a>, Self::Error> {
@@ -485,6 +535,10 @@ where
 
     async fn lower_case_table_names(&mut self) -> Result<bool, Self::Error> {
         self.upstream().await?.lower_case_table_names().await
+    }
+
+    async fn group_concat_max_len(&mut self) -> Result<usize, Self::Error> {
+        self.upstream().await?.group_concat_max_len().await
     }
 
     async fn shallow_exec_meta(

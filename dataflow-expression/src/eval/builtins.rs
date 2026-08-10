@@ -44,6 +44,17 @@ macro_rules! try_cast_or_none {
     }};
 }
 
+/// Build a text [`DfValue`] using the collation from a result type. The eval side of a
+/// string-producing builtin must honor the collation that lowering already picked via
+/// [`crate::lower::resolve_collation`] so that downstream `PartialEq` short-circuits on
+/// `collation_hash` agree across operands.
+fn text_with_collation(s: &str, ty: &DfType) -> ReadySetResult<DfValue> {
+    let Some(collation) = ty.collation() else {
+        internal!("text-producing builtin given non-text result type {ty:?}");
+    };
+    Ok(DfValue::from_str_and_collation(s, collation))
+}
+
 /// Returns the type of data stored in a JSON value as a string.
 fn get_json_value_type(json: &serde_json::Value) -> &'static str {
     match json {
@@ -829,7 +840,7 @@ impl BuiltinFunction {
                 if time_param1.is_none()
                     || time_param1
                         .sql_type()
-                        .and_then(|st| time_param2.sql_type().map(|st2| (st, st2)))
+                        .zip(time_param2.sql_type())
                         .filter(|(st1, st2)| st1.eq(st2))
                         .is_none()
                 {
@@ -1041,6 +1052,13 @@ impl BuiltinFunction {
                     *allow_duplicate_keys,
                 )
             }
+            BuiltinFunction::JsonBuildArray { args, dialect } => {
+                let pairs = args
+                    .iter()
+                    .map(|arg| Ok((arg.eval(record)?, arg.ty().clone())))
+                    .collect::<ReadySetResult<Vec<_>>>()?;
+                crate::eval::json::json_build_array(&pairs, dialect.engine())
+            }
             BuiltinFunction::JsonTypeof(expr) => {
                 let json = non_null!(expr.eval(record)?).to_json()?;
                 Ok(get_json_value_type(&json).into())
@@ -1163,18 +1181,16 @@ impl BuiltinFunction {
             }
             BuiltinFunction::Coalesce(arg1, rest_args) => {
                 let val1 = arg1.eval(record)?;
-                let rest_vals = rest_args
-                    .iter()
-                    .map(|expr| expr.eval(record))
-                    .collect::<Result<Vec<_>, _>>()?;
                 if !val1.is_none() {
-                    Ok(val1)
-                } else {
-                    Ok(rest_vals
-                        .into_iter()
-                        .find(|v| !v.is_none())
-                        .unwrap_or(DfValue::None))
+                    return Ok(val1);
                 }
+                for arg in rest_args {
+                    let val = arg.eval(record)?;
+                    if !val.is_none() {
+                        return Ok(val);
+                    }
+                }
+                Ok(DfValue::None)
             }
             BuiltinFunction::Concat(arg1, rest_args) => {
                 let mut s = <&str>::try_from(&non_null!(arg1.eval(record)?))?.to_owned();
@@ -1184,7 +1200,7 @@ impl BuiltinFunction {
                     s.push_str((&val).try_into()?)
                 }
 
-                Ok(s.into())
+                text_with_collation(&s, ty)
             }
             BuiltinFunction::ConcatWs(separator, first_arg, rest_args) => {
                 let separator = <&str>::try_from(&non_null!(separator.eval(record)?))?.to_owned();
@@ -1212,11 +1228,21 @@ impl BuiltinFunction {
                     }
                 }
 
-                Ok(result.into())
+                text_with_collation(&result, ty)
             }
             BuiltinFunction::Substring(string, from, len) => {
                 let string = non_null!(string.eval(record)?);
-                let s = <&str>::try_from(&string)?;
+                // MySQL implicitly casts non-string types to their string
+                // representation for SUBSTRING. Fall back to Display when
+                // the value isn't directly convertible to &str.
+                let fallback;
+                let s = match <&str>::try_from(&string) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        fallback = string.to_string();
+                        &fallback
+                    }
+                };
 
                 let from = match from {
                     Some(from) => non_null!(from.eval(record)?).try_into()?,
@@ -1261,21 +1287,20 @@ impl BuiltinFunction {
                         let parts = parts.collect::<Vec<_>>();
                         let rfield = -field as usize;
                         if rfield >= parts.len() {
-                            return Ok("".into());
+                            return text_with_collation("", ty);
                         }
-                        Ok(parts
-                            .get(parts.len() - rfield)
-                            .copied()
-                            .unwrap_or("")
-                            .into())
+                        text_with_collation(
+                            parts.get(parts.len() - rfield).copied().unwrap_or(""),
+                            ty,
+                        )
                     }
                     Ordering::Equal => Err(invalid_query_err!("field position must not be zero")),
-                    Ordering::Greater => {
-                        Ok(parts
+                    Ordering::Greater => text_with_collation(
+                        parts
                             .nth((field - 1/* 1-indexed */).try_into().unwrap())
-                            .unwrap_or("")
-                            .into())
-                    }
+                            .unwrap_or(""),
+                        ty,
+                    ),
                 }
             }
             BuiltinFunction::Greatest { args, compare_as } => {
@@ -1322,7 +1347,7 @@ impl BuiltinFunction {
                     }
                 }
 
-                Ok(res.into())
+                text_with_collation(&res, ty)
             }
             BuiltinFunction::DateTrunc(precision, source) => {
                 let precision =
@@ -1580,7 +1605,7 @@ impl BuiltinFunction {
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveTime;
+    use chrono::{NaiveDate, NaiveTime};
     use chrono_tz::{Asia, Atlantic};
     use lazy_static::lazy_static;
     use pretty_assertions::assert_eq;
@@ -1625,6 +1650,37 @@ mod tests {
             MySQL => crate::Dialect::DEFAULT_MYSQL,
         };
         Expr::lower(ast, expr_dialect, &numbered_columns()).unwrap()
+    }
+
+    /// Postgres passes non-finite values through `round` unchanged.
+    #[test]
+    fn eval_call_round_non_finite() {
+        let round = parse_and_lower("round(c0)", PostgreSQL);
+        for val in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert_eq!(
+                round.eval(&[DfValue::Double(val)]).unwrap(),
+                DfValue::Double(val),
+                "round({val})"
+            );
+            assert_eq!(
+                round.eval(&[DfValue::Float(val as f32)]).unwrap(),
+                DfValue::Float(val as f32),
+                "round({val} as f32)"
+            );
+        }
+
+        let round_to_2 = parse_and_lower("round(c0, 2)", PostgreSQL);
+        for decimal in [
+            readyset_decimal::Decimal::Infinity,
+            readyset_decimal::Decimal::NegativeInfinity,
+            readyset_decimal::Decimal::NaN,
+        ] {
+            let value = DfValue::Numeric(std::sync::Arc::new(decimal));
+            assert_eq!(
+                round_to_2.eval(std::slice::from_ref(&value)).unwrap(),
+                value
+            );
+        }
     }
 
     #[test]
@@ -2296,7 +2352,13 @@ mod tests {
             MySQL,
         );
         let res = expr.eval::<DfValue>(&[]).unwrap();
-        assert_eq!(res, "First name,Second name,Last Name".into());
+        assert_eq!(
+            res,
+            DfValue::from_str_and_collation(
+                "First name,Second name,Last Name",
+                Collation::Utf8AiCi,
+            ),
+        );
 
         let expr = parse_and_lower("concat_ws(',', '', 'b', 'c')", MySQL);
         let res = expr.eval::<DfValue>(&[]).unwrap();
@@ -2305,13 +2367,15 @@ mod tests {
 
     #[test]
     fn concat_ws_with_nulls() {
+        let expected = DfValue::from_str_and_collation("First name,Last Name", Collation::Utf8AiCi);
+
         let expr = parse_and_lower("concat_ws(',', 'First name', null, 'Last Name')", MySQL);
         let res = expr.eval::<DfValue>(&[]).unwrap();
-        assert_eq!(res, "First name,Last Name".into());
+        assert_eq!(res, expected);
 
         let expr = parse_and_lower("concat_ws(',', null, 'First name', 'Last Name')", MySQL);
         let res = expr.eval::<DfValue>(&[]).unwrap();
-        assert_eq!(res, "First name,Last Name".into());
+        assert_eq!(res, expected);
     }
 
     #[test]
@@ -2636,6 +2700,28 @@ mod tests {
             test("'[1, 2, 3]'", Some(3));
         }
 
+        #[test]
+        fn json_build_array() {
+            #[track_caller]
+            fn test(args: &str, expected: &str) {
+                for f in ["json_build_array", "jsonb_build_array"] {
+                    let expr = format!("{f}({args})");
+                    assert_eq!(
+                        eval_expr(&expr, PostgreSQL),
+                        expected.into(),
+                        "incorrect result for `{expr}`"
+                    );
+                }
+            }
+
+            test("", "[]");
+            test("1, 2, 3", "[1,2,3]");
+            // Mixed argument types are each rendered to their JSON form, and NULL
+            // arguments become JSON nulls rather than propagating the NULL.
+            test("'a', 2, null", r#"["a",2,null]"#);
+            test("null", "[null]");
+        }
+
         mod json_depth {
             use super::*;
             use pretty_assertions::assert_eq;
@@ -2902,7 +2988,7 @@ mod tests {
 
         mod json_object {
             use super::*;
-            use crate::utils::{empty_array_expr, iter_to_array_expr};
+            use crate::utils::{empty_array_expr_with_cast, iter_to_array_expr};
             use pretty_assertions::assert_eq;
 
             #[track_caller]
@@ -2953,8 +3039,8 @@ mod tests {
             #[test]
             fn null_propagation() {
                 test_nullable("null", None, None);
-                test_nullable("null", Some("array[]"), None);
-                test_nullable("array[]", Some("null"), None);
+                test_nullable("null", Some("array[]::text[]"), None);
+                test_nullable("array[]::text[]", Some("null"), None);
             }
 
             #[test]
@@ -2992,7 +3078,16 @@ mod tests {
             fn pairs_2d() {
                 #[track_caller]
                 fn test(pairs: &[[&str; 2]], expected_json: &str) {
-                    let pairs = iter_to_array_expr(pairs.iter().map(strings_to_array_expr));
+                    // Empty arrays collapse to 1-D under PG's dimensionless
+                    // empty-array semantics, so the cast's bracket count is
+                    // immaterial for the empty branch -- a 2-D cast is used
+                    // here only for syntactic parity with the non-empty
+                    // branch.  The non-empty branch is the actual 2-D test.
+                    let pairs = if pairs.is_empty() {
+                        empty_array_expr_with_cast(2, "text")
+                    } else {
+                        iter_to_array_expr(pairs.iter().map(strings_to_array_expr))
+                    };
                     test_non_null(&pairs, None, expected_json);
                 }
 
@@ -3063,13 +3158,22 @@ mod tests {
 
             #[test]
             fn empty() {
-                // PostgreSQL allows empty arrays of any number of dimensions.
-                for arg1_dimensions in 1..=5 {
-                    let arg1 = empty_array_expr(arg1_dimensions);
+                // All empty arrays collapse to 1-D regardless of cast bracket
+                // count (PG's dimensionless-empty semantics, mirrored at
+                // lowering), so each arg's eval result is the same 1-D empty
+                // array.  The dimension loop here exercises *cast bracket
+                // parsing* and *cast intercept handling* across 1-D / 2-D /
+                // 3-D targets, plus the single-arg vs two-arg dispatch
+                // through json_object -- not multi-D array values, since
+                // those aren't reachable from empty inputs.  1..=3 is enough;
+                // higher counts would only re-exercise the same cast-parse
+                // path with no new behavior.
+                for arg1_dimensions in 1..=3 {
+                    let arg1 = empty_array_expr_with_cast(arg1_dimensions, "text");
                     test_non_null(&arg1, None, "{}");
 
-                    for arg2_dimensions in 1..=5 {
-                        let arg2 = empty_array_expr(arg2_dimensions);
+                    for arg2_dimensions in 1..=3 {
+                        let arg2 = empty_array_expr_with_cast(arg2_dimensions, "text");
                         test_non_null(&arg1, Some(&arg2), "{}");
                     }
                 }
@@ -3144,10 +3248,10 @@ mod tests {
 
             #[test]
             fn null_propagation() {
-                test_nullable("null", "array[]", "'42'", Some(false), None);
+                test_nullable("null", "array[]::text[]", "'42'", Some(false), None);
                 test_nullable("'{}'", "null", "'42'", Some(false), None);
-                test_nullable("'{}'", "array[]", "null", Some(false), None);
-                test_nullable("'{}'", "array[]", "'42'", None, None);
+                test_nullable("'{}'", "array[]::text[]", "null", Some(false), None);
+                test_nullable("'{}'", "array[]::text[]", "'42'", None, None);
             }
 
             #[test]
@@ -3274,10 +3378,10 @@ mod tests {
 
             #[test]
             fn null_propagation() {
-                test_nullable("null", "array[]", "'42'", Some(false), None);
+                test_nullable("null", "array[]::text[]", "'42'", Some(false), None);
                 test_nullable("'{}'", "null", "'42'", Some(false), None);
-                test_nullable("'{}'", "array[]", "null", Some(false), None);
-                test_nullable("'{}'", "array[]", "'42'", None, None);
+                test_nullable("'{}'", "array[]::text[]", "null", Some(false), None);
+                test_nullable("'{}'", "array[]::text[]", "'42'", None, None);
             }
 
             #[test]
@@ -3500,7 +3604,7 @@ mod tests {
                     let null_value_treatment = null_value_treatment.to_string();
                     test_nullable(
                         "null",
-                        "array[]",
+                        "array[]::text[]",
                         "'42'",
                         Some(false),
                         Some(&null_value_treatment),
@@ -3516,7 +3620,7 @@ mod tests {
                     );
                     test_nullable(
                         "'{}'",
-                        "array[]",
+                        "array[]::text[]",
                         "'42'",
                         None,
                         Some(&null_value_treatment),
@@ -3882,5 +3986,49 @@ mod tests {
             .eval(&[DfValue::TimestampTz(utc_time.into())])
             .unwrap();
         assert_eq!(result, DfValue::TimestampTz(expected_utc.into()));
+    }
+
+    /// MySQL implicitly casts non-string types to string for SUBSTRING.
+    /// SUBSTRING(12345, 1, 3) should return '123'.
+    #[test]
+    fn substring_implicit_cast_int() {
+        let expr = parse_and_lower("substring(c0, 1, 3)", MySQL);
+        let res = expr.eval::<DfValue>(&[DfValue::Int(12345)]).unwrap();
+        assert_eq!(res, "123".into());
+    }
+
+    #[test]
+    fn substring_implicit_cast_double() {
+        let expr = parse_and_lower("substring(c0, 1, 4)", MySQL);
+        let res = expr.eval::<DfValue>(&[DfValue::Double(3.125)]).unwrap();
+        assert_eq!(res, "3.12".into());
+    }
+
+    /// SUBSTRING(NULL, ...) should return NULL.
+    #[test]
+    fn substring_null_returns_null() {
+        let expr = parse_and_lower("substring(c0, 1, 3)", MySQL);
+        let res = expr.eval::<DfValue>(&[DfValue::None]).unwrap();
+        assert_eq!(res, DfValue::None);
+    }
+
+    /// SUBSTRING on unsigned int.
+    #[test]
+    fn substring_implicit_cast_unsigned_int() {
+        let expr = parse_and_lower("substring(c0, 1, 3)", MySQL);
+        let res = expr
+            .eval::<DfValue>(&[DfValue::UnsignedInt(99999)])
+            .unwrap();
+        assert_eq!(res, "999".into());
+    }
+
+    /// SUBSTRING on a DATE value.
+    /// MySQL: SUBSTRING('2025-03-15', 1, 4) → '2025'
+    #[test]
+    fn substring_implicit_cast_date() {
+        let expr = parse_and_lower("substring(c0, 1, 4)", MySQL);
+        let date = NaiveDate::from_ymd_opt(2025, 3, 15).unwrap();
+        let res = expr.eval::<DfValue>(&[DfValue::from(date)]).unwrap();
+        assert_eq!(res, "2025".into());
     }
 }

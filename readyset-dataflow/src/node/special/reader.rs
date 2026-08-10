@@ -1,16 +1,15 @@
 use std::collections::HashSet;
 use std::time::SystemTime;
 
-use dataflow_expression::ReaderProcessing;
 use failpoint_macros::failpoint;
 use metrics::histogram;
-use readyset_client::metrics::recorded;
 use readyset_client::{KeyColumnIdx, KeyComparison, ViewPlaceholder};
 #[cfg(feature = "failure_injection")]
 use readyset_util::failpoints;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 
+use crate::ReaderProcessing;
 use crate::backlog;
 use crate::prelude::*;
 use crate::redis_notifier;
@@ -131,8 +130,7 @@ impl Reader {
         m.handle_trace(
             |trace| match SystemTime::now().duration_since(trace.start) {
                 Ok(d) => {
-                    histogram!(recorded::PACKET_WRITE_PROPAGATION_TIME)
-                        .record(d.as_micros() as f64);
+                    histogram!(metric::PACKET_WRITE_PROPAGATION_TIME).record(d.as_micros() as f64);
                 }
                 Err(e) => {
                     warn!(error = %e, "Write latency trace failed");

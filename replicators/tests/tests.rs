@@ -1,8 +1,8 @@
 use std::env;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use database_utils::{DatabaseURL, ReplicationServerId, UpstreamConfig as Config};
 #[cfg(feature = "failure_injection")]
@@ -11,7 +11,7 @@ use itertools::Itertools;
 use mysql_async::prelude::Queryable;
 use mysql_time::MySqlTime;
 use rand::distr::Alphanumeric;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use readyset_client::consensus::{Authority, LocalAuthority, LocalAuthorityStore};
 use readyset_client::recipe::changelist::{Change, ChangeList, CreateCache};
 use readyset_client::ReadySetHandle;
@@ -21,19 +21,18 @@ use readyset_data::{Collation, DfValue, Dialect, TimestampTz, TinyText};
 use readyset_errors::{internal, internal_err, ReadySetError, ReadySetResult};
 use readyset_server::Builder;
 use readyset_server::NodeIndex;
-use readyset_sql::ast::{NonReplicatedRelation, Relation};
+use readyset_sql::ast::{ColumnConstraint, NonReplicatedRelation, Relation};
 use readyset_sql_parsing::{parse_select, ParsingPreset};
 use readyset_telemetry_reporter::{TelemetryEvent, TelemetryInitializer, TelemetrySender};
 #[cfg(feature = "failure_injection")]
 use readyset_util::failpoints;
 use readyset_util::shutdown::ShutdownSender;
 use readyset_util::{eventually, retry_with_exponential_backoff};
-use replicators::db_util::error_is_slot_not_found;
 use replicators::table_filter::TableFilter;
 use replicators::{
     ControllerMessage, ControllerMessageDiscriminants, NoriaAdapter, ReplicatorMessage,
 };
-use test_utils::tags;
+use test_utils::{tags, upstream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
 use tokio_postgres::error::SqlState;
@@ -464,6 +463,7 @@ impl TestHandle {
                 false, // disable statement logging in tests
                 parsing_preset,
                 tokio::sync::mpsc::unbounded_channel().0, // sink; we don't care
+                Arc::new(RwLock::new(None)),
             )
             .await;
             error!(%error, "Error in replicator");
@@ -530,8 +530,9 @@ impl TestHandle {
                             parse_select(readyset_sql::Dialect::MySQL, select_stmt.clone())
                                 .unwrap(),
                         ),
-                        always: false,
+                        trx_cache_policy: readyset_sql::ast::TrxCachePolicy::Never,
                         schema_generation_used: None,
+                        topk_buffer_multiplier: None,
                     }),
                 ],
                 self.dialect,
@@ -547,7 +548,7 @@ impl TestHandle {
             .await?
             .into_reader_handle()
             .unwrap();
-        let results = getter.lookup(&[0.into()], true).await?;
+        let results = getter.lookup(&[0.into()], Dialect::DEFAULT_MYSQL).await?;
         let mut results = results.into_vec();
         results.sort(); // Simple `lookup` does not sort the results, so we just sort them ourselves
         Ok(results)
@@ -685,14 +686,6 @@ fn pgsql_url() -> String {
     )
 }
 
-fn pgsql13_url() -> String {
-    format!(
-        "postgresql://postgres:noria@{}:{}/noria",
-        env::var("PGHOST13").unwrap_or_else(|_| "127.0.0.1".into()),
-        env::var("PGPORT13").unwrap_or_else(|_| "5433".into()),
-    )
-}
-
 fn mysql_url() -> String {
     format!(
         "mysql://root:noria@{}:{}/public",
@@ -702,7 +695,8 @@ fn mysql_url() -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn pgsql_replication() {
     replication_test_inner(&pgsql_url()).await
 }
@@ -710,81 +704,78 @@ async fn pgsql_replication() {
 /// Tests multiple readyset instances pointed at the same postgres upstream to verify that multiple
 /// readyset instances can replicate off the same upstream.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 #[ignore = "Flaky test (REA-3061)"]
 async fn pgsql_replication_multiple() {
     replication_test_multiple(&pgsql_url()).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_replication_multiple() {
     replication_test_multiple(&mysql_url()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_replication() {
     replication_test_inner(&mysql_url()).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, very_slow, postgres_upstream)]
+#[tags(serial, very_slow)]
+#[upstream(postgres)]
 async fn pgsql_replication_catch_up() {
     replication_catch_up_inner(&pgsql_url()).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, very_slow, mysql_upstream)]
+#[tags(serial, very_slow)]
+#[upstream(mysql)]
 async fn mysql_replication_catch_up() {
     replication_catch_up_inner(&mysql_url()).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, very_slow, postgres_upstream)]
+#[tags(serial, very_slow)]
+#[upstream(postgres)]
 async fn pgsql_replication_many_tables() {
     replication_many_tables_inner(&pgsql_url()).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, very_slow, mysql_upstream)]
+#[tags(serial, very_slow)]
+#[upstream(mysql)]
 async fn mysql_replication_many_tables() {
     replication_many_tables_inner(&mysql_url()).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, very_slow, postgres_upstream)]
+#[tags(serial, very_slow)]
+#[upstream(postgres)]
 async fn pgsql_replication_big_tables() {
     replication_big_tables_inner(&pgsql_url()).await.unwrap()
 }
 
 #[cfg(feature = "failure_injection")]
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
-async fn pgsql_snapshot_compaction_timeout_marks_table_not_replicated_table_timeout() {
-    pgsql_snapshot_compaction_timeout_inner("table-timeout", 30, 5).await;
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn pgsql_snapshot_compaction_timeout_marks_table_not_replicated() {
+    pgsql_snapshot_compaction_timeout_inner("table-timeout", 5).await;
 }
 
 #[cfg(feature = "failure_injection")]
-#[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
-async fn pgsql_snapshot_compaction_timeout_marks_table_not_replicated_worker_timeout() {
-    pgsql_snapshot_compaction_timeout_inner("worker-timeout", 5, 30).await;
-}
-
-#[cfg(feature = "failure_injection")]
-async fn pgsql_snapshot_compaction_timeout_inner(
-    label: &str,
-    worker_timeout_secs: u64,
-    table_timeout_secs: u64,
-) {
+async fn pgsql_snapshot_compaction_timeout_inner(label: &str, table_timeout_secs: u64) {
     readyset_tracing::init_test_logging();
     let _fail_scenario = FailScenario::setup();
     let url = pgsql_url();
 
     info!(
         %label,
-        worker_timeout_secs,
         table_timeout_secs,
         "Starting compaction timeout scenario"
     );
@@ -808,7 +799,6 @@ async fn pgsql_snapshot_compaction_timeout_inner(
 
     let mut builder = Builder::for_tests();
     builder.set_dialect(sql_dialect_from_url(&url));
-    builder.set_worker_timeout(Duration::from_secs(worker_timeout_secs));
     builder.set_table_request_timeout(Duration::from_secs(table_timeout_secs));
 
     let (mut ctx, shutdown_tx) =
@@ -844,13 +834,15 @@ async fn pgsql_snapshot_compaction_timeout_inner(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, very_slow, mysql_upstream)]
+#[tags(serial, very_slow)]
+#[upstream(mysql)]
 async fn mysql_replication_big_tables() {
     replication_big_tables_inner(&mysql_url()).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_datetime_replication() {
     mysql_datetime_replication_inner().await.unwrap();
 }
@@ -1090,49 +1082,57 @@ async fn mysql_char_collation_padding_inner() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_binary_collation_padding() {
     mysql_binary_collation_padding_inner().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_char_collation_padding() {
     mysql_char_collation_padding_inner().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres15_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres, 15)]
 async fn pgsql_replication_filter() {
     replication_filter_inner(&pgsql_url()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_replication_filter() {
     replication_filter_inner(&mysql_url()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn pgsql_replication_all_schemas() {
     replication_all_schemas_inner(&pgsql_url()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_replication_all_schemas() {
     replication_all_schemas_inner(&mysql_url()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn pgsql_replication_resnapshot() {
     resnapshot_inner(&pgsql_url()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_rename_swap_with_ignore() {
     readyset_tracing::init_test_logging();
     let url = &mysql_url();
@@ -1213,7 +1213,8 @@ async fn mysql_rename_swap_with_ignore() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_create_table_like_with_ignored() {
     readyset_tracing::init_test_logging();
     let url = &mysql_url();
@@ -1301,57 +1302,45 @@ async fn mysql_create_table_like_with_ignored() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_replication_resnapshot() {
     resnapshot_inner(&mysql_url()).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
-async fn psql14_ddl_replicate_drop_table() {
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn psql_ddl_replicate_drop_table() {
     postgresql_ddl_replicate_drop_table_internal(&pgsql_url()).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
-async fn psql13_ddl_replicate_drop_table() {
-    postgresql_ddl_replicate_drop_table_internal(&pgsql13_url()).await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
-async fn psql14_ddl_replicate_create_table() {
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn psql_ddl_replicate_create_table() {
     postgresql_ddl_replicate_create_table_internal(&pgsql_url()).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
-async fn psql13_ddl_replicate_create_table() {
-    postgresql_ddl_replicate_create_table_internal(&pgsql13_url()).await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
-async fn psql14_ddl_replicate_drop_view() {
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn psql_ddl_replicate_drop_view() {
     postgresql_ddl_replicate_drop_view_internal(&pgsql_url()).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
-async fn psql13_ddl_replicate_drop_view() {
-    postgresql_ddl_replicate_drop_view_internal(&pgsql13_url()).await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
-async fn psql14_ddl_replicate_create_view() {
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn psql_ddl_replicate_create_view() {
     postgresql_ddl_replicate_create_view_internal(&pgsql_url()).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
-async fn psql13_ddl_replicate_create_view() {
-    postgresql_ddl_replicate_create_view_internal(&pgsql13_url()).await
+#[tags(serial)]
+#[upstream(postgres)]
+async fn psql_snapshot_has_column_collation() {
+    postgresql_snapshot_has_column_collation_internal(&pgsql_url()).await
 }
 
 /// This test checks that when writes and replication happen in parallel
@@ -1993,7 +1982,8 @@ async fn resnapshot_inner(url: &str) -> ReadySetResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_enum_replication() {
     readyset_tracing::init_test_logging();
     let url = &mysql_url();
@@ -2076,7 +2066,8 @@ async fn mysql_enum_replication() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql8_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql, modern)]
 async fn mysql_binlog_transaction_compression() {
     readyset_tracing::init_test_logging();
     let url = &mysql_url();
@@ -2133,14 +2124,15 @@ async fn mysql_binlog_transaction_compression() {
         )
         .await
         .unwrap();
+    let teapot = |s: &str| DfValue::from_str_and_collation(s, Collation::Utf8AiCi);
     check_results!(
         ctx,
         "binlog_compression_test",
         "mysql_binlog_transaction_compression",
         &[
-            &[DfValue::Int(1), DfValue::Text("I am a small teapot".into())],
-            &[DfValue::Int(3), DfValue::Text("I am a big teapot".into())],
-            &[DfValue::Int(4), DfValue::Text("I am a tiny teapot".into())],
+            &[DfValue::Int(1), teapot("I am a small teapot")],
+            &[DfValue::Int(3), teapot("I am a big teapot")],
+            &[DfValue::Int(4), teapot("I am a tiny teapot")],
         ],
     );
     check_results!(
@@ -2148,14 +2140,76 @@ async fn mysql_binlog_transaction_compression() {
         "binlog_compression_test2",
         "mysql_binlog_transaction_compression2",
         &[
-            &[DfValue::Int(1), DfValue::Text("I am a small teapot".into())],
-            &[DfValue::Int(3), DfValue::Text("I am a big teapot".into())],
-            &[DfValue::Int(4), DfValue::Text("I am a tiny teapot".into())],
+            &[DfValue::Int(1), teapot("I am a small teapot")],
+            &[DfValue::Int(3), teapot("I am a big teapot")],
+            &[DfValue::Int(4), teapot("I am a tiny teapot")],
         ],
     );
 
     client.stop().await;
     ctx.stop().await;
+    shutdown_tx.shutdown().await;
+}
+
+async fn postgresql_snapshot_has_column_collation_internal(url: &str) {
+    readyset_tracing::init_test_logging();
+    let mut client = DbConnection::connect(url).await.unwrap();
+    client
+        .query(
+            "DROP TABLE IF EXISTS coll_t CASCADE;
+             CREATE TABLE coll_t (
+                id          int PRIMARY KEY,
+                s_c         text COLLATE \"C\",
+                s_posix     text COLLATE \"POSIX\",
+                s_default   text
+             );",
+        )
+        .await
+        .unwrap();
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(url.to_string(), None)
+        .await
+        .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    let table = ctx
+        .noria
+        .table(Relation {
+            schema: Some("public".into()),
+            name: "coll_t".into(),
+        })
+        .await
+        .unwrap();
+    let body = table
+        .schema()
+        .expect("table should have a schema after snapshot");
+
+    let collation_for = |col_name: &str| -> Option<String> {
+        let field = body
+            .fields
+            .iter()
+            .find(|f| f.column.name == col_name)
+            .unwrap_or_else(|| panic!("column {col_name} missing from snapshotted schema"));
+        field.constraints.iter().find_map(|c| match c {
+            ColumnConstraint::Collation(name) => Some(name.name.to_string()),
+            _ => None,
+        })
+    };
+
+    assert_eq!(collation_for("s_c").as_deref(), Some("C"));
+    assert_eq!(collation_for("s_posix").as_deref(), Some("POSIX"));
+    // Plain `text` columns inherit the database default, which the catalog reports as the
+    // `pg_collation` row named "default" (provider 'd'). The resolver substitutes the actual
+    // `lc_collate` later.
+    assert_eq!(collation_for("s_default").as_deref(), Some("default"));
+    // Non-collatable columns (`attcollation = 0`) have no constraint.
+    assert_eq!(collation_for("id"), None);
+
+    client.query("DROP TABLE coll_t CASCADE;").await.unwrap();
     shutdown_tx.shutdown().await;
 }
 
@@ -2279,8 +2333,9 @@ async fn postgresql_ddl_replicate_drop_view_internal(url: &str) {
             )
             .unwrap(),
         ),
-        always: false,
+        trx_cache_policy: readyset_sql::ast::TrxCachePolicy::Never,
         schema_generation_used: None,
+        topk_buffer_multiplier: None,
     });
     eventually! {
         ctx.noria
@@ -2363,8 +2418,9 @@ async fn postgresql_ddl_replicate_create_view_internal(url: &str) {
                     )
                     .unwrap(),
                 ),
-                always: true,
+                trx_cache_policy: readyset_sql::ast::TrxCachePolicy::Always,
                 schema_generation_used: None,
+                topk_buffer_multiplier: None,
             }),
             Dialect::DEFAULT_POSTGRESQL
         ))
@@ -2375,13 +2431,15 @@ async fn postgresql_ddl_replicate_create_view_internal(url: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn snapshot_telemetry_mysql() {
     snapshot_telemetry_inner(readyset_sql::Dialect::MySQL, &mysql_url()).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn snapshot_telemetry_postgresql() {
     snapshot_telemetry_inner(readyset_sql::Dialect::PostgreSQL, &pgsql_url()).await
 }
@@ -2437,13 +2495,15 @@ async fn snapshot_telemetry_inner(dialect: readyset_sql::Dialect, url: &String) 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn replication_tables_updates_mysql() {
     applies_replication_table_updates_on_restart(&mysql_url()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn replication_tables_updates_postgresql() {
     applies_replication_table_updates_on_restart(&pgsql_url()).await;
 }
@@ -2532,7 +2592,8 @@ async fn applies_replication_table_updates_on_restart(url: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgresql_replicate_copy_from() {
     // Replication of data inserted via COPY is tricky due to it triggering the creation of
     // multiple replication events with the same LSN. This test was written to reproduce the
@@ -2596,7 +2657,8 @@ async fn postgresql_replicate_copy_from() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgresql_non_base_offsets() {
     // This test reproduces the panic described in ENG-2204.
     // It is not clear to my why a JOIN is necessary to reproduce the problem, but a view that
@@ -2634,7 +2696,8 @@ async fn postgresql_non_base_offsets() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgresql_orphaned_nodes() {
     // This test checks for the error described in ENG-2190.
     // The bug would be triggered when a view would fail to be added due to certain types of
@@ -2677,7 +2740,8 @@ async fn postgresql_orphaned_nodes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgresql_replicate_citext() {
     readyset_tracing::init_test_logging();
     let url = pgsql_url();
@@ -2720,7 +2784,8 @@ async fn postgresql_replicate_citext() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgresql_replicate_citext_array() {
     readyset_tracing::init_test_logging();
     let url = pgsql_url();
@@ -2769,7 +2834,8 @@ async fn postgresql_replicate_citext_array() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgresql_replicate_custom_type() {
     let url = pgsql_url();
     let mut client = DbConnection::connect(&url).await.unwrap();
@@ -2819,7 +2885,8 @@ async fn postgresql_replicate_custom_type() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgresql_replicate_truncate() {
     let url = pgsql_url();
     let mut client = DbConnection::connect(&url).await.unwrap();
@@ -2880,7 +2947,8 @@ async fn postgresql_replicate_truncate() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgresql_drop_nonexistent_replication_slot() {
     let connector = native_tls::TlsConnector::builder()
         .danger_accept_invalid_certs(true)
@@ -2896,23 +2964,34 @@ async fn postgresql_drop_nonexistent_replication_slot() {
 
     let _conn = tokio::spawn(async move { conn.await.unwrap() });
 
-    // This slot shouldn't exist, and should generate a corresponding "error", which we will usually
-    // want to instead consider good enough from replication's point of view
-    let slot_name = "doesnotexist";
-    let res = client
-        .simple_query(&format!("DROP_REPLICATION_SLOT {slot_name}"))
-        .await;
-    assert!(error_is_slot_not_found(&res.unwrap_err().into(), slot_name));
+    // Dropping a non-existent slot should produce UNDEFINED_OBJECT
+    let err = client
+        .simple_query("DROP_REPLICATION_SLOT doesnotexist")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_db_error().map(|db| db.code().clone()),
+        Some(SqlState::UNDEFINED_OBJECT),
+        "expected UNDEFINED_OBJECT for non-existent slot, got: {err}"
+    );
 
-    // Different type of error shouldn't pass the check
-    let slot_name = "invalid syntax";
-    let res = client
-        .simple_query(&format!("DROP_REPLICATION_SLOT {slot_name}"))
-        .await;
-    assert!(!error_is_slot_not_found(
-        &res.unwrap_err().into(),
-        slot_name
-    ));
+    // Verify postgres_err delegates to as_db_error() for DB errors
+    assert_eq!(
+        readyset_errors::postgres_err(&err),
+        err.as_db_error().unwrap().to_string(),
+        "postgres_err should return DbError::Display for DB errors"
+    );
+
+    // A syntax error should NOT produce UNDEFINED_OBJECT
+    let err = client
+        .simple_query("DROP_REPLICATION_SLOT invalid syntax")
+        .await
+        .unwrap_err();
+    assert_ne!(
+        err.as_db_error().map(|db| db.code().clone()),
+        Some(SqlState::UNDEFINED_OBJECT),
+        "syntax error should not be UNDEFINED_OBJECT"
+    );
 }
 
 /// Given a table, check that it has an associated TOAST table
@@ -2933,7 +3012,8 @@ async fn postgresql_is_toasty(client: &tokio_postgres::client::Client, table: &s
 /// replicate correctly.
 /// Case 1: The table is unkeyed.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgresql_toast_update_unkeyed() {
     readyset_tracing::init_test_logging();
 
@@ -2968,7 +3048,7 @@ async fn postgresql_toast_update_unkeyed() {
              ALTER TABLE t REPLICA IDENTITY FULL;
              CREATE VIEW v AS SELECT * FROM t;
              INSERT INTO t VALUES (0, '{}');",
-            &toast
+            toast
         ))
         .await
         .unwrap();
@@ -3008,7 +3088,8 @@ async fn postgresql_toast_update_unkeyed() {
 /// replicate correctly.
 /// Case 2: The table is keyed, and one or more key columns is modified.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgresql_toast_update_key() {
     readyset_tracing::init_test_logging();
 
@@ -3075,7 +3156,8 @@ async fn postgresql_toast_update_key() {
 /// replicate correctly.
 /// Case 3: The table is keyed, but no key columns are modified.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgresql_toast_update_not_key() {
     readyset_tracing::init_test_logging();
 
@@ -3144,7 +3226,8 @@ async fn postgresql_toast_update_not_key() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn pgsql_unsupported() {
     readyset_tracing::init_test_logging();
     let url = pgsql_url();
@@ -3194,7 +3277,8 @@ async fn pgsql_unsupported() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn pgsql_delete_from_table_without_pk() {
     readyset_tracing::init_test_logging();
     let url = pgsql_url();
@@ -3265,7 +3349,8 @@ async fn pgsql_delete_from_table_without_pk() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, postgres_upstream)]
+#[tags(serial)]
+#[upstream(postgres)]
 async fn pgsql_dont_replicate_partitioned_table() {
     readyset_tracing::init_test_logging();
     let url = pgsql_url();
@@ -3368,7 +3453,8 @@ async fn pgsql_dont_replicate_partitioned_table() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn mysql_dont_replicate_unsupported_storage_engine() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -3430,7 +3516,8 @@ async fn mysql_dont_replicate_unsupported_storage_engine() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_dont_enforce_fk_replication() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -3495,7 +3582,8 @@ async fn mysql_dont_enforce_fk_replication() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_generated_columns() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -3644,19 +3732,22 @@ async fn fk_resnapshot_inner(url: &str) -> ReadySetResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_fk_tables_resnapshot() {
     fk_resnapshot_inner(&mysql_url()).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn postgres_fk_tables_resnapshot() {
     fk_resnapshot_inner(&pgsql_url()).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_handle_dml_in_statement_events() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -3699,23 +3790,28 @@ async fn mysql_handle_dml_in_statement_events() {
         .query("SET binlog_format=STATEMENT; INSERT INTO stmt_table (x) VALUES (2);")
         .await
         .unwrap();
-    sleep(Duration::from_millis(50)).await;
 
-    // Ensure that:
-    // 1. The base table has been dropped
-    // 2. The table is not replicated
-    // 3. The cache has been dropped
-    let tables = ctx.noria.tables().await.unwrap();
-    let non_replicated_tables = ctx.noria.non_replicated_relations().await.unwrap();
-    let caches = ctx.noria.views().await.unwrap();
-    assert!(tables.is_empty());
-    assert!(non_replicated_tables.contains(&NonReplicatedRelation::new(relation)));
-    assert_eq!(caches.len(), 0);
+    // Wait for the replicator to process the STATEMENT binlog event, which should
+    // cause it to drop the base table and mark it as non-replicated.
+    eventually! {
+        run_test: {
+            let tables = ctx.noria.tables().await.unwrap();
+            let non_replicated_tables = ctx.noria.non_replicated_relations().await.unwrap();
+            let caches = ctx.noria.views().await.unwrap();
+            (tables, non_replicated_tables, caches)
+        },
+        then_assert: |(tables, non_replicated_tables, caches)| {
+            assert!(tables.is_empty());
+            assert!(non_replicated_tables.contains(&NonReplicatedRelation::new(relation.clone())));
+            assert_eq!(caches.len(), 0);
+        }
+    }
     shutdown_tx.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_replicate_json_field() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -3815,7 +3911,8 @@ async fn mysql_replicate_json_field() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn alter_readyset_add_table_replication_tables() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -3891,7 +3988,8 @@ async fn alter_readyset_add_table_replication_tables() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn alter_readyset_add_table_replication_tables_ignore() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -3972,7 +4070,8 @@ async fn alter_readyset_add_table_replication_tables_ignore() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_minimal_row_based_replication() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -4067,7 +4166,8 @@ async fn mysql_minimal_row_based_replication() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_minimal_row_based_replication_empty_row() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -4114,7 +4214,8 @@ async fn mysql_minimal_row_based_replication_empty_row() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_minimal_row_based_collation_and_signedness() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -4161,7 +4262,8 @@ async fn mysql_minimal_row_based_collation_and_signedness() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_minimal_row_based_char_padding() {
     // REA-5699
     // This test will create a table without PK. The insert will ommit column n, since we are using MRBR it will be deferred to Readyset to fill in the default value.
@@ -4219,7 +4321,8 @@ async fn mysql_minimal_row_based_char_padding() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_minimal_row_based_binary() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -4272,7 +4375,8 @@ async fn mysql_minimal_row_based_binary() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_minimal_row_based_blob() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -4319,7 +4423,8 @@ async fn mysql_minimal_row_based_blob() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn alter_table_add_key_mysql() {
     readyset_tracing::init_test_logging();
     let url = mysql_url();
@@ -4425,8 +4530,555 @@ async fn alter_table_add_key_mysql() {
     shutdown_tx.shutdown().await;
 }
 
+/// Test that transaction batching with intermediate flushes persists the correct
+/// replication offset, and that crash recovery correctly skips already-applied
+/// rows without re-snapshotting.
+///
+/// With `replication_batch_size = 3`:
+/// 1. Creates table, inserts snapshot row
+/// 2. Starts replicator with small batch size
+/// 3. Inserts 7 rows in a single transaction
+///    - Rows 1-3: accumulated, batch full → flushed via 1 RPC (persisted)
+///    - Rows 4-5: accumulated in memory (second batch, not yet full)
+///    - Failpoint: crash after 5th row event
+/// 4. Verifies partial state: snapshot + rows 1-3 only. Rows 4-5 were in
+///    the in-memory accumulator and never reached storage — this confirms
+///    only 1 RPC call was made (the first batch).
+/// 5. Arms a snapshot failpoint that panics if any table is snapshotted
+/// 6. Restarts replicator — crash recovery skips rows 1-3, applies 4-7
+/// 7. Verifies all 7 rows present (no re-snapshot panic means recovery
+///    used replication)
+#[cfg(feature = "failure_injection")]
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
+async fn mysql_transaction_batch_crash_recovery() {
+    readyset_tracing::init_test_logging();
+    let _fail_scenario = FailScenario::setup();
+    let url = mysql_url();
+
+    let mut client = DbConnection::connect(&url).await.unwrap();
+
+    client
+        .query(
+            "CREATE TABLE batch_crash (id INT PRIMARY KEY, val INT);
+             INSERT INTO batch_crash VALUES (0, 100);",
+        )
+        .await
+        .unwrap();
+
+    // Start Readyset with a small batch size to trigger intermediate flushes
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(
+        url.to_string(),
+        Some(Config {
+            replication_batch_size: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // Verify snapshot
+    ctx.get_results("batch_crash", &[&[DfValue::Int(0), DfValue::Int(100)]])
+        .await
+        .unwrap();
+
+    // Crash after the 5th row event. With batch_size=3, the first batch
+    // (rows 1-3) will have been flushed and persisted via a single RPC.
+    // Rows 4-5 are accumulated in the second batch but never flushed.
+    static ROW_EVENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    ROW_EVENT_COUNT.store(0, Ordering::SeqCst);
+
+    fail::cfg_callback(failpoints::MYSQL_GTID_ROW_EVENT, move || {
+        let count = ROW_EVENT_COUNT.fetch_add(1, Ordering::SeqCst);
+        info!(
+            "FAILPOINT: mysql-gtid-row-event triggered, count={}",
+            count + 1
+        );
+        if count >= 5 {
+            panic!("Injected crash after {} row events", count + 1);
+        }
+    })
+    .unwrap();
+
+    // Insert 7 rows in a single transaction
+    client.query("START TRANSACTION;").await.unwrap();
+    for i in 1..=7 {
+        client
+            .query(&format!("INSERT INTO batch_crash VALUES ({}, {});", i, i))
+            .await
+            .unwrap();
+    }
+    client.query("COMMIT;").await.unwrap();
+
+    // Let the replicator process events and crash
+    sleep(Duration::from_secs(2)).await;
+    ctx.stop_repl().await;
+
+    // Verify partial state: snapshot + first batch (rows 1-3) only.
+    // Rows 4-5 were in the in-memory accumulator and never persisted.
+    // This proves only 1 RPC call was made (the first batch of 3 rows).
+    ctx.get_results(
+        "batch_crash",
+        &[
+            &[DfValue::Int(0), DfValue::Int(100)],
+            &[DfValue::Int(1), DfValue::Int(1)],
+            &[DfValue::Int(2), DfValue::Int(2)],
+            &[DfValue::Int(3), DfValue::Int(3)],
+        ],
+    )
+    .await
+    .unwrap();
+
+    // Clear crash failpoint and arm the snapshot failpoint: if the
+    // replicator attempts to re-snapshot any table, this will panic,
+    // proving that recovery must use replication instead.
+    fail::cfg(failpoints::MYSQL_GTID_ROW_EVENT, "off").unwrap();
+    fail::cfg(
+        failpoints::MYSQL_SNAPSHOT_TABLE,
+        "panic(re-snapshot should not happen during recovery)",
+    )
+    .unwrap();
+
+    let telemetry_sender = TelemetrySender::new_no_op();
+    ctx.replicator_tx = Some(
+        ctx.start_repl(
+            Some(Config {
+                replication_batch_size: 3,
+                ..Default::default()
+            }),
+            telemetry_sender,
+            false,
+            ParsingPreset::for_tests(),
+        )
+        .await
+        .unwrap(),
+    );
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // Verify all rows present after recovery.
+    // The replicator should have:
+    // - Loaded the persisted offset with event_index=3 (from the first batch)
+    // - Skipped rows 1-3 (already applied)
+    // - Applied rows 4-7 (remaining in the transaction)
+    ctx.get_results(
+        "batch_crash",
+        &[
+            &[DfValue::Int(0), DfValue::Int(100)],
+            &[DfValue::Int(1), DfValue::Int(1)],
+            &[DfValue::Int(2), DfValue::Int(2)],
+            &[DfValue::Int(3), DfValue::Int(3)],
+            &[DfValue::Int(4), DfValue::Int(4)],
+            &[DfValue::Int(5), DfValue::Int(5)],
+            &[DfValue::Int(6), DfValue::Int(6)],
+            &[DfValue::Int(7), DfValue::Int(7)],
+        ],
+    )
+    .await
+    .unwrap();
+
+    fail::cfg(failpoints::MYSQL_SNAPSHOT_TABLE, "off").unwrap();
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Test that transaction batching correctly handles normal replication followed
+/// by a crash mid-transaction, and that crash recovery replays the lost rows.
+///
+/// With `replication_batch_size = 10`:
+/// 1. Creates table, inserts snapshot row
+/// 2. Inserts 5 rows in transaction A — committed and fully replicated
+/// 3. Inserts 5 rows in transaction B — crash after 3rd row event
+/// 4. Verifies transaction A data is present but transaction B is not
+///    (the batch was never flushed before the panic)
+/// 5. Restarts replicator, crash recovery replays transaction B
+/// 6. Verifies all data from both transactions is present
+#[cfg(feature = "failure_injection")]
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql, modern)]
+async fn mysql_batch_replication_then_crash_recovery() {
+    readyset_tracing::init_test_logging();
+    let _fail_scenario = FailScenario::setup();
+    let url = mysql_url();
+
+    let mut client = DbConnection::connect(&url).await.unwrap();
+
+    client
+        .query(
+            "CREATE TABLE batch_then_crash (id INT PRIMARY KEY, val INT);
+             INSERT INTO batch_then_crash VALUES (0, 100);",
+        )
+        .await
+        .unwrap();
+
+    // Batch size 10 means all 5 rows in a transaction fit in one batch.
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(
+        url.to_string(),
+        Some(Config {
+            replication_batch_size: 10,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // Verify snapshot
+    ctx.get_results(
+        "batch_then_crash",
+        &[&[DfValue::Int(0), DfValue::Int(100)]],
+    )
+    .await
+    .unwrap();
+
+    // Transaction A: 5 rows, committed normally (no failpoint yet)
+    client.query("START TRANSACTION;").await.unwrap();
+    for i in 1..=5 {
+        client
+            .query(&format!(
+                "INSERT INTO batch_then_crash VALUES ({i}, {i});"
+            ))
+            .await
+            .unwrap();
+    }
+    client.query("COMMIT;").await.unwrap();
+
+    // Wait for transaction A to be fully replicated
+    ctx.get_results(
+        "batch_then_crash",
+        &[
+            &[DfValue::Int(0), DfValue::Int(100)],
+            &[DfValue::Int(1), DfValue::Int(1)],
+            &[DfValue::Int(2), DfValue::Int(2)],
+            &[DfValue::Int(3), DfValue::Int(3)],
+            &[DfValue::Int(4), DfValue::Int(4)],
+            &[DfValue::Int(5), DfValue::Int(5)],
+        ],
+    )
+    .await
+    .unwrap();
+
+    // Now install failpoint: crash after 3rd row event of the NEXT
+    // transaction (transaction B). The counter starts at 0 since we
+    // install it after transaction A is already replicated.
+    static BATCH_ROW_EVENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    BATCH_ROW_EVENT_COUNT.store(0, Ordering::SeqCst);
+
+    fail::cfg_callback(failpoints::MYSQL_GTID_ROW_EVENT, move || {
+        let count = BATCH_ROW_EVENT_COUNT.fetch_add(1, Ordering::SeqCst);
+        info!(
+            "FAILPOINT: batch-then-crash row event, count={}",
+            count + 1
+        );
+        if count >= 3 {
+            panic!("Injected crash after {} row events", count + 1);
+        }
+    })
+    .unwrap();
+
+    // Transaction B: 5 rows, will crash after 3rd row event.
+    // With batch_size=10, none of these rows are flushed before the
+    // crash because the batch threshold isn't reached.
+    client.query("START TRANSACTION;").await.unwrap();
+    for i in 6..=10 {
+        client
+            .query(&format!(
+                "INSERT INTO batch_then_crash VALUES ({i}, {i});"
+            ))
+            .await
+            .unwrap();
+    }
+    client.query("COMMIT;").await.unwrap();
+
+    // Let the replicator hit the failpoint
+    sleep(Duration::from_secs(2)).await;
+    ctx.stop_repl().await;
+
+    // Transaction A data should be present, transaction B should NOT
+    // (batch was never flushed before the panic)
+    ctx.get_results(
+        "batch_then_crash",
+        &[
+            &[DfValue::Int(0), DfValue::Int(100)],
+            &[DfValue::Int(1), DfValue::Int(1)],
+            &[DfValue::Int(2), DfValue::Int(2)],
+            &[DfValue::Int(3), DfValue::Int(3)],
+            &[DfValue::Int(4), DfValue::Int(4)],
+            &[DfValue::Int(5), DfValue::Int(5)],
+        ],
+    )
+    .await
+    .unwrap();
+
+    // Clear failpoint and restart
+    fail::cfg(failpoints::MYSQL_GTID_ROW_EVENT, "off").unwrap();
+
+    let telemetry_sender = TelemetrySender::new_no_op();
+    ctx.replicator_tx = Some(
+        ctx.start_repl(
+            Some(Config {
+                replication_batch_size: 10,
+                ..Default::default()
+            }),
+            telemetry_sender,
+            false,
+            ParsingPreset::for_tests(),
+        )
+        .await
+        .unwrap(),
+    );
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // After recovery: all data from both transactions should be present
+    ctx.get_results(
+        "batch_then_crash",
+        &[
+            &[DfValue::Int(0), DfValue::Int(100)],
+            &[DfValue::Int(1), DfValue::Int(1)],
+            &[DfValue::Int(2), DfValue::Int(2)],
+            &[DfValue::Int(3), DfValue::Int(3)],
+            &[DfValue::Int(4), DfValue::Int(4)],
+            &[DfValue::Int(5), DfValue::Int(5)],
+            &[DfValue::Int(6), DfValue::Int(6)],
+            &[DfValue::Int(7), DfValue::Int(7)],
+            &[DfValue::Int(8), DfValue::Int(8)],
+            &[DfValue::Int(9), DfValue::Int(9)],
+            &[DfValue::Int(10), DfValue::Int(10)],
+        ],
+    )
+    .await
+    .unwrap();
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Test that group commit coalesces multiple transactions and that crash
+/// recovery works correctly when a crash occurs mid-group.
+///
+/// With `group_commit_wait_us = 30_000_000` (30s) and `group_commit_max_trx = 3`:
+/// 1. Creates table, inserts snapshot row
+/// 2. Runs 3 autocommit transactions — reaches max_trx, group flushes
+/// 3. Verifies all 3 transactions replicated
+/// 4. Installs failpoint: crash after 3rd row event
+/// 5. Runs 2 more transactions (1-row + 5-row), crash during 2nd
+///    transaction's 2nd row. The group has NOT been flushed yet (only
+///    2 transactions, below the max_trx=3 threshold, and the 30s
+///    timeout hasn't expired), so none of these rows reach storage.
+/// 6. Verifies only the first 3 transactions' data is present
+/// 7. Restarts with short group_commit_wait_us, verifies recovery
+///    replays the 2 lost transactions
+#[cfg(feature = "failure_injection")]
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql, modern)]
+async fn mysql_group_commit_crash_recovery() {
+    readyset_tracing::init_test_logging();
+    let _fail_scenario = FailScenario::setup();
+    let url = mysql_url();
+
+    let mut client = DbConnection::connect(&url).await.unwrap();
+
+    client
+        .query(
+            "CREATE TABLE gc_crash (id INT PRIMARY KEY, val INT);
+             INSERT INTO gc_crash VALUES (0, 100);",
+        )
+        .await
+        .unwrap();
+
+    // Long wait (300s) ensures the group only flushes when max_trx is
+    // reached, giving us precise control over when the flush happens.
+    // This needs to be very large because CI machines under load can
+    // take >30s to run through the test, which would cause the timeout
+    // to expire and flush the group prematurely.
+    let config = Config {
+        group_commit_max_trx: 3,
+        group_commit_wait_us: 300_000_000,
+        replication_batch_size: 50_000,
+        ..Default::default()
+    };
+
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(
+        url.to_string(),
+        Some(config),
+    )
+    .await
+    .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // Verify snapshot
+    ctx.get_results("gc_crash", &[&[DfValue::Int(0), DfValue::Int(100)]])
+        .await
+        .unwrap();
+
+    // Phase 1: Run exactly 3 autocommit transactions.
+    // With max_trx=3, the group will flush after the 3rd commit.
+    client
+        .query("INSERT INTO gc_crash VALUES (1, 1);")
+        .await
+        .unwrap();
+    client
+        .query("INSERT INTO gc_crash VALUES (2, 2);")
+        .await
+        .unwrap();
+    client
+        .query("INSERT INTO gc_crash VALUES (3, 3);")
+        .await
+        .unwrap();
+
+    // Wait for group to flush and verify
+    ctx.get_results(
+        "gc_crash",
+        &[
+            &[DfValue::Int(0), DfValue::Int(100)],
+            &[DfValue::Int(1), DfValue::Int(1)],
+            &[DfValue::Int(2), DfValue::Int(2)],
+            &[DfValue::Int(3), DfValue::Int(3)],
+        ],
+    )
+    .await
+    .unwrap();
+
+    // Phase 2: Install failpoint and run 2 more transactions.
+    // Transaction C: 1 row (autocommit)
+    // Transaction D: 5 rows (explicit transaction), crash during 2nd row
+    //
+    // The failpoint fires per row event. Transaction C has 1 row event,
+    // transaction D starts with its rows. Crash after 3 total row events
+    // (= C's 1 row + D's first 2 rows).
+    //
+    // With max_trx=3 and only 2 transactions committed before crash,
+    // the group hasn't reached the flush threshold and the 30s timeout
+    // hasn't expired, so NO rows from this group reach storage.
+    static GC_ROW_EVENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    GC_ROW_EVENT_COUNT.store(0, Ordering::SeqCst);
+
+    fail::cfg_callback(failpoints::MYSQL_GTID_ROW_EVENT, move || {
+        let count = GC_ROW_EVENT_COUNT.fetch_add(1, Ordering::SeqCst);
+        info!(
+            "FAILPOINT: gc-crash row event, count={}",
+            count + 1
+        );
+        if count >= 3 {
+            panic!("Injected crash after {} row events", count + 1);
+        }
+    })
+    .unwrap();
+
+    // Transaction C: single autocommit row
+    client
+        .query("INSERT INTO gc_crash VALUES (4, 4);")
+        .await
+        .unwrap();
+
+    // Transaction D: 5 rows, crash will happen during 2nd row
+    client.query("START TRANSACTION;").await.unwrap();
+    for i in 5..=9 {
+        client
+            .query(&format!("INSERT INTO gc_crash VALUES ({i}, {i});"))
+            .await
+            .unwrap();
+    }
+    client.query("COMMIT;").await.unwrap();
+
+    // Let the replicator hit the failpoint
+    sleep(Duration::from_secs(2)).await;
+    ctx.stop_repl().await;
+
+    // Only phase 1 data should be present. The group from phase 2
+    // was never flushed (below max_trx threshold, timeout not expired).
+    ctx.get_results(
+        "gc_crash",
+        &[
+            &[DfValue::Int(0), DfValue::Int(100)],
+            &[DfValue::Int(1), DfValue::Int(1)],
+            &[DfValue::Int(2), DfValue::Int(2)],
+            &[DfValue::Int(3), DfValue::Int(3)],
+        ],
+    )
+    .await
+    .unwrap();
+
+    // Clear failpoint and restart with a short group commit window
+    // so recovery flushes promptly.
+    fail::cfg(failpoints::MYSQL_GTID_ROW_EVENT, "off").unwrap();
+
+    let telemetry_sender = TelemetrySender::new_no_op();
+    ctx.replicator_tx = Some(
+        ctx.start_repl(
+            Some(Config {
+                group_commit_max_trx: 3,
+                group_commit_wait_us: 500,
+                replication_batch_size: 50_000,
+                ..Default::default()
+            }),
+            telemetry_sender,
+            false,
+            ParsingPreset::for_tests(),
+        )
+        .await
+        .unwrap(),
+    );
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // After recovery: all data should be present, including both
+    // transactions C and D from the lost group.
+    ctx.get_results(
+        "gc_crash",
+        &[
+            &[DfValue::Int(0), DfValue::Int(100)],
+            &[DfValue::Int(1), DfValue::Int(1)],
+            &[DfValue::Int(2), DfValue::Int(2)],
+            &[DfValue::Int(3), DfValue::Int(3)],
+            &[DfValue::Int(4), DfValue::Int(4)],
+            &[DfValue::Int(5), DfValue::Int(5)],
+            &[DfValue::Int(6), DfValue::Int(6)],
+            &[DfValue::Int(7), DfValue::Int(7)],
+            &[DfValue::Int(8), DfValue::Int(8)],
+            &[DfValue::Int(9), DfValue::Int(9)],
+        ],
+    )
+    .await
+    .unwrap();
+
+    shutdown_tx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn alter_table_add_key_postgres() {
     readyset_tracing::init_test_logging();
     let url = pgsql_url();
@@ -4545,6 +5197,1019 @@ async fn alter_table_add_key_postgres() {
 
     // Verify again after resnapshot
     verify_tables_and_caches(&mut ctx, table_id).await.unwrap();
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Test that `INSERT INTO ... SELECT FROM ...` executed via binlog replication
+/// correctly replicates rows into a table that was created during replication
+/// (not during snapshot). This exercises the interaction between group commit
+/// batching and DDL processing: the CREATE TABLE for the destination table and
+/// the subsequent INSERT rows must not be bundled into the same replication
+/// batch, because that causes the just-created table's mutator lookup to fail
+/// and be negatively cached — silently discarding the rows.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn mysql_insert_select_after_create_table() {
+    readyset_tracing::init_test_logging();
+    let url = mysql_url();
+    let mut client = DbConnection::connect(&url).await.unwrap();
+
+    // Create the source table (schema only) during snapshot.
+    client
+        .query(
+            "DROP TABLE IF EXISTS insert_select_src CASCADE;
+             DROP TABLE IF EXISTS insert_select_dst CASCADE;
+             CREATE TABLE insert_select_src (id INT PRIMARY KEY, val INT);",
+        )
+        .await
+        .unwrap();
+
+    // Use a large group commit window so the INSERT rows are guaranteed to
+    // still be pending when the CREATE TABLE DDL arrives from the binlog.
+    let config = Config {
+        group_commit_wait_us: 10_000_000, // 10 seconds
+        ..Default::default()
+    };
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(url.to_string(), Some(config))
+        .await
+        .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // Insert rows into the source table AFTER snapshot — these arrive via
+    // binlog replication and sit in the group commit pending buffer. When
+    // the following CREATE TABLE DDL arrives, the connector flushes them
+    // together with the DDL in the same batch, which triggers the bug:
+    // the just-created destination table's mutator lookup fails, gets
+    // negatively cached, and subsequent row actions are discarded.
+    client
+        .query(
+            "INSERT INTO insert_select_src (id, val) VALUES (1, 10), (2, 20), (3, 30);
+             CREATE TABLE insert_select_dst (id INT PRIMARY KEY, val INT);
+             INSERT INTO insert_select_dst (id, val) SELECT id, val FROM insert_select_src;",
+        )
+        .await
+        .unwrap();
+
+    // The source table should have all three rows via replication.
+    check_results!(
+        ctx,
+        "insert_select_src",
+        "Source",
+        &[
+            &[DfValue::Int(1), DfValue::Int(10)],
+            &[DfValue::Int(2), DfValue::Int(20)],
+            &[DfValue::Int(3), DfValue::Int(30)],
+        ]
+    );
+
+    // The destination table should also have all three rows.
+    check_results!(
+        ctx,
+        "insert_select_dst",
+        "InsertSelect",
+        &[
+            &[DfValue::Int(1), DfValue::Int(10)],
+            &[DfValue::Int(2), DfValue::Int(20)],
+            &[DfValue::Int(3), DfValue::Int(30)],
+        ]
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Test that compressed transactions (TRANSACTION_PAYLOAD_EVENT) participate
+/// in group commit alongside uncompressed transactions.
+///
+/// With `group_commit_max_trx = 3` and a 30-second wait window:
+/// 1. Uncompressed INSERT (trx 1) — coalesces, group not full
+/// 2. Compressed INSERT  (trx 2) — coalesces, group not full
+///    → Verify data is NOT yet visible (still in pending buffer)
+/// 3. Compressed INSERT  (trx 3) — group reaches max_trx → flush
+///    → Verify all three rows appear promptly
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql, modern)]
+async fn mysql_compressed_transaction_flushes_group_commit() {
+    readyset_tracing::init_test_logging();
+    let url = mysql_url();
+    let mut client = DbConnection::connect(&url).await.unwrap();
+
+    // Set up table during snapshot (compression OFF for snapshot data).
+    client
+        .query(
+            "DROP TABLE IF EXISTS gc_compress_test CASCADE;
+             CREATE TABLE gc_compress_test (id INT PRIMARY KEY, val INT);",
+        )
+        .await
+        .unwrap();
+
+    // Long wait window so the timeout never fires during the test.
+    // max_trx = 3 so the group flushes after exactly 3 committed
+    // transactions regardless of how they are encoded.
+    let config = Config {
+        group_commit_wait_us: 30_000_000, // 30 seconds
+        group_commit_max_trx: 3,
+        ..Default::default()
+    };
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(url.to_string(), Some(config))
+        .await
+        .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // Trx 1: uncompressed INSERT — coalesces in group commit.
+    client
+        .query("INSERT INTO gc_compress_test VALUES (1, 10)")
+        .await
+        .unwrap();
+
+    // Trx 2: compressed INSERT — coalesces (2 < 3).
+    client
+        .query("SET binlog_transaction_compression = 'ON'")
+        .await
+        .unwrap();
+    client
+        .query("INSERT INTO gc_compress_test VALUES (2, 20)")
+        .await
+        .unwrap();
+
+    // Data should NOT be visible yet — the group has 2 transactions,
+    // below the max_trx threshold of 3.
+    sleep(Duration::from_secs(2)).await;
+    let result = ctx.get_results_inner("gc_compress_test").await;
+    assert!(
+        result.is_err() || result.unwrap().is_empty(),
+        "expected no rows before group commit flush"
+    );
+
+    // Trx 3: compressed INSERT — reaches max_trx, triggers flush.
+    client
+        .query("INSERT INTO gc_compress_test VALUES (3, 30)")
+        .await
+        .unwrap();
+    client
+        .query("SET binlog_transaction_compression = 'OFF'")
+        .await
+        .unwrap();
+
+    // All three rows should appear promptly.
+    check_results!(
+        ctx,
+        "gc_compress_test",
+        "CompressedFlush",
+        &[
+            &[DfValue::Int(1), DfValue::Int(10)],
+            &[DfValue::Int(2), DfValue::Int(20)],
+            &[DfValue::Int(3), DfValue::Int(30)],
+        ]
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Test that TRUNCATE arriving during group commit is deferred and processed
+/// separately from the pending row actions. Uses two tables: an INSERT into
+/// table A sits in the group commit buffer, then a TRUNCATE on table B
+/// arrives. The TRUNCATE must not be bundled with the flushed INSERT — they
+/// share the same offset, and the storage layer would drop the second
+/// TableAction as "already processed".
+/// placeholder to trigger build
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn mysql_truncate_during_group_commit() {
+    readyset_tracing::init_test_logging();
+    let url = mysql_url();
+    let mut client = DbConnection::connect(&url).await.unwrap();
+
+    // Snapshot: two tables, one row each.
+    client
+        .query(
+            "DROP TABLE IF EXISTS gc_trunc_a CASCADE;
+             DROP TABLE IF EXISTS gc_trunc_b CASCADE;
+             CREATE TABLE gc_trunc_a (id INT PRIMARY KEY, val INT);
+             CREATE TABLE gc_trunc_b (id INT PRIMARY KEY, val INT);
+             INSERT INTO gc_trunc_a VALUES (1, 10);
+             INSERT INTO gc_trunc_b VALUES (1, 100);",
+        )
+        .await
+        .unwrap();
+
+    let config = Config {
+        group_commit_wait_us: 10_000_000, // 10 seconds
+        ..Default::default()
+    };
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(url.to_string(), Some(config))
+        .await
+        .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // Verify snapshot.
+    check_results!(
+        ctx,
+        "gc_trunc_a",
+        "SnapshotA",
+        &[&[DfValue::Int(1), DfValue::Int(10)]]
+    );
+    check_results!(
+        ctx,
+        "gc_trunc_b",
+        "SnapshotB",
+        &[&[DfValue::Int(1), DfValue::Int(100)]]
+    );
+
+    // INSERT into table A (sits in group commit), then TRUNCATE table B.
+    client
+        .query(
+            "INSERT INTO gc_trunc_a VALUES (2, 20);
+             TRUNCATE TABLE gc_trunc_b;",
+        )
+        .await
+        .unwrap();
+
+    // Table A should have both rows (original + new insert).
+    check_results!(
+        ctx,
+        "gc_trunc_a",
+        "AfterInsert",
+        &[
+            &[DfValue::Int(1), DfValue::Int(10)],
+            &[DfValue::Int(2), DfValue::Int(20)],
+        ]
+    );
+
+    // Table B should be empty after truncate.
+    check_results!(ctx, "gc_trunc_b", "AfterTruncate", &[]);
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Helper to create a cache for a given SELECT statement and read the results.
+async fn get_results_for_query(
+    ctx: &mut TestHandle,
+    cache_name: &str,
+    select_stmt: &str,
+    expected_results: &[&[DfValue]],
+) {
+    let cache_name = cache_name.to_string();
+    let select_stmt = select_stmt.to_string();
+    let _: ReadySetResult<Vec<Vec<DfValue>>> = eventually! {
+        attempts: 40,
+        sleep: Duration::from_millis(500),
+        run_test: {
+            get_results_for_query_inner(ctx, &cache_name, &select_stmt).await
+        },
+        then_assert: |res| {
+            let res = res.unwrap();
+            assert_eq!(res, expected_results);
+            Ok(res)
+        }
+    };
+}
+
+async fn get_results_for_query_inner(
+    ctx: &mut TestHandle,
+    cache_name: &str,
+    select_stmt: &str,
+) -> ReadySetResult<Vec<Vec<DfValue>>> {
+    ctx.controller()
+        .await
+        .extend_recipe(ChangeList::from_changes(
+            vec![
+                Change::Drop {
+                    name: Relation {
+                        schema: Some("public".into()),
+                        name: cache_name.into(),
+                    },
+                    if_exists: true,
+                },
+                Change::CreateCache(CreateCache {
+                    name: Some(Relation {
+                        schema: Some("public".into()),
+                        name: cache_name.into(),
+                    }),
+                    statement: Box::new(
+                        parse_select(readyset_sql::Dialect::MySQL, select_stmt).unwrap(),
+                    ),
+                    trx_cache_policy: readyset_sql::ast::TrxCachePolicy::Never,
+                    schema_generation_used: None,
+                    topk_buffer_multiplier: None,
+                }),
+            ],
+            Dialect::DEFAULT_MYSQL,
+        ))
+        .await?;
+    let mut getter = ctx
+        .controller()
+        .await
+        .view(Relation {
+            schema: Some("public".into()),
+            name: cache_name.into(),
+        })
+        .await?
+        .into_reader_handle()
+        .unwrap();
+    let results = getter.lookup(&[0.into()], Dialect::DEFAULT_MYSQL).await?;
+    let mut results = results.into_vec();
+    results.sort();
+    Ok(results)
+}
+
+/// Tests MySQL INVISIBLE column support end-to-end:
+/// 1. Snapshot: table with invisible column is snapshotted with all data
+/// 2. Caches: SELECT * excludes invisible column; explicit columns include it
+/// 3. Replication: INSERT via binlog reflects in both caches
+/// 4. DDL replication: a new table created after snapshot also works
+async fn mysql_invisible_column_inner() {
+    let url = &mysql_url();
+    let mut client = DbConnection::connect(url).await.unwrap();
+
+    // Set up initial table before starting replication
+    client
+        .query(
+            "
+            DROP TABLE IF EXISTS `invisible_col` CASCADE;
+            DROP TABLE IF EXISTS `invisible_col2` CASCADE;
+            CREATE TABLE `invisible_col` (
+                id int NOT NULL PRIMARY KEY,
+                visible_col int DEFAULT NULL,
+                hidden_col int DEFAULT NULL INVISIBLE
+            );
+            INSERT INTO `invisible_col` (id, visible_col, hidden_col) VALUES (1, 10, 100);
+            INSERT INTO `invisible_col` (id, visible_col, hidden_col) VALUES (2, 20, 200);",
+        )
+        .await
+        .unwrap();
+
+    // Use OnlySqlparser because nom-sql does not yet parse the INVISIBLE keyword
+    let mut builder = Builder::for_tests();
+    builder.set_dialect(sql_dialect_from_url(url));
+    builder.set_parsing_preset(ParsingPreset::OnlySqlparser);
+    let (mut ctx, shutdown_tx) =
+        TestHandle::start_noria_with_builder(url.to_string(), None, builder)
+            .await
+            .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // 1) Snapshot: SELECT * via check_results! excludes the invisible column
+    check_results!(
+        ctx,
+        "invisible_col",
+        "Snapshot",
+        &[
+            &[DfValue::Int(1), DfValue::Int(10)],
+            &[DfValue::Int(2), DfValue::Int(20)],
+        ]
+    );
+
+    // 2a) Cache with SELECT * should exclude the invisible column
+    get_results_for_query(
+        &mut ctx,
+        "q_invisible_star",
+        "SELECT * FROM `public`.`invisible_col`",
+        &[
+            &[DfValue::Int(1), DfValue::Int(10)],
+            &[DfValue::Int(2), DfValue::Int(20)],
+        ],
+    )
+    .await;
+
+    // 2b) Cache with explicit columns should include the invisible column
+    get_results_for_query(
+        &mut ctx,
+        "q_invisible_all",
+        "SELECT `id`, `visible_col`, `hidden_col` FROM `public`.`invisible_col`",
+        &[
+            &[DfValue::Int(1), DfValue::Int(10), DfValue::Int(100)],
+            &[DfValue::Int(2), DfValue::Int(20), DfValue::Int(200)],
+        ],
+    )
+    .await;
+
+    // 3) Replication: insert a new row via binlog and verify both caches update
+    client
+        .query(
+            "INSERT INTO `invisible_col` (id, visible_col, hidden_col) VALUES (3, 30, 300);",
+        )
+        .await
+        .unwrap();
+
+    get_results_for_query(
+        &mut ctx,
+        "q_invisible_star",
+        "SELECT * FROM `public`.`invisible_col`",
+        &[
+            &[DfValue::Int(1), DfValue::Int(10)],
+            &[DfValue::Int(2), DfValue::Int(20)],
+            &[DfValue::Int(3), DfValue::Int(30)],
+        ],
+    )
+    .await;
+
+    get_results_for_query(
+        &mut ctx,
+        "q_invisible_all",
+        "SELECT `id`, `visible_col`, `hidden_col` FROM `public`.`invisible_col`",
+        &[
+            &[DfValue::Int(1), DfValue::Int(10), DfValue::Int(100)],
+            &[DfValue::Int(2), DfValue::Int(20), DfValue::Int(200)],
+            &[DfValue::Int(3), DfValue::Int(30), DfValue::Int(300)],
+        ],
+    )
+    .await;
+
+    // 4) DDL replication: create a new table with invisible column after snapshot
+    client
+        .query(
+            "
+            CREATE TABLE `invisible_col2` (
+                id int NOT NULL PRIMARY KEY,
+                a int DEFAULT NULL,
+                b int DEFAULT NULL INVISIBLE
+            );
+            INSERT INTO `invisible_col2` (id, a, b) VALUES (1, 11, 111);",
+        )
+        .await
+        .unwrap();
+
+    // Verify the replicated table's SELECT * excludes invisible column
+    get_results_for_query(
+        &mut ctx,
+        "q_invisible2_star",
+        "SELECT * FROM `public`.`invisible_col2`",
+        &[&[DfValue::Int(1), DfValue::Int(11)]],
+    )
+    .await;
+
+    // Verify explicit columns include invisible column
+    get_results_for_query(
+        &mut ctx,
+        "q_invisible2_all",
+        "SELECT `id`, `a`, `b` FROM `public`.`invisible_col2`",
+        &[&[DfValue::Int(1), DfValue::Int(11), DfValue::Int(111)]],
+    )
+    .await;
+
+    client.stop().await;
+    ctx.stop().await;
+    shutdown_tx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql, modern)]
+async fn mysql_invisible_column() {
+    mysql_invisible_column_inner().await;
+}
+/// Test that group commit coalesces multiple transactions into a single
+/// batch. With `group_commit_max_trx = 3` and a long wait window, three
+/// autocommit INSERTs should all arrive together after the third commit
+/// triggers the group flush.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn pgsql_group_commit_coalesces_transactions() {
+    readyset_tracing::init_test_logging();
+    let url = pgsql_url();
+    let mut client = DbConnection::connect(&url).await.unwrap();
+
+    client
+        .query(
+            "DROP TABLE IF EXISTS gc_coal_test CASCADE;
+             CREATE TABLE gc_coal_test (id INT PRIMARY KEY, val INT);
+             INSERT INTO gc_coal_test VALUES (0, 0);",
+        )
+        .await
+        .unwrap();
+
+    // Long wait window so the timeout never fires during the test.
+    // max_trx = 3 so the group flushes after exactly 3 committed
+    // transactions.
+    let config = Config {
+        group_commit_wait_us: 30_000_000, // 30 seconds
+        group_commit_max_trx: 3,
+        ..Default::default()
+    };
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(url.to_string(), Some(config))
+        .await
+        .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // Verify snapshot row
+    check_results!(
+        ctx,
+        "gc_coal_test",
+        "Snapshot",
+        &[&[DfValue::Int(0), DfValue::Int(0)]]
+    );
+
+    // Trx 1: autocommit INSERT — coalesces, group not full.
+    client
+        .query("INSERT INTO gc_coal_test VALUES (1, 10)")
+        .await
+        .unwrap();
+
+    // Trx 2: autocommit INSERT — coalesces, group not full.
+    client
+        .query("INSERT INTO gc_coal_test VALUES (2, 20)")
+        .await
+        .unwrap();
+
+    // Verify data is NOT visible during the group commit window. Poll
+    // repeatedly so we actively assert the snapshot count stays stable —
+    // if any new row appears, group commit is not coalescing as expected.
+    // The poll window is well below `group_commit_wait_us` (30s) so the
+    // timeout cannot fire and confound the test.
+    let poll_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < poll_deadline {
+        if let Ok(rows) = ctx.get_results_inner("gc_coal_test").await {
+            assert_eq!(
+                rows.len(),
+                1,
+                "expected only snapshot row before group commit flush, got: {rows:?}"
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // Trx 3: autocommit INSERT — reaches max_trx, triggers flush.
+    client
+        .query("INSERT INTO gc_coal_test VALUES (3, 30)")
+        .await
+        .unwrap();
+
+    // All three should appear together.
+    check_results!(
+        ctx,
+        "gc_coal_test",
+        "AfterFlush",
+        &[
+            &[DfValue::Int(0), DfValue::Int(0)],
+            &[DfValue::Int(1), DfValue::Int(10)],
+            &[DfValue::Int(2), DfValue::Int(20)],
+            &[DfValue::Int(3), DfValue::Int(30)],
+        ]
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Test that a single transaction is flushed after the group commit
+/// timeout expires, even if max_trx is not reached.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn pgsql_group_commit_timeout_flush() {
+    readyset_tracing::init_test_logging();
+    let url = pgsql_url();
+    let mut client = DbConnection::connect(&url).await.unwrap();
+
+    client
+        .query(
+            "DROP TABLE IF EXISTS gc_timeout_test CASCADE;
+             CREATE TABLE gc_timeout_test (id INT PRIMARY KEY, val INT);
+             INSERT INTO gc_timeout_test VALUES (0, 0);",
+        )
+        .await
+        .unwrap();
+
+    // Short timeout, high max_trx so the timeout fires before max_trx.
+    // 50ms is short enough to keep the test fast but long enough that the
+    // WAL event reliably arrives and the COMMIT is processed before the
+    // group commit deadline expires — otherwise the timeout would fire
+    // with nothing pending and the test wouldn't actually exercise the
+    // timeout-based flush path.
+    let config = Config {
+        group_commit_wait_us: 50_000, // 50ms
+        group_commit_max_trx: 10_000, // effectively never by count
+        ..Default::default()
+    };
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(url.to_string(), Some(config))
+        .await
+        .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    check_results!(
+        ctx,
+        "gc_timeout_test",
+        "Snapshot",
+        &[&[DfValue::Int(0), DfValue::Int(0)]]
+    );
+
+    // Single INSERT — should appear after timeout flush.
+    client
+        .query("INSERT INTO gc_timeout_test VALUES (1, 10)")
+        .await
+        .unwrap();
+
+    check_results!(
+        ctx,
+        "gc_timeout_test",
+        "AfterTimeout",
+        &[
+            &[DfValue::Int(0), DfValue::Int(0)],
+            &[DfValue::Int(1), DfValue::Int(10)],
+        ]
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Test that TRUNCATE arriving during group commit is deferred and
+/// processed separately from the pending row actions. An INSERT into
+/// table A sits in the group commit buffer, then a TRUNCATE on table B
+/// arrives. Both must be applied correctly.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn pgsql_truncate_during_group_commit() {
+    readyset_tracing::init_test_logging();
+    let url = pgsql_url();
+    let mut client = DbConnection::connect(&url).await.unwrap();
+
+    // Snapshot: two tables, one row each.
+    client
+        .query(
+            "DROP TABLE IF EXISTS gc_trunc_a CASCADE;
+             DROP TABLE IF EXISTS gc_trunc_b CASCADE;
+             CREATE TABLE gc_trunc_a (id INT PRIMARY KEY, val INT);
+             CREATE TABLE gc_trunc_b (id INT PRIMARY KEY, val INT);
+             INSERT INTO gc_trunc_a VALUES (1, 10);
+             INSERT INTO gc_trunc_b VALUES (1, 100);",
+        )
+        .await
+        .unwrap();
+
+    let config = Config {
+        group_commit_wait_us: 10_000_000, // 10 seconds
+        ..Default::default()
+    };
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(url.to_string(), Some(config))
+        .await
+        .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // Verify snapshot.
+    check_results!(
+        ctx,
+        "gc_trunc_a",
+        "SnapshotA",
+        &[&[DfValue::Int(1), DfValue::Int(10)]]
+    );
+    check_results!(
+        ctx,
+        "gc_trunc_b",
+        "SnapshotB",
+        &[&[DfValue::Int(1), DfValue::Int(100)]]
+    );
+
+    // INSERT into table A (sits in group commit), then TRUNCATE table B.
+    client
+        .query("INSERT INTO gc_trunc_a VALUES (2, 20)")
+        .await
+        .unwrap();
+    client
+        .query("TRUNCATE TABLE gc_trunc_b")
+        .await
+        .unwrap();
+
+    // Table A should have both rows (original + new insert).
+    check_results!(
+        ctx,
+        "gc_trunc_a",
+        "AfterInsert",
+        &[
+            &[DfValue::Int(1), DfValue::Int(10)],
+            &[DfValue::Int(2), DfValue::Int(20)],
+        ]
+    );
+
+    // Table B should be empty after truncate.
+    check_results!(ctx, "gc_trunc_b", "AfterTruncate", &[]);
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Test that a CREATE TABLE (DDL) arriving during group commit is deferred
+/// and processed separately. Pending row actions are flushed first, then
+/// the DDL is applied.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn pgsql_ddl_during_group_commit() {
+    readyset_tracing::init_test_logging();
+    let url = pgsql_url();
+    let mut client = DbConnection::connect(&url).await.unwrap();
+
+    client
+        .query(
+            "DROP TABLE IF EXISTS gc_ddl_src CASCADE;
+             DROP TABLE IF EXISTS gc_ddl_new CASCADE;
+             CREATE TABLE gc_ddl_src (id INT PRIMARY KEY, val INT);
+             INSERT INTO gc_ddl_src VALUES (1, 10);",
+        )
+        .await
+        .unwrap();
+
+    // Use a large group commit window so the INSERT rows are guaranteed to
+    // still be pending when the CREATE TABLE DDL arrives.
+    let config = Config {
+        group_commit_wait_us: 10_000_000, // 10 seconds
+        ..Default::default()
+    };
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(url.to_string(), Some(config))
+        .await
+        .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    check_results!(
+        ctx,
+        "gc_ddl_src",
+        "Snapshot",
+        &[&[DfValue::Int(1), DfValue::Int(10)]]
+    );
+
+    // INSERT into source table (sits in group commit buffer), then DDL.
+    client
+        .query("INSERT INTO gc_ddl_src VALUES (2, 20)")
+        .await
+        .unwrap();
+    client
+        .query("CREATE TABLE gc_ddl_new (id INT PRIMARY KEY, val INT)")
+        .await
+        .unwrap();
+
+    // Source table should have both rows.
+    check_results!(
+        ctx,
+        "gc_ddl_src",
+        "AfterDDL",
+        &[
+            &[DfValue::Int(1), DfValue::Int(10)],
+            &[DfValue::Int(2), DfValue::Int(20)],
+        ]
+    );
+
+    // Insert into the new table and verify it's replicated.
+    client
+        .query("INSERT INTO gc_ddl_new VALUES (1, 100)")
+        .await
+        .unwrap();
+
+    check_results!(
+        ctx,
+        "gc_ddl_new",
+        "NewTableAfterDDL",
+        &[&[DfValue::Int(1), DfValue::Int(100)]]
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Regression test for a position-tracking bug in the PG group commit state
+/// machine. When a row-producing transaction is coalesced (`should_flush_group`
+/// returns false, `next_action` keeps looping without flushing), and the next
+/// transaction begins with `WalEvent::Begin`, `cur_pos` is clobbered to
+/// `(T_next.final_lsn, 0)` by `PostgresPosition::commit_start`. If that next
+/// transaction is a `TRUNCATE` on a *different* table, the `WalEvent::Truncate`
+/// arm of `next_action` flushes the pending row actions and returns them
+/// tagged with the clobbered `cur_pos` — leaving the base table holding
+/// those rows with a replication offset whose `lsn` component is the `0`
+/// sentinel.
+///
+/// The correct behavior is for the flushed rows to carry the position of the
+/// last fully-processed COMMIT (non-zero `lsn`), not the sentinel start
+/// position of an in-progress transaction. A non-zero `lsn` is what the
+/// connector subsequently propagates into standby status updates, so the bug
+/// can cause `Lsn(0)` to be ACKed to the upstream WAL slot.
+///
+/// A plain end-to-end check doesn't catch the bug because the buggy offset
+/// is transient: T_trunc's subsequent COMMIT returns a `LogPosition` action,
+/// and `handle_log_position` advances *every* table whose offset is behind
+/// the COMMIT's position — including `gc_pos_a` with its bogus
+/// `(T_trunc.final_lsn, 0)` — masking the violation before it can be
+/// observed. This test uses a failpoint at `POSTGRES_NEXT_WAL_EVENT` to
+/// crash the replicator after the Truncate event has been processed but
+/// before the COMMIT of the truncate transaction arrives, preserving the
+/// buggy offset for inspection.
+#[cfg(feature = "failure_injection")]
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn pgsql_group_commit_truncate_preserves_pending_position() {
+    readyset_tracing::init_test_logging();
+    let _fail_scenario = FailScenario::setup();
+    let url = pgsql_url();
+    let mut client = DbConnection::connect(&url).await.unwrap();
+
+    // Snapshot phase: both tables start with one row.
+    client
+        .query(
+            "DROP TABLE IF EXISTS gc_pos_a CASCADE;
+             DROP TABLE IF EXISTS gc_pos_b CASCADE;
+             CREATE TABLE gc_pos_a (id INT PRIMARY KEY, val INT);
+             CREATE TABLE gc_pos_b (id INT PRIMARY KEY, val INT);
+             INSERT INTO gc_pos_a VALUES (1, 10);
+             INSERT INTO gc_pos_b VALUES (1, 100);",
+        )
+        .await
+        .unwrap();
+
+    // Long wait window: the INSERT into gc_pos_a must stay in the group
+    // commit buffer until the TRUNCATE on gc_pos_b arrives, so we actually
+    // reach the Truncate-with-pending-rows branch in `next_action` rather
+    // than flushing at the earlier COMMIT.
+    let config = Config {
+        group_commit_wait_us: 10_000_000, // 10 seconds
+        group_commit_max_trx: 20,
+        ..Default::default()
+    };
+    let (mut ctx, shutdown_tx) = TestHandle::start_noria(url.to_string(), Some(config))
+        .await
+        .unwrap();
+    ctx.controller_rx
+        .as_mut()
+        .unwrap()
+        .snapshot_completed()
+        .await
+        .unwrap();
+
+    // Sanity-check the snapshot landed.
+    check_results!(
+        ctx,
+        "gc_pos_a",
+        "SnapshotA",
+        &[&[DfValue::Int(1), DfValue::Int(10)]]
+    );
+    check_results!(
+        ctx,
+        "gc_pos_b",
+        "SnapshotB",
+        &[&[DfValue::Int(1), DfValue::Int(100)]]
+    );
+
+    // Capture the snapshot offset for gc_pos_a so we can verify later
+    // that the test actually exercised the post-INSERT flush path (i.e.
+    // that the offset advanced beyond the snapshot state).
+    let table_a = Relation {
+        schema: Some("public".into()),
+        name: "gc_pos_a".into(),
+    };
+    let snapshot_a_pos = {
+        let offsets = ctx
+            .controller()
+            .await
+            .replication_offsets()
+            .await
+            .expect("replication_offsets RPC");
+        let a_offset = offsets
+            .tables
+            .get(&table_a)
+            .and_then(|o| o.as_ref())
+            .cloned()
+            .expect("gc_pos_a has a snapshot offset");
+        replication_offset::postgres::PostgresPosition::try_from(&a_offset)
+            .expect("gc_pos_a snapshot offset is a postgres position")
+    };
+
+    // Install a failpoint on WAL event fetch that panics after 4 events
+    // have been fetched post-install. The replicator has already consumed
+    // an empty startup transaction (the readyset_snapshot_done marker) and
+    // the `BEGIN` of our INSERT transaction by the time the failpoint is
+    // armed, so the 4 events we actually count are:
+    //   1. Insert row for gc_pos_a
+    //   2. COMMIT of the INSERT transaction (coalesced, not flushed)
+    //   3. BEGIN of the TRUNCATE transaction (clobbers cur_pos.lsn to 0)
+    //   4. Truncate event (pending > 0 → flush, return bogus position
+    //      `(T2.final_lsn, 0)`; the Truncate is stashed in `peek` and
+    //      processed on the next `next_action` call, which updates
+    //      gc_pos_b's offset separately)
+    //
+    // Panicking on the 5th callback (before the COMMIT of the TRUNCATE
+    // transaction is fetched) prevents the Commit arm from returning a
+    // `LogPosition` action that would otherwise mask the bug by advancing
+    // gc_pos_a's offset to the COMMIT position.
+    static WAL_EVENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+    WAL_EVENT_COUNT.store(0, Ordering::SeqCst);
+    fail::cfg_callback(failpoints::POSTGRES_NEXT_WAL_EVENT, move || {
+        let count = WAL_EVENT_COUNT.fetch_add(1, Ordering::SeqCst);
+        info!(
+            "FAILPOINT: pgsql_group_commit_truncate wal event, count={}",
+            count + 1,
+        );
+        if count >= 4 {
+            panic!(
+                "Injected crash after {} wal events (preventing the \
+                 truncate-transaction COMMIT's LogPosition from masking \
+                 gc_pos_a's buggy offset)",
+                count + 1,
+            );
+        }
+    })
+    .unwrap();
+
+    // Trx 1: INSERT into gc_pos_a — coalesced in the group commit buffer
+    // because max_trx=20 and wait=10s are both far from being reached.
+    client
+        .query("INSERT INTO gc_pos_a VALUES (2, 20)")
+        .await
+        .unwrap();
+
+    // Trx 2: TRUNCATE gc_pos_b — this forces the Truncate arm of
+    // `next_action` to flush gc_pos_a's pending row before processing the
+    // TRUNCATE. The flush is the critical code path exercised by this
+    // test: BEGIN of this transaction clobbers `cur_pos` to
+    // `(T2.final_lsn, 0)` before the Truncate arm is reached.
+    client
+        .query("TRUNCATE TABLE gc_pos_b")
+        .await
+        .unwrap();
+
+    // Wait for the replicator to hit the failpoint and panic, then stop
+    // the replicator task so we can inspect the controller state without
+    // further mutations.
+    sleep(Duration::from_secs(2)).await;
+    ctx.stop_repl().await;
+
+    // Clear the failpoint so we don't leak it to other tests.
+    fail::cfg(failpoints::POSTGRES_NEXT_WAL_EVENT, "off").unwrap();
+
+    // Assert the invariant: gc_pos_a's replication offset must have
+    // advanced past the snapshot (i.e. the INSERT was actually flushed,
+    // so this test did exercise the bug path) AND the offset's `lsn`
+    // component must not be the `0` sentinel. With the bug present, the
+    // INSERT flush returned a position whose `lsn` is `0` from
+    // `PostgresPosition::commit_start(T_trunc.final_lsn)`, and this
+    // assertion fails.
+    let offsets = ctx
+        .controller()
+        .await
+        .replication_offsets()
+        .await
+        .expect("replication_offsets RPC");
+    let a_offset = offsets
+        .tables
+        .get(&table_a)
+        .expect("gc_pos_a is present in the offsets map")
+        .as_ref()
+        .expect("gc_pos_a has a non-None offset after INSERT applied");
+    let a_pos = replication_offset::postgres::PostgresPosition::try_from(a_offset)
+        .expect("gc_pos_a offset is a postgres position");
+    assert!(
+        a_pos > snapshot_a_pos,
+        "gc_pos_a offset did not advance past the snapshot \
+         ({snapshot_a_pos:?}); the test did not actually exercise the \
+         group commit flush path. Got {a_pos:?}.",
+    );
+    assert_ne!(
+        a_pos.lsn,
+        replication_offset::postgres::Lsn::default(),
+        "gc_pos_a replication offset has lsn=0 after INSERT-then-TRUNCATE; \
+         the group commit Truncate-flush path returned a `cur_pos` that \
+         was clobbered by BEGIN of the truncate transaction. Expected a \
+         non-zero lsn from the last fully-processed COMMIT, got {a_pos:?}",
+    );
 
     shutdown_tx.shutdown().await;
 }

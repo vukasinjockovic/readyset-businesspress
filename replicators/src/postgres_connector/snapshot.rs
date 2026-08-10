@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
 use std::fmt::{self, Display};
 use std::future;
@@ -14,8 +14,8 @@ use readyset_client::{TableOperation, TableStatus};
 use readyset_data::{DfType, DfValue, Dialect as DataDialect, PgEnumMetadata};
 use readyset_errors::{internal, internal_err, unsupported, ReadySetError, ReadySetResult};
 use readyset_sql::ast::{
-    Column, ColumnConstraint, ColumnSpecification, CreateTableBody, CreateTableStatement,
-    NonReplicatedRelation, NotReplicatedReason, Relation, SqlIdentifier, TableKey,
+    Column, ColumnSpecification, CreateTableBody, CreateTableStatement, NonReplicatedRelation,
+    NotReplicatedReason, Relation, SqlIdentifier, TableKey,
 };
 use readyset_sql::Dialect;
 use readyset_sql::DialectDisplay;
@@ -30,11 +30,13 @@ use tokio_postgres as pgsql;
 use tracing::{debug, info, info_span, trace, warn, Instrument};
 
 use super::connector::CreatedSlot;
+use super::pg_column_constraints;
 use crate::db_util::CreateSchema;
+use crate::row_diagnostics;
 use crate::table_filter::TableFilter;
 use crate::{report_snapshot_progress, TablesSnapshottingGaugeGuard};
 
-const BATCH_SIZE: usize = 1024; // How many queries to buffer before pushing to ReadySet
+const BATCH_SIZE: usize = 8192; // How many rows to buffer before pushing to ReadySet
 
 macro_rules! get_transaction {
     ($self:expr) => {
@@ -98,6 +100,16 @@ struct ColumnEntry {
     not_null: bool,
     /// The [`Type`] of this column
     pg_type: Type,
+    /// The upstream Postgres collation name for this column, if any. `None` for non-collatable
+    /// types (e.g. integers, where `pg_attribute.attcollation = 0`). Set to `"default"` (with
+    /// `collation_provider = Some(b'd' as i8)`) for columns that inherit the database default;
+    /// the resolver in `DfType::from_sql_type` is responsible for substituting the database's
+    /// `lc_collate`.
+    collation_name: Option<String>,
+    /// The `pg_collation.collprovider` character: `'c'` (libc), `'i'` (ICU), `'b'` (builtin,
+    /// PG 17+), or `'d'` (default). Same Some/None semantics as `collation_name`.
+    #[allow(dead_code)]
+    collation_provider: Option<i8>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +183,8 @@ impl TryFrom<pgsql::Row> for ColumnEntry {
             not_null: row.try_get(2 /* pg_attribute.attnotnull */)?,
             sql_type: row.try_get(4)?,
             pg_type,
+            collation_name: row.try_get(14 /* pg_collation.collname */)?,
+            collation_provider: row.try_get(15 /* pg_collation.collprovider */)?,
         })
     }
 }
@@ -307,12 +321,15 @@ impl TableEntry {
                 member_tn.nspname,
                 (SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder ASC)
                  FROM pg_enum e
-                 WHERE (member_t.oid IS NULL AND (e.enumtypid = t.oid)) OR e.enumtypid = member_t.oid)
+                 WHERE (member_t.oid IS NULL AND (e.enumtypid = t.oid)) OR e.enumtypid = member_t.oid),
+                co.collname,
+                co.collprovider
             FROM pg_catalog.pg_attribute a
             JOIN pg_catalog.pg_type t ON a.atttypid = t.oid
             JOIN pg_catalog.pg_namespace tn ON t.typnamespace = tn.oid
             LEFT JOIN pg_catalog.pg_type member_t ON t.typelem = member_t.oid
             LEFT JOIN pg_catalog.pg_namespace member_tn ON member_t.typnamespace = member_tn.oid
+            LEFT JOIN pg_catalog.pg_collation co ON co.oid = a.attcollation AND a.attcollation != 0
             WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped
             ORDER BY a.attnum
             "#;
@@ -344,19 +361,50 @@ impl TableEntry {
             .try_collect()
     }
 
+    /// Batch-query replica identity columns for many tables at once.
+    ///
+    /// Returns a map from table OID to the ordered list of replica identity column names.
+    /// Tables that use the default replica identity (primary key) are absent from the map.
+    async fn batch_get_replica_identity_columns<'a>(
+        oids: &[u32],
+        transaction: &'a pgsql::Transaction<'a>,
+    ) -> ReadySetResult<HashMap<u32, Vec<SqlIdentifier>>> {
+        if oids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let query = r"
+            SELECT i.indrelid, a.attname
+            FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            WHERE i.indrelid = ANY($1::oid[]) AND i.indisreplident = true
+              AND a.attnum > 0 AND NOT a.attisdropped
+            ORDER BY i.indrelid, array_position(i.indkey, a.attnum)
+        ";
+
+        let rows = transaction.query(query, &[&oids]).await?;
+        let mut map: HashMap<u32, Vec<SqlIdentifier>> = HashMap::new();
+        for row in rows {
+            let oid: u32 = row.try_get(0)?;
+            let name: String = row.try_get(1)?;
+            map.entry(oid).or_default().push(SqlIdentifier::from(name));
+        }
+        Ok(map)
+    }
+
     async fn get_table<'a>(
         &self,
         transaction: &'a pgsql::Transaction<'a>,
         parsing_preset: ParsingPreset,
     ) -> Result<TableDescription, ReadySetError> {
+        let table_relation = Relation {
+            schema: Some(self.schema.clone().into()),
+            name: self.name.clone().into(),
+        };
         let columns = Self::get_columns(self.oid, transaction)
             .await
             .map_err(|e| {
                 ReadySetError::TableError {
-                    table: Relation {
-                        schema: Some(self.schema.clone().into()),
-                        name: self.name.clone().into(),
-                    },
+                    table: table_relation.clone(),
                     source: Box::new(e),
                 }
                 .context("when loading columns for the table")
@@ -365,10 +413,7 @@ impl TableEntry {
             .await
             .map_err(|e| {
                 ReadySetError::TableError {
-                    table: Relation {
-                        schema: Some(self.schema.clone().into()),
-                        name: self.name.clone().into(),
-                    },
+                    table: table_relation.clone(),
                     source: Box::new(ReadySetError::ReplicationFailed(e.to_string())),
                 }
                 .context("when loading constraints")
@@ -376,10 +421,7 @@ impl TableEntry {
 
         Ok(TableDescription {
             oid: self.oid,
-            name: Relation {
-                schema: Some(self.schema.clone().into()),
-                name: self.name.clone().into(),
-            },
+            name: table_relation,
             columns,
             constraints,
         })
@@ -431,7 +473,41 @@ impl TableDescription {
             .ok_or_else(|| internal_err!("All tables must have a schema in the replicator"))
     }
 
-    fn try_into_change(self, parsing_preset: ParsingPreset) -> ReadySetResult<Change> {
+    fn try_into_change(
+        self,
+        parsing_preset: ParsingPreset,
+        replica_identity_columns: Option<Vec<SqlIdentifier>>,
+    ) -> ReadySetResult<Change> {
+        // Compute replica_identity_key by comparing RI columns with PK columns.
+        // If they match (or no RI override), set None.
+        let replica_identity_key = replica_identity_columns.and_then(|ri_cols| {
+            let pk_columns: Vec<&SqlIdentifier> = self
+                .constraints
+                .iter()
+                .filter_map(|c| match &c.definition {
+                    TableKey::PrimaryKey { columns, .. } => Some(
+                        columns
+                            .iter()
+                            .filter_map(|kp| kp.as_column().map(|c| &c.name)),
+                    ),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+
+            let matches = pk_columns.len() == ri_cols.len()
+                && pk_columns
+                    .iter()
+                    .zip(ri_cols.iter())
+                    .all(|(pk, ri)| *pk == ri);
+
+            if matches {
+                None
+            } else {
+                Some(ri_cols.into_boxed_slice())
+            }
+        });
+
         Ok(Change::CreateTable {
             pg_meta: Some(PostgresTableMetadata {
                 oid: self.oid,
@@ -440,6 +516,7 @@ impl TableDescription {
                     .iter()
                     .map(|c| (c.name.clone().into(), c.attnum))
                     .collect(),
+                replica_identity_key,
             }),
             statement: CreateTableStatement {
                 if_not_exists: false,
@@ -449,6 +526,8 @@ impl TableDescription {
                         .columns
                         .into_iter()
                         .map(|c| {
+                            let constraints =
+                                pg_column_constraints(c.not_null, c.collation_name.as_deref());
                             Ok(ColumnSpecification {
                                 column: Column {
                                     name: c.name.into(),
@@ -461,12 +540,9 @@ impl TableDescription {
                                 )
                                 .map_err(|e| internal_err!("Could not parse SQL type: {e}"))?,
                                 generated: None,
-                                constraints: if c.not_null {
-                                    vec![ColumnConstraint::NotNull]
-                                } else {
-                                    vec![]
-                                },
+                                constraints,
                                 comment: None,
+                                invisible: false,
                             })
                         })
                         .collect::<ReadySetResult<_>>()?,
@@ -480,6 +556,53 @@ impl TableDescription {
                 options: Ok(vec![]),
             },
         })
+    }
+
+    /// Indices into [`Self::columns`] of the columns that identify a row for diagnostics: the
+    /// primary key if usable, otherwise the first usable unique key. A key is usable when every
+    /// part is a plain column we know about, so expression indexes are not. Empty when no key is
+    /// usable, in which case callers report the whole row instead.
+    fn identifier_columns(&self) -> Vec<usize> {
+        let column_index = |name: &SqlIdentifier| {
+            self.columns
+                .iter()
+                .position(|c| c.name.as_str() == name.as_str())
+        };
+        let key_columns = |columns: &[readyset_sql::ast::IndexKeyPart]| {
+            columns
+                .iter()
+                .map(|part| part.as_column().and_then(|c| column_index(&c.name)))
+                .collect::<Option<Vec<_>>>()
+        };
+
+        let mut unique = None;
+        for constraint in &self.constraints {
+            match &constraint.definition {
+                TableKey::PrimaryKey { columns, .. } => {
+                    if let Some(indices) = key_columns(columns) {
+                        return indices;
+                    }
+                }
+                TableKey::UniqueKey { columns, .. } if unique.is_none() => {
+                    unique = key_columns(columns);
+                }
+                _ => {}
+            }
+        }
+        unique.unwrap_or_default()
+    }
+
+    /// Decodes `indices` out of `row` and describes them for an error message.
+    fn describe_columns(
+        &self,
+        row: &pgsql::binary_copy::BinaryCopyOutRow,
+        indices: &[usize],
+    ) -> String {
+        row_diagnostics::describe_columns(indices.iter().filter_map(|&i| {
+            self.columns
+                .get(i)
+                .map(|column| (column.name.clone(), row.try_get::<DfValue>(i).ok()))
+        }))
     }
 
     /// Copy a table's contents from PostgreSQL to ReadySet
@@ -518,9 +641,9 @@ impl TableDescription {
         let rows = transaction.copy_out(query.as_str()).await?;
 
         let type_map: Vec<_> = self.columns.iter().map(|c| c.pg_type.clone()).collect();
-        let binary_row_batches = pgsql::binary_copy::BinaryCopyOutStream::new(rows, &type_map)
-            .chunks(BATCH_SIZE)
-            .peekable();
+        let identifier_columns = self.identifier_columns();
+        let binary_row_batches =
+            pgsql::binary_copy::BinaryCopyOutStream::new(rows, &type_map).chunks(BATCH_SIZE);
 
         pin_mut!(binary_row_batches);
 
@@ -531,59 +654,45 @@ impl TableDescription {
         let mut last_log = start;
         let mut last_status = start;
         let mut progress = 0;
-        let mut set_replication_offset_and_snapshot_mode = false;
-        while let Some(batch) = binary_row_batches.as_mut().next().await {
+        while let Some(batch) = binary_row_batches.next().await {
             let progress_copy = progress;
-            let batch_size = batch.len();
-            let noria_rows_iter = batch
+            let noria_rows = batch
                 .into_iter()
                 .enumerate()
                 .map(|(index_within_batch, row)| {
                     row.map_err(ReadySetError::from).and_then(|row| {
-                        (0..type_map.len())
-                            .map(|i| row.try_get::<DfValue>(i))
-                            .collect::<Result<Vec<_>, _>>()
-                            .map_err(|err| {
-                                ReadySetError::ReplicationFailed(format!(
-                                    "Failed converting to DfValue, table: {}, row: {}, err: {}",
-                                    noria_table.table_name().display(Dialect::PostgreSQL),
-                                    progress_copy + index_within_batch,
-                                    err
-                                ))
-                            })
+                        let mut values = Vec::with_capacity(type_map.len());
+                        for i in 0..type_map.len() {
+                            match row.try_get::<DfValue>(i) {
+                                Ok(value) => values.push(value),
+                                Err(err) => {
+                                    let column = match self.columns.get(i) {
+                                        Some(c) => format!("{} {}", c.name, c.sql_type),
+                                        None => format!("index {i}"),
+                                    };
+                                    let identifier = row_diagnostics::describe_identifier(
+                                        &identifier_columns,
+                                        type_map.len(),
+                                        |indices| self.describe_columns(&row, indices),
+                                    );
+                                    return Err(row_diagnostics::conversion_failed(
+                                        noria_table.table_name().display(Dialect::PostgreSQL),
+                                        progress_copy + index_within_batch,
+                                        column,
+                                        &identifier,
+                                        &err,
+                                    ));
+                                }
+                            }
+                        }
+                        Ok(values)
                     })
-                });
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
-            progress += batch_size;
+            progress += noria_rows.len();
 
-            if binary_row_batches.as_mut().peek().await.is_none() {
-                // This is the last batch of rows we're adding to the table, so batch the RPCs to
-                // set the replication offset and compact the table along with the insertion
-                info!(
-                    table = %noria_table.table_name().display(Dialect::PostgreSQL),
-                    %wal_position,
-                    "Setting replication offset and compacting table"
-                );
-
-                let capacity = match noria_rows_iter.size_hint() {
-                    (_, Some(high)) => high,
-                    (low, None) => low,
-                } + 2;
-                let mut actions = Vec::with_capacity(capacity);
-                for row in noria_rows_iter {
-                    actions.push(TableOperation::Insert(row?));
-                }
-
-                actions.push(TableOperation::SetReplicationOffset(wal_position.clone()));
-                actions.push(TableOperation::SetSnapshotMode(false));
-
-                noria_table.perform_all(actions).await?;
-                set_replication_offset_and_snapshot_mode = true;
-            } else {
-                noria_table
-                    .insert_many(noria_rows_iter.collect::<Result<Vec<_>, _>>()?)
-                    .await?
-            }
+            noria_table.insert_many(noria_rows).await?;
 
             report_snapshot_progress(
                 noria_table.table_name(),
@@ -597,16 +706,18 @@ impl TableDescription {
             );
         }
 
-        // If the table was empty, we didn't set the replication offset or disable snapshot mode
-        // above, so we need to do it here
-        if !set_replication_offset_and_snapshot_mode {
-            noria_table
-                .perform_all([
-                    TableOperation::SetReplicationOffset(wal_position.clone()),
-                    TableOperation::SetSnapshotMode(false),
-                ])
-                .await?;
-        }
+        // Set replication offset and disable snapshot mode after all rows are inserted.
+        info!(
+            table = %noria_table.table_name().display(Dialect::PostgreSQL),
+            %wal_position,
+            "Setting replication offset and disabling snapshot mode"
+        );
+        noria_table
+            .perform_all([
+                TableOperation::SetReplicationOffset(wal_position.clone()),
+                TableOperation::SetSnapshotMode(false),
+            ])
+            .await?;
 
         info!(rows_replicated = %progress, "Snapshotting finished");
 
@@ -780,6 +891,8 @@ impl<'a> PostgresReplicator<'a> {
 
         self.set_replica_identity_for_tables(&table_list).await?;
 
+        let all_oids: Vec<u32> = table_list.iter().map(|t| t.oid).collect();
+
         self.noria
             .extend_recipe_no_leader_ready(ChangeList::from_changes(
                 non_replicated
@@ -833,17 +946,23 @@ impl<'a> PostgresReplicator<'a> {
             }
         }
 
+        // Batch-fetch replica identity columns for all tables in a single query
+        let mut ri_columns_map =
+            TableEntry::batch_get_replica_identity_columns(&all_oids, get_transaction!(self))
+                .await?;
+
         // For each table, retrieve its structure
         let mut tables = Vec::with_capacity(table_list.len());
         for table in table_list {
             let table_name = &table.name.clone().to_string();
+            let ri_cols = ri_columns_map.remove(&table.oid);
             let res = table
                 .get_table(get_transaction!(self), self.parsing_preset)
                 .and_then(|create_table| {
                     future::ready(
                         create_table
                             .clone()
-                            .try_into_change(self.parsing_preset)
+                            .try_into_change(self.parsing_preset, ri_cols)
                             .map(move |change| (change, create_table)),
                     )
                 })
@@ -1156,6 +1275,16 @@ impl<'a> PostgresReplicator<'a> {
         &self,
         table_list: &[TableEntry],
     ) -> ReadySetResult<()> {
+        // Suppress these self-issued ALTERs from reaching the WAL replication stream.
+        // The replicate_alter_table event trigger checks this flag and early-returns,
+        // preventing a resnapshot loop (RI changes now trigger resnapshot).
+        get_transaction!(self)
+            .execute(
+                "SET LOCAL readyset.current_command_is_replica_identity TO true",
+                &[],
+            )
+            .await?;
+
         let tables_needing_replica_identity = get_transaction!(self)
             .query(
                 // Find all tables that are in the table list, and don't already have a primary key
@@ -1182,6 +1311,13 @@ impl<'a> PostgresReplicator<'a> {
                 .await?;
         }
 
+        get_transaction!(self)
+            .execute(
+                "SET LOCAL readyset.current_command_is_replica_identity TO false",
+                &[],
+            )
+            .await?;
+
         Ok(())
     }
 }
@@ -1193,6 +1329,152 @@ mod tests {
     use readyset_sql_parsing::parse_query;
 
     use super::*;
+
+    fn column(name: &str) -> ColumnEntry {
+        ColumnEntry {
+            attnum: 0,
+            name: name.into(),
+            sql_type: "integer".into(),
+            not_null: false,
+            pg_type: Type::INT4,
+            collation_name: None,
+            collation_provider: None,
+        }
+    }
+
+    fn key_parts(names: &[&str]) -> Vec<IndexKeyPart> {
+        names
+            .iter()
+            .map(|name| {
+                IndexKeyPart::Column(Column {
+                    name: (*name).into(),
+                    table: None,
+                })
+            })
+            .collect()
+    }
+
+    fn description_with_constraints(
+        column_names: &[&str],
+        constraints: Vec<ConstraintEntry>,
+    ) -> TableDescription {
+        TableDescription {
+            oid: 1,
+            name: Relation {
+                schema: Some("public".into()),
+                name: "t".into(),
+            },
+            columns: column_names.iter().map(|name| column(name)).collect(),
+            constraints,
+        }
+    }
+
+    fn primary_key(columns: &[&str]) -> ConstraintEntry {
+        ConstraintEntry {
+            name: "t_pkey".into(),
+            definition: TableKey::PrimaryKey {
+                constraint_name: None,
+                constraint_timing: None,
+                index_name: None,
+                columns: key_parts(columns),
+            },
+            kind: Some(ConstraintKind::PrimaryKey),
+        }
+    }
+
+    fn unique_key(name: &str, columns: &[&str]) -> ConstraintEntry {
+        ConstraintEntry {
+            name: name.into(),
+            definition: TableKey::UniqueKey {
+                constraint_name: None,
+                constraint_timing: None,
+                index_name: None,
+                columns: key_parts(columns),
+                index_type: None,
+                nulls_distinct: None,
+            },
+            kind: Some(ConstraintKind::UniqueKey),
+        }
+    }
+
+    #[test]
+    fn identifier_columns_prefers_primary_key() {
+        let desc = description_with_constraints(
+            &["a", "b", "c"],
+            vec![unique_key("t_b_key", &["b"]), primary_key(&["c", "a"])],
+        );
+        assert_eq!(desc.identifier_columns(), vec![2, 0]);
+    }
+
+    #[test]
+    fn identifier_columns_falls_back_to_first_unique_key() {
+        let desc = description_with_constraints(
+            &["a", "b", "c"],
+            vec![unique_key("t_b_key", &["b"]), unique_key("t_c_key", &["c"])],
+        );
+        assert_eq!(desc.identifier_columns(), vec![1]);
+    }
+
+    #[test]
+    fn identifier_columns_empty_without_keys() {
+        let desc = description_with_constraints(&["a", "b"], vec![]);
+        assert!(desc.identifier_columns().is_empty());
+    }
+
+    #[test]
+    fn identifier_columns_ignores_foreign_keys() {
+        let foreign_key = ConstraintEntry {
+            name: "t_a_fkey".into(),
+            definition: TableKey::ForeignKey {
+                constraint_name: None,
+                index_name: None,
+                columns: vec![Column {
+                    name: "a".into(),
+                    table: None,
+                }],
+                target_table: Relation {
+                    schema: None,
+                    name: "other".into(),
+                },
+                target_columns: vec![Column {
+                    name: "id".into(),
+                    table: None,
+                }],
+                on_delete: None,
+                on_update: None,
+            },
+            kind: Some(ConstraintKind::ForeignKey),
+        };
+        let desc = description_with_constraints(&["a", "b"], vec![foreign_key]);
+        assert!(desc.identifier_columns().is_empty());
+    }
+
+    #[test]
+    fn identifier_columns_skips_keys_on_unknown_columns() {
+        // A functional index (`IndexKeyPart::Expr`) has no column to report, so the key is unusable
+        // and we fall back to reporting the whole row.
+        let desc = description_with_constraints(
+            &["a"],
+            vec![ConstraintEntry {
+                name: "t_expr_key".into(),
+                definition: TableKey::UniqueKey {
+                    constraint_name: None,
+                    constraint_timing: None,
+                    index_name: None,
+                    columns: vec![IndexKeyPart::Expr(Box::new(
+                        readyset_sql::ast::Expr::Column(Column {
+                            name: "a".into(),
+                            table: None,
+                        }),
+                    ))],
+                    index_type: None,
+                    nulls_distinct: None,
+                },
+                kind: Some(ConstraintKind::UniqueKey),
+            }],
+        );
+        assert!(desc.identifier_columns().is_empty());
+    }
 
     #[test]
     fn table_description_with_reserved_keywords_to_string_parses() {
@@ -1209,6 +1491,8 @@ mod tests {
                     sql_type: "varchar".into(),
                     not_null: true,
                     pg_type: Type::VARCHAR,
+                    collation_name: None,
+                    collation_provider: None,
                 },
                 ColumnEntry {
                     attnum: 1,
@@ -1216,6 +1500,8 @@ mod tests {
                     sql_type: "varchar".into(),
                     not_null: false,
                     pg_type: Type::VARCHAR,
+                    collation_name: None,
+                    collation_provider: None,
                 },
                 ColumnEntry {
                     attnum: 2,
@@ -1223,6 +1509,8 @@ mod tests {
                     sql_type: "timestamp(6) without time zone".into(),
                     not_null: true,
                     pg_type: Type::TIMESTAMP,
+                    collation_name: None,
+                    collation_provider: None,
                 },
                 ColumnEntry {
                     attnum: 3,
@@ -1230,6 +1518,8 @@ mod tests {
                     sql_type: "timestamp(6) without time zone".into(),
                     not_null: true,
                     pg_type: Type::TIMESTAMP,
+                    collation_name: None,
+                    collation_provider: None,
                 },
             ],
             constraints: vec![ConstraintEntry {
@@ -1290,6 +1580,186 @@ mod tests {
                 assert_eq!(columns.first().unwrap().as_column().unwrap().name, "key");
             }
             _ => panic!(),
+        }
+    }
+
+    /// Helper to build a TableDescription with a single PK constraint for testing.
+    fn make_table_with_pk(pk_columns: Vec<&str>) -> TableDescription {
+        TableDescription {
+            oid: 1234,
+            name: Relation {
+                schema: Some("public".into()),
+                name: "users".into(),
+            },
+            columns: vec![
+                ColumnEntry {
+                    attnum: 1,
+                    name: "id".into(),
+                    sql_type: "integer".into(),
+                    not_null: true,
+                    pg_type: Type::INT4,
+                    collation_name: None,
+                    collation_provider: None,
+                },
+                ColumnEntry {
+                    attnum: 2,
+                    name: "email".into(),
+                    sql_type: "varchar".into(),
+                    not_null: true,
+                    pg_type: Type::VARCHAR,
+                    collation_name: None,
+                    collation_provider: None,
+                },
+                ColumnEntry {
+                    attnum: 3,
+                    name: "name".into(),
+                    sql_type: "varchar".into(),
+                    not_null: false,
+                    pg_type: Type::VARCHAR,
+                    collation_name: None,
+                    collation_provider: None,
+                },
+            ],
+            constraints: vec![ConstraintEntry {
+                name: "users_pkey".into(),
+                definition: TableKey::PrimaryKey {
+                    constraint_name: None,
+                    constraint_timing: None,
+                    index_name: None,
+                    columns: pk_columns
+                        .into_iter()
+                        .map(|name| {
+                            IndexKeyPart::Column(Column {
+                                name: name.into(),
+                                table: None,
+                            })
+                        })
+                        .collect(),
+                },
+                kind: Some(ConstraintKind::PrimaryKey),
+            }],
+        }
+    }
+
+    #[test]
+    fn try_into_change_ri_matches_pk_returns_none() {
+        let desc = make_table_with_pk(vec!["id"]);
+        let change = desc
+            .try_into_change(ParsingPreset::for_tests(), Some(vec!["id".into()]))
+            .unwrap();
+
+        match change {
+            Change::CreateTable { pg_meta, statement } => {
+                let pg_meta = pg_meta.unwrap();
+                assert!(
+                    pg_meta.replica_identity_key.is_none(),
+                    "RI matching PK should produce None"
+                );
+                // The PK constraint should be preserved as-is in the statement
+                let keys = statement.body.unwrap().keys.unwrap();
+                assert!(keys
+                    .iter()
+                    .any(|k| matches!(k, TableKey::PrimaryKey { .. })));
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_into_change_ri_differs_from_pk() {
+        let desc = make_table_with_pk(vec!["id"]);
+        let change = desc
+            .try_into_change(
+                ParsingPreset::for_tests(),
+                Some(vec!["id".into(), "email".into()]),
+            )
+            .unwrap();
+
+        match change {
+            Change::CreateTable { pg_meta, statement } => {
+                let pg_meta = pg_meta.unwrap();
+                let ri_key = pg_meta.replica_identity_key.unwrap();
+                assert_eq!(ri_key.len(), 2);
+                assert_eq!(ri_key[0], "id");
+                assert_eq!(ri_key[1], "email");
+                // The statement's PK should NOT be mutated
+                let keys = statement.body.unwrap().keys.unwrap();
+                let pk = keys
+                    .iter()
+                    .find(|k| matches!(k, TableKey::PrimaryKey { .. }))
+                    .expect("PK should still exist in statement");
+                match pk {
+                    TableKey::PrimaryKey { columns, .. } => {
+                        assert_eq!(columns.len(), 1);
+                        assert_eq!(columns[0].as_column().unwrap().name, "id");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_into_change_no_ri_returns_none() {
+        let desc = make_table_with_pk(vec!["id"]);
+        let change = desc
+            .try_into_change(ParsingPreset::for_tests(), None)
+            .unwrap();
+
+        match change {
+            Change::CreateTable { pg_meta, .. } => {
+                assert!(pg_meta.unwrap().replica_identity_key.is_none());
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_into_change_ri_with_no_existing_pk() {
+        let desc = TableDescription {
+            oid: 1234,
+            name: Relation {
+                schema: Some("public".into()),
+                name: "users".into(),
+            },
+            columns: vec![
+                ColumnEntry {
+                    attnum: 1,
+                    name: "id".into(),
+                    sql_type: "integer".into(),
+                    not_null: true,
+                    pg_type: Type::INT4,
+                    collation_name: None,
+                    collation_provider: None,
+                },
+                ColumnEntry {
+                    attnum: 2,
+                    name: "email".into(),
+                    sql_type: "varchar".into(),
+                    not_null: true,
+                    pg_type: Type::VARCHAR,
+                    collation_name: None,
+                    collation_provider: None,
+                },
+            ],
+            constraints: vec![],
+        };
+        let change = desc
+            .try_into_change(
+                ParsingPreset::for_tests(),
+                Some(vec!["id".into(), "email".into()]),
+            )
+            .unwrap();
+
+        match change {
+            Change::CreateTable { pg_meta, .. } => {
+                let ri_key = pg_meta.unwrap().replica_identity_key.unwrap();
+                assert_eq!(ri_key.len(), 2);
+                assert_eq!(ri_key[0], "id");
+                assert_eq!(ri_key[1], "email");
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
         }
     }
 }

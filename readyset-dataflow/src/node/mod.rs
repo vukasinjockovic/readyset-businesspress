@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use readyset_data::{Collation, DfType, Dialect};
 use readyset_sql::ast::{ColumnSpecification, Relation, SqlIdentifier};
+use readyset_util::SizeOf;
 use serde::{Deserialize, Serialize};
 
 use crate::ops::grouped::accumulator::AccumulatorState;
@@ -23,9 +24,6 @@ pub use self::ntype::NodeType;
 use crate::processing::{ColumnMiss, ColumnRef, ColumnSource};
 
 mod debug;
-
-#[cfg(feature = "bench")]
-pub use process::bench;
 
 // NOTE(jfrg): the migration code should probably move into the dataflow crate...
 // it is the reason why so much stuff here is pub
@@ -93,7 +91,17 @@ impl Column {
     }
 }
 
+/// A node in the dataflow graph.
+///
+/// # Wire format
+///
+/// `Node` lives inside the `ingredients: Graph` field of `DfState`, which the
+/// Authority persists to RocksDB via `rmp_serde::to_vec`. Removing or
+/// reordering any serde-included field here breaks decoding of every older
+/// payload. See the warning above `Config` in `readyset-server/src/lib.rs`
+/// for the full policy and the compat-shim recipe.
 #[must_use]
+#[allow(deprecated)]
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Node {
     name: Relation,
@@ -112,7 +120,11 @@ pub struct Node {
 
     pub purge: bool,
 
-    sharded_by: Sharding,
+    /// Deserialized only for compatibility with older persisted `ControllerState`; never
+    /// consulted at runtime.
+    #[serde(default)]
+    #[deprecated(note = "kept only for persisted state compat; do not consult at runtime")]
+    sharded_by: crate::Sharding,
 }
 
 // constructors
@@ -136,8 +148,29 @@ impl Node {
 
             purge: false,
 
-            sharded_by: Sharding::None,
+            #[allow(deprecated)]
+            sharded_by: crate::Sharding::None,
         }
+    }
+
+    /// Test-only accessor for the deprecated `sharded_by` field. Used by the
+    /// state-snapshot backwards-compatibility infrastructure to verify that
+    /// the `Sharding` variant index round-trips through `rmp_serde`. Do not
+    /// consult at runtime.
+    #[doc(hidden)]
+    #[allow(deprecated)]
+    pub fn sharded_by_for_compat_test(&self) -> crate::Sharding {
+        self.sharded_by
+    }
+
+    /// Test-only mutator for the deprecated `sharded_by` field. Used by the
+    /// state-snapshot backwards-compatibility infrastructure to seed nodes
+    /// that mirror the shape of pre-removal persisted graphs. Do not set at
+    /// runtime.
+    #[doc(hidden)]
+    #[allow(deprecated)]
+    pub fn set_sharded_by_for_compat_test(&mut self, s: crate::Sharding) {
+        self.sharded_by = s;
     }
 
     pub fn mirror<NT: Into<NodeType>>(&self, n: NT) -> Node {
@@ -174,7 +207,7 @@ impl DanglingDomainNode {
             .collect();
         n.parents = graph
             .neighbors_directed(ni, petgraph::EdgeDirection::Incoming)
-            .filter(|&c| !graph[c].is_source() && graph[c].domain() == dm)
+            .filter(|&c| !graph[c].is_graph_root() && graph[c].domain() == dm)
             .map(|ni| graph[ni].local_addr())
             .collect();
         n
@@ -189,6 +222,28 @@ pub enum AuxiliaryNodeState {
     TopK(TopKState),
 }
 
+/// Auxiliary state is real operator memory that the node's materialized state does not cover, so
+/// it is counted toward the same per-node totals the domain reports and evicts against. Evicting
+/// keys from the owning node's state releases the corresponding auxiliary entries through the
+/// operator's `on_eviction` hook.
+impl SizeOf for AuxiliaryNodeState {
+    fn deep_size_of(&self) -> usize {
+        match self {
+            AuxiliaryNodeState::Accumulator(s) => s.deep_size_of(),
+            AuxiliaryNodeState::Aggregation(s) => s.deep_size_of(),
+            AuxiliaryNodeState::TopK(s) => s.deep_size_of(),
+        }
+    }
+
+    fn size_is_empty(&self) -> bool {
+        match self {
+            AuxiliaryNodeState::Accumulator(s) => s.size_is_empty(),
+            AuxiliaryNodeState::Aggregation(s) => s.size_is_empty(),
+            AuxiliaryNodeState::TopK(s) => s.size_is_empty(),
+        }
+    }
+}
+
 // external parts of Ingredient
 impl Node {
     /// Called when a node is first connected to the graph.
@@ -198,6 +253,14 @@ impl Node {
     pub fn on_connected(&mut self, graph: &Graph) {
         if let Some(n) = self.as_mut_internal() {
             Ingredient::on_connected(n, graph)
+        }
+    }
+
+    /// Called on a freshly-deserialized node, before any other method. Rebuilds any
+    /// `#[serde(skip)]` state that is derivable from serialized fields.
+    pub fn post_deserialize(&mut self) {
+        if let Some(n) = self.as_mut_internal() {
+            Ingredient::post_deserialize(n)
         }
     }
 
@@ -241,7 +304,7 @@ impl Node {
             }
             ColumnSource::Union(ref colrefs) => {
                 if cfg!(debug_assertions) {
-                    for ColumnRef { ref columns, .. } in colrefs {
+                    for ColumnRef { columns, .. } in colrefs {
                         debug_assert_eq!(cols.len(), columns.len());
                     }
                 }
@@ -359,8 +422,8 @@ impl Node {
             },
             NodeType::Ingress
             | NodeType::Base(_)
+            | NodeType::Constant(_)
             | NodeType::Egress(_)
-            | NodeType::Sharder(_)
             | NodeType::Reader(_)
             | NodeType::Source
             | NodeType::Dropped => None,
@@ -376,15 +439,6 @@ impl Node {
 
     pub fn columns(&self) -> &[Column] {
         &self.columns[..]
-    }
-
-    pub fn sharded_by(&self) -> Sharding {
-        self.sharded_by
-    }
-
-    /// Set this node's sharding property.
-    pub fn shard_by(&mut self, s: Sharding) {
-        self.sharded_by = s;
     }
 
     /// Returns the node's inner NodeType as a String.
@@ -419,15 +473,6 @@ impl Node {
 
 // derefs
 impl Node {
-    /// If this node is a [`special::Sharder`], return a reference to that sharder, otherwise return
-    /// None
-    pub fn as_sharder(&self) -> Option<&special::Sharder> {
-        match &self.inner {
-            NodeType::Sharder(r) => Some(r),
-            _ => None,
-        }
-    }
-
     /// If this node is a [`Internal`], return a reference to the operator, otherwise return
     /// None
     pub fn as_internal(&self) -> Option<&ops::NodeOperator> {
@@ -442,15 +487,6 @@ impl Node {
     pub fn as_mut_internal(&mut self) -> Option<&mut ops::NodeOperator> {
         match &mut self.inner {
             NodeType::Internal(i) if !self.taken => Some(i),
-            _ => None,
-        }
-    }
-
-    /// If this node is a [`special::Sharder`], return a mutable reference to that sharder,
-    /// otherwise return None
-    pub fn as_mut_sharder(&mut self) -> Option<&mut special::Sharder> {
-        match &mut self.inner {
-            NodeType::Sharder(r) => Some(r),
             _ => None,
         }
     }
@@ -655,19 +691,19 @@ impl Node {
     }
 
     pub fn is_sender(&self) -> bool {
-        matches!(self.inner, NodeType::Egress { .. } | NodeType::Sharder(..))
+        matches!(self.inner, NodeType::Egress { .. })
     }
 
     pub fn is_internal(&self) -> bool {
         matches!(self.inner, NodeType::Internal(..))
     }
 
-    pub fn is_source(&self) -> bool {
+    /// Returns `true` if this is the singular graph root node (`NodeType::Source`).
+    ///
+    /// The graph root has a single outgoing edge to every base table node. It is not a data source
+    /// itself — see [`is_source`](Self::is_source) for base tables and constants.
+    pub fn is_graph_root(&self) -> bool {
         matches!(self.inner, NodeType::Source)
-    }
-
-    pub fn is_sharder(&self) -> bool {
-        matches!(self.inner, NodeType::Sharder { .. })
     }
 
     /// Returns `true` if self is fully materialized.
@@ -680,15 +716,26 @@ impl Node {
         matches!(self.inner, NodeType::Base(..))
     }
 
-    pub fn is_union(&self) -> bool {
-        matches!(self.inner, NodeType::Internal(NodeOperator::Union(_)))
+    /// Returns `true` if self is a constant node (VALUES clause)
+    pub fn is_constant(&self) -> bool {
+        matches!(self.inner, NodeType::Constant(..))
     }
 
-    pub fn is_shard_merger(&self) -> bool {
-        if let NodeType::Internal(NodeOperator::Union(ref u)) = self.inner {
-            u.is_shard_merger()
-        } else {
-            false
+    /// Returns `true` if self is a data source node — a base table or constant that originates
+    /// data rather than transforming it from upstream.
+    pub fn is_source(&self) -> bool {
+        self.is_base() || self.is_constant()
+    }
+
+    /// Get the constant rows if this is a Constant node
+    pub fn constant_rows(&self) -> Option<&[Vec<DfValue>]> {
+        match &self.inner {
+            NodeType::Constant(c) => Some(c.rows()),
+            _ => None,
         }
+    }
+
+    pub fn is_union(&self) -> bool {
+        matches!(self.inner, NodeType::Internal(NodeOperator::Union(_)))
     }
 }

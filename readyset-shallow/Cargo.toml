@@ -6,7 +6,9 @@ authors = ["Readyset Technology, Inc. <info@readyset.io>"]
 edition = "2024"
 
 [dependencies]
+antithesis_sdk = { workspace = true }
 dashmap = { workspace = true }
+serde_json = { workspace = true }
 metrics = { workspace = true }
 moka = { workspace = true }
 papaya = { workspace = true }
@@ -18,25 +20,25 @@ tokio-postgres = { workspace = true }
 seize = { workspace = true }
 psql-srv = { path = "../psql-srv" }
 
+metric = { path = "../metric" }
 readyset-client = { path = "../readyset-client" }
+readyset-data = { path = "../readyset-data" }
 readyset-errors = { path = "../readyset-errors" }
 readyset-sql = { path = "../readyset-sql" }
 readyset-util = { path = "../readyset-util" }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-rustix = { workspace = true }
 
 [features]
 bench = []
 
 [dev-dependencies]
-assert_matches = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 futures = { workspace = true }
 proptest = { workspace = true }
 rand = { workspace = true }
-readyset-data = { path = "../readyset-data" }
+readyset-client = { path = "../readyset-client", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "cache_hit"
 harness = false
+required-features = ["bench"]

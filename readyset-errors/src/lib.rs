@@ -57,8 +57,6 @@ pub enum ErrorNodeType {
     Egress,
     /// Reader nodes
     Reader,
-    /// Sharder nodes
-    Sharder,
 }
 
 /// General error type to be used across all of the ReadySet codebase.
@@ -117,25 +115,25 @@ pub enum ReadySetError {
         source: Box<ReadySetError>,
     },
 
-    /// Attempted to issue a `call` to a [`tokio-tower`] service, but the underlying transport has
+    /// Attempted to issue a `call` to a [`readyset-multiplex`] service, but the underlying transport has
     /// been closed.
     #[error("Client was dropped")]
     ClientDropped,
 
-    /// Attempted to issue a `call` to a [`tokio-tower`] service when no more requests can be in
+    /// Attempted to issue a `call` to a [`readyset-multiplex`] service when no more requests can be in
     /// flight.
     #[error("no more in-flight requests allowed")]
     TransportFull,
 
-    /// The server sent a response  to a [`tokio-tower`] service that the client was not expecting.
+    /// The server sent a response  to a [`readyset-multiplex`] service that the client was not expecting.
     #[error("server sent a response the client did not expect")]
     Desynchronized,
 
-    /// An underlying transport for a [`tokio-tower`] service failed to send a request.
+    /// An underlying transport for a [`readyset-multiplex`] service failed to send a request.
     #[error("Transport send failed: {0}")]
     TransportSendFailed(String),
 
-    /// An underlying transport for a [`tokio-tower`] service failed while receiving a response.
+    /// An underlying transport for a [`readyset-multiplex`] service failed while receiving a response.
     #[error("Transport receive failed")]
     TransportRecvFailed,
 
@@ -335,8 +333,8 @@ pub enum ReadySetError {
     #[error("the query specified an empty lookup key")]
     EmptyKey,
 
-    /// The queries lookup key is not found at the reader - a cache miss.
-    #[error("the queries lookup key is not found at the reader")]
+    /// The query's lookup key was not found in the reader.
+    #[error("the query's lookup key was not found in the reader")]
     ReaderMissingKey,
 
     /// A prepared statement is missing.
@@ -492,35 +490,15 @@ pub enum ReadySetError {
     #[error("HTTP request {request} failed: {message}")]
     HttpRequestFailed { request: String, message: String },
 
-    /// A shard index was used for a domain that doesn't have that many shards
-    #[error("Shard {shard} out of bounds for domain {domain_index} with {num_shards} shards")]
-    ShardIndexOutOfBounds {
-        shard: usize,
-        domain_index: usize,
-        num_shards: usize,
-    },
-
-    /// A replica index was used for a domain that doesn't have that many shards
-    #[error("Replica {replica} out of bounds for view {view_name} with {num_replicas} replicas")]
-    ViewReplicaOutOfBounds {
-        replica: usize,
-        view_name: String,
-        num_replicas: usize,
-    },
-
     /// A view was attempted to be built for a reader whose domain is not running
-    #[error("Domain at replica {replica} for reader node {node:?} is not running")]
-    ReaderReplicaNotRunning { replica: usize, node: NodeIndex },
+    #[error("Domain for reader node {node:?} is not running")]
+    ReaderNotRunning { node: NodeIndex },
 
-    /// A request for a domain replica was sent to a worker that doesn't have that domain replica.
-    #[error("Could not find domain {domain_index}.{shard}.{replica} on worker")]
-    NoSuchReplica {
+    /// A request for a domain was sent to a worker that doesn't have that domain.
+    #[error("Could not find domain {domain_index}")]
+    DomainNotFound {
         /// The index of the domain.
         domain_index: usize,
-        /// The shard.
-        shard: usize,
-        /// The replica.
-        replica: usize,
     },
 
     /// A request referencing a node was sent to a domain not responsible for that node.
@@ -727,6 +705,9 @@ pub enum ReadySetError {
 
     #[error("CREATE CACHE failed: {0}")]
     CreateCacheError(String),
+
+    #[error("Readyset schema error: {0}")]
+    ReadysetSchemaError(String),
 }
 
 impl ReadySetError {
@@ -970,6 +951,43 @@ macro_rules! internal_err {
     }
 }
 
+/// Make a new [`ReadySetError::ReplicationFailed`] with the provided format arguments.
+///
+/// When building in debug mode, the returned error also captures file, line, and column information
+/// for further debugging purposes
+///
+/// # Examples
+///
+/// ```
+/// use readyset_errors::replication_failed_err;
+///
+/// let x = 4;
+/// let my_err = replication_failed_err!("{x} things went wrong during replication!");
+/// assert!(my_err.to_string().contains("4 things went wrong during replication!"));
+/// ```
+#[macro_export]
+macro_rules! replication_failed_err {
+    ($($format_args:tt)*) => {
+        $crate::ReadySetError::ReplicationFailed(format!(
+            "{}{}",
+            $crate::__location_info!("in {}: "),
+            format_args!($($format_args)*)
+        ))
+    }
+}
+
+/// Return a [`ReadySetError::ReplicationFailed`] from the current function.
+///
+/// Usage is like [`panic!`], in that you can pass a format string and arguments.
+/// When building in debug mode, the returned error also captures file, line, and column information
+/// for further debugging purposes.
+#[macro_export]
+macro_rules! replication_failed {
+    ($($format_args:tt)*) => {
+        return Err($crate::replication_failed_err!($($format_args)*).into())
+    };
+}
+
 /// Make a new [`ReadySetError::InvalidQuery`] with the provided format arguments.
 ///
 /// When building in debug mode, the returned error also captures file, line, and column information
@@ -1033,6 +1051,11 @@ macro_rules! unsupported_err {
 /// Make a new [`ReadySetError::BadRequest`] with the provided string-able argument.
 pub fn bad_request_err<T: Into<String>>(err: T) -> ReadySetError {
     ReadySetError::BadRequest(err.into())
+}
+
+/// Make a new [`ReadySetError::ReadysetSchemaError`] by stringifying the provided error.
+pub fn readyset_schema_err<E: ToString>(err: E) -> ReadySetError {
+    ReadySetError::ReadysetSchemaError(err.to_string())
 }
 
 /// Make a new [`ReadySetError::Internal`] for a column with no associated table. An internal error
@@ -1230,14 +1253,20 @@ impl_from_to_string!(rmp_serde::encode::Error, SerializationFailed);
 impl_from_to_string!(rmp_serde::decode::Error, SerializationFailed);
 impl_from_to_string!(url::ParseError, UrlParseFailed);
 impl_from_to_string!(mysql_async::Error, ReplicationFailed);
-impl_from_to_string!(tokio_postgres::Error, ReplicationFailed);
 impl_from_to_string!(deadpool_postgres::PoolError, ReplicationFailed);
 impl_from_to_string!(deadpool_postgres::CreatePoolError, ReplicationFailed);
 impl_from_to_string!(deadpool_postgres::BuildError, ReplicationFailed);
+
+impl From<tokio_postgres::Error> for ReadySetError {
+    fn from(e: tokio_postgres::Error) -> Self {
+        Self::ReplicationFailed(postgres_err(&e))
+    }
+}
+
 impl_from_to_string!(io::Error, IOError);
 impl_from_to_string!(tikv_jemalloc_ctl::Error, JemallocCtlError);
 impl_from_to_string!(tokio_native_tls::native_tls::Error, NativeTlsError);
-impl_from_to_string!(hyper::Error, HttpError);
+impl_from_to_string!(reqwest::Error, HttpError);
 impl_from_to_string!(readyset_decimal::ReadysetDecimalError, DecimalError);
 impl_from_to_string!(readyset_sql::AstConversionError, AstConversionError);
 impl_from_to_string!(pem::PemError, PemError);
@@ -1278,6 +1307,20 @@ macro_rules! set_failpoint_return_err {
             }
         ));
     }};
+}
+
+/// Extract a human-readable error string from a `tokio_postgres::Error`.
+///
+/// The upstream `tokio_postgres::Error::Display` only shows the error kind
+/// (e.g., "db error"). This function uses [`as_db_error()`] to extract the
+/// structured [`DbError`] message when available, falling back to the
+/// top-level `Display` for non-DB errors (timeouts, connection errors, etc.).
+pub fn postgres_err(e: &tokio_postgres::Error) -> String {
+    if let Some(db_err) = e.as_db_error() {
+        db_err.to_string()
+    } else {
+        e.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1370,11 +1413,7 @@ mod test {
         assert!(err.caused_by_controller_recovering());
 
         // Not caused by ControllerRecovering
-        let err = ReadySetError::NoSuchReplica {
-            domain_index: 0,
-            shard: 0,
-            replica: 0,
-        };
+        let err = ReadySetError::DomainNotFound { domain_index: 0 };
         assert!(!err.caused_by_controller_recovering());
     }
 }

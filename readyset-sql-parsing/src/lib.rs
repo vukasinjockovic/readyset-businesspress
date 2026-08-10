@@ -5,11 +5,14 @@ use std::time::Duration;
 use clap::ValueEnum;
 use readyset_errors::ReadySetError;
 use readyset_sql::ast::{
-    AddTablesStatement, AlterReadysetStatement, AlterTableStatement, CacheInner, CacheType,
-    ChangeUpstreamStatement, CreateCacheOptions, CreateCacheStatement, CreateTableStatement,
-    CreateViewStatement, DropCacheStatement, EvictionPolicy, Expr, ReadysetHintDirective,
-    ResnapshotTableStatement, SelectStatement, SetEviction, ShallowCacheQuery, SqlQuery, SqlType,
-    TableKey,
+    AddTablesStatement, AddUserStatement, AlterReadysetStatement, AlterTableStatement,
+    AutoparamControl, CacheInner, CacheType, ChangeCdcStatement, ChangeUpstreamStatement,
+    CreateCacheOptions, CreateCacheStatement, CreateTableStatement, CreateViewStatement,
+    DropCacheStatement, DropUserStatement, EvictionPolicy, Expr, FlushAllShallowCachesStatement,
+    FlushCacheStatement, ModifyUserStatement, ReadysetHintDirective, ResnapshotTableStatement,
+    SelectStatement, SessionAuthorizationValue, SetEviction, SetReplicationPositionStatement,
+    SetSessionAuthorization, SetStatement, ShallowCacheAllowlistChange, ShallowCacheAllowlistKind,
+    ShallowCacheQuery, SqlQuery, SqlType, TableKey, TrxCachePolicy,
 };
 use readyset_sql::{Dialect, IntoDialect, TryIntoDialect};
 use readyset_util::logging::{PARSING_LOG_PARSING_MISMATCH_SQLPARSER_FAILED, rate_limit};
@@ -136,6 +139,13 @@ impl ParsingPreset {
         Self::BothPreferSqlparser
     }
 
+    /// Whether parsing returns the sqlparser-derived AST whenever the sqlparser parse and AST
+    /// conversion succeed. When this is true, converting an already-parsed sqlparser AST is
+    /// equivalent to a full parse of the query text for such queries.
+    pub fn prefers_sqlparser_ast(self) -> bool {
+        matches!(self, Self::OnlySqlparser | Self::BothPreferSqlparser)
+    }
+
     pub fn into_config(self) -> ParsingConfig {
         match self {
             Self::OnlyNom => ParsingConfig::default().sqlparser(false),
@@ -202,17 +212,24 @@ fn sqlparser_dialect_from_readyset_dialect(
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy)]
 enum ReadysetKeyword {
+    ADAPTIVE,
+    ALLOWED,
     CACHES,
+    CDC,
     DEEP,
     DOMAINS,
     ENTER,
     ENTRIES,
     EVICTION,
     EXIT,
+    EXPIRES,
     MAINTENANCE,
     MATERIALIZATIONS,
+    MCP,
     MEMORY,
     MIGRATION,
+    MS,
+    NEVER,
     PERIOD,
     PATHS,
     POLICY,
@@ -222,9 +239,14 @@ enum ReadysetKeyword {
     REFRESH,
     REPLAY,
     RESNAPSHOT,
+    RSA,
+    SCOPE,
     SHALLOW,
     SIMPLIFIED,
+    STOP,
     SUPPORTED,
+    TOKEN,
+    TOKENS,
     TTL,
     UPSTREAM,
     /// To match both Readyset and sqlparser keywords in one go, we want to be able to accept both
@@ -235,17 +257,24 @@ enum ReadysetKeyword {
 impl ReadysetKeyword {
     fn as_str(&self) -> &str {
         match self {
+            Self::ADAPTIVE => "ADAPTIVE",
+            Self::ALLOWED => "ALLOWED",
             Self::CACHES => "CACHES",
+            Self::CDC => "CDC",
             Self::DEEP => "DEEP",
             Self::DOMAINS => "DOMAINS",
             Self::ENTER => "ENTER",
             Self::ENTRIES => "ENTRIES",
             Self::EVICTION => "EVICTION",
             Self::EXIT => "EXIT",
+            Self::EXPIRES => "EXPIRES",
             Self::MAINTENANCE => "MAINTENANCE",
             Self::MATERIALIZATIONS => "MATERIALIZATIONS",
+            Self::MCP => "MCP",
             Self::MEMORY => "MEMORY",
             Self::MIGRATION => "MIGRATION",
+            Self::MS => "MS",
+            Self::NEVER => "NEVER",
             Self::PERIOD => "PERIOD",
             Self::PATHS => "PATHS",
             Self::POLICY => "POLICY",
@@ -255,9 +284,14 @@ impl ReadysetKeyword {
             Self::REFRESH => "REFRESH",
             Self::REPLAY => "REPLAY",
             Self::RESNAPSHOT => "RESNAPSHOT",
+            Self::RSA => "RSA",
+            Self::SCOPE => "SCOPE",
             Self::SHALLOW => "SHALLOW",
             Self::SIMPLIFIED => "SIMPLIFIED",
+            Self::STOP => "STOP",
             Self::SUPPORTED => "SUPPORTED",
+            Self::TOKEN => "TOKEN",
+            Self::TOKENS => "TOKENS",
             Self::TTL => "TTL",
             Self::UPSTREAM => "UPSTREAM",
             Self::Standard(_) => panic!(
@@ -429,125 +463,564 @@ fn parse_alter(parser: &mut Parser, dialect: Dialect) -> Result<SqlQuery, Readys
             Ok(SqlQuery::AlterReadySet(
                 AlterReadysetStatement::ChangeUpstream(ChangeUpstreamStatement { url }),
             ))
-        } else {
-            Err(ReadysetParsingError::ReadysetParsingError(
-                "expected RESNAPSHOT TABLE, or ADD TABLES after READYSET".into(),
+        } else if parse_readyset_keywords(
+            parser,
+            &[
+                ReadysetKeyword::STOP,
+                ReadysetKeyword::Standard(Keyword::REPLICATION),
+            ],
+        ) {
+            Ok(SqlQuery::AlterReadySet(
+                AlterReadysetStatement::StopReplication,
             ))
+        } else if parse_readyset_keywords(
+            parser,
+            &[
+                ReadysetKeyword::Standard(Keyword::START),
+                ReadysetKeyword::Standard(Keyword::REPLICATION),
+            ],
+        ) {
+            Ok(SqlQuery::AlterReadySet(
+                AlterReadysetStatement::StartReplication,
+            ))
+        } else if parse_readyset_keywords(
+            parser,
+            &[
+                ReadysetKeyword::Standard(Keyword::SET),
+                ReadysetKeyword::Standard(Keyword::REPLICATION),
+            ],
+        ) {
+            parser.expect_keyword(Keyword::POSITION)?;
+            let position = parser.parse_literal_string()?;
+            Ok(SqlQuery::AlterReadySet(
+                AlterReadysetStatement::SetReplicationPosition(SetReplicationPositionStatement {
+                    position,
+                }),
+            ))
+        } else if parse_readyset_keywords(
+            parser,
+            &[
+                ReadysetKeyword::Standard(Keyword::CHANGE),
+                ReadysetKeyword::CDC,
+            ],
+        ) {
+            parser.expect_keyword(Keyword::TO)?;
+            let url = parser.parse_literal_string()?;
+            Ok(SqlQuery::AlterReadySet(AlterReadysetStatement::ChangeCdc(
+                ChangeCdcStatement { url },
+            )))
+        } else if parse_readyset_keywords(
+            parser,
+            &[
+                ReadysetKeyword::Standard(Keyword::ADD),
+                ReadysetKeyword::SHALLOW,
+                ReadysetKeyword::Standard(Keyword::CACHE),
+                ReadysetKeyword::ALLOWED,
+            ],
+        ) {
+            parse_shallow_cache_allowlist_change(parser, true)
+        } else if parse_readyset_keywords(
+            parser,
+            &[
+                ReadysetKeyword::Standard(Keyword::DROP),
+                ReadysetKeyword::SHALLOW,
+                ReadysetKeyword::Standard(Keyword::CACHE),
+                ReadysetKeyword::ALLOWED,
+            ],
+        ) {
+            parse_shallow_cache_allowlist_change(parser, false)
+        } else if parse_readyset_keywords(
+            parser,
+            &[
+                ReadysetKeyword::Standard(Keyword::ADD),
+                ReadysetKeyword::Standard(Keyword::USER),
+            ],
+        ) {
+            let user = parser.parse_literal_string()?.into();
+            parser.expect_keyword(Keyword::PASSWORD)?;
+            let password = parser.parse_literal_string()?.into();
+            Ok(SqlQuery::AlterReadySet(AlterReadysetStatement::AddUser(
+                AddUserStatement { user, password },
+            )))
+        } else if parse_readyset_keywords(
+            parser,
+            &[
+                ReadysetKeyword::Standard(Keyword::MODIFY),
+                ReadysetKeyword::Standard(Keyword::USER),
+            ],
+        ) {
+            let user = parser.parse_literal_string()?.into();
+            parser.expect_keyword(Keyword::PASSWORD)?;
+            let password = parser.parse_literal_string()?.into();
+            Ok(SqlQuery::AlterReadySet(AlterReadysetStatement::ModifyUser(
+                ModifyUserStatement { user, password },
+            )))
+        } else if parse_readyset_keywords(
+            parser,
+            &[
+                ReadysetKeyword::Standard(Keyword::DROP),
+                ReadysetKeyword::Standard(Keyword::USER),
+            ],
+        ) {
+            let user = parser.parse_literal_string()?.into();
+            Ok(SqlQuery::AlterReadySet(AlterReadysetStatement::DropUser(
+                DropUserStatement { user },
+            )))
+        } else {
+            Err(ReadysetParsingError::ReadysetParsingError(format!(
+                "unexpected token after ALTER READYSET: {}",
+                parser.peek_token()
+            )))
         }
+    } else if parse_readyset_keywords(parser, &[ReadysetKeyword::MCP, ReadysetKeyword::TOKEN]) {
+        parse_alter_mcp_token_body(parser)
     } else {
         Ok(parser.parse_alter()?.try_into_dialect(dialect)?)
     }
 }
 
-/// Parse cache options (POLICY, TTL, REFRESH, COALESCE, ALWAYS, CONCURRENTLY) from the token
-/// stream. The `CREATE [DEEP|SHALLOW] CACHE` keywords must already be consumed.
-///
-/// This is shared between `CREATE CACHE` DDL parsing and hint directive parsing.
-/// Syntax is identical in both contexts:
-///     `POLICY TTL <n> SECONDS [REFRESH [EVERY] <n> SECONDS] [COALESCE <n> SECONDS]`
-fn parse_cache_options(
+/// Parse the tail of `ALTER READYSET {ADD | DROP} SHALLOW CACHE ALLOWED ...`:
+/// the target-kind keyword (`FUNCTION`, `VARIABLE`, or `SCHEMA`) followed by a
+/// comma-separated list of names. `add` is `true` for `ADD`, `false` for `DROP`.
+fn parse_shallow_cache_allowlist_change(
     parser: &mut Parser,
-    cache_type: Option<CacheType>,
-) -> Result<CreateCacheOptions, ReadysetParsingError> {
-    let policy = if parse_readyset_keyword(parser, ReadysetKeyword::POLICY) {
-        if cache_type != Some(CacheType::Shallow) {
+    add: bool,
+) -> Result<SqlQuery, ReadysetParsingError> {
+    let kind = if parser.parse_keyword(Keyword::FUNCTION) {
+        ShallowCacheAllowlistKind::Function
+    } else if parser.parse_keyword(Keyword::VARIABLE) {
+        ShallowCacheAllowlistKind::Variable
+    } else if parser.parse_keyword(Keyword::SCHEMA) {
+        ShallowCacheAllowlistKind::Schema
+    } else {
+        return Err(ReadysetParsingError::ReadysetParsingError(format!(
+            "expected FUNCTION, VARIABLE, or SCHEMA after SHALLOW CACHE ALLOWED, got: {}",
+            parser.peek_token()
+        )));
+    };
+    let names = parser
+        .parse_comma_separated(|p| p.parse_identifier())?
+        .into_iter()
+        .map(|id| id.value.into())
+        .collect();
+    Ok(SqlQuery::AlterReadySet(
+        AlterReadysetStatement::ShallowCacheAllowlistChange(ShallowCacheAllowlistChange {
+            kind,
+            add,
+            names,
+        }),
+    ))
+}
+
+/// Consume a duration unit keyword (`SECONDS`, `MILLISECONDS`, or `MS`) and turn `value` into a
+/// [`Duration`]. `context` names the preceding clause for error messages (e.g. `"TTL"`,
+/// `"REFRESH"`, `"COALESCE"`).
+fn parse_duration_unit(
+    parser: &mut Parser,
+    value: u64,
+    context: &str,
+) -> Result<Duration, ReadysetParsingError> {
+    if parser.parse_keyword(Keyword::SECONDS) {
+        Ok(Duration::from_secs(value))
+    } else if parser.parse_keyword(Keyword::MILLISECONDS)
+        || parse_readyset_keyword(parser, ReadysetKeyword::MS)
+    {
+        Ok(Duration::from_millis(value))
+    } else {
+        Err(ReadysetParsingError::ReadysetParsingError(format!(
+            "Expected SECONDS, MILLISECONDS, or MS after {context} duration"
+        )))
+    }
+}
+
+/// Parse `<uint> (SECONDS | MILLISECONDS | MS)` and return the corresponding [`Duration`].
+fn parse_duration_with_unit(
+    parser: &mut Parser,
+    context: &str,
+) -> Result<Duration, ReadysetParsingError> {
+    let value = parser.parse_literal_uint().map_err(|_| {
+        ReadysetParsingError::ReadysetParsingError(format!("couldn't parse {context} duration"))
+    })?;
+    parse_duration_unit(parser, value, context)
+}
+
+/// Parse the tail of `ALTER MCP TOKEN '<name>' SET (EXPIRES '<datetime>' | NEVER EXPIRES)`.
+/// The `ALTER MCP TOKEN` keywords must already be consumed.
+fn parse_alter_mcp_token_body(parser: &mut Parser) -> Result<SqlQuery, ReadysetParsingError> {
+    let name = parser.parse_literal_string()?;
+    parser.expect_keyword(Keyword::SET)?;
+
+    let expires =
+        if parse_readyset_keywords(parser, &[ReadysetKeyword::NEVER, ReadysetKeyword::EXPIRES]) {
+            readyset_sql::ast::McpTokenExpiresChange::Never
+        } else if parse_readyset_keyword(parser, ReadysetKeyword::EXPIRES) {
+            let s = parser.parse_literal_string()?;
+            readyset_sql::ast::McpTokenExpiresChange::At(s)
+        } else {
             return Err(ReadysetParsingError::ReadysetParsingError(
-                "only shallow caches support caching policies".into(),
+                "expected EXPIRES or NEVER EXPIRES after SET".into(),
             ));
+        };
+
+    Ok(SqlQuery::AlterMcpToken(
+        readyset_sql::ast::AlterMcpTokenStatement { name, expires },
+    ))
+}
+
+/// A single parsed `CREATE CACHE` option, used internally before being applied to
+/// [`CreateCacheOptions`].
+enum CacheOptionKind {
+    Always,
+    UntilWrite,
+    Concurrently,
+    Policy(EvictionPolicy),
+    Coalesce(Duration),
+    Adaptive,
+    /// `TOPK_BUFFER_MULTIPLIER = N`. Only accepted inside the `WITH (...)` umbrella.
+    TopkBufferMultiplier(usize),
+    /// `AUTOPARAM OFF` or `AUTOPARAM (EXCLUDE_JOINS, EXCLUDE_EXISTS)`. Suppresses
+    /// autoparameterization for the named scope; not part of the public SQL reference.
+    Autoparam(AutoparamControl),
+}
+
+/// Consume an unquoted identifier matching `name` (case-insensitive). Returns `true` and advances
+/// the parser on a match; otherwise leaves the parser untouched and returns `false`.
+fn consume_bare_ident(parser: &mut Parser, name: &str) -> bool {
+    if let TokenWithSpan {
+        token:
+            Token::Word(Word {
+                value,
+                quote_style: None,
+                ..
+            }),
+        ..
+    } = parser.peek_token()
+        && value.eq_ignore_ascii_case(name)
+    {
+        parser.next_token();
+        return true;
+    }
+    false
+}
+
+/// Parse the `AUTOPARAM` option: `AUTOPARAM ON` (explicit default), `AUTOPARAM OFF` (suppress
+/// autoparameterization entirely), or `AUTOPARAM (EXCLUDE_JOINS, EXCLUDE_EXISTS)` (suppress it for
+/// literals originating in the named clause kinds). WITH-only, like `TOPK_BUFFER_MULTIPLIER` —
+/// never accepted in the bare options form. The inner parens keep the scope-list commas from
+/// colliding with the `WITH (...)` option separator. Returns `Ok(None)` (consuming nothing) when
+/// the next token isn't `AUTOPARAM`.
+fn parse_autoparam_option(
+    parser: &mut Parser,
+) -> Result<Option<AutoparamControl>, ReadysetParsingError> {
+    if !consume_bare_ident(parser, "autoparam") {
+        return Ok(None);
+    }
+    let mut ctrl = AutoparamControl::default();
+    if consume_bare_ident(parser, "off") {
+        ctrl.off = true;
+        return Ok(Some(ctrl));
+    }
+    if consume_bare_ident(parser, "on") {
+        // Explicit default (autoparameterize everything); lets generated DDL always emit an
+        // AUTOPARAM clause rather than conditionally omitting it.
+        return Ok(Some(ctrl));
+    }
+    parser.expect_token(&Token::LParen)?;
+    loop {
+        if parser.peek_token().token == Token::RParen {
+            break;
         }
+        if consume_bare_ident(parser, "exclude_joins") {
+            ctrl.exclude_joins = true;
+        } else if consume_bare_ident(parser, "exclude_exists") {
+            ctrl.exclude_exists = true;
+        } else if consume_bare_ident(parser, "exclude_subqueries") {
+            ctrl.exclude_subqueries = true;
+        } else {
+            return Err(ReadysetParsingError::ReadysetParsingError(format!(
+                "Unexpected token in AUTOPARAM (...): {}",
+                parser.peek_token()
+            )));
+        }
+        if !parser.consume_token(&Token::Comma) {
+            break;
+        }
+    }
+    parser.expect_token(&Token::RParen)?;
+    if ctrl.is_default() {
+        return Err(ReadysetParsingError::ReadysetParsingError(
+            "AUTOPARAM requires OFF or a non-empty exclude list".into(),
+        ));
+    }
+    Ok(Some(ctrl))
+}
+
+/// Try to consume `TOPK_BUFFER_MULTIPLIER = <uint>` from the parser. Returns `Ok(Some(value))`
+/// on success, `Ok(None)` if the identifier doesn't match (parser is left untouched), and
+/// `Err(_)` if the identifier matches but parsing fails after that point.
+///
+/// Only matches the bare (unquoted) identifier, so `"topk_buffer_multiplier"` and
+/// backtick-quoted forms are not accepted — same convention as the other cache options.
+fn try_parse_topk_buffer_multiplier(
+    parser: &mut Parser,
+) -> Result<Option<usize>, ReadysetParsingError> {
+    let TokenWithSpan {
+        token:
+            Token::Word(Word {
+                value,
+                quote_style: None,
+                ..
+            }),
+        ..
+    } = parser.peek_token()
+    else {
+        return Ok(None);
+    };
+    if !value.eq_ignore_ascii_case("topk_buffer_multiplier") {
+        return Ok(None);
+    }
+    parser.next_token();
+    parser.expect_token(&Token::Eq)?;
+    let value = parser.parse_literal_uint().map_err(|e| {
+        ReadysetParsingError::ReadysetParsingError(format!(
+            "TOPK_BUFFER_MULTIPLIER requires an unsigned integer literal: {e}"
+        ))
+    })?;
+    let value = usize::try_from(value).map_err(|_| {
+        ReadysetParsingError::ReadysetParsingError(format!(
+            "TOPK_BUFFER_MULTIPLIER value {value} does not fit in usize"
+        ))
+    })?;
+    Ok(Some(value))
+}
+
+/// Parse a single cache option (without leading `WITH (` or comma separators).
+/// Returns `None` if the next token doesn't begin a recognized option.
+fn parse_single_cache_option(
+    parser: &mut Parser,
+) -> Result<Option<CacheOptionKind>, ReadysetParsingError> {
+    if parse_readyset_keyword(parser, ReadysetKeyword::POLICY) {
         if !parse_readyset_keyword(parser, ReadysetKeyword::TTL) {
             return Err(ReadysetParsingError::ReadysetParsingError(
                 "Expected TTL after POLICY".into(),
             ));
         }
-        let ttl_secs = parser.parse_literal_uint().map_err(|_| {
-            ReadysetParsingError::ReadysetParsingError("couldn't parse TTL duration".into())
-        })?;
-        if !parser.parse_keyword(Keyword::SECONDS) {
-            return Err(ReadysetParsingError::ReadysetParsingError(
-                "Expected SECONDS after TTL duration".into(),
-            ));
-        }
+        let ttl = parse_duration_with_unit(parser, "TTL")?;
 
         let policy = if parse_readyset_keyword(parser, ReadysetKeyword::REFRESH) {
             let scheduled_refresh = parser.parse_keyword(Keyword::EVERY);
             match parser.parse_literal_uint() {
-                Ok(refresh_secs) => {
-                    if !parser.parse_keyword(Keyword::SECONDS) {
-                        return Err(ReadysetParsingError::ReadysetParsingError(
-                            "Expected SECONDS after REFRESH duration".into(),
-                        ));
-                    }
-                    if refresh_secs >= ttl_secs {
+                Ok(value) => {
+                    let refresh = parse_duration_unit(parser, value, "REFRESH")?;
+                    if refresh >= ttl {
                         return Err(ReadysetParsingError::ReadysetParsingError(
                             "REFRESH period must be less than TTL".into(),
                         ));
                     }
-
                     EvictionPolicy::TtlAndPeriod {
-                        ttl: Duration::from_secs(ttl_secs),
-                        refresh: Duration::from_secs(refresh_secs),
+                        ttl,
+                        refresh,
                         schedule: scheduled_refresh,
                     }
                 }
                 _ => {
                     parser.prev_token();
-                    EvictionPolicy::Ttl {
-                        ttl: Duration::from_secs(ttl_secs),
-                    }
+                    EvictionPolicy::Ttl { ttl }
                 }
             }
         } else {
-            EvictionPolicy::Ttl {
-                ttl: Duration::from_secs(ttl_secs),
-            }
+            EvictionPolicy::Ttl { ttl }
         };
-
-        Some(policy)
-    } else {
-        None
-    };
-
-    let coalesce_ms = if parser.parse_keyword(Keyword::COALESCE) {
-        if cache_type != Some(CacheType::Shallow) {
+        Ok(Some(CacheOptionKind::Policy(policy)))
+    } else if parser.parse_keyword(Keyword::COALESCE) {
+        Ok(Some(CacheOptionKind::Coalesce(parse_duration_with_unit(
+            parser, "COALESCE",
+        )?)))
+    } else if parser.parse_keyword(Keyword::ALWAYS) {
+        Ok(Some(CacheOptionKind::Always))
+    } else if parser.parse_keyword(Keyword::UNTIL) {
+        if !parser.parse_keyword(Keyword::WRITE) {
             return Err(ReadysetParsingError::ReadysetParsingError(
-                "COALESCE is only supported for SHALLOW caches".into(),
+                "expected WRITE after UNTIL".into(),
             ));
         }
-        let coalesce_secs = parser.parse_literal_uint().map_err(|_| {
-            ReadysetParsingError::ReadysetParsingError("Expected number after COALESCE".into())
-        })?;
-        if !parser.parse_keyword(Keyword::SECONDS) {
-            return Err(ReadysetParsingError::ReadysetParsingError(
-                "Expected SECONDS after COALESCE duration".into(),
-            ));
-        }
-        Some(Duration::from_secs(coalesce_secs))
+        Ok(Some(CacheOptionKind::UntilWrite))
+    } else if parser.parse_keyword(Keyword::CONCURRENTLY) {
+        Ok(Some(CacheOptionKind::Concurrently))
+    } else if parse_readyset_keyword(parser, ReadysetKeyword::ADAPTIVE) {
+        Ok(Some(CacheOptionKind::Adaptive))
     } else {
-        None
-    };
-
-    let mut always = false;
-    let mut concurrently = false;
-    match parser.parse_one_of_keywords(&[Keyword::ALWAYS, Keyword::CONCURRENTLY]) {
-        Some(Keyword::ALWAYS) => {
-            always = true;
-            concurrently = parser.parse_keyword(Keyword::CONCURRENTLY);
-        }
-        Some(Keyword::CONCURRENTLY) => {
-            concurrently = true;
-            always = parser.parse_keyword(Keyword::ALWAYS);
-        }
-        _ => {}
+        Ok(None)
     }
+}
 
-    Ok(CreateCacheOptions {
-        always,
-        concurrently,
+/// Apply a parsed option to the accumulator. Errors on duplicates and on shallow-only options
+/// used with a non-shallow cache.
+fn apply_cache_option(
+    opts: &mut CreateCacheOptions,
+    opt: CacheOptionKind,
+    cache_type: Option<CacheType>,
+) -> Result<(), ReadysetParsingError> {
+    match opt {
+        CacheOptionKind::Always => {
+            if !matches!(opts.trx_cache_policy, TrxCachePolicy::Never) {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "transaction cache policy specified more than once".into(),
+                ));
+            }
+            opts.trx_cache_policy = TrxCachePolicy::Always;
+        }
+        CacheOptionKind::UntilWrite => {
+            if !matches!(opts.trx_cache_policy, TrxCachePolicy::Never) {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "transaction cache policy specified more than once".into(),
+                ));
+            }
+            opts.trx_cache_policy = TrxCachePolicy::UntilWrite;
+        }
+        CacheOptionKind::Concurrently => {
+            if std::mem::replace(&mut opts.concurrently, true) {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "CONCURRENTLY specified more than once".into(),
+                ));
+            }
+        }
+        CacheOptionKind::Policy(policy) => {
+            if cache_type == Some(CacheType::Deep) {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "DEEP caches do not support caching policies".into(),
+                ));
+            }
+            if opts.policy.replace(policy).is_some() {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "POLICY specified more than once".into(),
+                ));
+            }
+        }
+        CacheOptionKind::Coalesce(duration) => {
+            if cache_type == Some(CacheType::Deep) {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "COALESCE is not supported for DEEP caches".into(),
+                ));
+            }
+            if opts.coalesce_ms.replace(duration).is_some() {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "COALESCE specified more than once".into(),
+                ));
+            }
+        }
+        CacheOptionKind::Adaptive => {
+            if cache_type == Some(CacheType::Deep) {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "ADAPTIVE is not supported for DEEP caches".into(),
+                ));
+            }
+            if std::mem::replace(&mut opts.adaptive, true) {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "ADAPTIVE specified more than once".into(),
+                ));
+            }
+        }
+        CacheOptionKind::TopkBufferMultiplier(value) => {
+            if cache_type == Some(CacheType::Shallow) {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "TOPK_BUFFER_MULTIPLIER is not supported for SHALLOW caches".into(),
+                ));
+            }
+            if opts.topk_buffer_multiplier.replace(value).is_some() {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "TOPK_BUFFER_MULTIPLIER specified more than once".into(),
+                ));
+            }
+        }
+        CacheOptionKind::Autoparam(ctrl) => {
+            if !opts.autoparam.is_default() {
+                return Err(ReadysetParsingError::ReadysetParsingError(
+                    "AUTOPARAM specified more than once".into(),
+                ));
+            }
+            opts.autoparam = ctrl;
+        }
+    }
+    Ok(())
+}
+
+/// Canonicalize options that have semantically-equivalent representations. Called after all
+/// options are applied so duplicate detection isn't confused by intermediate values.
+fn normalize_cache_options(opts: &mut CreateCacheOptions) {
+    // `TOPK_BUFFER_MULTIPLIER = 1` is identical to the default (`buffered = k`). Normalize to
+    // `None` so two statements that differ only in `Some(1)` vs `None` hash/compare equal.
+    if opts.topk_buffer_multiplier == Some(1) {
+        opts.topk_buffer_multiplier = None;
+    }
+}
+
+/// Parse the legacy bare options (`[POLICY TTL ...] [COALESCE ...] [ALWAYS] [CONCURRENTLY]`) that
+/// precede the cache name. The `CREATE [DEEP|SHALLOW] CACHE` keywords must already be consumed.
+/// Returns the default (no options) when none are present.
+fn parse_bare_cache_options(
+    parser: &mut Parser,
+    cache_type: Option<CacheType>,
+) -> Result<CreateCacheOptions, ReadysetParsingError> {
+    let mut opts = CreateCacheOptions {
         cache_type,
-        policy,
-        coalesce_ms,
-    })
+        ..Default::default()
+    };
+    while let Some(opt) = parse_single_cache_option(parser)? {
+        apply_cache_option(&mut opts, opt, cache_type)?;
+    }
+    Ok(opts)
+}
+
+/// If the next token is `WITH`, parse a `WITH ( option [, option]... )` clause into `opts` and
+/// return `true`. Returns `false` (consuming nothing) when there is no WITH clause. Empty
+/// `WITH ()` is accepted as "no options", so callers generating SQL can always emit
+/// `WITH (<options>)` without special-casing zero options.
+fn parse_with_cache_clause(
+    parser: &mut Parser,
+    cache_type: Option<CacheType>,
+    opts: &mut CreateCacheOptions,
+) -> Result<bool, ReadysetParsingError> {
+    if !parser.parse_keyword(Keyword::WITH) {
+        return Ok(false);
+    }
+    parser.expect_token(&Token::LParen)?;
+    loop {
+        if parser.peek_token().token == Token::RParen {
+            break;
+        }
+        // WITH-only knobs first, then fall back to the shared legacy-option parser.
+        let opt = if let Some(value) = try_parse_topk_buffer_multiplier(parser)? {
+            CacheOptionKind::TopkBufferMultiplier(value)
+        } else if let Some(ctrl) = parse_autoparam_option(parser)? {
+            CacheOptionKind::Autoparam(ctrl)
+        } else {
+            parse_single_cache_option(parser)?.ok_or_else(|| {
+                ReadysetParsingError::ReadysetParsingError(format!(
+                    "Unexpected token in WITH clause: {}",
+                    parser.peek_token()
+                ))
+            })?
+        };
+        apply_cache_option(opts, opt, cache_type)?;
+        if !parser.consume_token(&Token::Comma) {
+            break;
+        }
+    }
+    parser.expect_token(&Token::RParen)?;
+    Ok(true)
+}
+
+/// Whether any cache option is set, used to reject combining the bare form with a `WITH (...)`
+/// clause on the same statement.
+fn cache_options_present(opts: &CreateCacheOptions) -> bool {
+    opts.policy.is_some()
+        || opts.coalesce_ms.is_some()
+        || opts.adaptive
+        || opts.concurrently
+        || !matches!(opts.trx_cache_policy, TrxCachePolicy::Never)
+        || opts.topk_buffer_multiplier.is_some()
+        || !opts.autoparam.is_default()
 }
 
 /// Expects `CREATE CACHE` was already parsed. Attempts to parse a Readyset-specific create cache
@@ -569,25 +1042,48 @@ fn parse_cache_options(
 /// cache_options:
 ///     | ALWAYS
 ///     | CONCURRENTLY
+/// Parse the shared head of a `CREATE [DEEP|SHALLOW] CACHE` construct: the cache-type keywords,
+/// the legacy bare options, the optional `[<name>]`, and the optional `WITH (...)` umbrella. The
+/// `FROM <query>` tail is statement-only and parsed by the caller; hint directives have no `FROM`.
+/// Keeping this in one place means new option or name syntax only has to be added once, rather
+/// than duplicated between the DDL and hint parsers.
+fn parse_cache_options(
+    parser: &mut Parser,
+    dialect: Dialect,
+) -> Result<CreateCacheOptions, ReadysetParsingError> {
+    let cache_type = parse_create_cache_keywords(parser)?;
+    // Legacy bare options come before the name; the `WITH (...)` umbrella comes after it.
+    let mut opts = parse_bare_cache_options(parser, cache_type)?;
+    let bare_present = cache_options_present(&opts);
+
+    // Optional cache name: absent when the next token is FROM (no name) or WITH (the umbrella,
+    // which follows the name slot).
+    opts.name = if parser.peek_keyword(Keyword::FROM) || parser.peek_keyword(Keyword::WITH) {
+        None
+    } else {
+        parser
+            .parse_object_name(false)
+            .ok()
+            .try_into_dialect(dialect)?
+    };
+
+    // Optional WITH (...) umbrella, after the name. Mutually exclusive with the bare form.
+    if parse_with_cache_clause(parser, cache_type, &mut opts)? && bare_present {
+        return Err(ReadysetParsingError::ReadysetParsingError(
+            "CREATE CACHE cannot combine bare options with a WITH (...) clause".into(),
+        ));
+    }
+    normalize_cache_options(&mut opts);
+    Ok(opts)
+}
+
 fn parse_create_cache(
     parser: &mut Parser,
     dialect: Dialect,
     input: impl AsRef<str>,
 ) -> Result<SqlQuery, ReadysetParsingError> {
-    let cache_type = parse_create_cache_keywords(parser)?;
-    let opts = parse_cache_options(parser, cache_type)?;
-
-    let from = parser.parse_keyword(Keyword::FROM);
-    let name = if !from {
-        let name = parser
-            .parse_object_name(false)
-            .ok()
-            .try_into_dialect(dialect)?;
-        parser.expect_keyword(Keyword::FROM)?;
-        name
-    } else {
-        None
-    };
+    let opts = parse_cache_options(parser, dialect)?;
+    parser.expect_keyword(Keyword::FROM)?;
 
     // FIXME(sqlparser): Remove this once we deprecate nom-sql and switch to sqlparser
     // This is here to match the behavior of nom-sql, where it returns the part of
@@ -607,23 +1103,27 @@ fn parse_create_cache(
 
     let inner = parse_query_for_create_cache(parser, dialect, remaining_query);
     Ok(SqlQuery::CreateCache(CreateCacheStatement {
-        name,
+        name: opts.name,
         cache_type: opts.cache_type,
         policy: opts.policy,
         coalesce_ms: opts.coalesce_ms,
+        adaptive: opts.adaptive,
         inner,
         unparsed_create_cache_statement: Some(input.as_ref().trim().to_string()),
-        always: opts.always,
+        trx_cache_policy: opts.trx_cache_policy,
         concurrently: opts.concurrently,
+        topk_buffer_multiplier: opts.topk_buffer_multiplier,
+        autoparam: opts.autoparam,
     }))
 }
 
 /// Parse a readyset hint text (without `/*rs+` and `*/` markers) into a directive.
 ///
-/// Uses the same `parse_cache_options()` infrastructure as `CREATE CACHE` DDL parsing,
-/// so any new options added to `CREATE CACHE` are automatically supported in hints.
+/// Dispatches to the appropriate parser based on the first keyword:
+/// - `CREATE [DEEP|SHALLOW] CACHE ...` → [`ReadysetHintDirective::CreateCache`]
+/// - `SKIP CACHE` → [`ReadysetHintDirective::SkipCache`]
 ///
-/// Returns `Ok(None)` for unrecognized directives (future-proof).
+/// Returns `Ok(None)` for unrecognized directives (forward-compatible).
 /// Returns `Err(...)` for recognized but malformed directives.
 pub fn parse_hint_directive(
     dialect: Dialect,
@@ -639,25 +1139,31 @@ pub fn parse_hint_directive(
         .try_with_sql(text)
         .map_err(|e| ReadysetParsingError::ReadysetParsingError(e.to_string()))?;
 
-    // Try parsing as CREATE [DEEP|SHALLOW] CACHE using the same function as DDL.
-    // If the first token isn't CREATE, this is an unrecognized directive.
-    let directive = match parse_create_cache_keywords(&mut parser) {
-        Ok(cache_type) => {
-            let opts = parse_cache_options(&mut parser, cache_type)?;
-            ReadysetHintDirective::CreateCache(opts)
+    let directive = if parser.parse_keywords(&[Keyword::SKIP, Keyword::CACHE]) {
+        Some(ReadysetHintDirective::SkipCache)
+    } else if parser.peek_keyword(Keyword::CREATE) {
+        // A hint has no FROM (the query is the statement the hint annotates), so we parse the same
+        // head as `CREATE CACHE` DDL and stop; anything left over trips the trailing-token check
+        // below. Hints create shallow caches only.
+        let opts = parse_cache_options(&mut parser, dialect)?;
+        if opts.cache_type == Some(CacheType::Deep) {
+            return Err(ReadysetParsingError::ReadysetParsingError(
+                "DEEP caches are not supported in a hint; hints create shallow caches only".into(),
+            ));
         }
-        Err(_) => return Ok(None),
+        Some(ReadysetHintDirective::CreateCache(opts))
+    } else {
+        None
     };
 
-    // Ensure all hint text was consumed
-    if parser.peek_token() != Token::EOF {
+    if directive.is_some() && parser.peek_token() != Token::EOF {
         return Err(ReadysetParsingError::ReadysetParsingError(format!(
-            "Unexpected token in CREATE CACHE hint: {}",
+            "Unexpected token in hint: {}",
             parser.peek_token()
         )));
     }
 
-    Ok(Some(directive))
+    Ok(directive)
 }
 
 fn peek_create_cache(parser: &mut Parser) -> bool {
@@ -700,6 +1206,91 @@ fn parse_optional_cache_type(parser: &mut Parser) -> Option<CacheType> {
     }
 }
 
+/// Peek ahead to see if the next statement is `CREATE MCP TOKEN`. Restores the
+/// parser position before returning.
+fn peek_create_mcp_token(parser: &mut Parser) -> bool {
+    let backup = |parser: &mut Parser<'_>, n| {
+        for _ in 0..n {
+            parser.prev_token();
+        }
+    };
+
+    if !parser.parse_keyword(Keyword::CREATE) {
+        return false;
+    }
+    if !parse_readyset_keyword(parser, ReadysetKeyword::MCP) {
+        backup(parser, 1);
+        return false;
+    }
+    if !parse_readyset_keyword(parser, ReadysetKeyword::TOKEN) {
+        backup(parser, 2);
+        return false;
+    }
+    backup(parser, 3);
+    true
+}
+
+/// Parse a scope keyword: read_only | cache_admin | full.
+fn parse_mcp_scope(
+    parser: &mut Parser,
+) -> Result<readyset_sql::ast::McpTokenScope, ReadysetParsingError> {
+    let ident = parser.parse_identifier()?;
+    match ident.value.to_ascii_lowercase().as_str() {
+        "read_only" => Ok(readyset_sql::ast::McpTokenScope::ReadOnly),
+        "cache_admin" => Ok(readyset_sql::ast::McpTokenScope::CacheAdmin),
+        "full" => Ok(readyset_sql::ast::McpTokenScope::Full),
+        other => Err(ReadysetParsingError::ReadysetParsingError(format!(
+            "expected scope read_only, cache_admin, or full, got {other}"
+        ))),
+    }
+}
+
+/// Parse `CREATE MCP TOKEN '<name>' [WITH SCOPE <scope>] [EXPIRES '<datetime>']`.
+/// The CREATE keyword must not yet be consumed.
+fn parse_create_mcp_token(parser: &mut Parser) -> Result<SqlQuery, ReadysetParsingError> {
+    if !parser.parse_keyword(Keyword::CREATE) {
+        return Err(ReadysetParsingError::ReadysetParsingError(
+            "expected CREATE".into(),
+        ));
+    }
+    if !parse_readyset_keyword(parser, ReadysetKeyword::MCP) {
+        return Err(ReadysetParsingError::ReadysetParsingError(
+            "expected MCP after CREATE".into(),
+        ));
+    }
+    if !parse_readyset_keyword(parser, ReadysetKeyword::TOKEN) {
+        return Err(ReadysetParsingError::ReadysetParsingError(
+            "expected TOKEN after CREATE MCP".into(),
+        ));
+    }
+    let name = parser.parse_literal_string()?;
+
+    let scope = if parser.parse_keyword(Keyword::WITH) {
+        if !parse_readyset_keyword(parser, ReadysetKeyword::SCOPE) {
+            return Err(ReadysetParsingError::ReadysetParsingError(
+                "expected SCOPE after WITH".into(),
+            ));
+        }
+        Some(parse_mcp_scope(parser)?)
+    } else {
+        None
+    };
+
+    let expires = if parse_readyset_keyword(parser, ReadysetKeyword::EXPIRES) {
+        Some(parser.parse_literal_string()?)
+    } else {
+        None
+    };
+
+    Ok(SqlQuery::CreateMcpToken(
+        readyset_sql::ast::CreateMcpTokenStatement {
+            name,
+            scope,
+            expires,
+        },
+    ))
+}
+
 fn parse_create_cache_keywords(
     parser: &mut Parser,
 ) -> Result<Option<CacheType>, ReadysetParsingError> {
@@ -728,7 +1319,9 @@ fn parse_query_for_create_cache(
     // Try to parse as statement first
     if let Ok(statement) = parser.try_parse(|p| p.parse_statement()) {
         let shallow = if let sqlparser::ast::Statement::Query(ref query) = statement {
-            Ok((*query.clone()).into())
+            let mut sq: ShallowCacheQuery = (*query.clone()).into();
+            sq.take_hints();
+            Ok(Box::new(sq))
         } else {
             Err(remaining_query.clone())
         };
@@ -763,8 +1356,13 @@ fn parse_explain(
         ));
     }
     if parse_readyset_keyword(parser, ReadysetKeyword::MATERIALIZATIONS) {
+        let for_cache = if parser.parse_keywords(&[Keyword::FOR, Keyword::CACHE]) {
+            Some(parser.parse_object_name(false)?.try_into_dialect(dialect)?)
+        } else {
+            None
+        };
         return Ok(SqlQuery::Explain(
-            readyset_sql::ast::ExplainStatement::Materializations,
+            readyset_sql::ast::ExplainStatement::Materializations { for_cache },
         ));
     }
     let simplified = parse_readyset_keyword(parser, ReadysetKeyword::SIMPLIFIED);
@@ -881,9 +1479,21 @@ fn parse_show(parser: &mut Parser, dialect: Dialect) -> Result<SqlQuery, Readyse
                     readyset_sql::ast::ReadySetTablesOptions { all: true },
                 ),
             ))
+        } else if parse_readyset_keywords(
+            parser,
+            &[
+                ReadysetKeyword::RSA,
+                ReadysetKeyword::Standard(Keyword::PUBLIC),
+                ReadysetKeyword::Standard(Keyword::KEY),
+            ],
+        ) {
+            Ok(SqlQuery::Show(
+                readyset_sql::ast::ShowStatement::ReadySetRsaPublicKey,
+            ))
         } else {
             Err(ReadysetParsingError::ReadysetParsingError(
-                "expected VERSION, STATUS, TABLES, ALL TABLES, or MIGRATION STATUS after READYSET"
+                "expected VERSION, STATUS, TABLES, ALL TABLES, \
+                 MIGRATION STATUS, or RSA PUBLIC KEY after READYSET"
                     .into(),
             ))
         }
@@ -959,10 +1569,35 @@ fn parse_show(parser: &mut Parser, dialect: Dialect) -> Result<SqlQuery, Readyse
         Ok(SqlQuery::Show(
             readyset_sql::ast::ShowStatement::ShallowCacheEntries { query_id, limit },
         ))
+    } else if parse_readyset_keywords(
+        parser,
+        &[
+            ReadysetKeyword::SHALLOW,
+            ReadysetKeyword::Standard(Keyword::CACHE),
+            ReadysetKeyword::ALLOWED,
+        ],
+    ) {
+        let kind = if parser.parse_keyword(Keyword::FUNCTIONS) {
+            ShallowCacheAllowlistKind::Function
+        } else if parser.parse_keyword(Keyword::VARIABLES) {
+            ShallowCacheAllowlistKind::Variable
+        } else if parser.parse_keyword(Keyword::SCHEMAS) {
+            ShallowCacheAllowlistKind::Schema
+        } else {
+            return Err(ReadysetParsingError::ReadysetParsingError(format!(
+                "expected FUNCTIONS, VARIABLES, or SCHEMAS after SHOW SHALLOW CACHE ALLOWED, got: {}",
+                parser.peek_token()
+            )));
+        };
+        Ok(SqlQuery::Show(
+            readyset_sql::ast::ShowStatement::ShallowCacheAllowlist(kind),
+        ))
     } else if parse_readyset_keywords(parser, &[ReadysetKeyword::REPLAY, ReadysetKeyword::PATHS]) {
         Ok(SqlQuery::Show(
             readyset_sql::ast::ShowStatement::ReplayPaths,
         ))
+    } else if parse_readyset_keywords(parser, &[ReadysetKeyword::MCP, ReadysetKeyword::TOKENS]) {
+        Ok(SqlQuery::Show(readyset_sql::ast::ShowStatement::McpTokens))
     } else {
         Ok(parser.parse_show()?.try_into_dialect(dialect)?)
     }
@@ -1000,8 +1635,39 @@ fn parse_drop(parser: &mut Parser, dialect: Dialect) -> Result<SqlQuery, Readyse
     } else if parser.parse_keyword(Keyword::CACHE) {
         let name = parser.parse_object_name(false)?.try_into_dialect(dialect)?;
         Ok(SqlQuery::DropCache(DropCacheStatement { name }))
+    } else if parse_readyset_keywords(parser, &[ReadysetKeyword::MCP, ReadysetKeyword::TOKEN]) {
+        let name = parser.parse_literal_string()?;
+        Ok(SqlQuery::DropMcpToken(
+            readyset_sql::ast::DropMcpTokenStatement { name },
+        ))
     } else {
         Ok(parser.parse_drop()?.try_into_dialect(dialect)?)
+    }
+}
+
+/// Expects `FLUSH` was already consumed. Parses a Readyset-specific flush statement.
+///
+/// FLUSH ALL SHALLOW CACHES
+/// FLUSH CACHE <name>
+fn parse_flush(parser: &mut Parser, dialect: Dialect) -> Result<SqlQuery, ReadysetParsingError> {
+    if parse_readyset_keywords(
+        parser,
+        &[
+            ReadysetKeyword::Standard(Keyword::ALL),
+            ReadysetKeyword::SHALLOW,
+            ReadysetKeyword::CACHES,
+        ],
+    ) {
+        Ok(SqlQuery::FlushAllShallowCaches(
+            FlushAllShallowCachesStatement,
+        ))
+    } else if parser.parse_keyword(Keyword::CACHE) {
+        let name = parser.parse_object_name(false)?.try_into_dialect(dialect)?;
+        Ok(SqlQuery::FlushCache(FlushCacheStatement { name }))
+    } else {
+        Err(ReadysetParsingError::ReadysetParsingError(
+            "expected ALL SHALLOW CACHES or CACHE after FLUSH".into(),
+        ))
     }
 }
 
@@ -1058,6 +1724,8 @@ fn parse_readyset_query(
 ) -> Result<SqlQuery, ReadysetParsingError> {
     if parser.parse_keyword(Keyword::ALTER) {
         parse_alter(parser, dialect)
+    } else if peek_create_mcp_token(parser) {
+        parse_create_mcp_token(parser)
     } else if peek_create_cache(parser) {
         parse_create_cache(parser, dialect, input)
     } else if parser.parse_keyword(Keyword::DROP) {
@@ -1066,9 +1734,75 @@ fn parse_readyset_query(
         parse_explain(parser, dialect, input)
     } else if parser.parse_keyword(Keyword::SHOW) {
         parse_show(parser, dialect)
+    } else if parser.parse_keyword(Keyword::FLUSH) {
+        parse_flush(parser, dialect)
+    } else if let Some(query) = parse_reset_session_authorization(parser)? {
+        // `RESET SESSION AUTHORIZATION` is not handled by the upstream `parse_statement`, so we
+        // intercept it here and model it as the `DEFAULT` authorization.
+        Ok(query)
+    } else if let Some(query) = parse_set_local_session_authorization(parser, dialect)? {
+        // `SET LOCAL SESSION AUTHORIZATION ...` requires two scope keywords, which the upstream
+        // `parse_set` does not accept; the bare `SET SESSION AUTHORIZATION ...` form is handled
+        // natively and flows through `parse_statement` below.
+        Ok(query)
     } else {
         Ok(parser.parse_statement()?.try_into_dialect(dialect)?)
     }
+}
+
+/// Parse `RESET SESSION AUTHORIZATION`, modeling it as `SET SESSION AUTHORIZATION DEFAULT`.
+///
+/// Returns `None` (without consuming tokens) when the input is not this statement, so other
+/// `RESET` forms fall through to the default parser.
+fn parse_reset_session_authorization(
+    parser: &mut Parser,
+) -> Result<Option<SqlQuery>, ReadysetParsingError> {
+    let parsed = parser.maybe_parse(|parser| {
+        if parser.parse_keywords(&[Keyword::RESET, Keyword::SESSION, Keyword::AUTHORIZATION]) {
+            Ok(true)
+        } else {
+            parser.expected("RESET SESSION AUTHORIZATION", parser.peek_token())
+        }
+    })?;
+    Ok(parsed.map(|_| {
+        SqlQuery::Set(SetStatement::SessionAuthorization(
+            SetSessionAuthorization {
+                local: false,
+                value: SessionAuthorizationValue::Default,
+            },
+        ))
+    }))
+}
+
+/// Parse `SET LOCAL SESSION AUTHORIZATION { user | DEFAULT }`.
+///
+/// Returns `None` (without consuming tokens) when the input is not this statement, so other `SET`
+/// forms fall through to the default parser.
+fn parse_set_local_session_authorization(
+    parser: &mut Parser,
+    dialect: Dialect,
+) -> Result<Option<SqlQuery>, ReadysetParsingError> {
+    let value = parser.maybe_parse(|parser| {
+        if !parser.parse_keywords(&[
+            Keyword::SET,
+            Keyword::LOCAL,
+            Keyword::SESSION,
+            Keyword::AUTHORIZATION,
+        ]) {
+            return parser.expected("SET LOCAL SESSION AUTHORIZATION", parser.peek_token());
+        }
+        if parser.parse_keyword(Keyword::DEFAULT) {
+            Ok(SessionAuthorizationValue::Default)
+        } else {
+            let ident = parser.parse_identifier()?;
+            Ok(SessionAuthorizationValue::User(ident.into_dialect(dialect)))
+        }
+    })?;
+    Ok(value.map(|value| {
+        SqlQuery::Set(SetStatement::SessionAuthorization(
+            SetSessionAuthorization { local: true, value },
+        ))
+    }))
 }
 
 fn parse_readyset_expr(
@@ -1221,7 +1955,7 @@ where
                     pretty_assertions::assert_eq!(
                         nom_ast,
                         sqlparser_ast,
-                        "nom-sql AST differs from sqlparser-rs AST for {} input: {:?}",
+                        "AST mismatch (left = nom-sql, right = sqlparser-rs) for {} input: {:?}",
                         dialect,
                         input.as_ref()
                     );
@@ -1247,9 +1981,10 @@ where
                 }
                 if config.error_on_mismatch {
                     Err(ReadysetParsingError::ReadysetParsingError(format!(
-                        "nom-sql AST differs from sqlparser-rs AST for {} input: {:?}",
+                        "AST mismatch (left = nom-sql, right = sqlparser-rs) for {} input: {:?}\n{}",
                         dialect,
-                        input.as_ref()
+                        input.as_ref(),
+                        pretty_assertions::Comparison::new(&nom_ast, &sqlparser_ast),
                     )))
                 } else if config.prefer_sqlparser {
                     Ok(sqlparser_ast)
@@ -1387,6 +2122,14 @@ macro_rules! export_parser {
 /// This is a custom implementation (rather than using `export_parser!`) because we need to merge
 /// `shallow_ast` from the sqlparser result into the nom result for `CreateCacheStatement` when
 /// both parsers succeed. This ensures `shallow_ast` is available even when nom is preferred.
+///
+/// We similarly adopt sqlparser's `deep` AST into the nom result when nom failed to parse the
+/// inner SELECT of a `CREATE DEEP CACHE` but sqlparser succeeded. Unlike `shallow` (which is
+/// always produced by sqlparser and so overwrites unconditionally), `deep` is genuinely parsed
+/// by both sides, so we only upgrade on asymmetric failure — this preserves the parity harness's
+/// ability to catch real `Ok`-vs-`Ok` disagreements on `SelectStatement`. The upgrade is further
+/// gated on `config.prefer_sqlparser` to match the top-level `(Err nom, Ok sqlparser)` branch in
+/// [`parse_both_inner`], which only returns sqlparser's result when sqlparser is preferred.
 pub fn parse_query_with_config(
     config: impl Into<ParsingConfig>,
     dialect: Dialect,
@@ -1414,6 +2157,18 @@ pub fn parse_query_with_config(
         _ => None,
     };
 
+    let sqlparser_deep_ok = match &sqlparser_result {
+        Ok(SqlQuery::CreateCache(cc)) => match &cc.inner {
+            CacheInner::Statement { deep: Ok(d), .. } => Some(d.clone()),
+            _ => None,
+        },
+        Ok(SqlQuery::Explain(readyset_sql::ast::ExplainStatement::CreateCache {
+            inner: CacheInner::Statement { deep: Ok(d), .. },
+            ..
+        })) => Some(d.clone()),
+        _ => None,
+    };
+
     let mut nom_result = nom_sql::parse_query(dialect, input.as_ref());
 
     if let Some(shallow_ast_val) = shallow_ast {
@@ -1430,6 +2185,30 @@ pub fn parse_query_with_config(
         };
         if let Some(target) = target {
             *target = shallow_ast_val;
+        }
+    }
+
+    if config.prefer_sqlparser
+        && let Some(sqlparser_deep) = sqlparser_deep_ok
+    {
+        let target = match nom_result.as_mut() {
+            Ok(SqlQuery::CreateCache(cc)) => match &mut cc.inner {
+                CacheInner::Statement { deep, .. } => Some(deep),
+                _ => None,
+            },
+            Ok(SqlQuery::Explain(readyset_sql::ast::ExplainStatement::CreateCache {
+                inner: CacheInner::Statement { deep, .. },
+                ..
+            })) => Some(deep),
+            _ => None,
+        };
+        if let Some(target @ Err(_)) = target {
+            tracing::debug!(
+                ?dialect,
+                input = %input.as_ref(),
+                "nom-sql failed to parse DEEP CACHE inner SELECT; adopting sqlparser-rs result"
+            );
+            *target = Ok(sqlparser_deep);
         }
     }
 
@@ -1494,3 +2273,257 @@ export_parser!(
     key_specification,
     TableKey
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use readyset_sql::ast::SqlQuery;
+    use readyset_sql::{Dialect, DialectDisplay, TryFromDialect};
+
+    /// Converting the sqlparser AST from a shallow parse must produce the same Readyset AST as
+    /// a sqlparser-only full parse of the query text; the adapter relies on this to skip the
+    /// second parse when the shallow path declines a query.
+    #[test]
+    fn shallow_ast_conversion_matches_full_parse() {
+        for dialect in [Dialect::MySQL, Dialect::PostgreSQL] {
+            for query in [
+                "SELECT a, count(*) FROM t WHERE b = 1 AND c IN (2, 3) GROUP BY a ORDER BY a LIMIT 10",
+                "SELECT /*rs+ CREATE SHALLOW CACHE */ a FROM t WHERE b = 1",
+                "SELECT a FROM t UNION SELECT b FROM u",
+                "WITH x AS (SELECT a FROM t) SELECT a FROM x",
+            ] {
+                let (shallow, _) =
+                    parse_shallow_query(dialect, query).expect("shallow parse should succeed");
+                let converted = SqlQuery::try_from_dialect((*shallow).clone(), dialect)
+                    .expect("conversion should succeed");
+                let parsed = parse_query_with_config(ParsingPreset::OnlySqlparser, dialect, query)
+                    .expect("full parse should succeed");
+                assert_eq!(converted, parsed, "{dialect} {query}");
+            }
+        }
+    }
+
+    fn parse_pg_sqlparser(input: &str) -> SqlQuery {
+        parse_query_with_config(ParsingPreset::OnlySqlparser, Dialect::PostgreSQL, input)
+            .unwrap_or_else(|e| panic!("failed to parse {input:?}: {e}"))
+    }
+
+    fn assert_pg_round_trip(input: &str, expected: &str) {
+        let query = parse_pg_sqlparser(input);
+        assert_eq!(
+            query.display(Dialect::PostgreSQL).to_string(),
+            expected,
+            "round-trip mismatch for {input:?}",
+        );
+    }
+
+    #[test]
+    fn discard_statements_round_trip() {
+        use readyset_sql::ast::{DiscardObject, DiscardStatement};
+
+        for (input, object_type) in [
+            ("DISCARD ALL", DiscardObject::All),
+            ("DISCARD PLANS", DiscardObject::Plans),
+            ("DISCARD SEQUENCES", DiscardObject::Sequences),
+            ("DISCARD TEMPORARY", DiscardObject::Temporary),
+        ] {
+            let query = parse_pg_sqlparser(input);
+            assert_eq!(query, SqlQuery::Discard(DiscardStatement { object_type }));
+            assert_eq!(query.display(Dialect::PostgreSQL).to_string(), input);
+        }
+    }
+
+    #[test]
+    fn reset_all_models_as_full_discard() {
+        use readyset_sql::ast::{DiscardObject, DiscardStatement};
+
+        // `RESET ALL` is modeled as the session reset it triggers so the
+        // adapter mirrors it the same way as `DISCARD ALL`; the original text
+        // is still proxied upstream verbatim.
+        let query = parse_pg_sqlparser("RESET ALL");
+        assert_eq!(
+            query,
+            SqlQuery::Discard(DiscardStatement {
+                object_type: DiscardObject::All
+            })
+        );
+    }
+
+    #[test]
+    fn reset_parameter_models_as_set_default() {
+        use readyset_sql::ast::{
+            PostgresParameterScope, SetPostgresParameter, SetPostgresParameterValue,
+        };
+
+        // `RESET <name>` is `SET <name> TO DEFAULT`; model it so the adapter
+        // resets the mirrored parameter. A namespaced GUC keeps its dotted
+        // name so it keys against the `set_config` form.
+        for (input, expected_name) in [
+            ("RESET role", "role"),
+            ("RESET app.tenant_id", "app.tenant_id"),
+            ("RESET request.jwt.claims", "request.jwt.claims"),
+        ] {
+            let query = parse_pg_sqlparser(input);
+            assert_eq!(
+                query,
+                SqlQuery::Set(SetStatement::PostgresParameter(SetPostgresParameter {
+                    scope: Some(PostgresParameterScope::Session),
+                    name: expected_name.into(),
+                    value: SetPostgresParameterValue::Default,
+                })),
+                "unexpected parse for {input:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn set_namespaced_guc_rejoins_dotted_name() {
+        use readyset_sql::ast::{SetPostgresParameter, SetPostgresParameterValue};
+
+        // Namespaced GUCs (`request.jwt.claims`, `app.tenant_id`) must parse so
+        // a psql / simple-protocol `SET` mirrors into the session the same way
+        // `set_config('<name>', ...)` does. A plain `SET` carries no scope
+        // keyword, so `scope` is `None` (session scope by default).
+        for (input, expected_name) in [
+            (
+                "SET request.jwt.claims = '{\"sub\":\"bob\"}'",
+                "request.jwt.claims",
+            ),
+            ("SET app.tenant_id = 'bob'", "app.tenant_id"),
+        ] {
+            let query = parse_pg_sqlparser(input);
+            let SqlQuery::Set(SetStatement::PostgresParameter(SetPostgresParameter {
+                scope,
+                name,
+                value,
+            })) = query
+            else {
+                panic!("expected PostgresParameter for {input:?}, got {query:?}");
+            };
+            assert_eq!(name.as_str(), expected_name, "name for {input:?}");
+            assert_eq!(scope, None, "scope for {input:?}");
+            assert!(matches!(value, SetPostgresParameterValue::Value(_)));
+        }
+    }
+
+    #[test]
+    fn set_role_keyword_maps_to_role_parameter() {
+        use readyset_sql::ast::{
+            PostgresParameterScope, PostgresParameterValue, PostgresParameterValueInner,
+            SetPostgresParameter, SetPostgresParameterValue,
+        };
+
+        // `SET [SESSION|LOCAL] ROLE <name>` is modeled as the `role` GUC so the
+        // session mirror resolves the effective role + bypass; `SET ROLE NONE`
+        // resets it to the startup role (`role = DEFAULT`).
+        let query = parse_pg_sqlparser("SET ROLE authenticated");
+        assert_eq!(
+            query,
+            SqlQuery::Set(SetStatement::PostgresParameter(SetPostgresParameter {
+                scope: None,
+                name: "role".into(),
+                value: SetPostgresParameterValue::Value(PostgresParameterValue::Single(
+                    PostgresParameterValueInner::Identifier("authenticated".into())
+                )),
+            }))
+        );
+
+        let session = parse_pg_sqlparser("SET SESSION ROLE authenticated");
+        let SqlQuery::Set(SetStatement::PostgresParameter(SetPostgresParameter { scope, .. })) =
+            session
+        else {
+            panic!("expected role parameter for SET SESSION ROLE");
+        };
+        assert_eq!(scope, Some(PostgresParameterScope::Session));
+
+        let none = parse_pg_sqlparser("SET ROLE NONE");
+        assert_eq!(
+            none,
+            SqlQuery::Set(SetStatement::PostgresParameter(SetPostgresParameter {
+                scope: None,
+                name: "role".into(),
+                value: SetPostgresParameterValue::Default,
+            }))
+        );
+    }
+
+    #[test]
+    fn set_session_authorization_round_trips() {
+        let query = parse_pg_sqlparser("SET SESSION AUTHORIZATION alice");
+        assert_eq!(
+            query,
+            SqlQuery::Set(SetStatement::SessionAuthorization(
+                SetSessionAuthorization {
+                    local: false,
+                    value: SessionAuthorizationValue::User("alice".into()),
+                }
+            ))
+        );
+        assert_pg_round_trip(
+            "SET SESSION AUTHORIZATION alice",
+            "SET SESSION AUTHORIZATION alice",
+        );
+        assert_pg_round_trip(
+            "SET SESSION AUTHORIZATION DEFAULT",
+            "SET SESSION AUTHORIZATION DEFAULT",
+        );
+    }
+
+    #[test]
+    fn set_local_session_authorization_round_trips() {
+        let query = parse_pg_sqlparser("SET LOCAL SESSION AUTHORIZATION DEFAULT");
+        assert_eq!(
+            query,
+            SqlQuery::Set(SetStatement::SessionAuthorization(
+                SetSessionAuthorization {
+                    local: true,
+                    value: SessionAuthorizationValue::Default,
+                }
+            ))
+        );
+        assert_pg_round_trip(
+            "SET LOCAL SESSION AUTHORIZATION DEFAULT",
+            "SET LOCAL SESSION AUTHORIZATION DEFAULT",
+        );
+        assert_pg_round_trip(
+            "SET LOCAL SESSION AUTHORIZATION bob",
+            "SET LOCAL SESSION AUTHORIZATION bob",
+        );
+    }
+
+    #[test]
+    fn reset_session_authorization_maps_to_default() {
+        let query = parse_pg_sqlparser("RESET SESSION AUTHORIZATION");
+        assert_eq!(
+            query,
+            SqlQuery::Set(SetStatement::SessionAuthorization(
+                SetSessionAuthorization {
+                    local: false,
+                    value: SessionAuthorizationValue::Default,
+                }
+            ))
+        );
+        // `RESET SESSION AUTHORIZATION` is modeled as the `DEFAULT` authorization, so it
+        // round-trips through the canonical `SET SESSION AUTHORIZATION DEFAULT` rendering.
+        assert_eq!(
+            query.display(Dialect::PostgreSQL).to_string(),
+            "SET SESSION AUTHORIZATION DEFAULT",
+        );
+    }
+
+    #[test]
+    fn mysql_invisible_column_parsed() {
+        // INVISIBLE is only supported by the sqlparser path; nom-sql strips versioned
+        // comments and does not recognize the bare INVISIBLE keyword.
+        let stmt = parse_create_table_with_config(
+            ParsingPreset::OnlySqlparser,
+            Dialect::MySQL,
+            "CREATE TABLE foo (a INT, b INT INVISIBLE)",
+        )
+        .expect("failed to parse CREATE TABLE with INVISIBLE column");
+        let body = stmt.body.expect("CREATE TABLE body should be Ok");
+        assert_eq!(body.fields.len(), 2);
+        assert!(!body.fields[0].invisible, "column 'a' should be visible");
+        assert!(body.fields[1].invisible, "column 'b' should be invisible");
+    }
+}

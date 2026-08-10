@@ -3,12 +3,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use rand::Rng;
+use rand::RngExt;
 use readyset_client::consensus::CacheDDLRequest;
 use readyset_client::query::QueryId;
 use readyset_shallow::{CacheManager, CacheResult, EvictionPolicy, QueryMetadata};
 use readyset_sql::Dialect;
-use readyset_sql::ast::ShallowCacheQuery;
+use readyset_sql::ast::{ShallowCacheQuery, TrxCachePolicy};
 
 const NUM_ENTRIES: usize = 1_000_000;
 const NUM_LOOKUPS: usize = 10_000;
@@ -18,14 +18,14 @@ fn bench_cache_hit(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
 
     let manager: Arc<CacheManager<Vec<readyset_data::DfValue>, String>> =
-        Arc::new(CacheManager::new(None));
+        Arc::new(CacheManager::new(None, None));
 
     let query_id = QueryId::from_unparsed_select("SELECT bench");
 
     manager
         .create_cache(
             None,
-            Some(query_id),
+            query_id,
             ShallowCacheQuery::default(),
             vec![],
             EvictionPolicy::Ttl {
@@ -35,9 +35,11 @@ fn bench_cache_hit(c: &mut Criterion) {
                 unparsed_stmt: "CREATE SHALLOW CACHE bench AS SELECT 1".to_string(),
                 schema_search_path: vec![],
                 dialect: Dialect::PostgreSQL.into(),
+                cache_name: None,
             },
-            false,
+            TrxCachePolicy::Never,
             None,
+            false,
         )
         .expect("failed to create cache");
 
@@ -88,14 +90,14 @@ fn bench_cache_insert(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
 
     let manager: Arc<CacheManager<Vec<readyset_data::DfValue>, String>> =
-        Arc::new(CacheManager::new(None));
+        Arc::new(CacheManager::new(None, None));
 
     let query_id = QueryId::from_unparsed_select("SELECT bench_insert");
 
     manager
         .create_cache(
             None,
-            Some(query_id),
+            query_id,
             ShallowCacheQuery::default(),
             vec![],
             EvictionPolicy::Ttl {
@@ -105,9 +107,11 @@ fn bench_cache_insert(c: &mut Criterion) {
                 unparsed_stmt: "CREATE SHALLOW CACHE bench_insert AS SELECT 1".to_string(),
                 schema_search_path: vec![],
                 dialect: Dialect::PostgreSQL.into(),
+                cache_name: None,
             },
-            false,
+            TrxCachePolicy::Never,
             None,
+            false,
         )
         .expect("failed to create cache");
 

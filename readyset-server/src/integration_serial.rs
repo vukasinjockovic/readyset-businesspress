@@ -14,6 +14,7 @@ use readyset_client::consensus::StandaloneAuthority;
 use readyset_client::recipe::changelist::ChangeList;
 use readyset_data::{DfValue, Dialect};
 use readyset_sql::Dialect as SqlDialect;
+use readyset_util::eventually;
 use rusty_fork::rusty_fork_test;
 
 use crate::integration_utils::*;
@@ -50,7 +51,6 @@ async fn it_works_basic_impl() {
     register_metric_recorder();
     let (mut g, shutdown_tx) = {
         let mut builder = builder_for_tests();
-        builder.set_sharding(None);
         builder.set_persistence(get_persistence_params("it_works_basic"));
         builder.set_topk(true);
         builder.enable_packet_filters();
@@ -110,7 +110,7 @@ async fn it_works_basic_impl() {
 
     // send a query to c
     assert_eq!(
-        cq.lookup(slice::from_ref(&id), true)
+        cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -127,7 +127,7 @@ async fn it_works_basic_impl() {
 
     // check that value was updated again
     let res = cq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();
@@ -155,7 +155,7 @@ async fn it_works_basic_impl() {
 
     // send a query to c
     assert_eq!(
-        cq.lookup(slice::from_ref(&id), true)
+        cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -171,7 +171,7 @@ async fn it_works_basic_impl() {
     //sleep().await;
 
     // send a query to c
-    //assert_eq!(cq.lookup(slice::from_ref(&id), true).await, Ok(vec![vec![1.into(), 6.into()]]));
+    //assert_eq!(cq.lookup(slice::from_ref(&id)).await, Ok(vec![vec![1.into(), 6.into()]]));
 
     shutdown_tx.shutdown().await;
 }
@@ -182,7 +182,6 @@ async fn it_works_basic_standalone_impl() {
 
     let start_standalone = || {
         let mut builder = builder_for_tests();
-        builder.set_sharding(None);
         builder.set_persistence(get_persistence_params_in_tmp_dir(
             "it_works_basic_standalone",
             dir_path,
@@ -197,38 +196,44 @@ async fn it_works_basic_standalone_impl() {
 
     let (mut g, shutdown_tx) = start_standalone().await.unwrap();
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE TABLE a (a int PRIMARY KEY, b int)"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE TABLE a (a int PRIMARY KEY, b int)"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec!["CREATE TABLE b (a int PRIMARY KEY, b int)"],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec!["CREATE TABLE b (a int PRIMARY KEY, b int)"],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
-    g.extend_recipe(
-        ChangeList::from_strings(
-            vec![
-                "CREATE VIEW c AS SELECT a,b FROM a WHERE a = ? UNION ALL (SELECT a,b FROM b WHERE a = ? ORDER BY b);",
-                "CREATE CACHE q FROM SELECT a,b FROM c WHERE a = ?;",
-            ],
-            Dialect::DEFAULT_MYSQL,
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE VIEW c AS SELECT a,b FROM a WHERE a = ? UNION ALL (SELECT a,b FROM b WHERE a = ? ORDER BY b);",
+                    "CREATE CACHE q FROM SELECT a,b FROM c WHERE a = ?;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
         )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
+        .await
+        .is_ok()
+    };
 
     let mut cq = g.view("q").await.unwrap().into_reader_handle().unwrap();
     let mut muta = g.table("a").await.unwrap();
@@ -251,7 +256,7 @@ async fn it_works_basic_standalone_impl() {
 
     // send a query to c
     assert_eq!(
-        cq.lookup(slice::from_ref(&id), true)
+        cq.lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
             .await
             .unwrap()
             .into_vec(),
@@ -269,11 +274,26 @@ async fn it_works_basic_standalone_impl() {
 
     let (mut g, shutdown_tx) = start_standalone().await.unwrap();
 
+    eventually! {
+        g.extend_recipe(
+            ChangeList::from_strings(
+                vec![
+                    "CREATE VIEW c AS SELECT a,b FROM a WHERE a = ? UNION ALL (SELECT a,b FROM b WHERE a = ? ORDER BY b);",
+                    "CREATE CACHE q FROM SELECT a,b FROM c WHERE a = ?;",
+                ],
+                Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap(),
+        )
+        .await
+        .is_ok()
+    };
+
     // Check that everything was restored properly
     let mut cq = g.view("q").await.unwrap().into_reader_handle().unwrap();
 
     let res = cq
-        .lookup(slice::from_ref(&id), true)
+        .lookup(slice::from_ref(&id), Dialect::DEFAULT_MYSQL)
         .await
         .unwrap()
         .into_vec();

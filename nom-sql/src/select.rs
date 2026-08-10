@@ -599,6 +599,7 @@ mod tests {
                         name: "PaperTag".into(),
                     }),
                     alias: Some("t".into()),
+                    column_aliases: vec![],
                 }],
                 fields: vec![FieldDefinitionExpr::All],
                 ..Default::default()
@@ -622,6 +623,7 @@ mod tests {
                         schema: Some("db1".into()),
                     }),
                     alias: Some("t".into()),
+                    column_aliases: vec![],
                 },],
                 fields: vec![FieldDefinitionExpr::All],
                 ..Default::default()
@@ -1084,23 +1086,20 @@ mod tests {
         let qstring = "SELECT coalesce(a, b,c) as x,d FROM sometable;";
 
         let res = selection(Dialect::MySQL)(LocatedSpan::new(qstring.as_bytes()));
-        let agg_expr = FunctionExpr::Call {
-            name: "coalesce".into(),
-            arguments: Some(vec![
-                Expr::Column(Column {
-                    name: "a".into(),
-                    table: None,
-                }),
-                Expr::Column(Column {
-                    name: "b".into(),
-                    table: None,
-                }),
-                Expr::Column(Column {
-                    name: "c".into(),
-                    table: None,
-                }),
-            ]),
-        };
+        let agg_expr = FunctionExpr::Coalesce(vec![
+            Expr::Column(Column {
+                name: "a".into(),
+                table: None,
+            }),
+            Expr::Column(Column {
+                name: "b".into(),
+                table: None,
+            }),
+            Expr::Column(Column {
+                name: "c".into(),
+                table: None,
+            }),
+        ]);
         let expected_stmt = SelectStatement {
             tables: vec![TableExpr::from(Relation::from("sometable"))],
             fields: vec![
@@ -1390,6 +1389,7 @@ mod tests {
                         ..Default::default()
                     })),
                     alias: Some("sq".into()),
+                    column_aliases: vec![],
                 }],
                 fields: columns(&["x"]),
                 where_clause: Some(Expr::BinaryOp {
@@ -1432,6 +1432,7 @@ mod tests {
                 right: JoinRightSide::Table(TableExpr {
                     inner: TableExprInner::Subquery(Box::new(inner_select)),
                     alias: Some("ids".into()),
+                    column_aliases: vec![],
                 }),
                 constraint: JoinConstraint::On(Expr::BinaryOp {
                     lhs: Box::new(Expr::Column(Column::from("orders.o_id"))),
@@ -1590,14 +1591,11 @@ mod tests {
                         FieldDefinitionExpr::from(Column::from("id")),
                         FieldDefinitionExpr::Expr {
                             alias: Some("created_day".into()),
-                            expr: Expr::Call(FunctionExpr::Call {
-                                name: "coalesce".into(),
-                                arguments: Some(vec![
-                                    Expr::Column(Column::from("a")),
-                                    Expr::Literal(Literal::String("b".to_owned())),
-                                    Expr::Column(Column::from("c"))
-                                ])
-                            }),
+                            expr: Expr::Call(FunctionExpr::Coalesce(vec![
+                                Expr::Column(Column::from("a")),
+                                Expr::Literal(Literal::String("b".to_owned())),
+                                Expr::Column(Column::from("c"))
+                            ])),
                         },
                     ],
                     where_clause: None,
@@ -1623,10 +1621,7 @@ mod tests {
                         FieldDefinitionExpr::from(
                             Expr::Literal(Literal::String("foo".to_owned()),)
                         ),
-                        FieldDefinitionExpr::from(Expr::Call(FunctionExpr::Call {
-                            name: "current_time".into(),
-                            arguments: None,
-                        })),
+                        FieldDefinitionExpr::from(Expr::Call(FunctionExpr::CurrentTime)),
                     ],
                     ..Default::default()
                 }
@@ -1786,6 +1781,7 @@ mod tests {
                         right: JoinRightSide::Table(TableExpr {
                             inner: TableExprInner::Table("t2".into()),
                             alias: None,
+                            column_aliases: vec![],
                         }),
                         constraint: JoinConstraint::On(Expr::Column("x".into()))
                     },
@@ -1794,6 +1790,7 @@ mod tests {
                         right: JoinRightSide::Table(TableExpr {
                             inner: TableExprInner::Table("t3".into()),
                             alias: None,
+                            column_aliases: vec![],
                         }),
                         constraint: JoinConstraint::On(Expr::Column("z".into()))
                     },
@@ -1823,14 +1820,11 @@ mod tests {
                         FieldDefinitionExpr::from(Column::from("id")),
                         FieldDefinitionExpr::Expr {
                             alias: Some("created_day".into()),
-                            expr: Expr::Call(FunctionExpr::Call {
-                                name: "coalesce".into(),
-                                arguments: Some(vec![
-                                    Expr::Column(Column::from("a")),
-                                    Expr::Literal(Literal::String("b".to_owned())),
-                                    Expr::Column(Column::from("c"))
-                                ])
-                            }),
+                            expr: Expr::Call(FunctionExpr::Coalesce(vec![
+                                Expr::Column(Column::from("a")),
+                                Expr::Literal(Literal::String("b".to_owned())),
+                                Expr::Column(Column::from("c"))
+                            ])),
                         },
                     ],
                     where_clause: None,
@@ -1856,10 +1850,7 @@ mod tests {
                         FieldDefinitionExpr::from(
                             Expr::Literal(Literal::String("foo".to_owned()),)
                         ),
-                        FieldDefinitionExpr::from(Expr::Call(FunctionExpr::Call {
-                            name: "current_time".into(),
-                            arguments: None,
-                        })),
+                        FieldDefinitionExpr::from(Expr::Call(FunctionExpr::CurrentTime)),
                     ],
                     ..Default::default()
                 }
@@ -1982,6 +1973,7 @@ mod tests {
                         name: "User".into(),
                     }),
                     alias: None,
+                    column_aliases: vec![],
                 }]
             );
         }
@@ -2150,6 +2142,103 @@ mod tests {
             let qstr = "select a::numericas n from t";
 
             test_parse_expect_err!(selection(Dialect::PostgreSQL), qstr.as_bytes());
+        }
+
+        #[test]
+        fn values_clause_in_join() {
+            let qstr = "SELECT v.category, c.name \
+                         FROM (VALUES ('Electronics'), ('Books'), ('Toys')) AS v(category) \
+                         LEFT JOIN categories c ON v.category = c.name";
+            let res = test_parse!(selection(Dialect::PostgreSQL), qstr.as_bytes());
+            assert_eq!(res.tables.len(), 1);
+            assert!(matches!(
+                &res.tables[0].inner,
+                TableExprInner::Values { rows } if rows.len() == 3
+            ));
+            assert_eq!(res.tables[0].alias, Some("v".into()));
+            assert_eq!(
+                res.tables[0].column_aliases,
+                vec![SqlIdentifier::from("category")]
+            );
+            assert_eq!(res.join.len(), 1);
+        }
+
+        #[test]
+        fn values_clause_multi_column() {
+            let qstr = "SELECT v.id, v.cat \
+                         FROM (VALUES (1, 'Electronics'), (2, 'Books')) AS v(id, cat) \
+                         JOIN products p ON v.id = p.id";
+            let res = test_parse!(selection(Dialect::PostgreSQL), qstr.as_bytes());
+            assert!(matches!(
+                &res.tables[0].inner,
+                TableExprInner::Values { rows } if rows.len() == 2 && rows[0].len() == 2
+            ));
+            assert_eq!(
+                res.tables[0].column_aliases,
+                vec![SqlIdentifier::from("id"), SqlIdentifier::from("cat"),]
+            );
+        }
+
+        #[test]
+        fn values_clause_on_right_side_of_join() {
+            let qstr = "SELECT c.name, v.category \
+                         FROM categories c \
+                         LEFT JOIN (VALUES ('Electronics'), ('Books')) AS v(category) \
+                         ON c.name = v.category";
+            let res = test_parse!(selection(Dialect::PostgreSQL), qstr.as_bytes());
+            assert_eq!(res.tables.len(), 1);
+            assert!(matches!(&res.tables[0].inner, TableExprInner::Table(_)));
+            assert_eq!(res.join.len(), 1);
+            match &res.join[0].right {
+                JoinRightSide::Table(te) => {
+                    assert!(
+                        matches!(&te.inner, TableExprInner::Values { rows } if rows.len() == 2)
+                    );
+                    assert_eq!(te.alias, Some("v".into()));
+                    assert_eq!(te.column_aliases, vec![SqlIdentifier::from("category")]);
+                }
+                _ => panic!("expected Table join right side"),
+            }
+        }
+
+        #[test]
+        fn values_clause_no_column_aliases() {
+            let qstr = "SELECT v.column1 \
+                         FROM (VALUES ('Electronics'), ('Books')) AS v \
+                         LEFT JOIN categories c ON v.column1 = c.name";
+            let res = test_parse!(selection(Dialect::PostgreSQL), qstr.as_bytes());
+            assert_eq!(res.tables[0].alias, Some("v".into()));
+            assert!(res.tables[0].column_aliases.is_empty());
+        }
+
+        #[test]
+        fn values_clause_mysql_row_keyword() {
+            let qstr = "SELECT v.category, c.name \
+                         FROM (VALUES ROW('Electronics'), ROW('Books'), ROW('Toys')) AS v(category) \
+                         LEFT JOIN categories c ON v.category = c.name";
+            let res = test_parse!(selection(Dialect::MySQL), qstr.as_bytes());
+            assert_eq!(res.tables.len(), 1);
+            assert!(matches!(
+                &res.tables[0].inner,
+                TableExprInner::Values { rows } if rows.len() == 3
+            ));
+            assert_eq!(res.tables[0].alias, Some("v".into()));
+            assert_eq!(
+                res.tables[0].column_aliases,
+                vec![SqlIdentifier::from("category")]
+            );
+        }
+
+        #[test]
+        fn values_clause_mysql_row_multi_column() {
+            let qstr = "SELECT v.id, v.cat \
+                         FROM (VALUES ROW(1, 'Electronics'), ROW(2, 'Books')) AS v(id, cat) \
+                         JOIN products p ON v.id = p.id";
+            let res = test_parse!(selection(Dialect::MySQL), qstr.as_bytes());
+            assert!(matches!(
+                &res.tables[0].inner,
+                TableExprInner::Values { rows } if rows.len() == 2 && rows[0].len() == 2
+            ));
         }
     }
 }

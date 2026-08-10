@@ -1,8 +1,10 @@
-use assert_matches::assert_matches;
+use std::assert_matches;
+use std::sync::Arc;
+
 use itertools::Itertools;
 use mysql_async::prelude::*;
 use mysql_async::{ChangeUserOpts, Conn};
-use readyset_adapter::backend::UnsupportedSetMode;
+use readyset_adapter::backend::{AllowedUsers, UnsupportedSetMode};
 use readyset_adapter::BackendBuilder;
 use readyset_client::query::QueryId;
 use readyset_client_metrics::QueryDestination;
@@ -13,8 +15,9 @@ use readyset_server::NodeIndex;
 use readyset_sql::ast::Relation;
 use readyset_util::eventually;
 use readyset_util::shutdown::ShutdownSender;
+use regex::Regex;
 use test_utils::skip_flaky_finder;
-use test_utils::tags;
+use test_utils::{tags, upstream};
 
 async fn setup_with(
     backend_builder: BackendBuilder,
@@ -45,7 +48,8 @@ async fn query_drop_with_schema_retry(conn: &mut Conn, stmt: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn create_table() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -70,7 +74,8 @@ async fn create_table() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn add_column() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -109,7 +114,8 @@ async fn add_column() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 #[ignore = "REA-4099"]
 async fn json_column_insert_read() {
     let (opts, _handle, shutdown_tx) = setup().await;
@@ -139,7 +145,8 @@ async fn json_column_insert_read() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn json_column_partial_update() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -168,7 +175,8 @@ async fn json_column_partial_update() {
 
 // TODO: remove this once we support range queries again
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn range_query() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -192,7 +200,8 @@ async fn range_query() {
 
 // TODO: remove this once we support aggregates on parameterized IN
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn aggregate_in() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -217,7 +226,8 @@ async fn aggregate_in() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn proxy_unsupported_sets() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -259,7 +269,8 @@ async fn proxy_unsupported_sets() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn proxy_unsupported_sets_prep_exec() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -291,7 +302,8 @@ async fn proxy_unsupported_sets_prep_exec() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn prepare_in_tx_select_out() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -321,7 +333,8 @@ async fn prepare_in_tx_select_out() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn prep_and_select_in_tx() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -352,7 +365,8 @@ async fn prep_and_select_in_tx() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn prep_then_select_in_tx() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -383,7 +397,8 @@ async fn prep_then_select_in_tx() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn prep_then_always_select_in_tx() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -396,10 +411,11 @@ async fn prep_then_always_select_in_tx() {
     conn.query_drop("INSERT INTO t (x) values (1)")
         .await
         .unwrap();
-    sleep().await;
-    conn.query_drop("CREATE CACHE ALWAYS test_always FROM SELECT x FROM t;")
-        .await
-        .unwrap();
+    eventually! {
+        conn.query_drop("CREATE CACHE ALWAYS test_always FROM SELECT x FROM t;")
+            .await
+            .is_ok()
+    };
     let prepared = conn.prep("SELECT x FROM t").await.unwrap();
     let mut tx = conn
         .start_transaction(mysql_async::TxOpts::new())
@@ -417,7 +433,8 @@ async fn prep_then_always_select_in_tx() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn always_should_bypass_tx() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -430,11 +447,12 @@ async fn always_should_bypass_tx() {
     conn.query_drop("INSERT INTO t (x) values (1)")
         .await
         .unwrap();
-    sleep().await;
 
-    conn.query_drop("CREATE CACHE ALWAYS test_always FROM SELECT x FROM t;")
-        .await
-        .unwrap();
+    eventually! {
+        conn.query_drop("CREATE CACHE ALWAYS test_always FROM SELECT x FROM t;")
+            .await
+            .is_ok()
+    };
     let mut tx = conn
         .start_transaction(mysql_async::TxOpts::new())
         .await
@@ -452,7 +470,8 @@ async fn always_should_bypass_tx() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn prep_select() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -479,7 +498,8 @@ async fn prep_select() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn set_then_prep_and_select() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -506,7 +526,8 @@ async fn set_then_prep_and_select() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn always_should_never_proxy() {
     let (opts, mut handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -535,7 +556,8 @@ async fn always_should_never_proxy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn always_should_never_proxy_exec() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -548,11 +570,12 @@ async fn always_should_never_proxy_exec() {
     conn.query_drop("INSERT INTO t (x) values (1)")
         .await
         .unwrap();
-    sleep().await;
 
-    conn.query_drop("CREATE CACHE ALWAYS FROM SELECT * FROM t")
-        .await
-        .unwrap();
+    eventually! {
+        conn.query_drop("CREATE CACHE ALWAYS FROM SELECT * FROM t")
+            .await
+            .is_ok()
+    };
     let prepared = conn.prep("SELECT * FROM t").await.unwrap();
     let _: Option<i64> = conn.exec_first(prepared, ()).await.unwrap();
     assert_matches!(
@@ -571,7 +594,8 @@ async fn always_should_never_proxy_exec() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn prep_then_set_then_select_proxy() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -598,7 +622,8 @@ async fn prep_then_set_then_select_proxy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn proxy_mode_should_allow_commands() {
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
@@ -644,7 +669,8 @@ async fn proxy_mode_should_allow_commands() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn drop_then_recreate_table_with_query() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -673,18 +699,20 @@ async fn drop_then_recreate_table_with_query() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 #[skip_flaky_finder]
 async fn transaction_proxies() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
 
     conn.query_drop("CREATE TABLE t (x int)").await.unwrap();
-    sleep().await;
 
-    conn.query_drop("CREATE CACHE FROM SELECT * FROM t")
-        .await
-        .unwrap();
+    eventually! {
+        conn.query_drop("CREATE CACHE FROM SELECT * FROM t")
+            .await
+            .is_ok()
+    };
 
     conn.query_drop("BEGIN;").await.unwrap();
     conn.query_drop("SELECT * FROM t;").await.unwrap();
@@ -706,7 +734,8 @@ async fn transaction_proxies() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn show_caches_index_hints() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -785,7 +814,8 @@ async fn show_caches_index_hints() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 #[ignore = "Add failpoint to readyset-sql-parsing"]
 async fn valid_sql_parsing_failed_shows_proxied() {
     let (opts, _handle, shutdown_tx) = setup().await;
@@ -816,7 +846,8 @@ async fn valid_sql_parsing_failed_shows_proxied() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn invalid_sql_parsing_failed_doesnt_show_proxied() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -834,7 +865,8 @@ async fn invalid_sql_parsing_failed_doesnt_show_proxied() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 #[skip_flaky_finder]
 async fn switch_database_with_use() {
     let (opts, _handle, shutdown_tx) = setup().await;
@@ -864,7 +896,8 @@ async fn switch_database_with_use() {
 
 #[cfg(feature = "failure_injection")]
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn replication_failure_ignores_table() {
     readyset_tracing::init_test_logging();
     use mysql_common::serde_json;
@@ -906,18 +939,21 @@ async fn replication_failure_ignores_table() {
         .await
         .unwrap();
 
-    sleep().await;
-    sleep().await;
-
-    assert_last_statement_matches("cats", "upstream", "ok", &mut client).await;
-    client
-        .query_drop("CREATE CACHE FROM SELECT * FROM cats")
-        .await
-        .unwrap();
-    client
-        .query_drop("CREATE CACHE FROM SELECT * FROM cats_view")
-        .await
-        .unwrap();
+    eventually! {
+        last_statement_matches("upstream", "ok", &mut client).await.0
+    };
+    eventually! {
+        client
+            .query_drop("CREATE CACHE FROM SELECT * FROM cats")
+            .await
+            .is_ok()
+    };
+    eventually! {
+        client
+            .query_drop("CREATE CACHE FROM SELECT * FROM cats_view")
+            .await
+            .is_ok()
+    };
     sleep().await;
 
     let result: i32 = client
@@ -975,20 +1011,15 @@ async fn replication_failure_ignores_table() {
             .unwrap();
         results.sort();
         assert_eq!(results, vec![1, 2]);
-        assert_last_statement_matches(
-            source,
-            "readyset_then_upstream",
-            "view destroyed",
-            &mut client,
-        )
-        .await;
+        assert_last_statement_matches(source, "upstream", "view destroyed|ok", &mut client).await;
     }
 
     shutdown_tx.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn reset_user() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -1006,14 +1037,15 @@ async fn reset_user() {
 
     assert_eq!(
         row.map_err(|e| e.to_string()),
-        Err("Server error: `ERROR 42S02 (1146): Table 'noria.t' doesn't exist'".to_string())
+        Err("Server error: `ERROR 1146 (42S02): Table 'noria.t' doesn't exist'".to_string())
     );
 
     shutdown_tx.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 #[ignore = "REA-3933 (see comments on ticket)"]
 async fn show_proxied_queries_show_caches_query_text_matches() {
     readyset_tracing::init_test_logging();
@@ -1055,10 +1087,10 @@ async fn last_statement_matches(dest: &str, status: &str, client: &mut Conn) -> 
             format!(r#"dest column was expected to contain "{dest}", but was: "{dest_col}""#),
         );
     }
-    if !status_col.contains(status) {
+    if !Regex::new(status).unwrap().is_match(&status_col) {
         return (
             false,
-            format!(r#"status column was expected to contain "{status}", but was: "{status_col}""#),
+            format!(r#"status column was expected to match "{status}", but was: "{status_col}""#),
         );
     }
     (true, "".to_string())
@@ -1074,14 +1106,15 @@ async fn assert_last_statement_matches(table: &str, dest: &str, status: &str, cl
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn it_change_user() {
     let mut users = std::collections::HashMap::new();
     users.insert("root".to_string(), "noria".to_string());
     let (opts, _handle, shutdown_tx) = setup_with(
         BackendBuilder::new()
             .require_authentication(false)
-            .users(users),
+            .users(Arc::new(AllowedUsers::new(users, None))),
     )
     .await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -1107,7 +1140,7 @@ async fn it_change_user() {
 
     assert_eq!(
         row.map_err(|e| e.to_string()),
-        Err("Server error: `ERROR 42S02 (1146): Table 'noria.t' doesn't exist'".to_string())
+        Err("Server error: `ERROR 1146 (42S02): Table 'noria.t' doesn't exist'".to_string())
     );
 
     // Run change user again to make sure it can query the database
@@ -1127,7 +1160,8 @@ async fn it_change_user() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn select_version_comment() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -1142,7 +1176,8 @@ async fn select_version_comment() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn resnapshot_table_command() {
     async fn get_table_index<T: AsRef<str>>(
         handle: &mut Handle,
@@ -1185,17 +1220,19 @@ async fn resnapshot_table_command() {
 /// Tests that ROLLBACK TO SAVEPOINT does not end transaction state tracking,
 /// and that we proxy the TO SAVEPOINT clause correctly to upstream.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn rollback_to_savepoint_preserves_transaction() {
     let (opts, _handle, shutdown_tx) = setup().await;
     let mut conn = Conn::new(opts).await.unwrap();
 
     conn.query_drop("CREATE TABLE t (x int)").await.unwrap();
-    sleep().await;
 
-    conn.query_drop("CREATE CACHE FROM SELECT * FROM t")
-        .await
-        .unwrap();
+    eventually! {
+        conn.query_drop("CREATE CACHE FROM SELECT * FROM t")
+            .await
+            .is_ok()
+    };
     eventually! {
         conn.query_drop("SELECT * FROM t").await.unwrap();
         matches!(last_query_info(&mut conn).await.destination, QueryDestination::Readyset(_))

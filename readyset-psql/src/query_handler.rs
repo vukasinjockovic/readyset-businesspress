@@ -2,15 +2,28 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use lazy_static::lazy_static;
+use readyset_adapter::backend::noria_connector;
 use readyset_adapter::backend::noria_connector::QueryResult;
-use readyset_adapter::backend::{SelectSchema, noria_connector};
-use readyset_adapter::{QueryHandler, SetBehavior};
+use readyset_adapter::{QueryHandler, SetBehavior, parse_timezone};
+use readyset_client::schema::SelectSchema;
 use readyset_errors::ReadySetResult;
 use readyset_sql::DialectDisplay;
 use readyset_sql::ast::{
     Literal, PostgresParameterValue, PostgresParameterValueInner, SetNames, SetPostgresParameter,
     SetPostgresParameterValue, SetStatement, SqlQuery,
 };
+
+/// Parse PG's numeric `SET TimeZone = N` shorthand. PG documents this as
+/// "N hours behind UTC" — POSIX-style, sign-inverted relative to ISO 8601 —
+/// so `SET TimeZone = -8` resolves to ISO offset `+08:00`.
+fn parse_posix_hours_offset(n: f64) -> Option<readyset_adapter::SessionTimezone> {
+    if !n.is_finite() {
+        return None;
+    }
+    // `f64 as i32` saturates; `from_fixed_offset_secs` rejects out-of-range.
+    let east_secs = (-n * 3600.0).round() as i32;
+    readyset_adapter::SessionTimezone::from_fixed_offset_secs(east_secs)
+}
 
 enum AllowedParameterValue {
     Literal(PostgresParameterValue),
@@ -319,7 +332,6 @@ lazy_static! {
                 PostgresParameterValue::literal("UTF8"),
                 PostgresParameterValue::literal("unicode"),
             ])),
-            ("timezone", AllowedParameterValue::literal("UTC")),
             ("datestyle", AllowedParameterValue::one_of([
                 PostgresParameterValue::literal("ISO"),
                 PostgresParameterValue::identifier("iso"),
@@ -333,7 +345,6 @@ lazy_static! {
                 PostgresParameterValue::literal(2),
                 PostgresParameterValue::literal(3),
             ])),
-            ("TimeZone",  AllowedParameterValue::literal("Etc/UTC")),
             ("bytea_output",  AllowedParameterValue::literal("hex")),
             ("transform_null_equals", AllowedParameterValue::literal(false)),
             ("backslash_quote", AllowedParameterValue::one_of([
@@ -369,60 +380,115 @@ impl QueryHandler for PostgreSqlQueryHandler {
     fn handle_set_statement(stmt: &SetStatement) -> SetBehavior {
         let behavior = SetBehavior::default();
         match stmt {
-            SetStatement::PostgresParameter(SetPostgresParameter { name, .. })
-                if ALLOWED_PARAMETERS_ANY_VALUE.contains(name.to_ascii_lowercase().as_str()) =>
-            {
-                behavior.unsupported(false)
-            }
-            SetStatement::PostgresParameter(SetPostgresParameter { name, value, .. }) => match name
-                .as_str()
-            {
-                "autocommit" => {
-                    let enabled = match value {
-                        SetPostgresParameterValue::Default => true,
-                        SetPostgresParameterValue::Value(val) => ![
-                            PostgresParameterValue::literal(0),
-                            PostgresParameterValue::literal(false),
-                            PostgresParameterValue::identifier("off"),
-                        ]
-                        .contains(val),
-                    };
-                    behavior.set_autocommit(enabled)
+            SetStatement::PostgresParameter(SetPostgresParameter { name, value, .. }) => {
+                // PG preserves case in double-quoted identifiers, so match
+                // against the lowercased name to converge `SET "TimeZone"`
+                // with `SET timezone`.
+                let name_lower = name.to_ascii_lowercase();
+                if ALLOWED_PARAMETERS_ANY_VALUE.contains(name_lower.as_str()) {
+                    return behavior.unsupported(false);
                 }
-                "search_path" => {
-                    let value_to_string = |value: &PostgresParameterValueInner| match value {
-                        PostgresParameterValueInner::Identifier(id) => id.clone(),
-                        PostgresParameterValueInner::Literal(Literal::String(s)) => s.into(),
-                        PostgresParameterValueInner::Literal(lit) => lit
-                            .display(readyset_sql::Dialect::PostgreSQL)
-                            .to_string()
-                            .into(),
-                    };
-
-                    let search_path = match value {
-                        SetPostgresParameterValue::Default => vec!["public".into()],
-                        SetPostgresParameterValue::Value(PostgresParameterValue::Single(val)) => {
-                            vec![value_to_string(val)]
+                match name_lower.as_str() {
+                    "autocommit" => {
+                        let enabled = match value {
+                            SetPostgresParameterValue::Default => true,
+                            SetPostgresParameterValue::Value(val) => ![
+                                PostgresParameterValue::literal(0),
+                                PostgresParameterValue::literal(false),
+                                PostgresParameterValue::identifier("off"),
+                            ]
+                            .contains(val),
+                        };
+                        behavior.set_autocommit(enabled)
+                    }
+                    // Non-UTC zones are flagged unsupported (cache results are
+                    // UTC-wallclock); the parsed value is still recorded so
+                    // future eval-side support can read it unchanged.
+                    "timezone" => {
+                        let parsed = match value {
+                            // `TO DEFAULT` resolves to the upstream config
+                            // default, which we can't inspect at SET time and
+                            // is frequently non-UTC.
+                            SetPostgresParameterValue::Default => None,
+                            SetPostgresParameterValue::Value(PostgresParameterValue::Single(
+                                PostgresParameterValueInner::Literal(Literal::String(s)),
+                            )) => parse_timezone(s),
+                            SetPostgresParameterValue::Value(PostgresParameterValue::Single(
+                                PostgresParameterValueInner::Identifier(id),
+                            )) => parse_timezone(id.as_str()),
+                            SetPostgresParameterValue::Value(PostgresParameterValue::Single(
+                                PostgresParameterValueInner::Literal(Literal::Integer(n)),
+                            )) => parse_posix_hours_offset(*n as f64),
+                            SetPostgresParameterValue::Value(PostgresParameterValue::Single(
+                                PostgresParameterValueInner::Literal(Literal::UnsignedInteger(n)),
+                            )) => parse_posix_hours_offset(*n as f64),
+                            SetPostgresParameterValue::Value(PostgresParameterValue::Single(
+                                PostgresParameterValueInner::Literal(Literal::Number(s)),
+                            )) => s.parse::<f64>().ok().and_then(parse_posix_hours_offset),
+                            _ => None,
+                        };
+                        match parsed {
+                            Some(tz) if tz.is_utc() => behavior.set_timezone(tz),
+                            Some(tz) => behavior.set_timezone(tz).unsupported(true),
+                            None => behavior.unsupported(true),
                         }
-                        SetPostgresParameterValue::Value(PostgresParameterValue::List(vals)) => {
-                            vals.iter().map(value_to_string).collect()
-                        }
-                    };
+                    }
+                    // `SET ROLE` / `SET role = ...` changes the effective
+                    // role, which `apply_set_statement` mirrors into the
+                    // SessionContext and RLS keys scoped caches on. Treat as
+                    // supported so it doesn't force `ProxyAlways` and disable
+                    // caching for the rest of the connection.
+                    "role" => behavior,
+                    "search_path" => {
+                        let value_to_string = |value: &PostgresParameterValueInner| match value {
+                            PostgresParameterValueInner::Identifier(id) => id.clone(),
+                            PostgresParameterValueInner::Literal(Literal::String(s)) => s.into(),
+                            PostgresParameterValueInner::Literal(lit) => lit
+                                .display(readyset_sql::Dialect::PostgreSQL)
+                                .to_string()
+                                .into(),
+                        };
 
-                    behavior.set_search_path(search_path)
-                }
-                _ => {
-                    if let Some(allowed_value) = ALLOWED_PARAMETERS_WITH_VALUE.get(name.as_str()) {
-                        behavior.unsupported(!allowed_value.set_value_is_allowed(value))
-                    } else {
-                        behavior.unsupported(true)
+                        let search_path = match value {
+                            SetPostgresParameterValue::Default => vec!["public".into()],
+                            SetPostgresParameterValue::Value(PostgresParameterValue::Single(
+                                val,
+                            )) => vec![value_to_string(val)],
+                            SetPostgresParameterValue::Value(PostgresParameterValue::List(
+                                vals,
+                            )) => vals.iter().map(value_to_string).collect(),
+                        };
+
+                        behavior.set_search_path(search_path)
+                    }
+                    other => {
+                        if let Some(allowed_value) = ALLOWED_PARAMETERS_WITH_VALUE.get(other) {
+                            behavior.unsupported(!allowed_value.set_value_is_allowed(value))
+                        } else if other.contains('.') {
+                            // Namespaced custom GUC (`request.jwt.claims`,
+                            // `app.tenant_id`, ...). These are per-session app
+                            // variables Readyset mirrors into the SessionContext
+                            // -- RLS keys scoped caches on the policy-referenced
+                            // ones. Treat as supported so they don't force
+                            // `ProxyAlways`, matching the `set_config('<name>',
+                            // ...)` path, which never disables caching.
+                            behavior.unsupported(false)
+                        } else {
+                            behavior.unsupported(true)
+                        }
                     }
                 }
-            },
+            }
             SetStatement::Names(SetNames { charset, .. }) => {
                 let charset = charset.to_ascii_lowercase();
                 behavior.unsupported(!["utf8", "utf-8"].contains(&charset.as_str()))
             }
+            // `SET [LOCAL] SESSION AUTHORIZATION { user | DEFAULT }` is handled:
+            // the adapter mirrors the resulting identity into the session
+            // context after upstream accepts it (see `Backend`'s SET dispatch).
+            // Treating it as supported keeps it from tripping proxy-always, which
+            // would route the whole connection upstream and defeat the mirror.
+            SetStatement::SessionAuthorization(_) => behavior.unsupported(false),
             _ => behavior.unsupported(true),
         }
     }
@@ -457,6 +523,285 @@ mod tests {
     #[test]
     fn client_encoding_utf8_allowed() {
         is_proxy("SET client_encoding = 'UTF8'");
+    }
+
+    #[test]
+    fn set_role_is_supported() {
+        // `SET ROLE` mirrors the effective role into the session and RLS keys
+        // scoped caches on it, so it must not flip the connection into
+        // ProxyAlways. Constructed directly (the keyword form only parses
+        // under the sqlparser-preferred prod preset, not the default).
+        let role_set = SetStatement::PostgresParameter(SetPostgresParameter {
+            scope: None,
+            name: "role".into(),
+            value: SetPostgresParameterValue::Value(PostgresParameterValue::Single(
+                PostgresParameterValueInner::Identifier("authenticated".into()),
+            )),
+        });
+        assert_eq!(
+            PostgreSqlQueryHandler::handle_set_statement(&role_set),
+            SetBehavior::default(),
+        );
+        let role_reset = SetStatement::PostgresParameter(SetPostgresParameter {
+            scope: None,
+            name: "role".into(),
+            value: SetPostgresParameterValue::Default,
+        });
+        assert_eq!(
+            PostgreSqlQueryHandler::handle_set_statement(&role_reset),
+            SetBehavior::default(),
+        );
+    }
+
+    #[test]
+    fn namespaced_custom_gucs_are_supported() {
+        // Custom GUCs (set per-request and mirrored into the SessionContext)
+        // must not flip the connection into ProxyAlways, matching the
+        // `set_config('<name>', ...)` path which never disables caching.
+        // Constructed directly: a namespaced `SET` only parses under the
+        // sqlparser-preferred prod preset, not the default test preset.
+        let stmt = |name: &str| {
+            SetStatement::PostgresParameter(SetPostgresParameter {
+                scope: None,
+                name: name.into(),
+                value: SetPostgresParameterValue::Value(PostgresParameterValue::Single(
+                    PostgresParameterValueInner::Literal(Literal::String("v".into())),
+                )),
+            })
+        };
+        assert_eq!(
+            PostgreSqlQueryHandler::handle_set_statement(&stmt("request.jwt.claims")),
+            SetBehavior::default(),
+        );
+        assert_eq!(
+            PostgreSqlQueryHandler::handle_set_statement(&stmt("app.tenant_id")),
+            SetBehavior::default(),
+        );
+    }
+
+    #[test]
+    fn set_time_zone_utc_equivalents_are_supported() {
+        for stmt in [
+            "SET timezone = 'UTC'",
+            "SET timezone = 'Etc/UTC'",
+            "SET timezone = 'utc'",
+            "SET timezone = 'etc/utc'",
+            "SET timezone = '+00:00'",
+            "SET timezone = 'Universal'",
+            "SET timezone = 'Zulu'",
+            "SET timezone = 'GMT'",
+            "SET timezone = 'Etc/GMT'",
+            "SET TimeZone = 'Etc/UTC'",
+            "SET TIMEZONE = 'UTC'",
+        ] {
+            let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(stmt));
+            assert!(
+                !beh.unsupported,
+                "{stmt:?} should be supported (UTC-equivalent), got {beh:?}"
+            );
+            let tz = beh
+                .set_timezone
+                .unwrap_or_else(|| panic!("{stmt:?} should record a parsed timezone, got {beh:?}"));
+            assert!(
+                tz.is_utc(),
+                "{stmt:?} should record a UTC-equivalent timezone, got {tz:?}"
+            );
+        }
+    }
+
+    /// `TO DEFAULT` is unsupported because the upstream default is frequently
+    /// non-UTC and we can't read it at SET time.
+    #[test]
+    fn set_time_zone_default_is_unsupported() {
+        let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(
+            "SET timezone TO DEFAULT",
+        ));
+        assert!(
+            beh.unsupported,
+            "SET timezone TO DEFAULT must be unsupported (upstream default may not be UTC), got {beh:?}"
+        );
+        assert!(
+            beh.set_timezone.is_none(),
+            "DEFAULT carries no parsed value, set_timezone should stay None"
+        );
+    }
+
+    /// PG preserves case in double-quoted identifiers; `SET "TimeZone"` must
+    /// still dispatch to the `timezone` arm.
+    #[test]
+    fn set_time_zone_quoted_identifier_dispatches() {
+        let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(
+            "SET \"TimeZone\" = 'UTC'",
+        ));
+        assert!(
+            !beh.unsupported,
+            "quoted-identifier UTC SET should be supported, got {beh:?}"
+        );
+        let tz = beh
+            .set_timezone
+            .expect("quoted-identifier SET should record the parsed timezone");
+        assert!(tz.is_utc(), "expected UTC, got {tz:?}");
+
+        let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(
+            "SET \"TimeZone\" = 'America/New_York'",
+        ));
+        assert!(
+            beh.unsupported,
+            "quoted-identifier non-UTC SET should be unsupported, got {beh:?}"
+        );
+        assert!(
+            beh.set_timezone.is_some(),
+            "quoted-identifier non-UTC SET should still record the parsed timezone, got {beh:?}"
+        );
+    }
+
+    #[test]
+    fn set_time_zone_numeric_zero_is_utc() {
+        for stmt in ["SET TimeZone = 0", "SET TimeZone TO 0"] {
+            let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(stmt));
+            assert!(
+                !beh.unsupported,
+                "{stmt:?} should be supported (UTC-equivalent), got {beh:?}"
+            );
+            let tz = beh
+                .set_timezone
+                .unwrap_or_else(|| panic!("{stmt:?} should record a parsed timezone"));
+            assert!(tz.is_utc(), "{stmt:?} should record UTC, got {tz:?}");
+        }
+    }
+
+    #[test]
+    fn set_time_zone_numeric_non_zero_is_unsupported_but_recorded() {
+        // POSIX-inverted: `SET TimeZone = -8` means UTC+8, `= 8` means UTC-8.
+        for (stmt, expected_offset_secs) in [
+            ("SET TimeZone = -8", 8 * 3600),
+            ("SET TimeZone = 8", -8 * 3600),
+            ("SET TimeZone = 5", -5 * 3600),
+            ("SET TimeZone TO -3", 3 * 3600),
+        ] {
+            let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(stmt));
+            assert!(
+                beh.unsupported,
+                "{stmt:?} should be unsupported (non-UTC), got {beh:?}"
+            );
+            let expected = readyset_adapter::SessionTimezone::FixedOffset(
+                chrono::FixedOffset::east_opt(expected_offset_secs).unwrap(),
+            );
+            assert_eq!(
+                beh.set_timezone,
+                Some(expected),
+                "{stmt:?} should record FixedOffset({expected_offset_secs}s), got {beh:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_time_zone_numeric_out_of_range_is_unsupported() {
+        for stmt in [
+            "SET TimeZone = 99",
+            "SET TimeZone = -99",
+            "SET TimeZone = 15",
+            "SET TimeZone = -15",
+        ] {
+            let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(stmt));
+            assert!(beh.unsupported, "{stmt:?} should be unsupported");
+            assert!(
+                beh.set_timezone.is_none(),
+                "{stmt:?} parsed nothing, set_timezone should stay None, got {beh:?}"
+            );
+        }
+    }
+
+    /// Fractional numerics arrive as `Literal::Number` rather than `Literal::Integer`.
+    #[test]
+    fn set_time_zone_numeric_fractional_zero_is_utc() {
+        for stmt in [
+            "SET TimeZone = 0.0",
+            "SET TimeZone = -0.0",
+            "SET TimeZone TO 0.0",
+        ] {
+            let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(stmt));
+            assert!(
+                !beh.unsupported,
+                "{stmt:?} should be supported (UTC-equivalent), got {beh:?}"
+            );
+            let tz = beh
+                .set_timezone
+                .unwrap_or_else(|| panic!("{stmt:?} should record a parsed timezone"));
+            assert!(tz.is_utc(), "{stmt:?} should record UTC, got {tz:?}");
+        }
+    }
+
+    #[test]
+    fn set_time_zone_numeric_fractional_non_zero_is_unsupported_but_recorded() {
+        for (stmt, expected_offset_secs) in [
+            ("SET TimeZone = 0.5", -1800),
+            ("SET TimeZone = -0.5", 1800),
+            ("SET TimeZone = -7.5", 27000),
+            ("SET TimeZone TO 5.5", -19800),
+        ] {
+            let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(stmt));
+            assert!(
+                beh.unsupported,
+                "{stmt:?} should be unsupported (non-UTC), got {beh:?}"
+            );
+            let expected = readyset_adapter::SessionTimezone::FixedOffset(
+                chrono::FixedOffset::east_opt(expected_offset_secs).unwrap(),
+            );
+            assert_eq!(
+                beh.set_timezone,
+                Some(expected),
+                "{stmt:?} should record FixedOffset({expected_offset_secs}s), got {beh:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_time_zone_numeric_fractional_out_of_range_is_unsupported() {
+        for stmt in ["SET TimeZone = 99.5", "SET TimeZone = -99.5"] {
+            let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(stmt));
+            assert!(beh.unsupported, "{stmt:?} should be unsupported");
+            assert!(
+                beh.set_timezone.is_none(),
+                "{stmt:?} parsed nothing, set_timezone should stay None, got {beh:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_time_zone_non_utc_is_unsupported() {
+        for stmt in [
+            "SET timezone = 'America/New_York'",
+            "SET timezone = 'Europe/London'",
+            "SET timezone = '+05:30'",
+            "SET TimeZone = 'us/eastern'",
+        ] {
+            let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(stmt));
+            assert!(
+                beh.unsupported,
+                "{stmt:?} should be unsupported (non-UTC), got {beh:?}"
+            );
+            assert!(
+                beh.set_timezone.is_some(),
+                "{stmt:?} should still record the parsed timezone, got {beh:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_time_zone_unparseable_is_unsupported() {
+        for stmt in [
+            "SET timezone = 'Narnia/Cair_Paravel'",
+            "SET timezone = 'not a zone'",
+            "SET timezone = ''",
+        ] {
+            let beh = PostgreSqlQueryHandler::handle_set_statement(&parse_set_statement(stmt));
+            assert!(beh.unsupported, "{stmt:?} should be unsupported");
+            assert!(
+                beh.set_timezone.is_none(),
+                "{stmt:?} parsed nothing, set_timezone should stay None"
+            );
+        }
     }
 
     #[test]

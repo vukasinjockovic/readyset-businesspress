@@ -3,7 +3,7 @@ name = "readyset-dataflow"
 version = "0.7.0"
 publish = false
 authors = ["Readyset Technology, Inc. <info@readyset.io>"]
-edition = "2021"
+edition = "2024"
 
 description = "Readyset dataflow crate"
 
@@ -15,7 +15,6 @@ bincode = { workspace = true }
 bufstream = { workspace = true }
 byteorder = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
-criterion = { workspace = true, features = ["async_tokio"], optional = true }
 derive_more = { workspace = true }
 enum-kinds = { workspace = true }
 exponential-backoff = { workspace = true }
@@ -39,6 +38,7 @@ tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tracing = { workspace = true, features = ["release_max_level_debug"] }
 url = { workspace = true }
+readyset-decimal = { path = "../readyset-decimal" }
 vec1 = { workspace = true }
 vec_map = { workspace = true, features = ["eders"] }
 
@@ -54,6 +54,8 @@ dataflow-expression = { path = "../dataflow-expression" }
 dataflow-state = { path = "../dataflow-state" }
 failpoint-macros = { path = "../failpoint-macros" }
 merging-interval-tree = { path = "../merging-interval-tree" }
+metric = { path = "../metric" }
+partial-map = { path = "../partial-map" }
 reader-map = { path = "../reader-map" }
 readyset-alloc = { path = "../readyset-alloc" }
 readyset-client = { path = "../readyset-client" }
@@ -64,10 +66,10 @@ readyset-util = { path = "../readyset-util" }
 replication-offset = { path = "../replication-offset" }
 
 [dev-dependencies]
+readyset-decimal = { path = "../readyset-decimal" }
 test-utils = { path = "../test-utils" }
 
 [features]
-bench = ["criterion"]
 failure_injection = ["fail/failpoints", "readyset-util/failure_injection"]
 display_literals = []
 

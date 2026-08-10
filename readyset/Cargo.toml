@@ -1,10 +1,11 @@
 [package]
 name = "readyset"
-version = "1.23.0"
+version = "1.30.0"
 publish = false
 authors = ["Readyset Technology, Inc. <info@readyset.io>"]
 edition = "2021"
 license = "BSL 1.1"
+autotests = false
 description = """\
 A real-time SQL caching engine for Postgres and MySQL."""
 
@@ -29,6 +30,7 @@ tokio = { workspace = true, features = ["full"] }
 tokio-native-tls = { workspace = true }
 tokio-postgres = { workspace = true, features = ["with-chrono-0_4"] }
 tokio-stream = { workspace = true, features = ["net"] }
+tokio-util = "0.7"
 tracing = { workspace = true, features = ["release_max_level_debug"] }
 tracing-futures = { workspace = true }
 walkdir = { workspace = true }
@@ -37,6 +39,7 @@ walkdir = { workspace = true }
 database-utils = { path = "../database-utils" }
 dataflow-state = { path = "../dataflow-state" }
 health-reporter = { path = "../health-reporter" }
+metric = { path = "../metric" }
 mysql-srv = { path = "../mysql-srv" }
 psql-srv = { path = "../psql-srv" }
 readyset-adapter = { path = "../readyset-adapter" }
@@ -46,11 +49,16 @@ readyset-client = { path = "../readyset-client/" }
 readyset-client-metrics = { path = "../readyset-client-metrics" }
 readyset-common = { path = "../readyset-common" }
 readyset-shallow = { path = "../readyset-shallow" }
+readyset-rls = { path = "../readyset-rls" }
 readyset-data = { path = "../readyset-data" }
 readyset-dataflow = { path = "../readyset-dataflow" }
 readyset-errors = { path = "../readyset-errors" }
+readyset-mcp = { path = "../readyset-mcp" }
+readyset-metrics = { path = "../readyset-metrics" }
 readyset-mysql = { path = "../readyset-mysql" }
 readyset-psql = { path = "../readyset-psql" }
+readyset-query-logger = { path = "../readyset-query-logger" }
+readyset-schema = { path = "../readyset-schema/" }
 readyset-server = { path = "../readyset-server/" }
 readyset-sql = { path = "../readyset-sql" }
 readyset-sql-parsing = { path = "../readyset-sql-parsing" }
@@ -63,13 +71,21 @@ replicators = { path = "../replicators" }
 schema-catalog = { path = "../schema-catalog" }
 
 
+[build-dependencies]
+test-discovery = { path = "../test-discovery" }
+
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
 futures = { workspace = true }
+metrics-util = { workspace = true }
 pprof = { workspace = true, features = ["flamegraph", "criterion"] }
 readyset-sql-parsing = { path = "../readyset-sql-parsing" }
 temp-dir = { workspace = true }
 test-utils = { path = "../test-utils" }
+
+[[test]]
+name = "tests"
+path = "tests.rs"
 
 [[bench]]
 name = "query_logger"

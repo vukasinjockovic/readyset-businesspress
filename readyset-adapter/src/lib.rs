@@ -1,17 +1,25 @@
 #![deny(unreachable_pub)]
 pub mod backend;
+mod deep_vrels;
 pub mod http_router;
-pub mod metrics_handle;
+pub mod mcp_http;
 pub mod migration_handler;
 pub mod proxied_queries_reporter;
 mod query_handler;
+mod query_stats_vrel;
 pub mod query_status_cache;
 pub mod rsc_admission;
+pub mod rls_coordinator;
+pub mod rls_relations;
 pub mod sampler;
+pub mod session_context;
+pub mod session_mutation;
+pub mod shallow_key;
 pub mod shallow_refresh_pool;
 mod status_reporter;
 pub mod table_extraction_visitor;
 pub mod upstream_database;
+mod users_vrel;
 mod utils;
 pub mod views_synchronizer;
 
@@ -22,8 +30,10 @@ use std::time::Duration;
 use anyhow::anyhow;
 use clap::ValueEnum;
 
-pub use crate::backend::{Backend, BackendBuilder, recreate_shallow_caches};
-pub use crate::query_handler::{QueryHandler, SetBehavior};
+pub use crate::backend::{Backend, BackendBuilder, ConnectionInfo, recreate_shallow_caches};
+pub use crate::query_handler::{
+    QueryHandler, SessionTimezone, SetBehavior, UpstreamSetRewrite, parse_timezone,
+};
 pub use crate::status_reporter::{ReadySetStatus, ReadySetStatusReporter};
 pub use crate::upstream_database::{
     UpstreamConfig, UpstreamDatabase, UpstreamDestination, UpstreamPrepare,

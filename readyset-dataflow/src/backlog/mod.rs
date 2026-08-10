@@ -3,15 +3,15 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use ahash::RandomState;
-use dataflow_expression::{PostLookup, ReaderProcessing};
 use reader_map::{EvictionQuantity, EvictionStrategy};
-use readyset_client::results::SharedResults;
 use readyset_client::KeyComparison;
+use readyset_client::post_processing::{PostLookup, SharedResults};
 use readyset_data::Bound;
 use readyset_util::SizeOf;
 use vec1::Vec1;
 
 pub use self::multir::LookupError;
+use crate::ReaderProcessing;
 use crate::prelude::*;
 
 /// The kind of reader update notification, currently the eviction epoch of the writer
@@ -94,11 +94,11 @@ fn new_inner(
         let mut contiguous = true;
         let mut last = None;
         for &k in &index.columns {
-            if let Some(last) = last {
-                if k != last + 1 {
-                    contiguous = false;
-                    break;
-                }
+            if let Some(last) = last
+                && k != last + 1
+            {
+                contiguous = false;
+                break;
             }
             last = Some(k);
         }
@@ -468,7 +468,7 @@ impl SizeOf for WriteHandle {
         self.mem_size
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         self.handle.is_empty()
     }
 }
@@ -591,7 +591,7 @@ impl SingleReadHandle {
 
 #[cfg(test)]
 mod tests {
-    use readyset_client::results::SharedRows;
+    use readyset_client::post_processing::SharedRows;
     use readyset_data::Bound;
 
     use super::*;

@@ -1,7 +1,6 @@
 use std::convert::TryFrom;
 
 use postgres_types::Kind;
-use readyset_adapter::backend as cl;
 use readyset_data::{Collation, DfType, PgEnumMetadata};
 use readyset_errors::unsupported;
 use {psql_srv as ps, tokio_postgres as pgsql};
@@ -10,7 +9,7 @@ use crate::Error;
 
 /// A simple wrapper around `noria_client`'s `SelectSchema` facilitating conversion to
 /// `psql_srv::Schema`.
-pub struct SelectSchema<'a>(pub cl::SelectSchema<'a>);
+pub struct SelectSchema<'a>(pub readyset_client::schema::SelectSchema<'a>);
 
 impl TryFrom<SelectSchema<'_>> for Vec<ps::Column> {
     type Error = Error;
@@ -19,7 +18,7 @@ impl TryFrom<SelectSchema<'_>> for Vec<ps::Column> {
     }
 }
 
-pub struct NoriaSchema<'a>(pub &'a [readyset_client::ColumnSchema]);
+pub struct NoriaSchema<'a>(pub &'a [readyset_client::schema::ColumnSchema]);
 
 impl<'a> TryFrom<NoriaSchema<'a>> for Vec<pgsql::types::Type> {
     type Error = Error;
@@ -63,33 +62,25 @@ pub fn type_to_pgsql(col_type: &DfType) -> Result<pgsql::types::Type, Error> {
         DfType::Unknown => Ok(Type::TEXT), // The default type for "unknown" in pgsql is TEXT
         DfType::Bool => Ok(Type::BOOL),
         DfType::Char(..) => Ok(Type::BPCHAR),
-        DfType::VarChar(_, Collation::Utf8) => Ok(Type::VARCHAR),
+        DfType::VarChar(_, Collation::Utf8 | Collation::Binary | Collation::Utf8Binary) => {
+            Ok(Type::VARCHAR)
+        }
         DfType::VarChar(_, Collation::Utf8Ci) => {
             // TODO: use the right CITEXT type
             Ok(Type::VARCHAR)
         }
         DfType::VarChar(
             _,
-            Collation::Utf8AiCi
-            | Collation::Binary
-            | Collation::Latin1SwedishCi
-            | Collation::Utf8Binary
-            | Collation::Utf8AiCiPad,
+            Collation::Utf8AiCi | Collation::Latin1SwedishCi | Collation::Utf8AiCiPad,
         ) => unreachable!("not used by Postgres"),
         DfType::Int => Ok(Type::INT4),
         DfType::BigInt => Ok(Type::INT8),
         DfType::SmallInt => Ok(Type::INT2),
         DfType::Float => Ok(Type::FLOAT4),
         DfType::Double => Ok(Type::FLOAT8),
-        DfType::Text(Collation::Utf8) => Ok(Type::TEXT),
+        DfType::Text(Collation::Utf8 | Collation::Binary | Collation::Utf8Binary) => Ok(Type::TEXT),
         DfType::Text(Collation::Utf8Ci) => Ok(Type::TEXT), // TODO: use the right CITEXT type
-        DfType::Text(
-            Collation::Utf8AiCi
-            | Collation::Binary
-            | Collation::Latin1SwedishCi
-            | Collation::Utf8Binary
-            | Collation::Utf8AiCiPad,
-        ) => {
+        DfType::Text(Collation::Utf8AiCi | Collation::Latin1SwedishCi | Collation::Utf8AiCiPad) => {
             unreachable!("not used by Postgres")
         }
         DfType::Timestamp { .. } => Ok(Type::TIMESTAMP),
@@ -141,35 +132,31 @@ pub fn type_to_pgsql(col_type: &DfType) -> Result<pgsql::types::Type, Error> {
                 }
                 DfType::Bool => Ok(Type::BOOL_ARRAY),
                 DfType::Char(..) => Ok(Type::BPCHAR_ARRAY),
-                DfType::VarChar(_, Collation::Utf8) => Ok(Type::VARCHAR_ARRAY),
+                DfType::VarChar(_, Collation::Utf8 | Collation::Binary | Collation::Utf8Binary) => {
+                    Ok(Type::VARCHAR_ARRAY)
+                }
                 DfType::VarChar(_, Collation::Utf8Ci) => {
                     // TODO: use the right CITEXT type
                     Ok(Type::VARCHAR_ARRAY)
                 }
                 DfType::VarChar(
                     _,
-                    Collation::Utf8AiCi
-                    | Collation::Binary
-                    | Collation::Latin1SwedishCi
-                    | Collation::Utf8Binary
-                    | Collation::Utf8AiCiPad,
+                    Collation::Utf8AiCi | Collation::Latin1SwedishCi | Collation::Utf8AiCiPad,
                 ) => unreachable!("not used by Postgres"),
                 DfType::Int => Ok(Type::INT4_ARRAY),
                 DfType::BigInt => Ok(Type::INT8_ARRAY),
                 DfType::SmallInt => Ok(Type::INT2_ARRAY),
                 DfType::Float => Ok(Type::FLOAT4_ARRAY),
                 DfType::Double => Ok(Type::FLOAT8_ARRAY),
-                DfType::Text(Collation::Utf8) => Ok(Type::TEXT_ARRAY),
+                DfType::Text(Collation::Utf8 | Collation::Binary | Collation::Utf8Binary) => {
+                    Ok(Type::TEXT_ARRAY)
+                }
                 DfType::Text(Collation::Utf8Ci) => {
                     // TODO: use the right CITEXT_ARRAY type
                     Ok(Type::TEXT_ARRAY)
                 }
                 DfType::Text(
-                    Collation::Utf8AiCi
-                    | Collation::Binary
-                    | Collation::Latin1SwedishCi
-                    | Collation::Utf8Binary
-                    | Collation::Utf8AiCiPad,
+                    Collation::Utf8AiCi | Collation::Latin1SwedishCi | Collation::Utf8AiCiPad,
                 ) => unreachable!("not used by Postgres"),
                 DfType::Timestamp { .. } => Ok(Type::TIMESTAMP_ARRAY),
                 DfType::TimestampTz { .. } => Ok(Type::TIMESTAMPTZ_ARRAY),
@@ -216,7 +203,11 @@ pub fn type_to_pgsql(col_type: &DfType) -> Result<pgsql::types::Type, Error> {
                 DfType::Uuid => Ok(Type::UUID_ARRAY),
                 DfType::Bit(_) => Ok(Type::BIT_ARRAY),
                 DfType::VarBit(_) => Ok(Type::VARBIT_ARRAY),
-                DfType::Array(_) | DfType::Row => unsupported_type!(),
+                // PostgreSQL uses the same array OID regardless of dimensionality
+                // (e.g. int8[] and int8[][] both use INT8_ARRAY), so recursively
+                // unwrap to find the base scalar type.
+                DfType::Array(_) => type_to_pgsql(elem),
+                DfType::Row(_) => unsupported_type!(),
                 // postgres built-in point type not supported, but postgis point is supported
                 DfType::Point => unsupported_type!(),
                 DfType::PostgisPoint => Ok(Type::BYTEA_ARRAY),
@@ -224,6 +215,42 @@ pub fn type_to_pgsql(col_type: &DfType) -> Result<pgsql::types::Type, Error> {
                 DfType::Tsvector => Ok(Type::TS_VECTOR_ARRAY),
             }
         }
-        DfType::Row => Ok(Type::RECORD),
+        // An anonymous `ROW` is reported to the client as the `record` pseudo-type, but its wire
+        // encoding is field-wise, so the field types ride along in the `Kind` for the encoder.
+        DfType::Row(fields) => Ok(ps::util::record_type(
+            fields
+                .iter()
+                .map(type_to_pgsql)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_postgres::types::Type;
+
+    #[test]
+    fn multidimensional_array_uses_same_oid() {
+        // PostgreSQL uses the same array OID regardless of dimensionality.
+        // e.g. int8[] and int8[][] both map to INT8_ARRAY.
+        let one_d = DfType::Array(Box::new(DfType::BigInt));
+        let two_d = DfType::Array(Box::new(DfType::Array(Box::new(DfType::BigInt))));
+        let three_d = DfType::Array(Box::new(DfType::Array(Box::new(DfType::Array(Box::new(
+            DfType::BigInt,
+        ))))));
+
+        assert_eq!(type_to_pgsql(&one_d).unwrap(), Type::INT8_ARRAY);
+        assert_eq!(type_to_pgsql(&two_d).unwrap(), Type::INT8_ARRAY);
+        assert_eq!(type_to_pgsql(&three_d).unwrap(), Type::INT8_ARRAY);
+    }
+
+    #[test]
+    fn multidimensional_text_array() {
+        let two_d = DfType::Array(Box::new(DfType::Array(Box::new(DfType::Text(
+            Collation::Utf8,
+        )))));
+        assert_eq!(type_to_pgsql(&two_d).unwrap(), Type::TEXT_ARRAY);
     }
 }

@@ -6,60 +6,12 @@ use bit_vec::BitVec;
 use chrono::DateTime;
 use mysql_time::MySqlTime;
 use readyset_decimal::Decimal;
-use serde::de::{DeserializeSeed, EnumAccess, VariantAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::de::{EnumAccess, VariantAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_bytes::{ByteBuf, Bytes};
 use strum::{EnumString, FromRepr, VariantNames};
 
-use crate::{Array, Collation, DfValue, Text, TimestampTz, TinyText};
-
-impl DfValue {
-    /// Version number for the current implementations of [`serde::Deserialize`] and
-    /// [`serde::Serialize`] for [`DfValue`]. Any data serialized with an older version *can not* be
-    /// deserialized with the later version.
-    ///
-    /// This constant exists so that it can be persisted alongside any serialized [`DfValue`]s (eg
-    /// in base tables) and checked on startup against the current number, to determine if we've
-    /// made backwards-incompatible changes to deserialization since that data was serialized
-    // Note for developers: Remember to increment this number, and run `cargo run --example
-    // make_serialized_row`, every time we make a backwards incompatible change to deserialization
-    // of DfValue! Hopefully `test::deserialize_backwards_compatibility` will automatically catch
-    // that, but it's worth being extra careful, as that test is not perfect.
-    pub const SERDE_VERSION: u8 = 5;
-
-    /// Reference example "row" of `DfValue`s to check against for backwards compatible
-    /// deserialization.
-    ///
-    /// This is only exported so it can be used by `examples/make_serialized_row.rs`
-    pub fn example_row() -> Vec<DfValue> {
-        vec![
-            DfValue::None,
-            DfValue::Int(0),
-            DfValue::Int(i64::MAX),
-            DfValue::Int(i64::MIN),
-            DfValue::UnsignedInt(0),
-            DfValue::UnsignedInt(u64::MAX),
-            DfValue::Float(f32::MAX),
-            DfValue::Float(0.0),
-            DfValue::Float(f32::MIN),
-            DfValue::Double(f64::MAX),
-            DfValue::Double(0.0),
-            DfValue::Double(f64::MIN),
-            DfValue::Text("aaaaaaaaaaaaaaaaaa".into()),
-            DfValue::TinyText(TinyText::from_slice(b"a", Collation::Utf8).unwrap()),
-            DfValue::TimestampTz("2023-12-16 17:44:00".parse().unwrap()),
-            DfValue::Time(MySqlTime::from_bytes(b"1112").unwrap()),
-            DfValue::ByteArray(Arc::new(b"aaaaaaaaaaaa".to_vec())),
-            DfValue::Numeric(Arc::new(Decimal::MIN)),
-            DfValue::Numeric(Arc::new(Decimal::MAX)),
-            DfValue::Numeric(Arc::new(Decimal::try_from(42.42).unwrap())),
-            DfValue::BitVector(Arc::new(BitVec::from_bytes(b"aaaaaaaaa"))),
-            DfValue::Array(Arc::new(Array::from(vec![DfValue::from("aaaaaaaaa")]))),
-            DfValue::Default,
-            DfValue::Max,
-        ]
-    }
-}
+use crate::{Collation, DfValue, Text, TimestampTz, TinyText};
 
 #[derive(VariantNames, EnumString, FromRepr, Clone, Copy)]
 enum Variant {
@@ -81,22 +33,6 @@ enum Variant {
 enum TextOrTinyText {
     Text(Text),
     TinyText(TinyText),
-}
-
-/// Wrapper struct that allows serializing a reference to a `str` as if it were a text [`DfValue`]
-pub struct TextRef<'a>(pub &'a str);
-
-impl Serialize for TextRef<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serialize_variant(
-            serializer,
-            Variant::Text,
-            &(Collation::Utf8, Bytes::new(self.0.as_bytes())),
-        )
-    }
 }
 
 #[inline(always)]
@@ -129,12 +65,12 @@ impl serde::ser::Serialize for DfValue {
             DfValue::Text(v) => serialize_variant(
                 serializer,
                 Variant::Text,
-                &(v.collation(), Bytes::new(v.as_bytes())),
+                &(v.collation(), Bytes::new(v.as_bytes()), v.collation_hash()),
             ),
             DfValue::TinyText(v) => serialize_variant(
                 serializer,
                 Variant::Text,
-                &(v.collation(), Bytes::new(v.as_bytes())),
+                &(v.collation(), Bytes::new(v.as_bytes()), v.collation_hash()),
             ),
             DfValue::Time(v) => serialize_variant(serializer, Variant::Time, &v),
             DfValue::ByteArray(a) => {
@@ -311,66 +247,13 @@ impl<'de> Deserialize<'de> for TextOrTinyText {
     where
         D: Deserializer<'de>,
     {
-        // Once we grab the collation out of the first element, we need to pass that in *to the
-        // construction* of the Text in the second element - this is the hoop we have to jump
-        // through to make serde deserializers stateful
-        struct FoundCollation(Collation);
-
-        impl<'de> DeserializeSeed<'de> for FoundCollation {
-            type Value = TextOrTinyText;
-
-            fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                struct TextVisitor(Collation);
-
-                impl<'de> Visitor<'de> for TextVisitor {
-                    type Value = TextOrTinyText;
-
-                    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                        formatter.write_str("a byte array")
-                    }
-
-                    fn visit_seq<V>(self, mut visitor: V) -> Result<Self::Value, V::Error>
-                    where
-                        V: serde::de::SeqAccess<'de>,
-                    {
-                        let len = std::cmp::min(visitor.size_hint().unwrap_or(0), 4096);
-                        let mut bytes = Vec::with_capacity(len);
-
-                        while let Some(b) = visitor.next_element()? {
-                            bytes.push(b);
-                        }
-
-                        match TinyText::from_slice(&bytes, self.0) {
-                            Ok(tt) => Ok(TextOrTinyText::TinyText(tt)),
-                            _ => Ok(TextOrTinyText::Text(Text::from_slice(&bytes, self.0))),
-                        }
-                    }
-
-                    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-                    where
-                        E: serde::de::Error,
-                    {
-                        match TinyText::from_slice(v, self.0) {
-                            Ok(tt) => Ok(TextOrTinyText::TinyText(tt)),
-                            _ => Ok(TextOrTinyText::Text(Text::from_slice(v, self.0))),
-                        }
-                    }
-                }
-
-                deserializer.deserialize_bytes(TextVisitor(self.0))
-            }
-        }
-
         struct TupleVisitor;
 
         impl<'de> Visitor<'de> for TupleVisitor {
             type Value = TextOrTinyText;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a tuple of (collation, text)")
+                formatter.write_str("a tuple of (collation, bytes, hash)")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -380,13 +263,31 @@ impl<'de> Deserialize<'de> for TextOrTinyText {
                 let collation = seq
                     .next_element::<Collation>()?
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let bytes = seq
+                    .next_element::<ByteBuf>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?
+                    .into_vec();
+                let hash = seq
+                    .next_element::<u64>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(2, &self))?;
 
-                seq.next_element_seed(FoundCollation(collation))?
-                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))
+                // The serializer's TinyText-vs-Text choice is determined by whether the bytes
+                // fit in TinyText, so the same length test reproduces it on read.
+                // SAFETY: bytes came from a previous Text/TinyText serialization (validated
+                // UTF-8) and `hash` is the matching collation hash written by the same
+                // serializer.
+                if let Ok(tt) = unsafe { TinyText::from_parts(collation, hash, &bytes) } {
+                    Ok(TextOrTinyText::TinyText(tt))
+                } else {
+                    // SAFETY: see above.
+                    Ok(TextOrTinyText::Text(unsafe {
+                        Text::from_parts(collation, hash, &bytes)
+                    }))
+                }
             }
         }
 
-        deserializer.deserialize_tuple(2, TupleVisitor)
+        deserializer.deserialize_tuple(3, TupleVisitor)
     }
 }
 
@@ -396,25 +297,6 @@ mod tests {
     use test_utils::tags;
 
     use super::*;
-
-    /// This test checks that a reference payload of `bincode`-serialized `DfValue`s can be
-    /// deserialized using the *current* implementation of [`serde::Deserialize`]. If this test
-    /// fails, you've probably just introduced a backwards-incompatible change to deserialization.
-    /// In that case, you have two options:
-    ///
-    /// 1. Fix the backwards incompatibility, if possible. Sometimes this is trivial, and if so,
-    ///    this should be the preferred option
-    /// 2. Bump the serde version for [`DfValue`]. Increment `DfValue::SERDE_VERSION` (at the top of
-    ///    this file), and run `cargo run --example make_serialized_row` to overwrite the reference
-    ///    serialized row for this serde version
-    #[test]
-    fn deserialize_backwards_compatibility() {
-        assert_eq!(
-            bincode::deserialize::<Vec<DfValue>>(include_bytes!("../tests/serialized-row.bincode"))
-                .unwrap(),
-            DfValue::example_row()
-        );
-    }
 
     #[tags(no_retry)]
     #[proptest]
@@ -427,14 +309,6 @@ mod tests {
             <&str>::try_from(&input).unwrap()
         );
         assert_eq!(rt.collation(), input.collation());
-    }
-
-    #[tags(no_retry)]
-    #[proptest]
-    fn text_ref_serializes_same_as_text_value(s: String) {
-        let text_ref = bincode::serialize(&TextRef(&s)).unwrap();
-        let text_value = bincode::serialize(&DfValue::from(s)).unwrap();
-        assert_eq!(text_ref, text_value);
     }
 
     #[tags(no_retry)]

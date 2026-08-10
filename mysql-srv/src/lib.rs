@@ -57,8 +57,8 @@
 //!         Ok(())
 //!     }
 //!
-//!     async fn on_init(&mut self, _: &str, w: Option<InitWriter<'_, W>>) -> io::Result<()> {
-//!         w.unwrap().ok().await
+//!     async fn on_init(&mut self, _: &str) -> io::Result<()> {
+//!         Ok(())
 //!     }
 //!     async fn on_change_user(&mut self, _: &str, _: &str, _: &str) -> io::Result<()> {
 //!         Ok(())
@@ -82,8 +82,11 @@
 //!             return match var {
 //!                 Some("max_allowed_packet") => {
 //!                     let cols = &[Column {
+//!                         schema: String::new(),
 //!                         table: String::new(),
+//!                         org_table: String::new(),
 //!                         column: "@@max_allowed_packet".to_owned(),
+//!                         org_name: String::new(),
 //!                         coltype: myc::constants::ColumnType::MYSQL_TYPE_LONG,
 //!                         column_length: 11,
 //!                         colflags: myc::constants::ColumnFlags::UNSIGNED_FLAG,
@@ -99,8 +102,11 @@
 //!         } else {
 //!             let cols = [
 //!                 Column {
+//!                     schema: String::new(),
 //!                     table: "foo".to_string(),
+//!                     org_table: String::new(),
 //!                     column: "a".to_string(),
+//!                     org_name: String::new(),
 //!                     coltype: ColumnType::MYSQL_TYPE_LONGLONG,
 //!                     column_length: 11,
 //!                     colflags: ColumnFlags::empty(),
@@ -108,8 +114,11 @@
 //!                     decimals: 0,
 //!                 },
 //!                 Column {
+//!                     schema: String::new(),
 //!                     table: "foo".to_string(),
+//!                     org_table: String::new(),
 //!                     column: "b".to_string(),
+//!                     org_name: String::new(),
 //!                     coltype: ColumnType::MYSQL_TYPE_STRING,
 //!                     column_length: 11,
 //!                     colflags: ColumnFlags::empty(),
@@ -136,9 +145,17 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
+//!     let _ = AuthKeys::initialize(None);
 //!     let listener = net::TcpListener::bind("127.0.0.1:0").unwrap();
 //!     let port = listener.local_addr().unwrap().port();
 //!     let mut rt = tokio::runtime::Runtime::new().unwrap();
+//!
+//!     // Pre-populate the caching_sha2_password fast-auth cache so that
+//!     // clients hit fast-auth on their first connection. The cache is
+//!     // authoritative -- cache-miss denies the connection rather than
+//!     // falling back to the RSA-based full-auth exchange.
+//!     let auth_cache = AuthCache::new();
+//!     auth_cache.insert("root", b"password");
 //!
 //!     let jh = thread::spawn(move || {
 //!         if let Ok((s, _)) = listener.accept() {
@@ -147,7 +164,10 @@
 //!                 s.set_nonblocking(true).expect("couldn't set nonblocking");
 //!                 tokio::net::TcpStream::from_std(s).unwrap()
 //!             };
-//!             rt.block_on(MySqlIntermediary::run_on_tcp(Backend, s, false, None, TlsMode::Optional))
+//!             rt.block_on(MySqlIntermediary::run_on_tcp(
+//!                 Backend, s, false, None, TlsMode::Optional,
+//!                 auth_cache, AuthPlugin::default(),
+//!             ))
 //!                 .unwrap();
 //!         }
 //!     });
@@ -184,29 +204,34 @@
 
 extern crate mysql_common as myc;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io;
+use std::str;
 use std::sync::Arc;
 
 use constants::{
-    CLIENT_PLUGIN_AUTH, CONNECT_WITH_DB, LONG_PASSWORD, PROTOCOL_41, RESERVED, SECURE_CONNECTION,
-    SSL,
+    CLIENT_PLUGIN_AUTH, CONNECT_WITH_DB, DEPRECATE_EOF, LONG_PASSWORD, PROTOCOL_41, RESERVED,
+    SECURE_CONNECTION, SSL,
 };
 use database_utils::TlsMode;
 use error::{other_error, OtherErrorKind};
 use mysql_common::constants::CapabilityFlags;
 use readyset_adapter_types::{DeallocateId, ParsedCommand};
+use readyset_data::encoding::Encoding;
 use readyset_data::DfType;
 use readyset_util::redacted::RedactedString;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net;
 use tokio_native_tls::TlsAcceptor;
-use tracing::{debug, info, trace};
+use tracing::{debug, info};
 use writers::write_err;
 
-use crate::authentication::{generate_auth_data, hash_password, AUTH_PLUGIN_NAME};
+pub use crate::authentication::{
+    AuthCache, AuthContext, AuthKeys, AuthPlugin, CachingSha2Password, MysqlNativePassword,
+};
 use crate::commands::change_user;
-use crate::constants::CONNECT_ATTRS;
+use crate::constants::{CONNECT_ATTRS, INTERACTIVE};
 pub use crate::myc::constants::{ColumnFlags, ColumnType, StatusFlags};
 pub use crate::writers::prepare_column_definitions;
 
@@ -226,14 +251,20 @@ mod writers;
 /// or an output column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
+    /// The database (schema) this column's table belongs to.
+    pub schema: String,
     /// This column's associated table.
     ///
     /// Note that this is *technically* the table's alias.
     pub table: String,
+    /// This column's original table, before any aliasing.
+    pub org_table: String,
     /// This column's name.
     ///
     /// Note that this is *technically* the column's alias.
     pub column: String,
+    /// This column's original name, before any aliasing.
+    pub org_name: String,
     /// This column's type.
     pub coltype: ColumnType,
     /// This column's display length.
@@ -249,11 +280,22 @@ pub struct Column {
     pub decimals: u8,
 }
 
-impl From<&mysql_async::Column> for Column {
-    fn from(c: &mysql_async::Column) -> Self {
+impl Column {
+    /// Convert column metadata received from an upstream MySQL server, whose text fields (names,
+    /// tables, schema) are encoded in the upstream session's `character_set_results`, into
+    /// canonical UTF-8 form. Bytes that can't be decoded are replaced lossily.
+    pub fn from_mysql(c: &mysql_async::Column, encoding: Encoding) -> Self {
+        let decode = |bytes: &[u8]| {
+            encoding
+                .decode(bytes)
+                .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
+        };
         Column {
-            table: c.table_str().to_string(),
-            column: c.name_str().to_string(),
+            schema: decode(c.schema_ref()),
+            table: decode(c.table_ref()),
+            org_table: decode(c.org_table_ref()),
+            column: decode(c.name_ref()),
+            org_name: decode(c.org_name_ref()),
             coltype: c.column_type(),
             column_length: c.column_length(),
             character_set: c.character_set(),
@@ -263,10 +305,29 @@ impl From<&mysql_async::Column> for Column {
     }
 }
 
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+
+    #[test]
+    fn from_mysql_decodes_text_fields_per_results_encoding() {
+        let upstream = mysql_async::Column::new(ColumnType::MYSQL_TYPE_VAR_STRING)
+            .with_name(b"situa\xE7\xE3o");
+
+        let column = Column::from_mysql(&upstream, Encoding::LATIN1);
+        assert_eq!(column.column, "situação");
+
+        let upstream = mysql_async::Column::new(ColumnType::MYSQL_TYPE_VAR_STRING)
+            .with_name("situação".as_bytes());
+        let column = Column::from_mysql(&upstream, Encoding::Utf8);
+        assert_eq!(column.column, "situação");
+    }
+}
+
 pub use crate::error::MsqlSrvError;
 pub use crate::errorcodes::ErrorKind;
 pub use crate::params::{ParamParser, ParamValue, Params};
-pub use crate::resultset::{InitWriter, QueryResultWriter, RowWriter, StatementMetaWriter};
+pub use crate::resultset::{QueryResultWriter, RowWriter, StatementMetaWriter};
 pub use crate::value::{ToMySqlValue, Value, ValueInner};
 
 /// A wrapper to allow either an [`io::Result`] or a [`ParsedCommand`] to be returned
@@ -354,7 +415,7 @@ pub trait MySqlShim<S: AsyncRead + AsyncWrite + Unpin + Send> {
     async fn on_reset(&mut self) -> io::Result<()>;
 
     /// Called when client switches database.
-    async fn on_init(&mut self, _: &str, _: Option<InitWriter<'_, S>>) -> io::Result<()>;
+    async fn on_init(&mut self, _: &str) -> io::Result<()>;
 
     /// Called when client switches user.
     async fn on_change_user(&mut self, _: &str, _: &str, _: &str) -> io::Result<()>;
@@ -364,6 +425,12 @@ pub trait MySqlShim<S: AsyncRead + AsyncWrite + Unpin + Send> {
 
     /// Called when default character set changes after handshake or client switches user.
     async fn set_charset(&mut self, _: u16) -> io::Result<()>;
+
+    /// Called after handshake to inform whether the client negotiated the
+    /// `CLIENT_INTERACTIVE` capability. Default implementation is a no-op.
+    async fn set_interactive(&mut self, _interactive: bool) -> io::Result<()> {
+        Ok(())
+    }
 
     /// Optional hook invoked once after parsing client handshake to pass MySQL connect attributes
     /// Default implementation is a no-op.
@@ -385,6 +452,35 @@ pub trait MySqlShim<S: AsyncRead + AsyncWrite + Unpin + Send> {
     fn server_status_flags(&self) -> StatusFlags {
         StatusFlags::SERVER_STATUS_AUTOCOMMIT
     }
+
+    /// Returns the encoding in which the client sends query text, i.e. the session's effective
+    /// `character_set_client`.
+    fn client_encoding(&self) -> Encoding {
+        Encoding::Utf8
+    }
+
+    /// Returns the encoding in which the client expects result text, including column metadata,
+    /// i.e. the session's effective `character_set_results`.
+    fn results_encoding(&self) -> Encoding {
+        Encoding::Utf8
+    }
+}
+
+/// Decode inbound client bytes to UTF-8 per the session's `character_set_client`.
+///
+/// Unsupported encodings fall back to a UTF-8 attempt so decoding is never less recoverable than
+/// treating all inbound text as UTF-8.
+fn decode_from_client(encoding: Encoding, bytes: &[u8]) -> io::Result<Cow<'_, str>> {
+    match encoding {
+        Encoding::SingleByte(_) => {
+            Ok(Cow::Owned(encoding.decode(bytes).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, e)
+            })?))
+        }
+        Encoding::Utf8 | Encoding::Binary | Encoding::OtherMySql(_) => str::from_utf8(bytes)
+            .map(Cow::Borrowed)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+    }
 }
 
 /// Stores a preencoded result schema for a prepared MySQL statement
@@ -395,6 +491,9 @@ pub struct CachedSchema {
     pub column_types: Vec<DfType>,
     /// Preencoded schema as a byte dump
     pub preencoded_schema: Arc<[u8]>,
+    /// The results encoding `preencoded_schema` was built with; the bytes must be rebuilt if the
+    /// session's results encoding changes.
+    pub encoding: Encoding,
 }
 
 /// A server that speaks the MySQL/MariaDB protocol, and can delegate client commands to a backend
@@ -406,14 +505,19 @@ pub struct MySqlIntermediary<B, S: AsyncRead + AsyncWrite + Unpin> {
     schema_cache: HashMap<u32, CachedSchema>,
     /// Whether to log statements received from a client
     enable_statement_logging: bool,
-    /// The capabilities of the client
-    client_capabilities: CapabilityFlags,
     /// Auth data sent to client
     auth_data: [u8; 20],
     /// TLS acceptor
     tls_acceptor: Option<Arc<TlsAcceptor>>,
     // Tls mode
     tls_mode: TlsMode,
+    /// Shared cache of SHA256(SHA256(password)) for caching_sha2_password fast-auth.
+    auth_cache: Arc<AuthCache>,
+    /// The authentication plugin to advertise during the handshake.
+    auth_plugin: AuthPlugin,
+    /// The authentication plugin negotiated for this session, set once the
+    /// initial handshake completes. Reused for `COM_CHANGE_USER`.
+    session_auth_plugin: AuthPlugin,
 }
 
 impl<B: MySqlShim<net::TcpStream> + Send> MySqlIntermediary<B, net::TcpStream> {
@@ -425,6 +529,8 @@ impl<B: MySqlShim<net::TcpStream> + Send> MySqlIntermediary<B, net::TcpStream> {
         enable_statement_logging: bool,
         tls_acceptor: Option<Arc<TlsAcceptor>>,
         tls_mode: TlsMode,
+        auth_cache: Arc<AuthCache>,
+        auth_plugin: AuthPlugin,
     ) -> Result<(), io::Error> {
         stream.set_nodelay(true)?;
         MySqlIntermediary::run_on(
@@ -433,6 +539,8 @@ impl<B: MySqlShim<net::TcpStream> + Send> MySqlIntermediary<B, net::TcpStream> {
             enable_statement_logging,
             tls_acceptor,
             tls_mode,
+            auth_cache,
+            auth_plugin,
         )
         .await
     }
@@ -460,7 +568,9 @@ const CAPABILITIES: u32 = PROTOCOL_41
     | RESERVED
     | CLIENT_PLUGIN_AUTH
     | CONNECT_WITH_DB
-    | CONNECT_ATTRS;
+    | CONNECT_ATTRS
+    | INTERACTIVE
+    | DEPRECATE_EOF;
 
 impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlIntermediary<B, S> {
     /// Create a new server over a channel and process client commands until the client
@@ -471,16 +581,20 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
         enable_statement_logging: bool,
         tls_acceptor: Option<Arc<TlsAcceptor>>,
         tls_mode: TlsMode,
+        auth_cache: Arc<AuthCache>,
+        auth_plugin: AuthPlugin,
     ) -> Result<(), io::Error> {
         let mut mi = MySqlIntermediary {
             shim,
             conn: packet::PacketConn::new(stream),
             schema_cache: HashMap::new(),
             enable_statement_logging,
-            client_capabilities: CapabilityFlags::empty(),
             auth_data: [0; 20],
             tls_acceptor,
             tls_mode,
+            auth_cache,
+            auth_plugin,
+            session_auth_plugin: auth_plugin,
         };
         if let InitResult {
             auth_success: true,
@@ -492,8 +606,15 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
         {
             mi.shim.set_auth_info(&username, plain_password).await?;
             mi.shim.set_charset(charset).await?;
+            mi.shim
+                .set_interactive(
+                    mi.conn
+                        .client_capabilities
+                        .contains(CapabilityFlags::CLIENT_INTERACTIVE),
+                )
+                .await?;
             if let Some(database) = database {
-                mi.shim.on_init(&database, None).await?;
+                mi.shim.on_init(&database).await?;
             }
             mi.run().await?;
         }
@@ -511,14 +632,34 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
     /// whether authentication was successful, the username, the plaintext password if one was
     /// provided, and a database name if one was specified by the client in the handshake response.
     async fn init(&mut self) -> Result<InitResult, io::Error> {
-        let auth_data =
-            generate_auth_data().map_err(|_| other_error(OtherErrorKind::AuthDataErr))?;
+        let auth_data = AuthPlugin::generate_auth_data()
+            .map_err(|_| other_error(OtherErrorKind::AuthDataErr))?;
         self.auth_data = auth_data;
+        let version = self.shim.version();
+        let version_len = version.len() + if version.ends_with('\0') { 0 } else { 1 };
+        // HandshakeV10 packet layout — see MySQL protocol docs for field descriptions.
         let mut init_packet = Vec::with_capacity(
-            1 + 16 + 4 + 8 + 1 + 2 + 1 + 2 + 2 + 1 + 6 + 4 + 12 + 1 + AUTH_PLUGIN_NAME.len() + 1,
+            1                        // protocol version
+            + version_len            // server version string + NUL
+            + 4                       // connection id
+            + 8                       // auth_data part 1
+            + 1                       // filler
+            + 2                       // capability flags (lower 2 bytes)
+            + 1                       // character set
+            + 2                       // status flags
+            + 2                       // capability flags (upper 2 bytes)
+            + 1                       // auth plugin data length
+            + 10                      // reserved
+            + 12                      // auth_data part 2
+            + 1                       // auth_data part 2 NUL
+            + self.auth_plugin.name().len()  // auth plugin name
+            + 1, // auth plugin name NUL
         );
         init_packet.extend_from_slice(&[10]); // protocol 10
-        init_packet.extend_from_slice(self.shim.version().as_bytes());
+        init_packet.extend_from_slice(version.as_bytes());
+        if !version.ends_with('\0') {
+            init_packet.push(0); // ensure null-terminated version string
+        }
         init_packet.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]); // TODO: connection ID
         init_packet.extend_from_slice(&auth_data[..8]);
         init_packet.push(0);
@@ -536,14 +677,14 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
 
         // Status flags: fresh connections always have autocommit on, matching real MySQL behavior.
         init_packet.extend_from_slice(&StatusFlags::SERVER_STATUS_AUTOCOMMIT.bits().to_le_bytes());
-        init_packet.extend_from_slice(&CAPABILITIES.to_le_bytes()[2..]);
+        init_packet.extend_from_slice(&capabilities.to_le_bytes()[2..]);
         // We will add a \0 byte below so we need to account for that when sending the length, since
         // rust strings don't add the null terminator
         init_packet.extend_from_slice(&[(auth_data.len() + 1) as u8]);
         init_packet.extend_from_slice(&[0x00; 10][..]); // filler
         init_packet.extend_from_slice(&auth_data[8..]);
         init_packet.push(0);
-        init_packet.extend_from_slice(AUTH_PLUGIN_NAME.as_bytes());
+        init_packet.extend_from_slice(self.auth_plugin.name().as_bytes());
         init_packet.push(0);
 
         self.conn.enqueue_packet(init_packet);
@@ -557,7 +698,6 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
 
         if commands::is_ssl_request(&packet.data)
             .map_err(|_| io::Error::other("invalid client capabilities flags in the handshake"))?
-            .1
         {
             // switch to ssl
             self.tls_acceptor.as_ref().ok_or_else(|| {
@@ -571,7 +711,7 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
 
             // The connection has been switched to TLS successfully. Read the handshake
             // again as per TLS handshake protocol.
-            self.conn.set_seq(packet.seq + 1);
+            self.conn.set_seq(packet.next_seq());
             packet = self.conn.next().await?.ok_or_else(|| {
                 // We use the stdlib's "custom" [`io::ErrorKind`] for this expected/benign error that
                 // occurs during a Layer 4 network health check, to indicate it can be ignored higher up
@@ -582,7 +722,7 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
         } else {
             // Client connected using a non encrypted stream. Write an error if TLS mode is required.
             if self.tls_mode == TlsMode::Required {
-                self.conn.set_seq(packet.seq + 1);
+                self.conn.set_seq(packet.next_seq());
                 writers::write_err(
                     ErrorKind::ER_SECURE_TRANSPORT_REQUIRED,
                     b"Connections using insecure transport are prohibited.",
@@ -594,49 +734,49 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
             }
         }
 
-        let handshake = commands::client_handshake(&packet.data)
-            .map_err(|e| match e {
-                nom::Err::Incomplete(_) => io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "client sent incomplete handshake",
-                ),
-                nom::Err::Failure(nom::error::Error { input, code })
-                | nom::Err::Error(nom::error::Error { input, code }) => {
-                    if let nom::error::ErrorKind::Eof = code {
-                        io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            format!("client did not complete handshake; got {input:?}"),
-                        )
-                    } else {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("bad client handshake; got {input:?} ({code:?})"),
-                        )
-                    }
-                }
-            })?
-            .1;
+        let handshake = commands::client_handshake(&packet.data).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad client handshake: {e}"),
+            )
+        })?;
 
         // Pass MySQL connect attributes to backend shim, if any
         if !handshake.connect_attrs.is_empty() {
             self.shim.on_connect_attrs(&handshake.connect_attrs);
         }
 
-        self.conn.set_seq(packet.seq + 1);
+        self.conn.set_seq(packet.next_seq());
 
-        self.client_capabilities = handshake.capabilities;
+        self.conn.client_capabilities = handshake.capabilities;
         let charset = handshake.charset;
         let username = handshake.username.to_owned();
         let password = handshake.password.to_vec();
         let database = handshake.database.map(String::from);
         let client_auth_plugin = handshake.auth_plugin_name.map(|s| s.to_owned());
 
-        let handshake_password = if client_auth_plugin.iter().all(|apn| apn != AUTH_PLUGIN_NAME)
-            // Some clients (at the very least certain versions of PHP's MySQL PDO library) send an
-            // empty password response in the initial handshake, even if the auth plugin is set and
-            // correct. We want to send a switch-authentication request in that case too
-            || password.is_empty()
-        {
+        let client_plugin = client_auth_plugin
+            .as_deref()
+            .and_then(|s| s.parse::<AuthPlugin>().ok());
+
+        // If the client offered a plugin we support and sent a non-empty
+        // scramble with it, authenticate using that plugin directly. This
+        // lets MySQL 9.x clients -- which no longer ship
+        // `mysql_native_password.so` -- log in when we advertise the legacy
+        // plugin but they prefer `caching_sha2_password`.
+        //
+        // An empty initial scramble is a known quirk of some PHP PDO and
+        // libmysql versions that expect an auth-switch to produce a fresh
+        // nonce. When that happens we send an AUTH_SWITCH_REQUEST targeting
+        // the plugin the client already picked (rather than our advertised
+        // default) so a MySQL 9.x client isn't asked to load a plugin it
+        // doesn't have.
+        let use_client_plugin = client_plugin.is_some() && !password.is_empty();
+        let switch_plugin = client_plugin.unwrap_or(self.auth_plugin);
+
+        let (session_plugin, handshake_password) = if use_client_plugin {
+            (client_plugin.expect("checked above"), password)
+        } else {
             // Authentication mismatch - try to switch auth plugins
 
             if !handshake
@@ -659,16 +799,11 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
 
             debug!(
                 ?client_auth_plugin,
+                %switch_plugin,
                 "Client offered incorrect authentication plugin, sending switch request",
             );
 
-            let mut auth_switch_request_packet =
-                Vec::with_capacity(1 + AUTH_PLUGIN_NAME.len() + 1 + auth_data.len() + 1);
-            auth_switch_request_packet.push(0xfe);
-            auth_switch_request_packet.extend_from_slice(AUTH_PLUGIN_NAME.as_bytes());
-            auth_switch_request_packet.push(0);
-            auth_switch_request_packet.extend_from_slice(&auth_data);
-            auth_switch_request_packet.push(0);
+            let auth_switch_request_packet = switch_plugin.get_switch_packet(&auth_data);
             self.conn.enqueue_packet(auth_switch_request_packet);
             self.conn.flush().await?;
 
@@ -678,22 +813,26 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
                     "peer terminated connection when asked to switch auth plugin",
                 )
             })?;
-            self.conn.set_seq(packet.seq + 1);
+            self.conn.set_seq(packet.next_seq());
 
-            packet.data.to_vec()
-        } else {
-            password
+            (switch_plugin, packet.data.to_vec())
         };
 
         let plain_password = self.shim.password_for_username(&username);
         let require_auth = self.shim.require_authentication();
-        let auth_success = !require_auth
-            || plain_password.as_ref().is_some_and(|password| {
-                let expected = hash_password(password, &auth_data);
-                let actual = handshake_password.as_slice();
-                trace!(?expected, ?actual);
-                expected == actual
-            });
+        let auth_success = session_plugin
+            .handle_authentication(
+                &AuthContext {
+                    username: &username,
+                    password: plain_password.as_deref(),
+                    handshake_password: &handshake_password,
+                    auth_data: &self.auth_data,
+                    require_auth,
+                },
+                &mut self.conn,
+                &self.auth_cache,
+            )
+            .await?;
         let plain_password = if require_auth {
             Some(RedactedString::from(
                 plain_password
@@ -704,6 +843,7 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
             None
         };
         if auth_success {
+            self.session_auth_plugin = session_plugin;
             debug!(%username, "Successfully authenticated client");
             writers::write_ok_packet(&mut self.conn, 0, 0, self.shim.server_status_flags()).await?;
         } else {
@@ -730,14 +870,12 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
 
         let mut stmts: HashMap<u32, _> = HashMap::new();
         while let Some(packet) = self.conn.next().await? {
-            self.conn.set_seq(packet.seq + 1);
-            let cmd = commands::parse(&packet)
-                .map_err(|e| {
-                    other_error(OtherErrorKind::GenericErr {
-                        error: format!("{e:?}"),
-                    })
-                })?
-                .1;
+            self.conn.set_seq(packet.next_seq());
+            let cmd = commands::parse(&packet).map_err(|e| {
+                other_error(OtherErrorKind::GenericErr {
+                    error: format!("{e:?}"),
+                })
+            })?;
             // These other variants are logged by the readyset-mysql `Backend`.
             if self.enable_statement_logging
                 && !matches!(
@@ -750,44 +888,81 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
             {
                 info!(target: "client_statement", "{:?}", cmd);
             }
+            self.conn.results_encoding = self.shim.results_encoding();
             match cmd {
                 Command::ChangeUser(q) => {
-                    let change_user = change_user(q, self.client_capabilities)
-                        .map_err(|e| {
+                    let change_user =
+                        change_user(q, self.conn.client_capabilities).map_err(|e| {
                             other_error(OtherErrorKind::GenericErr {
                                 error: format!("{e:?}"),
                             })
-                        })?
-                        .1;
+                        })?;
                     let username = change_user.username.to_owned();
-                    let authpassword = change_user.password.to_vec();
 
-                    if change_user.auth_plugin_name != AUTH_PLUGIN_NAME {
-                        // This should never happen, as we already accepted a connection using
-                        // AUTH_PLUGIN_NAME
-                        writers::write_err(
-                            ErrorKind::ER_ACCESS_DENIED_ERROR,
-                            format!(
-                                "Access denied for user {}. Incorrect auth plugin {}",
-                                username, change_user.auth_plugin_name
+                    let client_plugin = change_user
+                        .auth_plugin_name
+                        .and_then(|s| s.parse::<AuthPlugin>().ok());
+
+                    // If the client embedded a non-empty auth response under a
+                    // plugin we support, verify it directly against the
+                    // original handshake nonce. This matches real MySQL's
+                    // COM_CHANGE_USER semantics (the embedded response is
+                    // hashed against the handshake nonce) and is required for
+                    // compatibility with clients like ProxySQL that don't
+                    // recompute the hash in response to an
+                    // AUTH_SWITCH_REQUEST that targets the same plugin.
+                    //
+                    // Otherwise, force an auth-switch round trip with a fresh
+                    // nonce -- targeted at the client's preferred plugin when
+                    // it differs from the session plugin, so MySQL 9.x clients
+                    // that lack `mysql_native_password.so` can still complete.
+                    let use_client_plugin =
+                        client_plugin.is_some() && !change_user.password.is_empty();
+
+                    let (session_plugin, handshake_password, change_user_auth_data) =
+                        if use_client_plugin {
+                            (
+                                client_plugin.expect("checked above"),
+                                change_user.password.to_vec(),
+                                self.auth_data,
                             )
-                            .as_bytes(),
+                        } else {
+                            let switch_plugin = client_plugin.unwrap_or(self.session_auth_plugin);
+                            let fresh_nonce = AuthPlugin::generate_auth_data()
+                                .map_err(|_| other_error(OtherErrorKind::AuthDataErr))?;
+                            self.conn
+                                .enqueue_packet(switch_plugin.get_switch_packet(&fresh_nonce));
+                            self.conn.flush().await?;
+
+                            let packet = self.conn.next().await?.ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::ConnectionAborted,
+                                    "peer terminated connection during change_user auth switch",
+                                )
+                            })?;
+                            self.conn.set_seq(packet.next_seq());
+
+                            (switch_plugin, packet.data.to_vec(), fresh_nonce)
+                        };
+
+                    let plain_password = self.shim.password_for_username(&username);
+                    let require_auth = self.shim.require_authentication();
+                    let auth_success = session_plugin
+                        .handle_authentication(
+                            &AuthContext {
+                                username: &username,
+                                password: plain_password.as_deref(),
+                                handshake_password: &handshake_password,
+                                auth_data: &change_user_auth_data,
+                                require_auth,
+                            },
                             &mut self.conn,
+                            &self.auth_cache,
                         )
                         .await?;
-                        self.conn.flush().await?;
-                        continue;
-                    }
-                    let plain_password = self.shim.password_for_username(&username);
-                    let auth_success = !self.shim.require_authentication()
-                        || plain_password.as_ref().is_some_and(|password| {
-                            let expected = hash_password(password, &self.auth_data);
-                            let actual = authpassword.as_slice();
-                            trace!(?expected, ?actual);
-                            expected == actual
-                        });
 
                     if auth_success {
+                        self.session_auth_plugin = session_plugin;
                         debug!("Successfully authenticated client");
                         match self
                             .shim
@@ -811,7 +986,12 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
                                 )
                                 .await?;
                             }
-                            Err(_) => {
+                            Err(e) => {
+                                debug!(
+                                    %username,
+                                    error = %e,
+                                    "COM_CHANGE_USER rejected by shim handler",
+                                );
                                 writers::write_err(
                                     ErrorKind::ER_ACCESS_DENIED_ERROR,
                                     format!("Access denied for user {username}").as_bytes(),
@@ -821,7 +1001,11 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
                             }
                         }
                     } else {
-                        debug!("Received incorrect password");
+                        debug!(
+                            %username,
+                            ?session_plugin,
+                            "COM_CHANGE_USER authentication failed: invalid credentials",
+                        );
                         writers::write_err(
                             ErrorKind::ER_ACCESS_DENIED_ERROR,
                             format!("Access denied for user {username}").as_bytes(),
@@ -832,15 +1016,9 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
                     self.conn.flush().await?;
                 }
                 Command::Query(q) => {
+                    let query = decode_from_client(self.shim.client_encoding(), q)?;
                     let w = QueryResultWriter::new(&mut self.conn, false);
-                    let res = self
-                        .shim
-                        .on_query(
-                            ::std::str::from_utf8(q)
-                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-                            w,
-                        )
-                        .await;
+                    let res = self.shim.on_query(&query, w).await;
 
                     match res {
                         QueryResultsResponse::Command(cmd) => {
@@ -876,17 +1054,13 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
                     }
                 }
                 Command::Prepare(q) => {
+                    let query = decode_from_client(self.shim.client_encoding(), q)?;
                     let w = StatementMetaWriter {
                         conn: &mut self.conn,
                         stmts: &mut stmts,
                     };
                     self.shim
-                        .on_prepare(
-                            ::std::str::from_utf8(q)
-                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-                            w,
-                            &mut self.schema_cache,
-                        )
+                        .on_prepare(&query, w, &mut self.schema_cache)
                         .await?;
                 }
                 Command::ResetStmtData(stmt) => {
@@ -952,16 +1126,26 @@ impl<B: MySqlShim<S> + Send, S: AsyncWrite + AsyncRead + Unpin + Send> MySqlInte
                 }
                 Command::Init(schema) => {
                     debug!(schema = %String::from_utf8_lossy(schema), "Handling COM_INIT_DB");
-                    let w = InitWriter {
-                        conn: &mut self.conn,
-                    };
-                    self.shim
-                        .on_init(
-                            ::std::str::from_utf8(schema)
-                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-                            Some(w),
-                        )
-                        .await?;
+                    let schema_str = decode_from_client(self.shim.client_encoding(), schema)?;
+                    match self.shim.on_init(&schema_str).await {
+                        Ok(()) => {
+                            writers::write_ok_packet(
+                                &mut self.conn,
+                                0,
+                                0,
+                                self.shim.server_status_flags(),
+                            )
+                            .await?;
+                        }
+                        Err(e) => {
+                            writers::write_err(
+                                ErrorKind::ER_BAD_DB_ERROR,
+                                e.to_string().as_bytes(),
+                                &mut self.conn,
+                            )
+                            .await?;
+                        }
+                    }
                 }
                 Command::Ping => {
                     self.shim.on_ping().await?;

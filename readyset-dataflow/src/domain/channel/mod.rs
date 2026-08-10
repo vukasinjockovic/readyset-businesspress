@@ -1,23 +1,20 @@
-//! A wrapper around TCP channels that ReadySet uses to communicate between clients and servers, and
-//! inside the data-flow graph. At this point, this is mostly a thin wrapper around
-//! [`async-bincode`](https://docs.rs/async-bincode/), and it might go away in the long run.
+//! Per-process channel coordination and TCP framing for a single ReadySet server.
+//!
+//! Inter-domain traffic stays in-process via the [`ChannelCoordinator`]; the only
+//! TCP path is for base-table writes from the replicator (or any external base-table
+//! writer), handled by the [`tcp`] submodule.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::RwLock;
 use std::task::{Context, Poll};
 
-use async_bincode::tokio::{AsyncBincodeWriter, AsyncDestination};
 use futures_util::sink::{Sink, SinkExt};
-use metrics::{gauge, Gauge};
-use readyset_client::internal::ReplicaAddress;
-use readyset_client::metrics::recorded;
-use readyset_client::{CONNECTION_FROM_BASE, CONNECTION_FROM_DOMAIN, CONNECTION_MAGIC_NUMBER};
+use metrics::{Gauge, gauge};
+use readyset_client::internal::DomainIndex;
 use readyset_errors::{ReadySetError, ReadySetResult};
 use strum::{EnumCount, IntoEnumIterator};
-use tokio::io::BufWriter;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -25,7 +22,51 @@ use crate::{Packet, PacketDiscriminants};
 
 pub mod tcp;
 
-pub use self::tcp::{DualTcpStream, TcpSender};
+pub use self::tcp::BaseWriteStream;
+
+/// Default capacity for the bounded replay channel used for backpressure during full
+/// materialization replays.
+const DEFAULT_REPLAY_CHANNEL_CAPACITY: usize = 256;
+
+/// Sender half of the bounded replay channel. Used by the replay thread to send chunked
+/// replay packets back to the domain with backpressure.
+#[derive(Clone)]
+pub struct ReplaySender {
+    tx: mpsc::Sender<Packet>,
+}
+
+impl ReplaySender {
+    /// Send a replay packet, blocking the current thread until capacity is available.
+    /// This provides backpressure so the replay thread doesn't outrun the domain.
+    #[allow(clippy::result_large_err)]
+    pub fn blocking_send(&self, packet: Packet) -> Result<(), mpsc::error::SendError<Packet>> {
+        self.tx.blocking_send(packet)
+    }
+}
+
+/// Receiver half of the bounded replay channel. Polled by the Replica event loop to
+/// receive chunked replay packets.
+pub struct ReplayReceiver {
+    rx: mpsc::Receiver<Packet>,
+}
+
+impl ReplayReceiver {
+    /// Receive the next replay packet, or `None` if all senders have been dropped.
+    pub async fn recv(&mut self) -> Option<Packet> {
+        self.rx.recv().await
+    }
+}
+
+/// Create a bounded replay channel with the default capacity.
+pub fn replay_channel() -> (ReplaySender, ReplayReceiver) {
+    replay_channel_with_capacity(DEFAULT_REPLAY_CHANNEL_CAPACITY)
+}
+
+/// Create a bounded replay channel with the given capacity.
+pub fn replay_channel_with_capacity(capacity: usize) -> (ReplaySender, ReplayReceiver) {
+    let (tx, rx) = mpsc::channel(capacity);
+    (ReplaySender { tx }, ReplayReceiver { rx })
+}
 
 /// Buffer size to use for the broadcast channel to notify replicas about changes to the addresses
 /// of other replicas
@@ -41,7 +82,7 @@ pub(crate) fn domain_channel() -> (DomainSender, DomainReceiver) {
     let packets_queued: [Gauge; PacketDiscriminants::COUNT] = PacketDiscriminants::iter()
         .map(|d| {
             let name: &'static str = d.into();
-            gauge!(recorded::DOMAIN_PACKETS_QUEUED, "packet_type" => name)
+            gauge!(metric::DOMAIN_PACKETS_QUEUED, "packet_type" => name)
         })
         .collect::<Vec<Gauge>>()
         .try_into()
@@ -94,18 +135,6 @@ impl DomainReceiver {
     }
 }
 
-pub struct Remote;
-pub struct MaybeLocal;
-
-#[must_use]
-pub struct DomainConnectionBuilder<D> {
-    sport: Option<u16>,
-    addr: SocketAddr,
-    chan: Option<DomainSender>,
-    is_for_base: bool,
-    _marker: D,
-}
-
 impl Sink<Packet> for DomainSender {
     type Error = mpsc::error::SendError<Packet>;
 
@@ -126,129 +155,17 @@ impl Sink<Packet> for DomainSender {
     }
 }
 
-impl DomainConnectionBuilder<Remote> {
-    pub fn for_base(addr: SocketAddr) -> Self {
-        DomainConnectionBuilder {
-            sport: None,
-            chan: None,
-            addr,
-            is_for_base: true,
-            _marker: Remote,
-        }
-    }
-}
-
-impl DomainConnectionBuilder<Remote> {
-    /// Establishes a TCP sink for an asynchronous context. The function may block for a long
-    /// time while the connection is being established, be careful not to call it on our main Tokio
-    /// executer, but only from inside a Domain thread.
-    pub fn build_async(
-        self,
-    ) -> io::Result<AsyncBincodeWriter<BufWriter<tokio::net::TcpStream>, Packet, AsyncDestination>>
-    {
-        // TODO: async
-        // we must currently write and call flush, because the remote end (currently) does a
-        // synchronous read upon accepting a connection.
-        let s = self.build_sync()?.into_inner().into_inner()?;
-        s.set_nonblocking(true).expect("couldn't set nonblocking");
-
-        tokio::net::TcpStream::from_std(s)
-            .map(BufWriter::new)
-            .map(AsyncBincodeWriter::from)
-            .map(AsyncBincodeWriter::for_async)
-    }
-
-    /// Establishes a TCP sink for a synchronous context. The function may block for a long
-    /// time while the connection is being established, be careful not to call it on our main Tokio
-    /// executer, but only from inside a Domain thread.
-    pub fn build_sync(self) -> io::Result<TcpSender> {
-        let mut s = TcpSender::connect_from(self.sport, &self.addr)?;
-        {
-            let s = s.get_mut();
-            s.write_all(&CONNECTION_MAGIC_NUMBER)?;
-            s.write_all(&[if self.is_for_base {
-                CONNECTION_FROM_BASE
-            } else {
-                CONNECTION_FROM_DOMAIN
-            }])?;
-            s.flush()?;
-        }
-
-        Ok(s)
-    }
-}
-
-pub trait Sender {
-    fn send(&mut self, packet: Packet) -> Result<(), tcp::SendError>;
-}
-
-impl Sender for DomainSender {
-    fn send(&mut self, packet: Packet) -> Result<(), tcp::SendError> {
-        DomainSender::send(self, packet).map_err(|_| {
-            tcp::SendError::IoError(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "local peer went away",
-            ))
-        })
-    }
-}
-
-impl Sender for TcpSender {
-    fn send(&mut self, packet: Packet) -> Result<(), tcp::SendError> {
-        self.send_ref(&packet)
-    }
-}
-
-impl DomainConnectionBuilder<MaybeLocal> {
-    pub fn build_async(
-        self,
-    ) -> io::Result<Box<dyn Sink<Packet, Error = bincode::Error> + Send + Unpin>> {
-        if let Some(chan) = self.chan {
-            Ok(
-                Box::new(chan.sink_map_err(|_| serde::de::Error::custom("failed to do local send")))
-                    as Box<_>,
-            )
-        } else {
-            DomainConnectionBuilder {
-                sport: self.sport,
-                chan: None,
-                addr: self.addr,
-                is_for_base: false,
-                _marker: Remote,
-            }
-            .build_async()
-            .map(|c| Box::new(c) as Box<_>)
-        }
-    }
-
-    pub fn build_sync(self) -> io::Result<Box<dyn Sender + Send>> {
-        if let Some(chan) = self.chan {
-            Ok(Box::new(chan))
-        } else {
-            DomainConnectionBuilder {
-                sport: self.sport,
-                chan: None,
-                addr: self.addr,
-                is_for_base: false,
-                _marker: Remote,
-            }
-            .build_sync()
-            .map(|c| Box::new(c) as Box<_>)
-        }
-    }
-}
-
 struct ChannelCoordinatorInner {
     /// Map from key to remote address.
-    addrs: HashMap<ReplicaAddress, SocketAddr>,
+    addrs: HashMap<DomainIndex, SocketAddr>,
     /// Map from key to channel sender for local connections.
-    locals: HashMap<ReplicaAddress, DomainSender>,
+    locals: HashMap<DomainIndex, DomainSender>,
 }
 
 pub struct ChannelCoordinator {
     inner: RwLock<ChannelCoordinatorInner>,
     /// Broadcast channel that can be used to be notified when the address for a key changes
-    changes_tx: broadcast::Sender<ReplicaAddress>,
+    changes_tx: broadcast::Sender<DomainIndex>,
 }
 
 impl Default for ChannelCoordinator {
@@ -270,11 +187,11 @@ impl ChannelCoordinator {
 
     /// Create a new [`broadcast::Receiver`] which will be notified whenver the *remote* address for
     /// a key is changed (but *not* when a new key is added, or when the local address changes!)
-    pub fn subscribe(&self) -> broadcast::Receiver<ReplicaAddress> {
+    pub fn subscribe(&self) -> broadcast::Receiver<DomainIndex> {
         self.changes_tx.subscribe()
     }
 
-    pub fn insert_remote(&self, key: ReplicaAddress, addr: SocketAddr) {
+    pub fn insert_remote(&self, key: DomainIndex, addr: SocketAddr) {
         #[allow(clippy::expect_used)]
         // This can only fail if the mutex is poisoned, in which case we can't recover,
         // so we allow to panic if that happens.
@@ -291,7 +208,7 @@ impl ChannelCoordinator {
         }
     }
 
-    pub fn remove(&self, key: ReplicaAddress) {
+    pub fn remove(&self, key: DomainIndex) {
         #[allow(clippy::expect_used)]
         // This can only fail if the mutex is poisoned, in which case we can't recover,
         // so we allow to panic if that happens.
@@ -306,7 +223,7 @@ impl ChannelCoordinator {
         }
     }
 
-    pub fn insert_local(&self, key: ReplicaAddress, chan: DomainSender) {
+    pub fn insert_local(&self, key: DomainIndex, chan: DomainSender) {
         #[allow(clippy::expect_used)]
         // This can only fail if the mutex is poisoned, in which case we can't recover,
         // so we allow to panic if that happens.
@@ -316,7 +233,7 @@ impl ChannelCoordinator {
         }
     }
 
-    pub fn has(&self, key: &ReplicaAddress) -> bool {
+    pub fn has(&self, key: &DomainIndex) -> bool {
         #[allow(clippy::expect_used)]
         // This can only fail if the mutex is poisoned, in which case we can't recover,
         // so we allow to panic if that happens.
@@ -324,7 +241,7 @@ impl ChannelCoordinator {
         guard.addrs.contains_key(key)
     }
 
-    pub fn get_addr(&self, key: &ReplicaAddress) -> Option<SocketAddr> {
+    pub fn get_addr(&self, key: &DomainIndex) -> Option<SocketAddr> {
         #[allow(clippy::expect_used)]
         // This can only fail if the mutex is poisoned, in which case we can't recover,
         // so we allow to panic if that happens.
@@ -332,7 +249,7 @@ impl ChannelCoordinator {
         guard.addrs.get(key).cloned()
     }
 
-    pub fn is_local(&self, key: &ReplicaAddress) -> Option<bool> {
+    pub fn is_local(&self, key: &DomainIndex) -> Option<bool> {
         #[allow(clippy::expect_used)]
         // This can only fail if the mutex is poisoned, in which case we can't recover,
         // so we allow to panic if that happens.
@@ -340,29 +257,27 @@ impl ChannelCoordinator {
         guard.locals.get(key).map(|_| true)
     }
 
-    pub fn builder_for(
+    /// Open a `Sink<Packet>` for sending packets to the given domain via its
+    /// in-process channel. Returns an error if the domain has not yet
+    /// registered itself with `insert_local`.
+    pub fn connect_to(
         &self,
-        key: &ReplicaAddress,
-    ) -> ReadySetResult<DomainConnectionBuilder<MaybeLocal>> {
+        key: &DomainIndex,
+    ) -> ReadySetResult<Box<dyn Sink<Packet, Error = bincode::Error> + Send + Unpin>> {
         #[allow(clippy::expect_used)]
         // This can only fail if the mutex is poisoned, in which case we can't recover,
         // so we allow to panic if that happens.
         let guard = self.inner.read().expect("poisoned mutex");
-        #[allow(clippy::significant_drop_in_scrutinee)]
-        match guard.addrs.get(key) {
-            None => Err(ReadySetError::NoSuchReplica {
-                domain_index: key.domain_index.index(),
-                shard: key.shard,
-                replica: key.replica,
-            }),
-            Some(addrs) => Ok(DomainConnectionBuilder {
-                sport: None,
-                addr: *addrs,
-                chan: guard.locals.get(key).cloned(),
-                is_for_base: false,
-                _marker: MaybeLocal,
-            }),
-        }
+        let chan = guard
+            .locals
+            .get(key)
+            .cloned()
+            .ok_or_else(|| ReadySetError::DomainNotFound {
+                domain_index: key.index(),
+            })?;
+        Ok(Box::new(chan.sink_map_err(|_| {
+            serde::de::Error::custom("failed to do local send")
+        })))
     }
 
     pub fn clear(&self) {

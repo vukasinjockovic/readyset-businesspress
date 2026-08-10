@@ -132,16 +132,21 @@ impl ps::PsqlBackend for Backend {
         self.inner.version()
     }
 
-    fn credentials_for_user(&self, user: &str) -> Option<ps::Credentials<'_>> {
-        self.users
-            .get(user)
-            .map(|pw| ps::Credentials::CleartextPassword(pw))
+    fn credentials_for_user(&self, user: &str) -> Option<ps::Credentials> {
+        self.password_for_user(user)
+            .map(ps::Credentials::CleartextPassword)
     }
 
     async fn set_auth_info(&mut self, user: &str, password: Option<RedactedString>) {
         if let Some(password) = password {
             let _ = self.inner.set_user(user, password).await;
+            self.inner.connectors.init_schema_search_path().await;
         }
+        // Stand up the RLS per-session security context with the
+        // authenticated `startup_user`. Subsequent SET / set_config /
+        // COMMIT traffic mirrors into this; MySQL leaves the slot
+        // empty.
+        self.inner.attach_session(user);
     }
 
     async fn on_init(&mut self, _database: &str) -> Result<ps::CredentialsNeeded, ps::Error> {
@@ -270,6 +275,9 @@ impl TryFrom<ParamRef<'_>> for DfValue {
             PsqlValue::Json(v) | PsqlValue::Jsonb(v) => Ok(DfValue::from(v.to_string())),
             PsqlValue::Bit(bits) | PsqlValue::VarBit(bits) => Ok(DfValue::from(bits.clone())),
             PsqlValue::Array(arr, _) => Ok(DfValue::from(arr.clone())),
+            // Records are only ever built on the way out to a client; the decoder resolves an
+            // inbound `record` parameter to a passthrough instead.
+            PsqlValue::Row(_, ty) => Err(ps::Error::UnsupportedType(ty.clone())),
             PsqlValue::PassThrough(p) => Ok(DfValue::PassThrough(Arc::new(p.clone()))),
         }
     }

@@ -95,7 +95,10 @@
 //!         .unwrap();
 //!     // looking up article 42 should yield the article we inserted with a vote count of 1
 //!     assert_eq!(
-//!         awvc.lookup(&[aid.into()], true).await.unwrap().into_vec(),
+//!         awvc.lookup(&[aid.into()], Dialect::DEFAULT_MYSQL)
+//!             .await
+//!             .unwrap()
+//!             .into_vec(),
 //!         vec![vec![
 //!             DfValue::from(aid),
 //!             title.try_into().unwrap(),
@@ -232,18 +235,18 @@ pub(crate) const PENDING_LIMIT: usize = 8192;
 pub const CONNECTION_MAGIC_NUMBER: [u8; 4] = [0x52, 0x53, 0x30, 0x31];
 
 /// A tag to be written over a newly-established connection to a domain to indicate that the
-/// connection is originating from a base table domain.
+/// connection is originating from a base table writer (the replicator or an external base
+/// writer). This is the only tag value the replica's listener accepts now that inter-domain
+/// traffic stays in-process.
 pub const CONNECTION_FROM_BASE: u8 = 1;
-
-/// A tag to be written over a newly-established connection to a domain to indicate that the
-/// connection is *not* originating from a base table domain.
-pub const CONNECTION_FROM_DOMAIN: u8 = 2;
 
 mod controller;
 pub mod events;
-pub mod metrics;
+pub mod post_processing;
 pub mod query;
+pub mod read;
 pub mod recipe;
+pub mod schema;
 pub mod status;
 mod table;
 mod view;
@@ -254,8 +257,6 @@ pub mod consensus;
 pub mod internal;
 pub mod replay_path;
 
-use std::convert::TryFrom;
-use std::default::Default;
 use std::fmt::Display;
 use std::future::Future;
 use std::hash::Hash;
@@ -263,22 +264,18 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 use clap::ValueEnum;
-use readyset_data::{DfType, DfValue};
+use metrics::counter;
+use readyset_data::DfValue;
+use readyset_multiplex::TagStore;
 use readyset_sql::ast::Relation;
 use readyset_tracing::propagation::Instrumented;
 use replication_offset::ReplicationOffset;
 use schema_catalog::{SchemaCatalogProvider, SchemaCatalogUpdate};
 use serde::{Deserialize, Serialize};
 use tokio::task_local;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
-use tokio_tower::multiplex;
 
-pub use view::{
-    ColumnBase, ColumnSchema, KeyColumnIdx, PlaceholderIdx, ReaderHandle, ViewPlaceholder,
-    ViewSchema,
-};
+pub use schema::{ColumnBase, ColumnSchema, ViewSchema};
+pub use view::{KeyColumnIdx, PlaceholderIdx, ReaderHandle, ViewPlaceholder};
 
 use crate::events::ControllerEvent;
 
@@ -288,11 +285,6 @@ use crate::internal::*;
 /// The prelude contains most of the types needed in everyday operation.
 pub mod prelude {
     pub use super::{ReadySetHandle, Table, View};
-}
-
-/// Wrapper types for ReadySet query results.
-pub mod results {
-    pub use super::view::results::{Key, ResultIterator, Results, Row, SharedResults, SharedRows};
 }
 
 task_local! {
@@ -314,29 +306,27 @@ pub async fn trace_ops_in<T>(f: impl Future<Output = T>) -> T {
 // only pub because we use it to figure out the error type for ViewError
 pub struct Tagger(slab::Slab<()>);
 
-impl<Request, Response> multiplex::TagStore<Tagged<Request>, Tagged<Response>> for Tagger {
+impl<Request, Response> TagStore<Tagged<Request>, Tagged<Response>> for Tagger {
     type Tag = u32;
 
-    fn assign_tag(mut self: Pin<&mut Self>, r: &mut Tagged<Request>) -> Self::Tag {
+    fn assign_tag(&mut self, r: &mut Tagged<Request>) -> Self::Tag {
         r.tag = self.0.insert(()) as u32;
         r.tag
     }
-    fn finish_tag(mut self: Pin<&mut Self>, r: &Tagged<Response>) -> Self::Tag {
+    fn finish_tag(&mut self, r: &Tagged<Response>) -> Self::Tag {
         self.0.remove(r.tag as usize);
         r.tag
     }
 }
 
-impl<Request, Response> multiplex::TagStore<Instrumented<Tagged<Request>>, Tagged<Response>>
-    for Tagger
-{
+impl<Request, Response> TagStore<Instrumented<Tagged<Request>>, Tagged<Response>> for Tagger {
     type Tag = u32;
 
-    fn assign_tag(mut self: Pin<&mut Self>, r: &mut Instrumented<Tagged<Request>>) -> Self::Tag {
+    fn assign_tag(&mut self, r: &mut Instrumented<Tagged<Request>>) -> Self::Tag {
         r.inner_mut().tag = self.0.insert(()) as u32;
         r.inner_mut().tag
     }
-    fn finish_tag(mut self: Pin<&mut Self>, r: &Tagged<Response>) -> Self::Tag {
+    fn finish_tag(&mut self, r: &Tagged<Response>) -> Self::Tag {
         self.0.remove(r.tag as usize);
         r.tag
     }
@@ -360,13 +350,14 @@ pub use crate::consensus::WorkerDescriptor;
 pub use crate::controller::{
     ControllerConnectionPool, ControllerDescriptor, GraphvizOptions, ReadySetHandle,
 };
+pub use crate::schema::SchemaType;
 pub use crate::table::{
     Modification, Operation, PacketData, PacketPayload, PacketTrace, PersistencePoint, Table,
     TableOperation, TableRequest, TableStatus, TABLE_STATUS_REPORT_INTERVAL,
 };
 pub use crate::view::{
-    KeyComparison, LookupResult, ReadQuery, ReadReply, ReadReplyBatch, ReadReplyStats, SchemaType,
-    ShallowViewRequest, View, ViewCreateRequest, ViewQuery,
+    KeyComparison, KeyComparisonRef, LookupResult, ReadQuery, ReadReply, ReadReplyBatch,
+    ReplayKeys, ShallowViewRequest, View, ViewCreateRequest, ViewQuery,
 };
 
 pub mod builders {
@@ -384,9 +375,6 @@ pub enum ViewFilter {
     /// Pool of worker addresses. If the pool is not empty, this will
     /// look for a view reader in the pool.
     Workers(Vec<Url>),
-    /// Request a specific replica of this view, returning an error if the given replica does not
-    /// exist
-    Replica(usize),
 }
 
 /// Represents a request for a view.
@@ -399,15 +387,13 @@ pub struct ViewRequest {
 }
 
 /// A [`ReaderAddress`] is a unique identifier of a reader, it consists of the reader node in the
-/// dataflow graph, the name of the reader and the shard index.
+/// dataflow graph and the name of the reader.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReaderAddress {
     /// The index of the reader node in the dataflow graph
     pub node: petgraph::graph::NodeIndex,
     /// The name of the reader
     pub name: Relation,
-    /// The shard index
-    pub shard: usize,
 }
 
 /// Represents an eviction of a single key from some partially materialized index identified by the
@@ -428,51 +414,13 @@ pub struct SingleKeyEviction {
     pub key: Vec<DfValue>,
 }
 
-#[inline]
-pub fn shard_by(dt: &DfValue, shards: usize) -> usize {
-    match *dt {
-        DfValue::Int(n) => n as usize % shards,
-        DfValue::UnsignedInt(n) => n as usize % shards,
-        DfValue::Text(..) | DfValue::TinyText(..) | DfValue::TimestampTz(_) => {
-            use std::hash::{BuildHasher, Hasher};
-
-            let mut hasher =
-                ahash::RandomState::with_seeds(0x3306, 0x6033, 0x5432, 0x6034).build_hasher();
-            // this unwrap should be safe because there are no error paths with a Text, TinyText,
-            // nor Timestamp converting to Text
-            #[allow(clippy::unwrap_used)]
-            let str_dt = dt
-                .coerce_to(&DfType::DEFAULT_TEXT, &DfType::Unknown)
-                .unwrap();
-            // this unwrap should be safe because we just coerced dt to a text
-            #[allow(clippy::unwrap_used)]
-            let s: &str = <&str>::try_from(&str_dt).unwrap();
-            hasher.write(s.as_bytes());
-            hasher.finish() as usize % shards
-        }
-        // a bit hacky: send all NULL values to the first shard
-        DfValue::None | DfValue::Default | DfValue::Max => 0,
-        DfValue::Float(_)
-        | DfValue::Double(_)
-        | DfValue::Time(_)
-        | DfValue::ByteArray(_)
-        | DfValue::Numeric(_)
-        | DfValue::BitVector(_)
-        | DfValue::Array(_)
-        | DfValue::PassThrough(_) => {
-            let hash = ahash::RandomState::with_seeds(0x3306, 0x6033, 0x5432, 0x6034).hash_one(dt);
-            hash as usize % shards
-        }
-    }
-}
-
 /// How Readyset handles CREATE CACHE statements without explicit DEEP or SHALLOW modifiers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, ValueEnum)]
 pub enum CacheMode {
     /// Only try deep caching.
-    #[default]
     Deep,
     /// Only try shallow caching.
+    #[default]
     Shallow,
     /// First try deep caching, and then fall back to shallow caching.
     DeepThenShallow,
@@ -502,26 +450,158 @@ impl CacheMode {
     }
 }
 
+/// Build a schema-catalog update stream from a broadcast receiver.
+///
+/// Maps each [`ControllerEvent`] to an optional [`SchemaCatalogUpdate`], filters out
+/// non-catalog events, and **terminates** the stream when the broadcast receiver reports lag
+/// (i.e. the consumer fell behind the producer).
+///
+/// # Lag recovery invariant
+///
+/// Terminating on lag is safe because each new stream starts with a complete catalog snapshot
+/// (not a delta). The snapshot-first invariant is enforced by
+/// `EventsHandle::subscribe_with_snapshot` on the server side. If a delta-based update model
+/// is introduced, this recovery path must be revisited to ensure no schema state is silently
+/// lost.
+fn schema_catalog_stream_from_broadcast(
+    events_rx: tokio::sync::broadcast::Receiver<ControllerEvent>,
+) -> Pin<Box<dyn futures_util::Stream<Item = SchemaCatalogUpdate> + Send>> {
+    use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+    use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::StreamExt;
+
+    let stream = BroadcastStream::new(events_rx)
+        .map(|evt| match evt {
+            Ok(ControllerEvent::SchemaCatalogUpdate(update)) => Ok(Some(update)),
+            Ok(_) => Ok(None),
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped,
+                    "Schema catalog event receiver lagged behind; will reconnect"
+                );
+                counter!(metric::SCHEMA_CATALOG_BROADCAST_LAGGED).increment(1);
+                counter!(metric::SCHEMA_CATALOG_BROADCAST_SKIPPED).increment(skipped);
+                antithesis_sdk::assert_reachable!(
+                    "Schema catalog broadcast receiver lagged",
+                    &serde_json::json!({"skipped": skipped})
+                );
+                Err(())
+            }
+        })
+        .take_while(|item| item.is_ok())
+        .filter_map(|item| item.ok().flatten());
+    Box::pin(stream)
+}
+
 #[async_trait]
 impl SchemaCatalogProvider for ReadySetHandle {
     fn schema_catalog_update_stream(
         &mut self,
     ) -> Pin<Box<dyn futures_util::Stream<Item = SchemaCatalogUpdate> + Send>> {
         let events_rx = self.subscribe_to_events();
-        let stream = BroadcastStream::new(events_rx).filter_map(|evt| match evt {
-            Ok(ControllerEvent::SchemaCatalogUpdate(update)) => Some(update),
-            Ok(_) => None,
-            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                tracing::warn!(skipped, "Schema catalog event receiver lagged behind");
-                {
-                    antithesis_sdk::assert_unreachable!(
-                        "Schema catalog broadcast receiver lagged",
-                        &serde_json::json!({"skipped": skipped})
-                    );
-                }
-                None
-            }
-        });
-        Box::pin(stream)
+        schema_catalog_stream_from_broadcast(events_rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use schema_catalog::{SchemaCatalog, SchemaCatalogUpdate};
+    use tokio::sync::broadcast;
+    use tokio_stream::StreamExt;
+
+    use super::schema_catalog_stream_from_broadcast;
+    use crate::events::ControllerEvent;
+
+    /// `stream.next()` with a timeout to catch regressions that would hang.
+    async fn try_next_with_timeout(
+        stream: &mut (impl futures_util::Stream<Item = SchemaCatalogUpdate> + Unpin),
+    ) -> Option<SchemaCatalogUpdate> {
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("stream.next() timed out")
+    }
+
+    /// Verify that the stream terminates (yields `None`) when the broadcast receiver
+    /// lags, rather than silently skipping events.
+    #[tokio::test]
+    async fn lag_terminates_schema_catalog_update_stream() {
+        // Capacity 1: channel buffers only 1 unseen message per receiver.
+        let (tx, rx) = broadcast::channel::<ControllerEvent>(1);
+
+        let catalog = SchemaCatalog::new();
+        let update = SchemaCatalogUpdate::try_from(&catalog).expect("serialize");
+
+        // Send 2 events. The second overwrites the first, so `rx` will see Lagged.
+        tx.send(ControllerEvent::SchemaCatalogUpdate(update.clone()))
+            .expect("send first");
+        tx.send(ControllerEvent::SchemaCatalogUpdate(update))
+            .expect("send second");
+
+        let mut stream = schema_catalog_stream_from_broadcast(rx);
+
+        // Stream must terminate (yield None) due to lag — not silently skip.
+        assert!(
+            try_next_with_timeout(&mut stream).await.is_none(),
+            "expected stream to terminate on lag, but got an item"
+        );
+    }
+
+    /// Verify that a valid `SchemaCatalogUpdate` event is yielded through the stream
+    /// and that the stream terminates once the sender is dropped.
+    #[tokio::test]
+    async fn schema_catalog_stream_yields_valid_update() {
+        let (tx, rx) = broadcast::channel::<ControllerEvent>(16);
+
+        let catalog = SchemaCatalog::new();
+        let update = SchemaCatalogUpdate::try_from(&catalog).expect("serialize");
+
+        tx.send(ControllerEvent::SchemaCatalogUpdate(update.clone()))
+            .expect("send");
+        drop(tx);
+
+        let mut stream = schema_catalog_stream_from_broadcast(rx);
+
+        let item = try_next_with_timeout(&mut stream)
+            .await
+            .expect("expected one update");
+        assert_eq!(item, update);
+
+        // After the sender is dropped, the stream should terminate.
+        assert!(
+            try_next_with_timeout(&mut stream).await.is_none(),
+            "expected stream to end after sender dropped"
+        );
+    }
+
+    /// Verify that non-`SchemaCatalogUpdate` events (e.g. `Heartbeat`) are filtered out.
+    #[tokio::test]
+    async fn schema_catalog_stream_filters_non_catalog_events() {
+        let (tx, rx) = broadcast::channel::<ControllerEvent>(16);
+
+        let catalog = SchemaCatalog::new();
+        let update = SchemaCatalogUpdate::try_from(&catalog).expect("serialize");
+
+        tx.send(ControllerEvent::Heartbeat)
+            .expect("send heartbeat 1");
+        tx.send(ControllerEvent::SchemaCatalogUpdate(update.clone()))
+            .expect("send update");
+        tx.send(ControllerEvent::Heartbeat)
+            .expect("send heartbeat 2");
+        drop(tx);
+
+        let mut stream = schema_catalog_stream_from_broadcast(rx);
+
+        // Only the SchemaCatalogUpdate should come through.
+        let item = try_next_with_timeout(&mut stream)
+            .await
+            .expect("expected one update");
+        assert_eq!(item, update);
+
+        assert!(
+            try_next_with_timeout(&mut stream).await.is_none(),
+            "expected stream to end after sender dropped"
+        );
     }
 }

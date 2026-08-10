@@ -13,29 +13,6 @@ use crate::{writers, Column, ErrorKind, StatementData};
 pub(crate) const DEFAULT_ROW_CAPACITY: usize = 4096;
 pub(crate) const MAX_POOL_ROW_CAPACITY: usize = DEFAULT_ROW_CAPACITY * 4;
 
-/// Convenience type for responding to a client `USE <db>` command.
-pub struct InitWriter<'a, S: AsyncRead + AsyncWrite + Unpin> {
-    pub(crate) conn: &'a mut PacketConn<S>,
-}
-
-impl<'a, S: AsyncRead + AsyncWrite + Unpin + 'a> InitWriter<'a, S> {
-    /// Tell client that database context has been changed
-    pub async fn ok(self) -> io::Result<()> {
-        writers::write_ok_packet(self.conn, 0, 0, StatusFlags::empty()).await
-    }
-
-    /// Tell client that there was a problem changing the database context.
-    /// Although you can return any valid MySQL error code you probably want
-    /// to keep it similar to the MySQL server and issue either a
-    /// `ErrorKind::ER_BAD_DB_ERROR` or a `ErrorKind::ER_DBACCESS_DENIED_ERROR`.
-    pub async fn error<E>(self, kind: ErrorKind, msg: &E) -> io::Result<()>
-    where
-        E: Borrow<[u8]> + ?Sized,
-    {
-        writers::write_err(kind, msg.borrow(), self.conn).await
-    }
-}
-
 /// Convenience type for responding to a client `PREPARE` command.
 ///
 /// This type should not be dropped without calling
@@ -147,7 +124,13 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin> QueryResultWriter<'a, S> {
                 last_insert_id,
                 ..
             }) => writers::write_ok_packet(self.conn, rows, last_insert_id, status).await,
-            Some(Finalizer::Eof { .. }) => writers::write_eof_packet(self.conn, status).await,
+            Some(Finalizer::Eof { .. }) => {
+                if self.conn.deprecate_eof() {
+                    writers::write_ok_eof_packet(self.conn, status).await
+                } else {
+                    writers::write_eof_packet(self.conn, status).await
+                }
+            }
         }
     }
 
@@ -551,5 +534,82 @@ impl<'a, S: AsyncRead + AsyncWrite + Unpin + 'a> RowWriter<'a, S> {
 
         self.finish_inner()?;
         Ok(self.result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mysql_common::constants::{CapabilityFlags, ColumnType};
+
+    use super::*;
+
+    /// Drive a one-column, one-row text result set through a fresh connection that negotiated the
+    /// given capabilities, and return each emitted packet's payload.
+    async fn collect_resultset(capabilities: CapabilityFlags) -> Vec<Vec<u8>> {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+
+        tokio::spawn(async move {
+            let mut conn = PacketConn::new(server);
+            conn.client_capabilities = capabilities;
+            let cols = [Column {
+                schema: String::new(),
+                table: "t".to_string(),
+                org_table: String::new(),
+                column: "c".to_string(),
+                org_name: String::new(),
+                coltype: ColumnType::MYSQL_TYPE_LONG,
+                column_length: 11,
+                character_set: 33,
+                colflags: ColumnFlags::empty(),
+                decimals: 0,
+            }];
+            let writer = QueryResultWriter::new(&mut conn, false);
+            let mut rw = writer.start(&cols).await.unwrap();
+            rw.write_row(std::iter::once(42i32)).await.unwrap();
+            rw.finish().await.unwrap();
+            conn.flush().await.unwrap();
+        });
+
+        let mut reader = PacketConn::new(client);
+        let mut packets = Vec::new();
+        while let Some(packet) = reader.next().await.unwrap() {
+            packets.push(packet.to_vec());
+        }
+        packets
+    }
+
+    /// An EOF or EOF-shaped OK terminator: leading byte 0xFE with a payload shorter than 9 bytes.
+    fn is_terminator(packet: &[u8]) -> bool {
+        packet.first() == Some(&0xFE) && packet.len() < 9
+    }
+
+    #[tokio::test]
+    async fn legacy_framing_without_deprecate_eof() {
+        let packets = collect_resultset(CapabilityFlags::empty()).await;
+        // column count, column definition, post-column EOF, row, terminating EOF.
+        assert_eq!(packets.len(), 5);
+        assert_eq!(packets[0], [0x01]);
+        assert!(is_terminator(&packets[2]), "expected post-column EOF");
+        assert_eq!(packets[2].len(), 5);
+        assert_eq!(packets[3], [0x02, b'4', b'2']);
+        assert!(is_terminator(&packets[4]), "expected terminating EOF");
+        assert_eq!(packets[4].len(), 5);
+    }
+
+    #[tokio::test]
+    async fn deprecate_eof_framing() {
+        let packets = collect_resultset(CapabilityFlags::CLIENT_DEPRECATE_EOF).await;
+        // column count, column definition, row, OK-shaped terminator. No post-column EOF.
+        assert_eq!(packets.len(), 4);
+        assert_eq!(packets[0], [0x01]);
+        assert!(
+            !is_terminator(&packets[2]),
+            "row must follow the column definitions directly"
+        );
+        assert_eq!(packets[2], [0x02, b'4', b'2']);
+        assert!(is_terminator(&packets[3]), "expected OK-shaped terminator");
+        assert_eq!(packets[3][0], 0xFE);
+        // affected_rows + last_insert_id (lenenc 0) + status (2) + warnings (2).
+        assert_eq!(packets[3].len(), 7);
     }
 }

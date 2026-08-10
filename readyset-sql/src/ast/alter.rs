@@ -6,6 +6,7 @@ use proptest::{
     sample::size_range,
 };
 use readyset_util::fmt::fmt_with;
+use readyset_util::redacted::{RedactedString, Sensitive};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::RenameTableNameKind;
 use test_strategy::Arbitrary;
@@ -494,6 +495,89 @@ pub struct ChangeUpstreamStatement {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Arbitrary)]
+pub struct SetReplicationPositionStatement {
+    /// The replication position string (e.g. "mysql-bin.000003:154" or "0/16B3748").
+    pub position: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Arbitrary)]
+pub struct ChangeCdcStatement {
+    /// The new CDC URL.
+    pub url: String,
+}
+
+/// Which shallow-cache auto-creation allowlist an `ALTER`/`SHOW READYSET`
+/// statement targets. Each kind is a dedicated, independently persisted set:
+/// [`Function`](Self::Function) names bypass the builtin function deny-lists,
+/// [`Variable`](Self::Variable) names bypass the session/user-variable guard,
+/// and [`Schema`](Self::Schema) names bypass the system-schema guard.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Arbitrary)]
+pub enum ShallowCacheAllowlistKind {
+    Function,
+    Variable,
+    Schema,
+}
+
+impl ShallowCacheAllowlistKind {
+    /// The singular keyword used in `ALTER READYSET ... SHALLOW CACHE ALLOWED <KW>`.
+    pub fn singular_keyword(self) -> &'static str {
+        match self {
+            Self::Function => "FUNCTION",
+            Self::Variable => "VARIABLE",
+            Self::Schema => "SCHEMA",
+        }
+    }
+
+    /// The plural keyword used in `SHOW SHALLOW CACHE ALLOWED <KW>`.
+    pub fn plural_keyword(self) -> &'static str {
+        match self {
+            Self::Function => "FUNCTIONS",
+            Self::Variable => "VARIABLES",
+            Self::Schema => "SCHEMAS",
+        }
+    }
+}
+
+/// `ALTER READYSET {ADD | DROP} SHALLOW CACHE ALLOWED {FUNCTION | VARIABLE | SCHEMA} <name>[, <name>...]`.
+///
+/// Adds or removes names from one of the shallow-cache auto-creation allowlists
+/// (selected by [`kind`](Self::kind)): a name on an allowlist is treated as
+/// eligible for auto-caching even when it would otherwise be denied (a builtin
+/// on a deny-list, a session/user variable, or a system schema).
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Arbitrary)]
+pub struct ShallowCacheAllowlistChange {
+    /// Which allowlist this change targets.
+    pub kind: ShallowCacheAllowlistKind,
+    /// `true` for `ADD`, `false` for `DROP`.
+    pub add: bool,
+    /// The names being allowed (`ADD`) or removed from the allowlist (`DROP`).
+    #[strategy(any_with::<Vec<SqlIdentifier>>(size_range(1..8).lift()))]
+    pub names: Vec<SqlIdentifier>,
+}
+
+/// `ALTER READYSET ADD USER <user> PASSWORD '<password>'`. Adds an entry to the adapter's
+/// allowed-users set.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Arbitrary)]
+pub struct AddUserStatement {
+    pub user: SqlIdentifier,
+    pub password: RedactedString,
+}
+
+/// `ALTER READYSET MODIFY USER <user> PASSWORD '<password>'`. Rotates the password for an
+/// existing allowed user.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Arbitrary)]
+pub struct ModifyUserStatement {
+    pub user: SqlIdentifier,
+    pub password: RedactedString,
+}
+
+/// `ALTER READYSET DROP USER <user>`. Removes an entry from the adapter's allowed-users set.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Arbitrary)]
+pub struct DropUserStatement {
+    pub user: SqlIdentifier,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, Arbitrary)]
 pub enum AlterReadysetStatement {
     ResnapshotTable(ResnapshotTableStatement),
     AddTables(AddTablesStatement),
@@ -502,6 +586,14 @@ pub enum AlterReadysetStatement {
     SetLogLevel(String),
     SetEviction(SetEviction),
     ChangeUpstream(ChangeUpstreamStatement),
+    StopReplication,
+    StartReplication,
+    SetReplicationPosition(SetReplicationPositionStatement),
+    ChangeCdc(ChangeCdcStatement),
+    ShallowCacheAllowlistChange(ShallowCacheAllowlistChange),
+    AddUser(AddUserStatement),
+    ModifyUser(ModifyUserStatement),
+    DropUser(DropUserStatement),
 }
 
 impl DialectDisplay for AlterReadysetStatement {
@@ -539,6 +631,85 @@ impl DialectDisplay for AlterReadysetStatement {
             Self::ChangeUpstream(stmt) => {
                 write!(f, "CHANGE UPSTREAM TO '{}'", stmt.url)
             }
+            Self::StopReplication => {
+                write!(f, "STOP REPLICATION")
+            }
+            Self::StartReplication => {
+                write!(f, "START REPLICATION")
+            }
+            Self::SetReplicationPosition(stmt) => {
+                write!(f, "SET REPLICATION POSITION '{}'", stmt.position)
+            }
+            Self::ChangeCdc(stmt) => {
+                write!(f, "CHANGE CDC TO '{}'", stmt.url)
+            }
+            Self::ShallowCacheAllowlistChange(stmt) => {
+                write!(
+                    f,
+                    "{} SHALLOW CACHE ALLOWED {} {}",
+                    if stmt.add { "ADD" } else { "DROP" },
+                    stmt.kind.singular_keyword(),
+                    stmt.names
+                        .iter()
+                        .map(|name| dialect.quote_identifier(name))
+                        .join(", ")
+                )
+            }
+            Self::AddUser(stmt) => {
+                let user = stmt.user.as_str().replace('\'', "''");
+                let password = stmt.password.replace('\'', "''");
+                write!(f, "ADD USER '{}' PASSWORD '{}'", user, Sensitive(&password))
+            }
+            Self::ModifyUser(stmt) => {
+                let user = stmt.user.as_str().replace('\'', "''");
+                let password = stmt.password.replace('\'', "''");
+                write!(
+                    f,
+                    "MODIFY USER '{}' PASSWORD '{}'",
+                    user,
+                    Sensitive(&password)
+                )
+            }
+            Self::DropUser(stmt) => {
+                let user = stmt.user.as_str().replace('\'', "''");
+                write!(f, "DROP USER '{}'", user)
+            }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without the `redact_sensitive` feature (the default, incl. tests) the password renders
+    /// faithfully with single quotes escaped, so the statement round-trips through the parser.
+    #[test]
+    fn user_statements_display() {
+        let add = AlterReadysetStatement::AddUser(AddUserStatement {
+            user: "alice".into(),
+            password: RedactedString("se'cret".to_string()),
+        });
+        assert_eq!(
+            add.display(Dialect::MySQL).to_string(),
+            "ADD USER 'alice' PASSWORD 'se''cret'"
+        );
+
+        let modify = AlterReadysetStatement::ModifyUser(ModifyUserStatement {
+            user: "alice".into(),
+            password: RedactedString("newsecret".to_string()),
+        });
+        assert_eq!(
+            modify.display(Dialect::MySQL).to_string(),
+            "MODIFY USER 'alice' PASSWORD 'newsecret'"
+        );
+
+        let drop = AlterReadysetStatement::DropUser(DropUserStatement {
+            user: "alice".into(),
+        });
+        assert_eq!(
+            drop.display(Dialect::MySQL).to_string(),
+            "DROP USER 'alice'"
+        );
     }
 }

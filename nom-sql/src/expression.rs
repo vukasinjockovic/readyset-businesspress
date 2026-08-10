@@ -130,6 +130,7 @@ fn binary_operator_no_and_or(i: LocatedSpan<&[u8]>) -> NomSqlResult<&[u8], Binar
             map(tag("#>>"), |_| BinaryOperator::HashArrow2),
             map(tag("#>"), |_| BinaryOperator::HashArrow1),
         )),
+        map(tag("&&"), |_| BinaryOperator::DoubleAmpersand),
         map(tag("#-"), |_| BinaryOperator::HashSubtract),
     ))(i)
 }
@@ -366,6 +367,7 @@ where
             Infix(AtArrowRight) => Affix::Infix(Precedence(8), Associativity::Left),
             Infix(AtArrowLeft) => Affix::Infix(Precedence(8), Associativity::Left),
             Infix(HashSubtract) => Affix::Infix(Precedence(8), Associativity::Left),
+            Infix(DoubleAmpersand) => Affix::Infix(Precedence(8), Associativity::Left),
 
             Infix(AtTimeZone) => Affix::Infix(Precedence(7), Associativity::Left),
             Infix(Like) => Affix::Infix(Precedence(7), Associativity::Left),
@@ -1597,15 +1599,12 @@ mod tests {
 
         #[test]
         fn between_function_call() {
-            let qs = b"f(foo, bar) between 1 and 2";
+            let qs = b"coalesce(foo, bar) between 1 and 2";
             let expected = Expr::Between {
-                operand: Box::new(Expr::Call(FunctionExpr::Call {
-                    name: "f".into(),
-                    arguments: Some(vec![
-                        Expr::Column(Column::from("foo")),
-                        Expr::Column(Column::from("bar")),
-                    ]),
-                })),
+                operand: Box::new(Expr::Call(FunctionExpr::Coalesce(vec![
+                    Expr::Column(Column::from("foo")),
+                    Expr::Column(Column::from("bar")),
+                ]))),
                 min: Box::new(Expr::Literal(1.into())),
                 max: Box::new(Expr::Literal(2.into())),
                 negated: false,

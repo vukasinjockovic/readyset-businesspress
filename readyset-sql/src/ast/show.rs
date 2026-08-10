@@ -32,6 +32,14 @@ pub enum ShowStatement {
         query_id: Option<String>,
         limit: Option<u64>,
     },
+    /// SHOW SHALLOW CACHE ALLOWED {FUNCTIONS | VARIABLES | SCHEMAS} — list one of
+    /// the operator-managed allowlists that bypass shallow-cache auto-creation
+    /// eligibility.
+    ShallowCacheAllowlist(ShallowCacheAllowlistKind),
+    /// SHOW READYSET RSA PUBLIC KEY
+    ReadySetRsaPublicKey,
+    /// SHOW MCP TOKENS — list all active MCP authentication tokens.
+    McpTokens,
 }
 
 impl DialectDisplay for ShowStatement {
@@ -99,6 +107,13 @@ impl DialectDisplay for ShowStatement {
                     }
                     Ok(())
                 }
+                Self::ShallowCacheAllowlist(kind) => {
+                    write!(f, "SHALLOW CACHE ALLOWED {}", kind.plural_keyword())
+                }
+                Self::ReadySetRsaPublicKey => {
+                    write!(f, "READYSET RSA PUBLIC KEY")
+                }
+                Self::McpTokens => write!(f, "MCP TOKENS"),
             }
         })
     }

@@ -7,10 +7,8 @@ use clap::ValueEnum;
 use metrics::SharedString;
 use readyset_client::query::QueryId;
 use readyset_errors::{ReadySetError, internal};
-use readyset_sql::ast::{Relation, SqlIdentifier, SqlQuery};
+use readyset_sql::ast::{Relation, SqlQuery};
 use serde::Serialize;
-
-pub mod recorded;
 
 /// Similar to logging levels, this enum allows control over how much data is
 /// recorded about queries for reporting into metrics systems. Each enum value,
@@ -40,26 +38,6 @@ impl QueryLogMode {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub enum QueryIdWrapper {
-    /// Caller is providing an already-calculated `QueryId`.
-    Calculated(QueryId),
-
-    /// Caller wants the `QueryId` to be recalculated by the logger engine
-    /// (outside of the hot path). Must send along the schema search path
-    /// for the `query` associated with this event.
-    Uncalculated(Vec<SqlIdentifier>),
-
-    #[default]
-    None,
-}
-
-impl From<Option<QueryId>> for QueryIdWrapper {
-    fn from(query_id: Option<QueryId>) -> Self {
-        query_id.map(Self::Calculated).unwrap_or_default()
-    }
-}
-
 #[derive(Debug, Clone)]
 /// Event logging for the execution of a single query in the adapter. Durations
 /// logged should be mirrored by an update to `QueryExecutionTimerHandle`.
@@ -71,7 +49,7 @@ pub struct QueryExecutionEvent {
     pub query: Option<Arc<SqlQuery>>,
 
     /// If query has an assigned readyset id
-    pub query_id: QueryIdWrapper,
+    pub query_id: Option<QueryId>,
 
     /// How long the request spent in parsing.
     pub parse_duration: Option<Duration>,
@@ -83,6 +61,11 @@ pub struct QueryExecutionEvent {
 
     /// Error returned by noria, if any.
     pub noria_error: Option<ReadySetError>,
+
+    /// Why the query landed on the destination it did, when the destination alone does
+    /// not say. A `ReadysetThenUpstream` shallow-cache miss sets this; an error path
+    /// leaves it unset, since `noria_error` is the better answer.
+    pub reason: Option<String>,
 
     /// Where the query ended up executing
     pub destination: Option<QueryDestination>,
@@ -122,8 +105,12 @@ impl ReadysetExecutionEvent {
 #[derive(Debug, PartialEq, Eq, Serialize, Clone)]
 pub enum QueryDestination {
     Readyset(Option<String>),
-    ReadysetShallow,
-    ReadysetThenUpstream,
+    ReadysetShallow(Option<String>),
+    /// Readyset had a go at the query and upstream finished it: a shallow-cache miss
+    /// that upstream fills, or a cache Readyset started serving and fell back on. The
+    /// name, where there is one, is the cache involved; `QueryExecutionEvent::reason`
+    /// says which of the two happened.
+    ReadysetThenUpstream(Option<String>),
     Upstream,
     Both,
 }
@@ -144,10 +131,26 @@ impl TryFrom<&str> for QueryDestination {
             return Ok(QueryDestination::Readyset(Some(name.to_string())));
         };
 
+        if let Some(name) = value
+            .strip_prefix("readyset_shallow(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            return Ok(QueryDestination::ReadysetShallow(Some(name.to_string())));
+        };
+
+        if let Some(name) = value
+            .strip_prefix("readyset_then_upstream(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            return Ok(QueryDestination::ReadysetThenUpstream(Some(
+                name.to_string(),
+            )));
+        };
+
         match value {
             "readyset" => Ok(QueryDestination::Readyset(None)),
-            "readyset_shallow" => Ok(QueryDestination::ReadysetShallow),
-            "readyset_then_upstream" => Ok(QueryDestination::ReadysetThenUpstream),
+            "readyset_shallow" => Ok(QueryDestination::ReadysetShallow(None)),
+            "readyset_then_upstream" => Ok(QueryDestination::ReadysetThenUpstream(None)),
             "upstream" => Ok(QueryDestination::Upstream),
             "both" => Ok(QueryDestination::Both),
             _ => internal!("Invalid query destination: {value}"),
@@ -167,8 +170,14 @@ impl fmt::Display for QueryDestination {
         match self {
             QueryDestination::Readyset(Some(name)) => write!(f, "readyset({})", name),
             QueryDestination::Readyset(None) => write!(f, "readyset"),
-            QueryDestination::ReadysetShallow => write!(f, "readyset_shallow"),
-            QueryDestination::ReadysetThenUpstream => write!(f, "readyset_then_upstream"),
+            QueryDestination::ReadysetShallow(Some(name)) => {
+                write!(f, "readyset_shallow({})", name)
+            }
+            QueryDestination::ReadysetShallow(None) => write!(f, "readyset_shallow"),
+            QueryDestination::ReadysetThenUpstream(Some(name)) => {
+                write!(f, "readyset_then_upstream({})", name)
+            }
+            QueryDestination::ReadysetThenUpstream(None) => write!(f, "readyset_then_upstream"),
             QueryDestination::Upstream => write!(f, "upstream"),
             QueryDestination::Both => write!(f, "both"),
         }
@@ -239,11 +248,12 @@ impl QueryExecutionEvent {
             event: t,
             sql_type: SqlQueryType::Other,
             query: None,
-            query_id: QueryIdWrapper::None,
+            query_id: None,
             parse_duration: None,
             upstream_duration: None,
             readyset_event: None,
             noria_error: None,
+            reason: None,
             destination: None,
         }
     }
@@ -262,7 +272,8 @@ impl QueryExecutionEvent {
 }
 
 /// A handle to updating the durations in a `QueryExecutionEvent`. Once dropped,
-/// updates the relevant timer.
+/// adds the elapsed time to the relevant timer, accumulating across multiple
+/// timed sections within one event.
 pub struct QueryExecutionTimerHandle<'a> {
     duration: &'a mut Option<Duration>,
     start: Instant,
@@ -279,6 +290,36 @@ impl<'a> QueryExecutionTimerHandle<'a> {
 
 impl Drop for QueryExecutionTimerHandle<'_> {
     fn drop(&mut self) {
-        self.duration.replace(self.start.elapsed());
+        let elapsed = self.start.elapsed();
+        *self.duration = Some(self.duration.map_or(elapsed, |d| d + elapsed));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `EXPLAIN LAST STATEMENT` prints a destination and its readers parse it back, so a
+    /// variant whose name payload only one side knows about silently reads as a different
+    /// destination.
+    #[test]
+    fn query_destination_round_trips_through_display() {
+        for dest in [
+            QueryDestination::Readyset(None),
+            QueryDestination::Readyset(Some("q_abc".into())),
+            QueryDestination::ReadysetShallow(None),
+            QueryDestination::ReadysetShallow(Some("shallow_cache".into())),
+            QueryDestination::ReadysetThenUpstream(None),
+            QueryDestination::ReadysetThenUpstream(Some("shallow_cache".into())),
+            QueryDestination::Upstream,
+            QueryDestination::Both,
+        ] {
+            let printed = dest.to_string();
+            assert_eq!(
+                QueryDestination::try_from(printed.as_str()).unwrap(),
+                dest,
+                "{printed} did not parse back to {dest:?}"
+            );
+        }
     }
 }

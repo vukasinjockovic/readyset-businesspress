@@ -306,12 +306,14 @@ mod tests {
     use futures::stream::FuturesUnordered;
     use futures::StreamExt;
     use readyset_data::Dialect;
+    use replication_offset::mysql::MySqlPosition;
+    use replication_offset::ReplicationOffset;
     use reqwest::Url;
     use serde::Deserialize;
     use tempfile::tempdir;
 
     use super::*;
-    use crate::consensus::CacheDDLRequest;
+    use crate::consensus::{CacheDDLRequest, SchemaCatalogEntry};
 
     #[tokio::test]
     async fn it_works() {
@@ -550,6 +552,7 @@ mod tests {
                     unparsed_stmt: stmt.to_string(),
                     schema_search_path: vec![],
                     dialect: Dialect::DEFAULT_POSTGRESQL,
+                    cache_name: None,
                 };
                 tokio::spawn(async move { authority.add_cache_ddl_request(ddl_req).await.unwrap() })
             })
@@ -568,5 +571,171 @@ mod tests {
             .collect::<Vec<_>>();
         stmts.sort();
         assert_eq!(stmts, STMTS);
+    }
+
+    #[tokio::test]
+    async fn schema_catalog_overwrite_round_trip() {
+        let dir = tempdir().unwrap();
+        let authority = Arc::new(
+            StandaloneAuthority::new(dir.path().to_str().unwrap(), "schema_catalog_round_trip")
+                .unwrap(),
+        );
+
+        assert!(authority.schema_catalog_entries().await.unwrap().is_empty());
+
+        let entries = vec![
+            SchemaCatalogEntry {
+                unparsed_stmt: "CREATE TABLE s.t (a INT)".to_string(),
+                schema_search_path: vec!["s".into()],
+                dialect: Dialect::DEFAULT_POSTGRESQL,
+            },
+            SchemaCatalogEntry {
+                unparsed_stmt: "CREATE VIEW s.v AS SELECT a FROM s.t".to_string(),
+                schema_search_path: vec!["s".into()],
+                dialect: Dialect::DEFAULT_POSTGRESQL,
+            },
+        ];
+        authority
+            .overwrite_schema_catalog(entries.clone())
+            .await
+            .unwrap();
+        assert_eq!(authority.schema_catalog_entries().await.unwrap(), entries);
+
+        // Overwrite drops prior entries.
+        let next = vec![SchemaCatalogEntry {
+            unparsed_stmt: "CREATE TABLE s.u (b TEXT)".to_string(),
+            schema_search_path: vec!["s".into()],
+            dialect: Dialect::DEFAULT_POSTGRESQL,
+        }];
+        authority
+            .overwrite_schema_catalog(next.clone())
+            .await
+            .unwrap();
+        assert_eq!(authority.schema_catalog_entries().await.unwrap(), next);
+
+        // Empty overwrite clears.
+        authority.overwrite_schema_catalog(vec![]).await.unwrap();
+        assert!(authority.schema_catalog_entries().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn schema_replication_offset_round_trip() {
+        let dir = tempdir().unwrap();
+        let authority = Arc::new(
+            StandaloneAuthority::new(
+                dir.path().to_str().unwrap(),
+                "schema_replication_offset_round_trip",
+            )
+            .unwrap(),
+        );
+
+        assert!(authority
+            .schema_replication_offset()
+            .await
+            .unwrap()
+            .is_none());
+
+        let offset = ReplicationOffset::MySql(
+            MySqlPosition::from_file_name_and_position("binlog.000001".to_owned(), 154).unwrap(),
+        );
+        authority
+            .overwrite_schema_replication_offset(offset.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            authority.schema_replication_offset().await.unwrap(),
+            Some(offset.clone())
+        );
+
+        // Overwrite replaces the prior value.
+        let next = ReplicationOffset::MySql(
+            MySqlPosition::from_file_name_and_position("binlog.000002".to_owned(), 42).unwrap(),
+        );
+        authority
+            .overwrite_schema_replication_offset(next.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            authority.schema_replication_offset().await.unwrap(),
+            Some(next)
+        );
+    }
+
+    #[tokio::test]
+    async fn shallow_cache_allowlist_round_trip() {
+        use readyset_sql::ast::ShallowCacheAllowlistKind;
+
+        let dir = tempdir().unwrap();
+        let authority = Arc::new(
+            StandaloneAuthority::new(dir.path().to_str().unwrap(), "shallow_cache_allowlist")
+                .unwrap(),
+        );
+
+        // Every kind starts empty and round-trips add/dedup/remove independently.
+        for kind in [
+            ShallowCacheAllowlistKind::Function,
+            ShallowCacheAllowlistKind::Variable,
+            ShallowCacheAllowlistKind::Schema,
+        ] {
+            assert!(authority
+                .shallow_cache_allowlist(kind)
+                .await
+                .unwrap()
+                .is_empty());
+
+            authority
+                .add_shallow_cache_allowed(kind, "now".to_string())
+                .await
+                .unwrap();
+            authority
+                .add_shallow_cache_allowed(kind, "uuid".to_string())
+                .await
+                .unwrap();
+            // Adding an already-present name is a no-op.
+            authority
+                .add_shallow_cache_allowed(kind, "now".to_string())
+                .await
+                .unwrap();
+
+            let mut names = authority.shallow_cache_allowlist(kind).await.unwrap();
+            names.sort();
+            assert_eq!(names, vec!["now".to_string(), "uuid".to_string()]);
+
+            authority
+                .remove_shallow_cache_allowed(kind, "now".to_string())
+                .await
+                .unwrap();
+            assert_eq!(
+                authority.shallow_cache_allowlist(kind).await.unwrap(),
+                vec!["uuid".to_string()]
+            );
+        }
+
+        // The three kinds are stored under distinct keys, so a batch ALTER of
+        // one leaves the others untouched.
+        authority
+            .modify_shallow_cache_allowlist(
+                ShallowCacheAllowlistKind::Variable,
+                true,
+                vec!["version_comment".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            authority
+                .shallow_cache_allowlist(ShallowCacheAllowlistKind::Function)
+                .await
+                .unwrap(),
+            vec!["uuid".to_string()]
+        );
+        let mut vars = authority
+            .shallow_cache_allowlist(ShallowCacheAllowlistKind::Variable)
+            .await
+            .unwrap();
+        vars.sort();
+        assert_eq!(
+            vars,
+            vec!["uuid".to_string(), "version_comment".to_string()]
+        );
     }
 }

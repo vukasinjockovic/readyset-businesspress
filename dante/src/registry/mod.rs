@@ -1,0 +1,15 @@
+//! Pattern registry: collections of named pattern constructors.
+
+pub mod advanced;
+pub mod aggregates;
+pub mod basic;
+pub mod compound;
+pub mod ctes;
+pub mod examples;
+pub mod expressions;
+pub mod filters;
+pub mod functions;
+pub mod hoisting;
+pub mod joins;
+pub mod ordering;
+pub mod subqueries;

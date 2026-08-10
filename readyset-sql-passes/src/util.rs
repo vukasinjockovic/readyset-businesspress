@@ -1,5 +1,5 @@
 use itertools::Either;
-use readyset_errors::{ReadySetResult, unsupported_err};
+use readyset_errors::{ReadySetResult, invalid_query, unsupported_err};
 use readyset_sql::DialectDisplay;
 use readyset_sql::analysis::is_aggregate;
 use readyset_sql::ast::{
@@ -9,7 +9,6 @@ use readyset_sql::ast::{
 };
 use std::collections::{HashMap, HashSet};
 use std::iter;
-use std::sync::OnceLock;
 
 pub(crate) fn join_clause_tables(join: &JoinClause) -> impl Iterator<Item = &TableExpr> {
     match &join.right {
@@ -90,109 +89,113 @@ pub(crate) fn subquery_schemas<'a>(
     join: &'a mut [JoinClause],
     dialect: readyset_sql::Dialect,
 ) -> ReadySetResult<HashMap<&'a SqlIdentifier, Vec<&'a SqlIdentifier>>> {
-    ctes.iter_mut()
-        .map(|cte| (&cte.name, &mut cte.statement))
-        .chain(
-            tables
-                .iter_mut()
-                .chain(join.iter_mut().flat_map(|join| match &mut join.right {
-                    JoinRightSide::Table(t) => Either::Left(iter::once(t)),
-                    JoinRightSide::Tables(ts) => Either::Right(ts.iter_mut()),
-                }))
-                .filter_map(|te| match &mut te.inner {
-                    TableExprInner::Subquery(sq) => {
-                        te.alias.as_ref().map(|alias| (alias, sq.as_mut()))
+    // First pass: populate auto-generated column aliases for VALUES clauses that don't have
+    // explicit column names (e.g., `(VALUES (1, 'a')) AS v` gets columns `column1`, `column2`).
+    for table in tables.iter_mut() {
+        populate_values_column_aliases(table, dialect)?;
+    }
+    for jc in join.iter_mut() {
+        match &mut jc.right {
+            JoinRightSide::Table(te) => populate_values_column_aliases(te, dialect)?,
+            JoinRightSide::Tables(tes) => {
+                for te in tes {
+                    populate_values_column_aliases(te, dialect)?;
+                }
+            }
+        }
+    }
+
+    // Second pass: collect schemas from CTEs, subqueries, and VALUES clauses.
+    let mut schemas = HashMap::new();
+
+    for cte in ctes.iter_mut() {
+        schemas.insert(
+            &cte.name,
+            field_names(&mut cte.statement, dialect)?
+                .into_iter()
+                .map(|x| &*x)
+                .collect(),
+        );
+    }
+
+    for te in tables
+        .iter_mut()
+        .chain(join.iter_mut().flat_map(|j| match &mut j.right {
+            JoinRightSide::Table(t) => Either::Left(iter::once(t)),
+            JoinRightSide::Tables(ts) => Either::Right(ts.iter_mut()),
+        }))
+    {
+        match &mut te.inner {
+            TableExprInner::Subquery(sq) => {
+                if let Some(alias) = &te.alias {
+                    let mut cols: Vec<&SqlIdentifier> = field_names(sq.as_mut(), dialect)?
+                        .into_iter()
+                        .map(|x| &*x)
+                        .collect();
+                    // Explicit column aliases override the subquery's output names
+                    // e.g., `(SELECT x, y FROM t) AS sub(a, b)` → visible cols are [a, b]
+                    for (i, ca) in te.column_aliases.iter().enumerate() {
+                        if i < cols.len() {
+                            cols[i] = ca;
+                        }
                     }
-                    TableExprInner::Table(_) => None,
-                }),
-        )
-        .map(|(name, stmt)| {
-            Ok((
-                name,
-                field_names(stmt, dialect)?
-                    .into_iter()
-                    .map(|x| &*x)
-                    .collect::<Vec<&SqlIdentifier>>(),
-            ))
-        })
-        .collect()
+                    schemas.insert(alias, cols);
+                }
+            }
+            TableExprInner::Values { .. } => {
+                if let Some(alias) = &te.alias {
+                    schemas.insert(alias, te.column_aliases.iter().collect());
+                }
+            }
+            TableExprInner::Table(_) => {}
+        }
+    }
+
+    Ok(schemas)
 }
 
-// Built-in function names that are allowed in expressions containing aggregates.
-// All allowed functions must be deterministic, formatting-only, and must not affect result cardinality.
-static BUILTIN_FUNCTIONS_ALLOWED_IN_AGG_CONTEXT: OnceLock<HashSet<&'static str>> = OnceLock::new();
+/// Populate auto-generated column aliases for VALUES table expressions that don't have explicit
+/// column names. PostgreSQL uses 1-indexed names (column1, column2, ...) while MySQL uses
+/// 0-indexed names (column_0, column_1, ...).
+fn populate_values_column_aliases(
+    te: &mut TableExpr,
+    dialect: readyset_sql::Dialect,
+) -> ReadySetResult<()> {
+    if let TableExprInner::Values { rows } = &te.inner {
+        let num_cols = rows.first().map(|r| r.len()).unwrap_or(0);
+        let num_aliases = te.column_aliases.len();
 
-fn is_builtin_allowed_in_aggregate_context(name: &str) -> bool {
-    BUILTIN_FUNCTIONS_ALLOWED_IN_AGG_CONTEXT
-        .get_or_init(builtin_functions_allowed_in_agg_context)
-        .contains(name.to_ascii_lowercase().as_str())
-}
-
-fn builtin_functions_allowed_in_agg_context() -> HashSet<&'static str> {
-    use dataflow_expression::BuiltinFunctionDiscriminants;
-    use strum::IntoEnumIterator;
-    // Always add explicit arms to this match, do not use default arm here `_ =>`.
-    // We have to make sure, any newly added built-ins will be explicitly added here.
-    // To exclude a function from the list, the corresponding arm should return empty `!vec[]`.
-    BuiltinFunctionDiscriminants::iter()
-        .flat_map(|bf| match bf {
-            BuiltinFunctionDiscriminants::ConvertTZ => vec!["convert_tz"],
-            BuiltinFunctionDiscriminants::DayOfWeek => vec!["dayofweek"],
-            BuiltinFunctionDiscriminants::IfNull => vec!["ifnull"],
-            BuiltinFunctionDiscriminants::Month => vec!["month"],
-            BuiltinFunctionDiscriminants::Timediff => vec!["timediff"],
-            BuiltinFunctionDiscriminants::Addtime => vec!["addtime"],
-            BuiltinFunctionDiscriminants::DateFormat => vec!["date_format"],
-            BuiltinFunctionDiscriminants::Round => vec!["round"],
-            BuiltinFunctionDiscriminants::JsonDepth => vec!["json_depth"],
-            BuiltinFunctionDiscriminants::JsonValid => vec!["json_valid"],
-            BuiltinFunctionDiscriminants::JsonQuote => vec!["json_quote"],
-            BuiltinFunctionDiscriminants::JsonOverlaps => vec!["json_overlaps"],
-            BuiltinFunctionDiscriminants::JsonTypeof => vec!["json_typeof", "jsonb_typeof"],
-            BuiltinFunctionDiscriminants::JsonObject => vec!["json_object"],
-            BuiltinFunctionDiscriminants::JsonBuildObject => {
-                vec!["json_build_object", "jsonb_build_object"]
+        if num_aliases > num_cols {
+            invalid_query!(
+                "VALUES clause has {} columns but {} aliases were specified",
+                num_cols,
+                num_aliases
+            );
+        } else if num_aliases > 0 && num_aliases < num_cols {
+            if dialect == readyset_sql::Dialect::MySQL {
+                invalid_query!(
+                    "VALUES clause has {} columns but {} aliases were specified",
+                    num_cols,
+                    num_aliases
+                );
             }
-            BuiltinFunctionDiscriminants::JsonArrayLength => {
-                vec!["json_array_length", "jsonb_array_length"]
+            // PostgreSQL allows partial aliases; pad the rest with defaults.
+            for i in num_aliases..num_cols {
+                te.column_aliases
+                    .push(SqlIdentifier::from(format!("column{}", i + 1)));
             }
-            BuiltinFunctionDiscriminants::JsonStripNulls => {
-                vec!["json_strip_nulls", "jsonb_strip_nulls"]
+        } else if num_aliases == 0 {
+            // No aliases provided; generate all default names.
+            for i in 0..num_cols {
+                let name = match dialect {
+                    readyset_sql::Dialect::MySQL => format!("column_{}", i),
+                    readyset_sql::Dialect::PostgreSQL => format!("column{}", i + 1),
+                };
+                te.column_aliases.push(SqlIdentifier::from(name));
             }
-            BuiltinFunctionDiscriminants::JsonExtractPath => vec![
-                "json_extract_path",
-                "jsonb_extract_path",
-                "json_extract_path_text",
-                "jsonb_extract_path_text",
-            ],
-            BuiltinFunctionDiscriminants::JsonbInsert => vec![],
-            BuiltinFunctionDiscriminants::JsonbSet => vec![],
-            BuiltinFunctionDiscriminants::JsonbPretty => vec!["jsonb_pretty"],
-            BuiltinFunctionDiscriminants::Coalesce => vec!["coalesce"],
-            BuiltinFunctionDiscriminants::Concat => vec!["concat"],
-            BuiltinFunctionDiscriminants::ConcatWs => vec!["concat_ws"],
-            BuiltinFunctionDiscriminants::Substring => vec!["substring", "substr"],
-            BuiltinFunctionDiscriminants::SplitPart => vec!["split_part"],
-            BuiltinFunctionDiscriminants::Greatest => vec!["greatest"],
-            BuiltinFunctionDiscriminants::Least => vec!["least"],
-            BuiltinFunctionDiscriminants::ArrayToString => vec!["array_to_string"],
-            BuiltinFunctionDiscriminants::DateTrunc => vec!["date_trunc"],
-            BuiltinFunctionDiscriminants::Extract => vec!["extract"],
-            BuiltinFunctionDiscriminants::Length => {
-                vec!["length", "octet_length", "char_length", "character_length"]
-            }
-            BuiltinFunctionDiscriminants::Ascii => vec!["ascii"],
-            BuiltinFunctionDiscriminants::Lower => vec!["lower"],
-            BuiltinFunctionDiscriminants::Upper => vec!["upper"],
-            BuiltinFunctionDiscriminants::Hex => vec!["hex"],
-            BuiltinFunctionDiscriminants::SpatialAsText => {
-                vec!["st_astext", "st_aswkt"]
-            }
-            BuiltinFunctionDiscriminants::SpatialAsEWKT => vec!["st_asewkt"],
-            BuiltinFunctionDiscriminants::Bucket => vec!["bucket"],
-        })
-        .filter(|t| !t.is_empty())
-        .collect::<HashSet<_>>()
+        }
+    }
+    Ok(())
 }
 
 #[must_use]
@@ -203,7 +206,9 @@ pub fn map_aggregates(
     let mut ret = Vec::new();
     match expr {
         Expr::Call(f) if is_aggregate(f) => {
-            let name: SqlIdentifier = f.display(dialect).to_string().into();
+            let name: SqlIdentifier = Expr::Call(f.clone())
+                .qualified_alias(dialect)
+                .unwrap_or_else(|| f.display(dialect).to_string().into());
             ret.push((f.clone(), name.clone()));
             *expr = Expr::Column(Column { name, table: None });
         }
@@ -229,11 +234,107 @@ pub fn map_aggregates(
         ) => {
             ret.append(&mut map_aggregates(expr, dialect));
         }
-        Expr::Call(FunctionExpr::Call {
-            name,
-            arguments: Some(exprs),
-        }) if is_builtin_allowed_in_aggregate_context(name.as_str()) => {
+        Expr::Call(FunctionExpr::Coalesce(exprs)) => {
             ret.extend(exprs.iter_mut().flat_map(|e| map_aggregates(e, dialect)));
+        }
+        Expr::Call(FunctionExpr::IfNull(a, b)) => {
+            ret.append(&mut map_aggregates(a, dialect));
+            ret.append(&mut map_aggregates(b, dialect));
+        }
+        // Typed variants that are allowed in aggregate context: recurse into arguments
+        Expr::Call(FunctionExpr::ConvertTz(a, b, c) | FunctionExpr::SplitPart(a, b, c)) => {
+            ret.append(&mut map_aggregates(a, dialect));
+            ret.append(&mut map_aggregates(b, dialect));
+            ret.append(&mut map_aggregates(c, dialect));
+        }
+        Expr::Call(
+            FunctionExpr::DayOfWeek(expr)
+            | FunctionExpr::Month(expr)
+            | FunctionExpr::Length(expr)
+            | FunctionExpr::OctetLength(expr)
+            | FunctionExpr::CharLength(expr)
+            | FunctionExpr::Ascii(expr)
+            | FunctionExpr::Hex(expr)
+            | FunctionExpr::JsonDepth(expr)
+            | FunctionExpr::JsonValid(expr)
+            | FunctionExpr::JsonQuote(expr)
+            | FunctionExpr::JsonTypeof(expr)
+            | FunctionExpr::JsonArrayLength(expr)
+            | FunctionExpr::JsonStripNulls(expr)
+            | FunctionExpr::JsonbStripNulls(expr)
+            | FunctionExpr::JsonbPretty(expr)
+            | FunctionExpr::StAsText(expr)
+            | FunctionExpr::StAsWkt(expr)
+            | FunctionExpr::StAsEwkt(expr),
+        ) => {
+            ret.append(&mut map_aggregates(expr, dialect));
+        }
+        Expr::Call(
+            FunctionExpr::Timediff(a, b)
+            | FunctionExpr::Addtime(a, b)
+            | FunctionExpr::DateFormat(a, b)
+            | FunctionExpr::DateTrunc(a, b)
+            | FunctionExpr::JsonOverlaps(a, b),
+        ) => {
+            ret.append(&mut map_aggregates(a, dialect));
+            ret.append(&mut map_aggregates(b, dialect));
+        }
+        Expr::Call(FunctionExpr::Round(expr, prec)) => {
+            ret.append(&mut map_aggregates(expr, dialect));
+            if let Some(p) = prec {
+                ret.append(&mut map_aggregates(p, dialect));
+            }
+        }
+        Expr::Call(
+            FunctionExpr::Greatest(exprs)
+            | FunctionExpr::Least(exprs)
+            | FunctionExpr::Concat(exprs)
+            | FunctionExpr::ConcatWs(exprs)
+            | FunctionExpr::JsonObject(exprs)
+            | FunctionExpr::JsonbObject(exprs)
+            | FunctionExpr::JsonBuildObject(exprs)
+            | FunctionExpr::JsonbBuildObject(exprs)
+            | FunctionExpr::JsonBuildArray(exprs)
+            | FunctionExpr::JsonbBuildArray(exprs),
+        ) => {
+            ret.extend(exprs.iter_mut().flat_map(|e| map_aggregates(e, dialect)));
+        }
+        Expr::Call(
+            FunctionExpr::JsonExtractPathText(json, keys)
+            | FunctionExpr::JsonExtractPath(json, keys)
+            | FunctionExpr::JsonbExtractPath(json, keys),
+        ) => {
+            ret.append(&mut map_aggregates(json, dialect));
+            ret.extend(keys.iter_mut().flat_map(|e| map_aggregates(e, dialect)));
+        }
+        Expr::Call(FunctionExpr::ArrayToString(a, b, c)) => {
+            ret.append(&mut map_aggregates(a, dialect));
+            ret.append(&mut map_aggregates(b, dialect));
+            if let Some(c) = c {
+                ret.append(&mut map_aggregates(c, dialect));
+            }
+        }
+        // Previously these functions were excluded from aggregate context; they now
+        // recurse like all other strict multi-arg functions, allowing patterns such as
+        // `SELECT jsonb_insert(col, '{k}', count(*)::text) FROM t`.
+        Expr::Call(FunctionExpr::JsonbInsert(a, b, c, d) | FunctionExpr::JsonbSet(a, b, c, d)) => {
+            ret.append(&mut map_aggregates(a, dialect));
+            ret.append(&mut map_aggregates(b, dialect));
+            ret.append(&mut map_aggregates(c, dialect));
+            if let Some(d) = d {
+                ret.append(&mut map_aggregates(d, dialect));
+            }
+        }
+        Expr::Call(FunctionExpr::JsonbSetLax(a, b, c, d, e)) => {
+            ret.append(&mut map_aggregates(a, dialect));
+            ret.append(&mut map_aggregates(b, dialect));
+            ret.append(&mut map_aggregates(c, dialect));
+            if let Some(d) = d {
+                ret.append(&mut map_aggregates(d, dialect));
+            }
+            if let Some(e) = e {
+                ret.append(&mut map_aggregates(e, dialect));
+            }
         }
         Expr::Call(_) | Expr::Literal(_) | Expr::Column(_) | Expr::Variable(_) => {}
         Expr::BinaryOp { lhs, rhs, .. }
@@ -278,11 +379,33 @@ pub fn map_aggregates(
             ArrayArguments::Subquery(..) => {}
         },
         Expr::Collate { expr, .. } => ret.append(&mut map_aggregates(expr, dialect)),
-        // Window functions are handled separately
-        // `PARTITION BY` and `ORDER BY` can *NOT* contain aggregates
+        // Window functions are handled separately — aggregate extraction
+        // from PARTITION BY, ORDER BY, and function args is performed
+        // in QueryGraph construction (query_graph.rs).
         Expr::WindowFunction { .. } => {}
     }
     ret
+}
+
+/// Returns true if inlining the subquery `inl_stmt` into `base_stmt` (replacing
+/// the FROM item at ordinal `inl_from_item_ord_idx`) would produce a self-join —
+/// the same base table appearing in both the outer query and the inlined subquery.
+pub(crate) fn would_create_self_join(
+    base_stmt: &SelectStatement,
+    inl_stmt: &SelectStatement,
+    inl_from_item_ord_idx: usize,
+) -> bool {
+    // Collect base tables from the outer query, excluding the item being inlined
+    let outer_base_tables: HashSet<&Relation> = outermost_table_exprs(base_stmt)
+        .enumerate()
+        .filter(|(idx, _)| *idx != inl_from_item_ord_idx)
+        .filter_map(|(_, te)| te.inner.as_table())
+        .collect();
+
+    // Check if any base table in the inlined subquery overlaps
+    outermost_table_exprs(inl_stmt)
+        .filter_map(|te| te.inner.as_table())
+        .any(|rel| outer_base_tables.contains(rel))
 }
 
 /// Returns true if the given binary operator is a (boolean-valued) predicate
@@ -304,8 +427,12 @@ pub fn is_predicate(op: &BinaryOperator) -> bool {
             | LessOrEqual
             | Is
             | IsNot
+            | QuestionMark
+            | QuestionMarkPipe
+            | QuestionMarkAnd
             | AtArrowRight
             | AtArrowLeft
+            | DoubleAmpersand
     )
 }
 

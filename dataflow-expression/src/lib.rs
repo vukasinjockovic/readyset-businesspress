@@ -4,7 +4,6 @@ pub mod grouped;
 pub mod like;
 mod lower;
 mod promotion;
-mod reader_processing;
 pub mod utils;
 
 use std::fmt::{self, Display, Formatter};
@@ -21,10 +20,6 @@ use vec1::Vec1;
 
 pub use crate::binary_operator::*;
 pub use crate::lower::LowerContext;
-pub use crate::reader_processing::{
-    PostLookup, PostLookupAggregate, PostLookupAggregateFunction, PostLookupAggregates,
-    PreInsertion, ReaderProcessing,
-};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, EnumDiscriminants)]
 #[strum_discriminants(derive(Serialize, Deserialize, EnumIter))]
@@ -74,6 +69,11 @@ pub enum BuiltinFunction {
     },
     /// [`json[b]_array_length`](https://www.postgresql.org/docs/current/functions-json.html)
     JsonArrayLength(Expr),
+    /// [`json[b]_build_array`](https://www.postgresql.org/docs/current/functions-json.html)
+    JsonBuildArray {
+        args: Vec<Expr>,
+        dialect: Dialect,
+    },
     /// [`json[b]_strip_nulls`](https://www.postgresql.org/docs/current/functions-json.html)
     JsonStripNulls(Expr),
     /// [`json[b]_extract_path[_text]`](https://www.postgresql.org/docs/current/functions-json.html)
@@ -214,6 +214,7 @@ impl BuiltinFunction {
             JsonTypeof { .. } => "json_typeof",
             JsonObject { .. } => "json_object",
             JsonArrayLength { .. } => "json_array_length",
+            JsonBuildArray { .. } => "json_build_array",
             JsonStripNulls { .. } => "json_strip_nulls",
             JsonExtractPath { .. } => "json_extract_path",
             JsonbInsert { .. } => "jsonb_insert",
@@ -375,6 +376,7 @@ impl Display for BuiltinFunction {
                 write!(f, "({expr})")
             }
             JsonBuildObject { args, .. } => write!(f, "({})", args.iter().join(", ")),
+            JsonBuildArray { args, .. } => write!(f, "({})", args.iter().join(", ")),
             SpatialAsText { .. } => write!(f, "st_astext"),
             SpatialAsEWKT { .. } => write!(f, "st_asewkt"),
             Bucket { expr, interval } => {
@@ -489,6 +491,9 @@ pub enum Expr {
         /// If `true`, this expression will evaluate to `NULL` if the cast fails. If `false`, cast
         /// failure will return an error
         null_on_failure: bool,
+        /// The dialect whose semantics to apply where the upstreams disagree on how a value
+        /// converts, such as parsing text as a float
+        dialect: Dialect,
     },
 
     /// expr `AT TIME ZONE`
@@ -518,6 +523,7 @@ pub enum Expr {
 
     Row {
         elements: Vec<Expr>,
+        ty: DfType,
     },
 }
 
@@ -526,7 +532,7 @@ impl Display for Expr {
         use Expr::*;
 
         match self {
-            Row { elements } => write!(f, "({})", elements.iter().join(", ")),
+            Row { elements, .. } => write!(f, "({})", elements.iter().join(", ")),
             Column { index, .. } => write!(f, "{index}"),
             Literal { val, .. } => write!(f, "(lit: {val})"),
             Op {
@@ -547,6 +553,7 @@ impl Display for Expr {
                 expr,
                 ty,
                 null_on_failure,
+                dialect: _,
             } => {
                 if *null_on_failure {
                     write!(f, "try_")?;
@@ -590,8 +597,8 @@ impl Expr {
             | Expr::CaseWhen { ty, .. }
             | Expr::Cast { ty, .. }
             | Expr::Array { ty, .. }
+            | Expr::Row { ty, .. }
             | Expr::AtTimeZone { ty, .. } => ty,
-            Expr::Row { .. } => &DfType::Row,
         }
     }
 }

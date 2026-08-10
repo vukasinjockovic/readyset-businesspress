@@ -43,17 +43,18 @@ use readyset_sql::ast::{
     AlterTableDefinition, AlterTableStatement, CacheInner, CreateCacheStatement,
     CreateTableStatement, CreateViewStatement, DropTableStatement, DropViewStatement,
     NonReplicatedRelation, Relation, RenameTableStatement, SelectStatement, SqlIdentifier,
-    SqlQuery, TableKey,
+    SqlQuery, TableKey, TrxCachePolicy,
 };
-use readyset_sql::DialectDisplay;
 use readyset_sql_parsing::{parse_query_with_config, ParsingConfig, ParsingPreset};
 use readyset_sql_passes::adapter_rewrites::{self, AdapterRewriteContext, AdapterRewriteParams};
 use schema_catalog::SchemaGeneration;
 use serde::{Deserialize, Serialize};
 use test_strategy::Arbitrary;
-use tracing::{debug, error};
+use tracing::error;
 
 use crate::consensus::CacheDDLRequest;
+use crate::query::QueryId;
+use crate::view::ViewCreateRequest;
 
 /// The specification for a list of changes that must be made
 /// to the MIR and dataflow graphs.
@@ -201,7 +202,8 @@ impl ChangeList {
                 SqlQuery::CreateCache(CreateCacheStatement {
                     name,
                     inner,
-                    always,
+                    trx_cache_policy,
+                    topk_buffer_multiplier,
                     ..
                 }) => {
                     // We don't call the rewrite on the CreateCache like we do in the adapte
@@ -226,8 +228,9 @@ impl ChangeList {
                     changes.push(Change::CreateCache(CreateCache {
                         name,
                         statement,
-                        always,
+                        trx_cache_policy,
                         schema_generation_used: None,
+                        topk_buffer_multiplier,
                     }))
                 }
                 SqlQuery::AlterTable(ats) => changes.push(Change::AlterTable(ats)),
@@ -307,35 +310,6 @@ impl ChangeList {
         this
     }
 
-    /// Returns true if any `CreateCache` in this changelist is missing a schema generation.
-    pub fn has_missing_schema_generation(&self) -> bool {
-        self.changes.iter().any(|change| match change {
-            Change::CreateCache(cache) => cache.schema_generation_used.is_none(),
-            _ => false,
-        })
-    }
-
-    /// Fill only missing schema generations for `CreateCache` changes.
-    ///
-    /// Returns true if any fields were filled.
-    pub fn fill_missing_schema_generation(&mut self, schema_generation: SchemaGeneration) -> bool {
-        let mut filled = false;
-        for change in &mut self.changes {
-            if let Change::CreateCache(cache) = change {
-                if cache.schema_generation_used.is_none() {
-                    debug!(
-                        generation = %schema_generation,
-                        query = %cache.statement.display(self.dialect.into()),
-                        "Filling missing schema generation for CreateCache"
-                    );
-                    cache.schema_generation_used = Some(schema_generation);
-                    filled = true;
-                }
-            }
-        }
-        filled
-    }
-
     /// Return a mutable reference to the changes in this `ChangeList`
     pub fn changes_mut(&mut self) -> &mut Vec<Change> {
         &mut self.changes
@@ -368,20 +342,22 @@ pub struct CreateCache {
     pub name: Option<Relation>,
     /// The `SELECT` statement for the body of the cache
     pub statement: Box<SelectStatement>,
-    /// If set to `true`, execution of this cache will bypass transaction handling in the
-    /// adapter
-    pub always: bool,
+    /// Controls whether the cache is served when the connection is inside a transaction.
+    /// See [`TrxCachePolicy`].
+    pub trx_cache_policy: TrxCachePolicy,
     /// Schema generation that was used to rewrite this cache.
     ///
     /// This captures the generation of the `SchemaCatalog` at the time the query was rewritten
     /// by the adapter. The controller validates this matches its current generation before
     /// performing the migration.
     ///
-    /// # Values
-    /// - `None` indicates the generation was not set (e.g., in tests or legacy paths)
-    /// - `has_missing_schema_generation()` treats `None` as "missing"
-    /// - `fill_missing_schema_generation()` will fill in `None` with the current generation
+    /// `None` indicates the generation was not set (e.g., in tests or legacy paths).
     pub schema_generation_used: Option<SchemaGeneration>,
+    /// Optional multiplier for the TopK operator's buffer size when this cache lowers to a
+    /// TopK node. `buffered = k * multiplier`. `None` keeps the legacy default of
+    /// `buffered = k`. Only set via `CREATE CACHE WITH (TOPK_BUFFER_MULTIPLIER = N)`.
+    #[serde(default)]
+    pub topk_buffer_multiplier: Option<usize>,
 }
 
 /// Metadata about a PostgreSQL table
@@ -391,6 +367,11 @@ pub struct PostgresTableMetadata {
     pub oid: u32,
     /// A map from column name to the attribute number of that column
     pub column_oids: HashMap<SqlIdentifier, i16>,
+    /// When the table's REPLICA IDENTITY USING INDEX references columns different
+    /// from the PRIMARY KEY, this holds those columns. The base node uses these as
+    /// its primary key (for RocksDB storage and WAL key matching).
+    #[serde(default)]
+    pub replica_identity_key: Option<Box<[SqlIdentifier]>>,
 }
 
 impl Hash for PostgresTableMetadata {
@@ -399,6 +380,7 @@ impl Hash for PostgresTableMetadata {
         let mut column_oids = self.column_oids.iter().collect::<Vec<_>>();
         column_oids.sort();
         column_oids.hash(state);
+        self.replica_identity_key.hash(state);
     }
 }
 
@@ -472,7 +454,8 @@ impl Change {
     pub fn create_cache<N>(
         name: N,
         statement: SelectStatement,
-        always: bool,
+        trx_cache_policy: TrxCachePolicy,
+        topk_buffer_multiplier: Option<usize>,
         schema_generation_used: Option<SchemaGeneration>,
     ) -> Self
     where
@@ -481,8 +464,9 @@ impl Change {
         Self::CreateCache(CreateCache {
             name: Some(name.into()),
             statement: Box::new(statement),
-            always,
+            trx_cache_policy,
             schema_generation_used,
+            topk_buffer_multiplier,
         })
     }
 
@@ -502,9 +486,14 @@ impl Change {
                         | AlterTableDefinition::AddKey(TableKey::PrimaryKey { .. })
                         | AlterTableDefinition::AddKey(TableKey::UniqueKey { .. })
                         | AlterTableDefinition::DropForeignKey { .. }
-                        | AlterTableDefinition::DropConstraint { .. } => true,
-                        AlterTableDefinition::ReplicaIdentity(_)
-                        | AlterTableDefinition::AddKey(TableKey::FulltextKey { .. })
+                        | AlterTableDefinition::DropConstraint { .. }
+                        // All replica identity changes require resnapshotting.
+                        // Self-issued ALTERs during snapshot are suppressed at the DDL
+                        // event trigger level (via
+                        // readyset.current_command_is_replica_identity), so any RI change
+                        // arriving via WAL is user-initiated and requires resnapshot.
+                        | AlterTableDefinition::ReplicaIdentity(_) => true,
+                        AlterTableDefinition::AddKey(TableKey::FulltextKey { .. })
                         | AlterTableDefinition::AddKey(TableKey::Key { .. })
                         | AlterTableDefinition::AddKey(TableKey::CheckConstraint { .. })
                         | AlterTableDefinition::AddKey(TableKey::ForeignKey { .. })
@@ -566,7 +555,9 @@ impl Change {
             SqlQuery::CreateCache(CreateCacheStatement {
                 name,
                 inner,
-                always,
+                trx_cache_policy,
+                topk_buffer_multiplier,
+                autoparam,
                 ..
             }) => {
                 let mut statement = match inner {
@@ -586,17 +577,37 @@ impl Change {
                     }
                 };
 
+                let mut adapter_rewrite_params = adapter_rewrite_params;
+                adapter_rewrite_params.autoparameterize = !autoparam.off;
+                // EXCLUDE_* scopes mark their literals before the rewrite pipeline hoists them
+                // out of their clause of origin, so the recipe's form matches the adapter's.
+                adapter_rewrites::wrap_autoparam_exclusions(&mut statement, &autoparam);
                 adapter_rewrites::rewrite_query(
                     &mut statement,
                     adapter_rewrite_params,
                     adapter_rewrite_context,
                 )?;
 
+                // An unnamed CREATE CACHE keeps the name the adapter resolved at create time so
+                // implicit cache names survive replay. Entries persisted before `cache_name`
+                // existed recompute it the same way the adapter does: the query id of the
+                // rewritten statement under the request's schema search path.
+                let name = name
+                    .or_else(|| ddl_req.cache_name.clone())
+                    .unwrap_or_else(|| {
+                        QueryId::from(&ViewCreateRequest::new(
+                            statement.as_ref().clone(),
+                            ddl_req.schema_search_path.clone(),
+                        ))
+                        .into()
+                    });
+
                 Ok(Change::CreateCache(CreateCache {
-                    name,
+                    name: Some(name),
                     statement,
-                    always,
+                    trx_cache_policy,
                     schema_generation_used: schema_generation,
+                    topk_buffer_multiplier,
                 }))
             },
             SqlQuery::DropCache(dcs) => Ok(Change::Drop {
@@ -620,6 +631,8 @@ mod tests {
     hash_laws!(PostgresTableMetadata);
 
     mod requires_resnapshot {
+        use readyset_sql::ast::ReplicaIdentity;
+
         use super::*;
 
         #[test]
@@ -660,6 +673,127 @@ mod tests {
                 },
             };
             assert!(change.requires_resnapshot())
+        }
+
+        #[test]
+        fn alter_table_replica_identity_using_index() {
+            let change = Change::AlterTable(AlterTableStatement {
+                table: "users".into(),
+                only: false,
+                definitions: Ok(vec![AlterTableDefinition::ReplicaIdentity(
+                    ReplicaIdentity::UsingIndex {
+                        index_name: "users_id_email_unique".into(),
+                    },
+                )]),
+            });
+            assert!(change.requires_resnapshot())
+        }
+
+        #[test]
+        fn alter_table_replica_identity_nothing() {
+            let change = Change::AlterTable(AlterTableStatement {
+                table: "items".into(),
+                only: false,
+                definitions: Ok(vec![AlterTableDefinition::ReplicaIdentity(
+                    ReplicaIdentity::Nothing,
+                )]),
+            });
+            assert!(change.requires_resnapshot())
+        }
+
+        #[test]
+        fn alter_table_replica_identity_default() {
+            let change = Change::AlterTable(AlterTableStatement {
+                table: "items".into(),
+                only: false,
+                definitions: Ok(vec![AlterTableDefinition::ReplicaIdentity(
+                    ReplicaIdentity::Default,
+                )]),
+            });
+            assert!(change.requires_resnapshot())
+        }
+
+        #[test]
+        fn alter_table_replica_identity_full() {
+            let change = Change::AlterTable(AlterTableStatement {
+                table: "items".into(),
+                only: false,
+                definitions: Ok(vec![AlterTableDefinition::ReplicaIdentity(
+                    ReplicaIdentity::Full,
+                )]),
+            });
+            assert!(change.requires_resnapshot())
+        }
+    }
+
+    mod from_cache_ddl_request {
+        use std::sync::Arc;
+
+        use schema_catalog::{RewriteContext, SchemaCatalog};
+
+        use super::*;
+
+        fn convert(unparsed_stmt: &str, cache_name: Option<&str>) -> CreateCache {
+            let ddl_req = CacheDDLRequest {
+                unparsed_stmt: unparsed_stmt.into(),
+                schema_search_path: vec!["public".into()],
+                dialect: Dialect::DEFAULT_POSTGRESQL,
+                cache_name: cache_name.map(Relation::from),
+            };
+            let mut catalog = SchemaCatalog::default();
+            catalog.view_schemas.insert(
+                Relation {
+                    schema: Some("public".into()),
+                    name: "t".into(),
+                },
+                vec!["x".into(), "y".into()],
+            );
+            let rewrite_context = RewriteContext::new(
+                ddl_req.dialect,
+                Arc::new(catalog),
+                ddl_req.schema_search_path.clone(),
+            );
+            let change = Change::from_cache_ddl_request(
+                &ddl_req,
+                AdapterRewriteParams::new(ddl_req.dialect.into()),
+                &rewrite_context,
+                ParsingPreset::for_tests(),
+                None,
+            )
+            .unwrap();
+            match change {
+                Change::CreateCache(create_cache) => create_cache,
+                change => panic!("expected CreateCache, got {change:?}"),
+            }
+        }
+
+        #[test]
+        fn unnamed_takes_name_from_request() {
+            let create_cache = convert(
+                "CREATE CACHE FROM SELECT x FROM t WHERE x = 1",
+                Some("q_deadbeef"),
+            );
+            assert_eq!(create_cache.name, Some(Relation::from("q_deadbeef")));
+        }
+
+        #[test]
+        fn explicit_name_wins_over_request_name() {
+            let create_cache = convert(
+                "CREATE CACHE foo FROM SELECT x FROM t WHERE x = 1",
+                Some("q_deadbeef"),
+            );
+            assert_eq!(create_cache.name, Some(Relation::from("foo")));
+        }
+
+        #[test]
+        fn unnamed_derives_query_id() {
+            let create_cache = convert("CREATE CACHE FROM SELECT x FROM t WHERE x = 1", None);
+            let expected: Relation = QueryId::from(&ViewCreateRequest::new(
+                create_cache.statement.as_ref().clone(),
+                vec!["public".into()],
+            ))
+            .into();
+            assert_eq!(create_cache.name, Some(expected));
         }
     }
 }

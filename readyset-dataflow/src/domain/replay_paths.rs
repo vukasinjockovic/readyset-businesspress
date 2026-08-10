@@ -1,17 +1,17 @@
 use std::borrow::{Borrow, Cow};
-use std::collections::{btree_map, BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
 use std::hash::Hash;
 use std::{fmt, iter, ops};
 
 use itertools::Either;
-use readyset_client::internal::LocalNodeIndex;
 use readyset_client::KeyComparison;
+use readyset_client::internal::LocalNodeIndex;
 use serde::{Deserialize, Serialize};
 use vec1::Vec1;
 
 use super::{RemappedKeys, TriggerEndpoint};
-use crate::prelude::*;
 use crate::NodeMap;
+use crate::prelude::*;
 
 /// Information about the subset of a replay path that is relevant to a particular domain.
 ///
@@ -30,13 +30,21 @@ pub struct ReplayPath {
     /// The nodes in the replay path.
     pub(super) path: Vec1<ReplayPathSegment>,
     pub(super) notify_done: bool,
-    pub(crate) partial_unicast_sharder: Option<NodeIndex>,
     pub(super) trigger: TriggerEndpoint,
 }
 
 impl fmt::Display for ReplayPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ReplayPath {{ source: {:?}, destination_index: {:?}, target_index: {:?}, path: {:?}, notify_done: {:?}, partial_unicast_sharder: {:?}, trigger: {:?} }}", self.source, self.destination_index, self.target_index, self.path, self.notify_done, self.partial_unicast_sharder, self.trigger)
+        write!(
+            f,
+            "ReplayPath {{ source: {:?}, destination_index: {:?}, target_index: {:?}, path: {:?}, notify_done: {:?}, trigger: {:?} }}",
+            self.source,
+            self.destination_index,
+            self.target_index,
+            self.path,
+            self.notify_done,
+            self.trigger
+        )
     }
 }
 
@@ -109,7 +117,6 @@ pub(super) struct ReplayPathSpec {
     pub(super) source: Option<LocalNodeIndex>,
     pub(super) source_index: Option<Index>,
     pub(super) path: Vec1<ReplayPathSegment>,
-    pub(super) partial_unicast_sharder: Option<NodeIndex>,
     pub(super) notify_done: bool,
     pub(super) trigger: TriggerEndpoint,
 }
@@ -333,7 +340,6 @@ impl ReplayPaths {
             source,
             source_index,
             path,
-            partial_unicast_sharder,
             notify_done,
             trigger,
         } = path;
@@ -383,7 +389,6 @@ impl ReplayPaths {
                 target_index,
                 path,
                 notify_done,
-                partial_unicast_sharder,
                 trigger,
             },
         );
@@ -446,7 +451,6 @@ mod tests {
                     partial_index: Some(Index::hash_map(vec![0])),
                     is_target: true
                 }],
-                partial_unicast_sharder: None,
                 notify_done: false,
                 trigger: TriggerEndpoint::Local(Index::hash_map(vec![0])),
             })
@@ -475,7 +479,6 @@ mod tests {
                     partial_index: Some(Index::hash_map(vec![1, 2])),
                     is_target: false
                 }],
-                partial_unicast_sharder: None,
                 notify_done: false,
                 trigger: TriggerEndpoint::Local(Index::hash_map(vec![0])),
             })

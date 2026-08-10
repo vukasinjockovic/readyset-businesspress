@@ -1,13 +1,23 @@
+use std::assert_matches;
+use std::panic::AssertUnwindSafe;
+use std::time::Duration;
+
 use itertools::Itertools;
+use mysql_async::consts::Command;
 use mysql_async::prelude::Queryable;
 use pretty_assertions::assert_eq;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+use readyset_adapter::backend::MigrationMode;
+use readyset_client_metrics::QueryDestination;
 use readyset_client_test_helpers::{
     TestBuilder,
-    mysql_helpers::{self, MySQLAdapter},
+    mysql_helpers::{self, MySQLAdapter, last_query_info},
 };
+use readyset_data::encoding::{Encoding, SingleByteCharset, mysql_character_set_name_to_collation_id};
 use readyset_util::eventually;
-use std::time::Duration;
-use test_utils::tags;
+use test_utils::{tags, upstream};
 
 macro_rules! check_rows {
     ($my_rows:expr_2021, $rs_rows:expr_2021, $($format_args:tt)*) => {
@@ -18,7 +28,34 @@ macro_rules! check_rows {
 }
 
 const CHUNK_SIZE: usize = 1000;
-const CHARACTER_SETS: [&str; 4] = ["latin1", "cp850", "utf8mb3", "utf8mb4"];
+
+/// The character sets used for verifying results conversion. The column's own charset checks
+/// same-charset readback, and latin1 and utf8mb4 check conversion to another single-byte charset
+/// and to UTF-8. The binary pseudo-charset disables results conversion and is skipped.
+fn results_character_sets(collation: &str) -> Vec<&str> {
+    let own = collation.split('_').next().unwrap_or("");
+    let mut sets = Vec::new();
+    for cs in [own, "latin1", "utf8mb4"] {
+        if !cs.is_empty() && cs != "binary" && !sets.contains(&cs) {
+            sets.push(cs);
+        }
+    }
+    sets
+}
+
+/// The bytes of a single-byte charset that convert to a character and back unchanged, as
+/// (id, hex) pairs. Byte values with no assigned character convert to '?'. MySQL stores the raw
+/// byte and returns it as-is when character_set_results is the column's own charset (no
+/// conversion happens), but Readyset stores the column converted to UTF-8, where such a byte
+/// already became '?'. Tests therefore only insert bytes that convert back and forth cleanly.
+fn roundtrip_bytes(charset_name: &str) -> impl Iterator<Item = (u32, String)> {
+    let charset = SingleByteCharset::from_name(charset_name).unwrap();
+    let encoding = Encoding::SingleByte(charset);
+    (0u8..=255).filter_map(move |b| {
+        let decoded = encoding.decode(&[b]).unwrap();
+        (*encoding.encode(&decoded).unwrap() == [b]).then(|| (b as u32, format!("{b:02X}")))
+    })
+}
 
 /// Tests snapshotting replication of a varchar column with the specified character set.
 /// Verifies that the same utf8 encoded version of the data is stored in Readyset.
@@ -80,7 +117,7 @@ where
     // Test snapshot replication
     let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
         .recreate_database(false)
-        .replicate_db(db_name.clone())
+        .replicate_db(&db_name)
         .build::<MySQLAdapter>()
         .await;
 
@@ -142,8 +179,8 @@ where
             }
         );
 
-        // Verify this chunk after updates in all supported character sets
-        for character_set in CHARACTER_SETS {
+        // Verify this chunk after updates in the relevant character sets
+        for character_set in results_character_sets(collation) {
             upstream_conn
                 .query_drop(format!(
                     "SET @@session.character_set_results = {character_set}"
@@ -211,7 +248,7 @@ where
     // Test streaming replication
     let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
         .recreate_database(false)
-        .replicate_db(db_name.clone())
+        .replicate_db(&db_name)
         .build::<MySQLAdapter>()
         .await;
 
@@ -282,7 +319,7 @@ where
             }
         );
 
-        for character_set in CHARACTER_SETS {
+        for character_set in results_character_sets(collation) {
             upstream_conn
                 .query_drop(format!(
                     "SET @@session.character_set_results = {character_set}"
@@ -335,13 +372,15 @@ macro_rules! test_encoding_replication {
     ($name:ident, $coltype:expr_2021, $charset:expr_2021, $range:expr_2021) => {
         paste::paste! {
             #[tokio::test]
-            #[tags(serial, slow, mysql_upstream)]
+            #[tags(serial, slow)]
+            #[upstream(mysql)]
             async fn [<test_ $name _snapshot>]() {
                 test_snapshot_encoding(stringify!($name), $coltype, $charset, $range).await;
             }
 
             #[tokio::test]
-            #[tags(serial, slow, mysql_upstream)]
+            #[tags(serial, slow)]
+            #[upstream(mysql)]
             async fn [<test_ $name _streaming>]() {
                 test_streaming_encoding(stringify!($name), $coltype, $charset, $range).await;
             }
@@ -353,13 +392,15 @@ macro_rules! test_encoding_replication_very_slow {
     ($name:ident, $coltype:expr_2021, $charset:expr_2021, $range:expr_2021) => {
         paste::paste! {
             #[tokio::test]
-            #[tags(serial, very_slow, mysql_upstream)]
+            #[tags(serial, very_slow)]
+            #[upstream(mysql)]
             async fn [<test_ $name _snapshot>]() {
                 test_snapshot_encoding(stringify!($name), $coltype, $charset, $range).await;
             }
 
             #[tokio::test]
-            #[tags(serial, very_slow, mysql_upstream)]
+            #[tags(serial, very_slow)]
+            #[upstream(mysql)]
             async fn [<test_ $name _streaming>]() {
                 test_streaming_encoding(stringify!($name), $coltype, $charset, $range).await;
             }
@@ -569,6 +610,178 @@ test_encoding_replication!(
     "cp850_general_ci",
     format_u32s(2, 0..=255)
 );
+// Every remaining single-byte charset replicates VARCHAR data under its default collation.
+// Three representatives (koi8r as a common Cyrillic charset, greek as another ISO-8859 layout,
+// swe7 as the one charset that remaps ASCII) also cover CHAR, which exercises binlog CHAR
+// padding, and TEXT.
+test_encoding_replication!(
+    armscii8_general_ci_varchar,
+    "VARCHAR(255)",
+    "armscii8_general_ci",
+    roundtrip_bytes("armscii8")
+);
+test_encoding_replication!(
+    cp1250_general_ci_varchar,
+    "VARCHAR(255)",
+    "cp1250_general_ci",
+    roundtrip_bytes("cp1250")
+);
+test_encoding_replication!(
+    cp1251_general_ci_varchar,
+    "VARCHAR(255)",
+    "cp1251_general_ci",
+    roundtrip_bytes("cp1251")
+);
+test_encoding_replication!(
+    cp1256_general_ci_varchar,
+    "VARCHAR(255)",
+    "cp1256_general_ci",
+    roundtrip_bytes("cp1256")
+);
+test_encoding_replication!(
+    cp1257_general_ci_varchar,
+    "VARCHAR(255)",
+    "cp1257_general_ci",
+    roundtrip_bytes("cp1257")
+);
+test_encoding_replication!(
+    cp852_general_ci_varchar,
+    "VARCHAR(255)",
+    "cp852_general_ci",
+    roundtrip_bytes("cp852")
+);
+test_encoding_replication!(
+    cp866_general_ci_varchar,
+    "VARCHAR(255)",
+    "cp866_general_ci",
+    roundtrip_bytes("cp866")
+);
+test_encoding_replication!(
+    dec8_swedish_ci_varchar,
+    "VARCHAR(255)",
+    "dec8_swedish_ci",
+    roundtrip_bytes("dec8")
+);
+test_encoding_replication!(
+    geostd8_general_ci_varchar,
+    "VARCHAR(255)",
+    "geostd8_general_ci",
+    roundtrip_bytes("geostd8")
+);
+test_encoding_replication!(
+    greek_general_ci_varchar,
+    "VARCHAR(255)",
+    "greek_general_ci",
+    roundtrip_bytes("greek")
+);
+test_encoding_replication!(
+    greek_general_ci_char,
+    "CHAR(10)",
+    "greek_general_ci",
+    roundtrip_bytes("greek")
+);
+test_encoding_replication!(
+    greek_general_ci_text,
+    "TEXT",
+    "greek_general_ci",
+    roundtrip_bytes("greek")
+);
+test_encoding_replication!(
+    hebrew_general_ci_varchar,
+    "VARCHAR(255)",
+    "hebrew_general_ci",
+    roundtrip_bytes("hebrew")
+);
+test_encoding_replication!(
+    hp8_english_ci_varchar,
+    "VARCHAR(255)",
+    "hp8_english_ci",
+    roundtrip_bytes("hp8")
+);
+test_encoding_replication!(
+    keybcs2_general_ci_varchar,
+    "VARCHAR(255)",
+    "keybcs2_general_ci",
+    roundtrip_bytes("keybcs2")
+);
+test_encoding_replication!(
+    koi8r_general_ci_varchar,
+    "VARCHAR(255)",
+    "koi8r_general_ci",
+    roundtrip_bytes("koi8r")
+);
+test_encoding_replication!(
+    koi8r_general_ci_char,
+    "CHAR(10)",
+    "koi8r_general_ci",
+    roundtrip_bytes("koi8r")
+);
+test_encoding_replication!(
+    koi8r_general_ci_text,
+    "TEXT",
+    "koi8r_general_ci",
+    roundtrip_bytes("koi8r")
+);
+test_encoding_replication!(
+    koi8u_general_ci_varchar,
+    "VARCHAR(255)",
+    "koi8u_general_ci",
+    roundtrip_bytes("koi8u")
+);
+test_encoding_replication!(
+    latin2_general_ci_varchar,
+    "VARCHAR(255)",
+    "latin2_general_ci",
+    roundtrip_bytes("latin2")
+);
+test_encoding_replication!(
+    latin5_turkish_ci_varchar,
+    "VARCHAR(255)",
+    "latin5_turkish_ci",
+    roundtrip_bytes("latin5")
+);
+test_encoding_replication!(
+    latin7_general_ci_varchar,
+    "VARCHAR(255)",
+    "latin7_general_ci",
+    roundtrip_bytes("latin7")
+);
+test_encoding_replication!(
+    macce_general_ci_varchar,
+    "VARCHAR(255)",
+    "macce_general_ci",
+    roundtrip_bytes("macce")
+);
+test_encoding_replication!(
+    macroman_general_ci_varchar,
+    "VARCHAR(255)",
+    "macroman_general_ci",
+    roundtrip_bytes("macroman")
+);
+test_encoding_replication!(
+    swe7_swedish_ci_varchar,
+    "VARCHAR(255)",
+    "swe7_swedish_ci",
+    roundtrip_bytes("swe7")
+);
+test_encoding_replication!(
+    swe7_swedish_ci_char,
+    "CHAR(10)",
+    "swe7_swedish_ci",
+    roundtrip_bytes("swe7")
+);
+test_encoding_replication!(
+    swe7_swedish_ci_text,
+    "TEXT",
+    "swe7_swedish_ci",
+    roundtrip_bytes("swe7")
+);
+test_encoding_replication!(
+    tis620_thai_ci_varchar,
+    "VARCHAR(255)",
+    "tis620_thai_ci",
+    roundtrip_bytes("tis620")
+);
 test_encoding_replication!(
     utf8mb4_bin_ascii_varchar,
     "VARCHAR(255)",
@@ -718,3 +931,990 @@ test_encoding_replication!(
     "binary",
     format_u32s(2, 0..=255)
 );
+
+/// A minimal raw MySQL client for exercising handshake charsets mysql_async cannot negotiate (it
+/// always sends utf8mb4) and statements containing non-UTF-8 bytes.
+struct RawConn {
+    stream: TcpStream,
+}
+
+impl RawConn {
+    async fn read_packet(&mut self) -> (u8, Vec<u8>) {
+        let mut header = [0u8; 4];
+        self.stream.read_exact(&mut header).await.unwrap();
+        let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+        let mut payload = vec![0u8; len];
+        self.stream.read_exact(&mut payload).await.unwrap();
+        (header[3], payload)
+    }
+
+    async fn write_packet(&mut self, seq: u8, payload: &[u8]) {
+        let mut buf = Vec::with_capacity(4 + payload.len());
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes()[..3]);
+        buf.push(seq);
+        buf.extend_from_slice(payload);
+        self.stream.write_all(&buf).await.unwrap();
+    }
+
+    /// Connect and complete a handshake advertising the given charset (a collation id).
+    async fn connect_with_charset(opts: &mysql_async::Opts, charset: u8) -> Self {
+        const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
+        const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+        const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+        const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
+
+        let stream = TcpStream::connect((opts.ip_or_hostname(), opts.tcp_port()))
+            .await
+            .unwrap();
+        let mut conn = RawConn { stream };
+        let (seq, _server_handshake) = conn.read_packet().await;
+
+        let mut capabilities =
+            CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
+        if opts.db_name().is_some() {
+            capabilities |= CLIENT_CONNECT_WITH_DB;
+        }
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&capabilities.to_le_bytes());
+        payload.extend_from_slice(&(16u32 << 20).to_le_bytes()); // max packet size
+        payload.push(charset);
+        payload.extend_from_slice(&[0u8; 23]);
+        payload.extend_from_slice(opts.user().unwrap_or("root").as_bytes());
+        payload.push(0);
+        // Authentication is disabled in the test harness; any non-empty scramble is accepted.
+        payload.push(20);
+        payload.extend_from_slice(&[1u8; 20]);
+        if let Some(db) = opts.db_name() {
+            payload.extend_from_slice(db.as_bytes());
+            payload.push(0);
+        }
+        payload.extend_from_slice(b"mysql_native_password\0");
+        conn.write_packet(seq + 1, &payload).await;
+
+        let (_, response) = conn.read_packet().await;
+        assert_eq!(
+            response.first(),
+            Some(&0x00),
+            "handshake should succeed: {response:?}"
+        );
+        conn
+    }
+
+    /// Send a COM_QUERY with the given raw statement bytes and return the column names from the
+    /// result-set metadata along with the raw payloads of any row packets (both empty for an OK
+    /// response).
+    async fn query_with_metadata(&mut self, statement: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut payload = Vec::with_capacity(statement.len() + 1);
+        payload.push(0x03); // COM_QUERY
+        payload.extend_from_slice(statement);
+        self.write_packet(0, &payload).await;
+
+        let (_, first) = self.read_packet().await;
+        match first.first() {
+            Some(0x00) => return (Vec::new(), Vec::new()),
+            Some(0xFF) => panic!("query failed: {}", String::from_utf8_lossy(&first[9..])),
+            _ => {}
+        }
+        // A result set: `first` holds the column count; column definitions follow, terminated by
+        // EOF, then row packets, terminated by EOF.
+        let mut names = Vec::new();
+        for _ in 0..first[0] {
+            let (_, def) = self.read_packet().await;
+            names.push(column_def_name(&def));
+        }
+        let (_, eof) = self.read_packet().await;
+        assert_eq!(eof.first(), Some(&0xFE), "expected EOF after column defs");
+        let mut rows = Vec::new();
+        loop {
+            let (_, packet) = self.read_packet().await;
+            if packet.first() == Some(&0xFE) && packet.len() < 9 {
+                return (names, rows);
+            }
+            rows.push(packet);
+        }
+    }
+
+    /// Send a COM_QUERY with the given raw statement bytes and return the raw payloads of any
+    /// result row packets (empty for an OK response).
+    async fn query_raw(&mut self, statement: &[u8]) -> Vec<Vec<u8>> {
+        self.query_with_metadata(statement).await.1
+    }
+
+    /// The Query_destination column of EXPLAIN LAST STATEMENT.
+    async fn last_destination(&mut self) -> QueryDestination {
+        let (_, rows) = self.query_with_metadata(b"EXPLAIN LAST STATEMENT").await;
+        assert_eq!(rows.len(), 1, "expected a single row: {rows:?}");
+        let destination = String::from_utf8(first_text_column(&rows[0]).to_vec()).unwrap();
+        QueryDestination::try_from(destination).expect("a parseable query destination")
+    }
+}
+
+/// Extract the column name (alias) from a column definition payload, assuming its length-encoded
+/// strings are under 251 bytes.
+fn column_def_name(payload: &[u8]) -> Vec<u8> {
+    // The name is the fifth length-encoded string, after catalog, schema, table, and org_table.
+    let mut pos = 0;
+    for _ in 0..4 {
+        pos += 1 + payload[pos] as usize;
+    }
+    payload[pos + 1..][..payload[pos] as usize].to_vec()
+}
+
+/// Extract the first column's value from a text-protocol row, assuming a value under 251 bytes.
+fn first_text_column(row: &[u8]) -> &[u8] {
+    &row[1..1 + row[0] as usize]
+}
+
+/// Extract the value of a single-column text-protocol row, assuming a value under 251 bytes.
+fn single_text_column(row: &[u8]) -> &[u8] {
+    let len = row[0] as usize;
+    assert_eq!(row.len(), len + 1, "expected a one-column row: {row:?}");
+    &row[1..]
+}
+
+/// The latin1_swedish_ci collation id, latin1's default.
+const LATIN1_COLLATION: u8 = 8;
+
+/// The charsets exercised by the protocol-level tests. latin1 is the common case, cp1251 and
+/// koi8r are two different Cyrillic layouts, and swe7 is the one charset that remaps ASCII.
+const PROTOCOL_CHARSETS: [&str; 4] = ["latin1", "cp1251", "koi8r", "swe7"];
+
+/// Two non-ASCII letters encodable in the charset, for building sample values and identifiers.
+fn sample_chars(charset_name: &str) -> (char, char) {
+    let charset = SingleByteCharset::from_name(charset_name).unwrap();
+    let mut letters = charset
+        .spec()
+        .encode
+        .iter()
+        .map(|&(c, _)| c)
+        .filter(|c| !c.is_ascii() && c.is_alphabetic());
+    (letters.next().unwrap(), letters.next().unwrap())
+}
+
+/// The default collation id of the charset, as a handshake collation byte.
+fn collation_byte(charset_name: &str) -> u8 {
+    u8::try_from(mysql_character_set_name_to_collation_id(charset_name)).unwrap()
+}
+
+/// A single-byte-charset handshake must make the adapter decode inbound query bytes in that
+/// charset (instead of dropping the connection on invalid UTF-8) and return proxied result rows
+/// re-encoded to it via the upstream session's character_set_results.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn single_byte_handshake_roundtrip() {
+    readyset_tracing::init_test_logging();
+    let (opts, _handle, shutdown_tx) = TestBuilder::default()
+        .fallback(true)
+        .migration_mode(MigrationMode::OutOfBand)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let mut utf8_conn = mysql_async::Conn::new(opts.clone()).await.unwrap();
+    let upstream_opts = mysql_helpers::upstream_config().db_name(opts.db_name());
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    for charset in PROTOCOL_CHARSETS {
+        let encoding = Encoding::from_mysql_character_set_name(charset).unwrap();
+        let (c1, c2) = sample_chars(charset);
+        let value = format!("N{c1}{c2}o");
+        let wire_value = encoding.encode(&value).unwrap().into_owned();
+
+        utf8_conn
+            .query_drop(format!(
+                "CREATE TABLE charset_t_{charset} \
+                 (id INT PRIMARY KEY, t VARCHAR(32) CHARACTER SET {charset})"
+            ))
+            .await
+            .unwrap();
+
+        let mut raw = RawConn::connect_with_charset(&opts, collation_byte(charset)).await;
+        let mut insert =
+            format!("INSERT INTO charset_t_{charset} (id, t) VALUES (1, '").into_bytes();
+        insert.extend_from_slice(&wire_value);
+        insert.extend_from_slice(b"')");
+        raw.query_raw(&insert).await;
+
+        // The inbound bytes were decoded in the session's charset, so the upstream received
+        // well-formed UTF-8 and the column holds the charset-encoded bytes.
+        let hex: String = upstream_conn
+            .query_first(format!("SELECT hex(t) FROM charset_t_{charset} WHERE id = 1"))
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_hex: String = wire_value.iter().map(|b| format!("{b:02X}")).collect();
+        assert_eq!(hex, expected_hex, "{charset}");
+
+        // Proxied result rows come back in the client's charset.
+        let rows = raw
+            .query_raw(format!("SELECT t FROM charset_t_{charset} WHERE id = 1").as_bytes())
+            .await;
+        assert_eq!(rows.len(), 1, "{charset}");
+        assert_eq!(single_text_column(&rows[0]), wire_value, "{charset}");
+
+        // A utf8mb4 session reading the same row gets UTF-8 bytes.
+        let read: Vec<u8> = utf8_conn
+            .query_first(format!("SELECT t FROM charset_t_{charset} WHERE id = 1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, value.as_bytes(), "{charset}");
+    }
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Column names in result-set metadata arrive in the session's charset, matching MySQL. A
+/// single-byte-charset session gets name bytes in its charset for both proxied and cached
+/// results, while a utf8mb4 session gets UTF-8 name bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn single_byte_column_names_roundtrip() {
+    readyset_tracing::init_test_logging();
+    let (opts, _handle, shutdown_tx) = TestBuilder::default()
+        .fallback(true)
+        .migration_mode(MigrationMode::OutOfBand)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let mut utf8_conn = mysql_async::Conn::new(opts.clone()).await.unwrap();
+    utf8_conn
+        .query_drop("CREATE TABLE charset_colname (id INT PRIMARY KEY, x INT)")
+        .await
+        .unwrap();
+    utf8_conn
+        .query_drop("INSERT INTO charset_colname (id, x) VALUES (1, 42)")
+        .await
+        .unwrap();
+
+    for charset in PROTOCOL_CHARSETS {
+        let encoding = Encoding::from_mysql_character_set_name(charset).unwrap();
+        let (c1, c2) = sample_chars(charset);
+        let alias = format!("situa{c1}{c2}o");
+        let wire_alias = encoding.encode(&alias).unwrap().into_owned();
+
+        let mut raw = RawConn::connect_with_charset(&opts, collation_byte(charset)).await;
+
+        // A proxied alias containing non-ASCII chars sent in the session's charset comes back
+        // with the same name bytes. The alias is unquoted (MySQL allows unquoted identifiers
+        // with chars past ASCII) because swe7 has no backtick, its 0x60 byte being e-acute.
+        let mut select = b"SELECT 'x' AS ".to_vec();
+        select.extend_from_slice(&wire_alias);
+        let (names, rows) = raw.query_with_metadata(&select).await;
+        assert_eq!(
+            raw.last_destination().await,
+            QueryDestination::Upstream,
+            "{charset}"
+        );
+        assert_eq!(names, vec![wire_alias.clone()], "{charset}");
+        assert_eq!(rows.len(), 1, "{charset}");
+
+        // The same proxied query in a utf8mb4 session names the column in UTF-8.
+        let result = utf8_conn
+            .query_iter(format!("SELECT 'x' AS `{alias}`"))
+            .await
+            .unwrap();
+        assert_eq!(result.columns_ref()[0].name_ref(), alias.as_bytes());
+        drop(result);
+
+        // The cached path needs a backtick-quoted alias, which swe7 cannot express, so it is
+        // only exercised for charsets that keep the ASCII range intact.
+        if !SingleByteCharset::from_name(charset)
+            .unwrap()
+            .spec()
+            .ascii_transparent
+        {
+            continue;
+        }
+
+        utf8_conn
+            .query_drop(format!(
+                "CREATE CACHE FROM SELECT x AS `{alias}` FROM charset_colname WHERE id = ?"
+            ))
+            .await
+            .unwrap();
+
+        // Cached results also name the column in the session's charset.
+        let mut cached_select = b"SELECT x AS `".to_vec();
+        cached_select.extend_from_slice(&wire_alias);
+        cached_select.extend_from_slice(b"` FROM charset_colname WHERE id = 1");
+        eventually!(run_test: {
+            let (names, rows) = raw.query_with_metadata(&cached_select).await;
+            let destination = raw.last_destination().await;
+            AssertUnwindSafe(move || (names, rows, destination))
+        }, then_assert: |result| {
+            let (names, rows, destination) = result();
+            assert_matches!(destination, QueryDestination::Readyset(..));
+            assert_eq!(names, vec![wire_alias.clone()], "{charset}");
+            assert_eq!(rows.len(), 1, "{charset}");
+        });
+
+        let result = utf8_conn
+            .query_iter(format!(
+                "SELECT x AS `{alias}` FROM charset_colname WHERE id = 1"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.columns_ref()[0].name_ref(), alias.as_bytes());
+        drop(result);
+        assert_matches!(
+            last_query_info(&mut utf8_conn).await.destination,
+            QueryDestination::Readyset(..)
+        );
+    }
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A shallow cache entry filled under a lossy results charset must not leak its conversion loss
+/// into other charsets. A latin1 session caching a row containing a character latin1 can't
+/// represent stores MySQL's '?' substitution under its own key. A utf8mb4 session then misses
+/// and fills its own entry with the original character.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn shallow_cache_lossy_charset_not_shared() {
+    readyset_tracing::init_test_logging();
+    let (opts, _handle, shutdown_tx) = TestBuilder::default()
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let mut conn = mysql_async::Conn::new(opts.clone()).await.unwrap();
+    conn.query_drop(
+        "CREATE TABLE charset_lossy (id INT PRIMARY KEY, t VARCHAR(32) CHARACTER SET utf8mb4)",
+    )
+    .await
+    .unwrap();
+    conn.query_drop("INSERT INTO charset_lossy (id, t) VALUES (1, '日')")
+        .await
+        .unwrap();
+    conn.query_drop("CREATE SHALLOW CACHE FROM SELECT t FROM charset_lossy WHERE id = ?")
+        .await
+        .unwrap();
+
+    conn.query_drop("SET NAMES latin1").await.unwrap();
+
+    // The miss proxies to upstream, whose latin1 conversion substitutes '?' for 日.
+    let value: Vec<u8> = conn
+        .query_first("SELECT t FROM charset_lossy WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, b"?".to_vec());
+    assert_matches!(
+        last_query_info(&mut conn).await.destination,
+        QueryDestination::ReadysetThenUpstream(..)
+    );
+
+    // The latin1 entry serves the same substitution back, matching MySQL for a latin1 reader.
+    eventually!(run_test: {
+        let value: Vec<u8> = conn
+            .query_first("SELECT t FROM charset_lossy WHERE id = 1")
+            .await
+            .unwrap()
+            .unwrap();
+        let info = last_query_info(&mut conn).await;
+        AssertUnwindSafe(move || (info, value))
+    }, then_assert: |result| {
+        let (info, value) = result();
+        assert_matches!(info.destination, QueryDestination::ReadysetShallow(..));
+        assert_eq!(value, b"?".to_vec());
+    });
+
+    conn.query_drop("SET NAMES utf8mb4").await.unwrap();
+
+    // The utf8mb4 session keys its own entry, so it misses and gets the original character.
+    let value: Vec<u8> = conn
+        .query_first("SELECT t FROM charset_lossy WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, "日".as_bytes());
+    assert_matches!(
+        last_query_info(&mut conn).await.destination,
+        QueryDestination::ReadysetThenUpstream(..)
+    );
+
+    eventually!(run_test: {
+        let value: Vec<u8> = conn
+            .query_first("SELECT t FROM charset_lossy WHERE id = 1")
+            .await
+            .unwrap()
+            .unwrap();
+        let info = last_query_info(&mut conn).await;
+        AssertUnwindSafe(move || (info, value))
+    }, then_assert: |result| {
+        let (info, value) = result();
+        assert_matches!(info.destination, QueryDestination::ReadysetShallow(..));
+        assert_eq!(value, "日".as_bytes());
+    });
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Shallow cache entries are partitioned by the session's results charset. A latin1 session and
+/// a utf8mb4 session each fill and hit their own entry, and each receives bytes in its own
+/// charset.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn shallow_cache_cross_charset() {
+    readyset_tracing::init_test_logging();
+    let (opts, _handle, shutdown_tx) = TestBuilder::default()
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let mut utf8_conn = mysql_async::Conn::new(opts.clone()).await.unwrap();
+    utf8_conn
+        .query_drop(
+            "CREATE TABLE charset_shallow (id INT PRIMARY KEY, t VARCHAR(32) CHARACTER SET latin1)",
+        )
+        .await
+        .unwrap();
+    utf8_conn
+        .query_drop("INSERT INTO charset_shallow (id, t) VALUES (1, 'Não'), (2, 'Sim ã')")
+        .await
+        .unwrap();
+    utf8_conn
+        .query_drop("CREATE SHALLOW CACHE FROM SELECT t FROM charset_shallow WHERE id = ?")
+        .await
+        .unwrap();
+
+    let mut latin1_conn = mysql_async::Conn::new(opts.clone()).await.unwrap();
+    latin1_conn.query_drop("SET NAMES latin1").await.unwrap();
+
+    // The first execution misses, proxies to upstream (latin1 bytes for this session), and
+    // fills the cache with the canonical UTF-8 decoding.
+    let value: Vec<u8> = latin1_conn
+        .query_first("SELECT t FROM charset_shallow WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, b"N\xE3o".to_vec());
+    assert_matches!(
+        last_query_info(&mut latin1_conn).await.destination,
+        QueryDestination::ReadysetThenUpstream(..)
+    );
+
+    // A shallow hit in the latin1 session returns latin1 bytes.
+    eventually!(run_test: {
+        let value: Vec<u8> = latin1_conn
+            .query_first("SELECT t FROM charset_shallow WHERE id = 1")
+            .await
+            .unwrap()
+            .unwrap();
+        let info = last_query_info(&mut latin1_conn).await;
+        AssertUnwindSafe(move || (info, value))
+    }, then_assert: |result| {
+        let (info, value) = result();
+        assert_matches!(info.destination, QueryDestination::ReadysetShallow(..));
+        assert_eq!(value, b"N\xE3o".to_vec());
+    });
+
+    // The latin1 entry is not shared with the utf8mb4 session. Its first query for the same
+    // params misses and proxies to upstream in UTF-8.
+    let value: Vec<u8> = utf8_conn
+        .query_first("SELECT t FROM charset_shallow WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut utf8_conn).await.destination,
+        QueryDestination::ReadysetThenUpstream(..)
+    );
+    assert_eq!(value, "Não".as_bytes());
+
+    // A shallow hit in the utf8mb4 session returns UTF-8 bytes from its own entry.
+    eventually!(run_test: {
+        let value: Vec<u8> = utf8_conn
+            .query_first("SELECT t FROM charset_shallow WHERE id = 1")
+            .await
+            .unwrap()
+            .unwrap();
+        let info = last_query_info(&mut utf8_conn).await;
+        AssertUnwindSafe(move || (info, value))
+    }, then_assert: |result| {
+        let (info, value) = result();
+        assert_matches!(info.destination, QueryDestination::ReadysetShallow(..));
+        assert_eq!(value, "Não".as_bytes());
+    });
+
+    // The reverse direction partitions the same way. The utf8mb4 session fills id 2, and the
+    // latin1 session still misses on it before filling its own entry.
+    let value: Vec<u8> = utf8_conn
+        .query_first("SELECT t FROM charset_shallow WHERE id = 2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, "Sim ã".as_bytes());
+    assert_matches!(
+        last_query_info(&mut utf8_conn).await.destination,
+        QueryDestination::ReadysetThenUpstream(..)
+    );
+
+    let value: Vec<u8> = latin1_conn
+        .query_first("SELECT t FROM charset_shallow WHERE id = 2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut latin1_conn).await.destination,
+        QueryDestination::ReadysetThenUpstream(..)
+    );
+    assert_eq!(value, b"Sim \xE3".to_vec());
+
+    eventually!(run_test: {
+        let value: Vec<u8> = latin1_conn
+            .query_first("SELECT t FROM charset_shallow WHERE id = 2")
+            .await
+            .unwrap()
+            .unwrap();
+        let info = last_query_info(&mut latin1_conn).await;
+        AssertUnwindSafe(move || (info, value))
+    }, then_assert: |result| {
+        let (info, value) = result();
+        assert_matches!(info.destination, QueryDestination::ReadysetShallow(..));
+        assert_eq!(value, b"Sim \xE3".to_vec());
+    });
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Shallow-cache column names arrive in the session's charset. Entries are partitioned per
+/// results charset, so each session fills and hits its own entry with its own name bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn shallow_cross_charset_column_names() {
+    readyset_tracing::init_test_logging();
+    let (opts, _handle, shutdown_tx) = TestBuilder::default()
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let mut utf8_conn = mysql_async::Conn::new(opts.clone()).await.unwrap();
+    utf8_conn
+        .query_drop("CREATE TABLE charset_shallow_name (id INT PRIMARY KEY, x INT)")
+        .await
+        .unwrap();
+    utf8_conn
+        .query_drop("INSERT INTO charset_shallow_name (id, x) VALUES (1, 1), (2, 2)")
+        .await
+        .unwrap();
+    utf8_conn
+        .query_drop(
+            "CREATE SHALLOW CACHE FROM SELECT x AS `situação` FROM charset_shallow_name WHERE id = ?",
+        )
+        .await
+        .unwrap();
+
+    let mut raw = RawConn::connect_with_charset(&opts, LATIN1_COLLATION).await;
+
+    // Fill the entry from the latin1 session: the miss proxies to upstream, whose mirrored
+    // charset names the column in latin1.
+    let (names, _) = raw
+        .query_with_metadata(b"SELECT x AS `situa\xE7\xE3o` FROM charset_shallow_name WHERE id = 1")
+        .await;
+    assert_matches!(
+        raw.last_destination().await,
+        QueryDestination::ReadysetThenUpstream(..)
+    );
+    assert_eq!(names, vec![b"situa\xE7\xE3o".to_vec()]);
+
+    // A shallow hit in the latin1 session keeps the latin1 name bytes.
+    eventually!(run_test: {
+        let (names, _) = raw
+            .query_with_metadata(b"SELECT x AS `situa\xE7\xE3o` FROM charset_shallow_name WHERE id = 1")
+            .await;
+        let destination = raw.last_destination().await;
+        AssertUnwindSafe(move || (names, destination))
+    }, then_assert: |result| {
+        let (names, destination) = result();
+        assert_matches!(destination, QueryDestination::ReadysetShallow(..));
+        assert_eq!(names, vec![b"situa\xE7\xE3o".to_vec()]);
+    });
+
+    // The latin1 entry is not shared with the utf8mb4 session. Its first query misses, then its
+    // own entry serves the name in UTF-8.
+    let result = utf8_conn
+        .query_iter("SELECT x AS `situação` FROM charset_shallow_name WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(result.columns_ref()[0].name_ref(), "situação".as_bytes());
+    drop(result);
+    assert_matches!(
+        last_query_info(&mut utf8_conn).await.destination,
+        QueryDestination::ReadysetThenUpstream(..)
+    );
+
+    eventually!(run_test: {
+        let result = utf8_conn
+            .query_iter("SELECT x AS `situação` FROM charset_shallow_name WHERE id = 1")
+            .await
+            .unwrap();
+        let name = result.columns_ref()[0].name_ref().to_vec();
+        drop(result);
+        let info = last_query_info(&mut utf8_conn).await;
+        AssertUnwindSafe(move || (info, name))
+    }, then_assert: |result| {
+        let (info, name) = result();
+        assert_matches!(info.destination, QueryDestination::ReadysetShallow(..));
+        assert_eq!(name, "situação".as_bytes());
+    });
+
+    // The reverse direction partitions the same way. The utf8mb4 session fills id 2, the latin1
+    // session misses on it, and its own entry then serves latin1 name bytes.
+    utf8_conn
+        .query_drop("SELECT x AS `situação` FROM charset_shallow_name WHERE id = 2")
+        .await
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut utf8_conn).await.destination,
+        QueryDestination::ReadysetThenUpstream(..)
+    );
+
+    let (names, _) = raw
+        .query_with_metadata(b"SELECT x AS `situa\xE7\xE3o` FROM charset_shallow_name WHERE id = 2")
+        .await;
+    assert_matches!(
+        raw.last_destination().await,
+        QueryDestination::ReadysetThenUpstream(..)
+    );
+    assert_eq!(names, vec![b"situa\xE7\xE3o".to_vec()]);
+
+    eventually!(run_test: {
+        let (names, _) = raw
+            .query_with_metadata(b"SELECT x AS `situa\xE7\xE3o` FROM charset_shallow_name WHERE id = 2")
+            .await;
+        let destination = raw.last_destination().await;
+        AssertUnwindSafe(move || (names, destination))
+    }, then_assert: |result| {
+        let (names, destination) = result();
+        assert_matches!(destination, QueryDestination::ReadysetShallow(..));
+        assert_eq!(names, vec![b"situa\xE7\xE3o".to_vec()]);
+    });
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A scheduled refresh runs in the entry's charset. An entry filled by a latin1 session keeps
+/// returning latin1 bytes after the refresh picks up a new value.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn shallow_refresh_in_entry_charset() {
+    readyset_tracing::init_test_logging();
+    let (opts, _handle, shutdown_tx) = TestBuilder::default()
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let mut utf8_conn = mysql_async::Conn::new(opts.clone()).await.unwrap();
+    utf8_conn
+        .query_drop(
+            "CREATE TABLE charset_refresh (id INT PRIMARY KEY, t VARCHAR(32) CHARACTER SET latin1)",
+        )
+        .await
+        .unwrap();
+    utf8_conn
+        .query_drop("INSERT INTO charset_refresh (id, t) VALUES (1, 'Não')")
+        .await
+        .unwrap();
+    utf8_conn
+        .query_drop(
+            "CREATE SHALLOW CACHE
+               POLICY TTL 60 SECONDS
+               REFRESH EVERY 2 SECONDS
+               FROM SELECT t FROM charset_refresh WHERE id = ?",
+        )
+        .await
+        .unwrap();
+
+    let mut latin1_conn = mysql_async::Conn::new(opts.clone()).await.unwrap();
+    latin1_conn.query_drop("SET NAMES latin1").await.unwrap();
+
+    // Fill the latin1 entry.
+    let value: Vec<u8> = latin1_conn
+        .query_first("SELECT t FROM charset_refresh WHERE id = 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(value, b"N\xE3o".to_vec());
+    assert_matches!(
+        last_query_info(&mut latin1_conn).await.destination,
+        QueryDestination::ReadysetThenUpstream(..)
+    );
+
+    // Update the row upstream so the scheduled refresh picks up a new value.
+    utf8_conn
+        .query_drop("UPDATE charset_refresh SET t = 'Sim ã' WHERE id = 1")
+        .await
+        .unwrap();
+
+    // The refreshed hit returns latin1 bytes for the new value.
+    eventually!(run_test: {
+        let value: Vec<u8> = latin1_conn
+            .query_first("SELECT t FROM charset_refresh WHERE id = 1")
+            .await
+            .unwrap()
+            .unwrap();
+        let info = last_query_info(&mut latin1_conn).await;
+        AssertUnwindSafe(move || (info, value))
+    }, then_assert: |result| {
+        let (info, value) = result();
+        assert_matches!(info.destination, QueryDestination::ReadysetShallow(..));
+        assert_eq!(value, b"Sim \xE3".to_vec());
+    });
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A single-byte-charset session's string parameters over the binary protocol are transcoded to
+/// UTF-8 before reaching the utf8mb4 upstream session, storing the same bytes a native MySQL
+/// session in that charset stores.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn single_byte_execute_string_param() {
+    readyset_tracing::init_test_logging();
+    let (opts, _handle, shutdown_tx) = TestBuilder::default()
+        .fallback(true)
+        .migration_mode(MigrationMode::OutOfBand)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let mut conn = mysql_async::Conn::new(opts.clone()).await.unwrap();
+    let upstream_opts = mysql_helpers::upstream_config().db_name(opts.db_name());
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    for charset in PROTOCOL_CHARSETS {
+        let encoding = Encoding::from_mysql_character_set_name(charset).unwrap();
+        let (c1, c2) = sample_chars(charset);
+        let value = format!("N{c1}{c2}o");
+        let wire_value = encoding.encode(&value).unwrap().into_owned();
+
+        conn.query_drop(format!(
+            "CREATE TABLE charset_exec_{charset} \
+             (id INT PRIMARY KEY, t VARCHAR(32) CHARACTER SET {charset})"
+        ))
+        .await
+        .unwrap();
+        conn.query_drop(format!("SET NAMES {charset}"))
+            .await
+            .unwrap();
+
+        // mysql_async sends Value::Bytes parameters typed as VAR_STRING
+        let param = mysql_async::Value::Bytes(wire_value.clone());
+        conn.exec_drop(
+            format!("INSERT INTO charset_exec_{charset} (id, t) VALUES (?, ?)"),
+            (1, param.clone()),
+        )
+        .await
+        .unwrap();
+
+        // The same insert through a native MySQL session in this charset must store the same
+        // bytes
+        upstream_conn
+            .query_drop(format!("SET NAMES {charset}"))
+            .await
+            .unwrap();
+        upstream_conn
+            .exec_drop(
+                format!("INSERT INTO charset_exec_{charset} (id, t) VALUES (?, ?)"),
+                (2, param),
+            )
+            .await
+            .unwrap();
+
+        let expected_hex: String = wire_value.iter().map(|b| format!("{b:02X}")).collect();
+        let hexes: Vec<(i64, String)> = upstream_conn
+            .query(format!(
+                "SELECT id, hex(t) FROM charset_exec_{charset} ORDER BY id"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            hexes,
+            vec![(1, expected_hex.clone()), (2, expected_hex)],
+            "{charset}"
+        );
+    }
+
+    shutdown_tx.shutdown().await;
+}
+
+/// SET NAMES mid-session must make the adapter decode inbound query bytes in the named charset
+/// and return proxied result rows re-encoded to it.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn set_names_single_byte_roundtrip() {
+    readyset_tracing::init_test_logging();
+    let (opts, _handle, shutdown_tx) = TestBuilder::default()
+        .fallback(true)
+        .migration_mode(MigrationMode::OutOfBand)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let mut conn = mysql_async::Conn::new(opts.clone()).await.unwrap();
+    let upstream_opts = mysql_helpers::upstream_config().db_name(opts.db_name());
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    for charset in PROTOCOL_CHARSETS {
+        let encoding = Encoding::from_mysql_character_set_name(charset).unwrap();
+        let (c1, c2) = sample_chars(charset);
+        let value = format!("N{c1}{c2}o");
+        let wire_value = encoding.encode(&value).unwrap().into_owned();
+
+        conn.query_drop(format!(
+            "CREATE TABLE charset_names_{charset} \
+             (id INT PRIMARY KEY, t VARCHAR(32) CHARACTER SET {charset})"
+        ))
+        .await
+        .unwrap();
+
+        conn.query_drop(format!("SET NAMES {charset}"))
+            .await
+            .unwrap();
+
+        // mysql_async can't send non-UTF-8 statement text through its typed API, so write the
+        // COM_QUERY payload directly.
+        let mut insert =
+            format!("INSERT INTO charset_names_{charset} (id, t) VALUES (1, '").into_bytes();
+        insert.extend_from_slice(&wire_value);
+        insert.extend_from_slice(b"')");
+        conn.write_command_data(Command::COM_QUERY, &insert)
+            .await
+            .unwrap();
+        let ok = conn.read_packet().await.unwrap();
+        assert_eq!(ok[0], 0x00, "INSERT should return an OK packet");
+
+        // The inbound bytes were decoded in the named charset and stored as the same bytes in
+        // the column's matching charset.
+        let hex: String = upstream_conn
+            .query_first(format!(
+                "SELECT hex(t) FROM charset_names_{charset} WHERE id = 1"
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_hex: String = wire_value.iter().map(|b| format!("{b:02X}")).collect();
+        assert_eq!(hex, expected_hex, "{charset}");
+
+        // Proxied result rows come back in the session's charset.
+        let read: Vec<u8> = conn
+            .query_first(format!("SELECT t FROM charset_names_{charset} WHERE id = 1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, wire_value, "{charset}");
+    }
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A streamed write to a table whose column charset has no conversion table (multibyte gbk)
+/// fails row conversion and denies replication for just that table. A sibling table in a
+/// supported charset keeps replicating.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn unsupported_charset_write_denies_only_that_table() {
+    readyset_tracing::init_test_logging();
+    let db_name = "encoding_unsupported_denial";
+    mysql_helpers::recreate_database(db_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(db_name));
+    let mut upstream_conn = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    upstream_conn
+        .query_drop(
+            r#"
+            CREATE TABLE supported_t (id INT PRIMARY KEY, t VARCHAR(16) CHARACTER SET latin1);
+            CREATE TABLE gbk_t (id INT PRIMARY KEY, t VARCHAR(16) CHARACTER SET gbk);
+            INSERT INTO supported_t VALUES (1, 'one');
+            INSERT INTO gbk_t VALUES (1, 'one');
+        "#,
+        )
+        .await
+        .unwrap();
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .replicate_db(db_name)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut rs_conn = mysql_async::Conn::new(rs_opts).await.unwrap();
+
+    // Both tables snapshot fine. The snapshot connection reads results converted to utf8mb4 by
+    // the server, so the gbk column only fails once its rows arrive through the binlog.
+    eventually!(attempts: 5, sleep: Duration::from_secs(5), {
+        let supported: usize = rs_conn
+            .query_first("SELECT count(*) FROM supported_t")
+            .await
+            .unwrap()
+            .unwrap();
+        let gbk: usize = rs_conn
+            .query_first("SELECT count(*) FROM gbk_t")
+            .await
+            .unwrap()
+            .unwrap();
+        supported == 1 && gbk == 1
+    });
+
+    // The gbk write fails row conversion and the sibling write lands after it in the binlog.
+    upstream_conn
+        .query_drop("INSERT INTO gbk_t VALUES (2, 'two')")
+        .await
+        .unwrap();
+    upstream_conn
+        .query_drop("INSERT INTO supported_t VALUES (2, 'two')")
+        .await
+        .unwrap();
+
+    // Replication keeps going for the supported table.
+    eventually!(sleep: Duration::from_millis(100), {
+        let supported: usize = rs_conn
+            .query_first("SELECT count(*) FROM supported_t")
+            .await
+            .unwrap()
+            .unwrap();
+        supported == 2
+    });
+
+    // The gbk table was removed from Readyset, so querying it now errors.
+    eventually!(sleep: Duration::from_millis(100), {
+        rs_conn
+            .query_first::<usize, _>("SELECT count(*) FROM gbk_t")
+            .await
+            .is_err()
+    });
+
+    // After the denial, the connector's table filter skips further gbk events, so continued
+    // writes to the denied table don't disturb the sibling's replication.
+    upstream_conn
+        .query_drop("INSERT INTO gbk_t VALUES (3, 'three')")
+        .await
+        .unwrap();
+    upstream_conn
+        .query_drop("INSERT INTO supported_t VALUES (3, 'three')")
+        .await
+        .unwrap();
+    eventually!(sleep: Duration::from_millis(100), {
+        let supported: usize = rs_conn
+            .query_first("SELECT count(*) FROM supported_t")
+            .await
+            .unwrap()
+            .unwrap();
+        supported == 3
+    });
+
+    shutdown_tx.shutdown().await;
+
+    upstream_conn
+        .query_drop(format!("DROP DATABASE {db_name}"))
+        .await
+        .unwrap();
+}

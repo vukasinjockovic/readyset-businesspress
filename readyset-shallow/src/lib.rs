@@ -5,6 +5,7 @@ use std::time::Duration;
 mod cache;
 mod manager;
 
+use readyset_data::encoding::Encoding;
 use readyset_util::SizeOf;
 
 pub use cache::{CacheEntryInfo, CacheInfo};
@@ -13,6 +14,9 @@ pub use manager::{CacheInsertGuard, CacheManager, CacheResult, RequestRefresh};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlMetadata {
     pub columns: Arc<[mysql_async::Column]>,
+    /// The encoding of the text fields of `columns` (names, tables, schema): the
+    /// `character_set_results` of the session that captured the metadata.
+    pub columns_encoding: Encoding,
 }
 
 impl SizeOf for MySqlMetadata {
@@ -29,15 +33,15 @@ impl SizeOf for MySqlMetadata {
         sz
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         false
     }
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct PostgreSqlMetadata {
-    pub schema: Vec<psql_srv::Column>,
-    pub types: Vec<tokio_postgres::types::Type>,
+    pub schema: Arc<Vec<psql_srv::Column>>,
+    pub types: Arc<Vec<tokio_postgres::types::Type>>,
 }
 
 impl SizeOf for PostgreSqlMetadata {
@@ -45,7 +49,7 @@ impl SizeOf for PostgreSqlMetadata {
         self.schema.deep_size_of() + self.types.len() * size_of::<tokio_postgres::types::Type>()
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         false
     }
 }
@@ -69,7 +73,7 @@ impl SizeOf for QueryMetadata {
             }
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         false
     }
 }
@@ -78,6 +82,43 @@ impl SizeOf for QueryMetadata {
 pub struct QueryResult<V> {
     pub values: Arc<Vec<V>>,
     pub metadata: Arc<QueryMetadata>,
+}
+
+/// Hash of a cached row's value content, used by adaptive refresh to detect whether a refresh
+/// produced a different result than the one it replaced.
+pub trait ContentHash {
+    fn content_hash(&self) -> u64;
+}
+
+impl ContentHash for String {
+    fn content_hash(&self) -> u64 {
+        readyset_util::hash::hash(self)
+    }
+}
+
+impl ContentHash for u32 {
+    fn content_hash(&self) -> u64 {
+        readyset_util::hash::hash(self)
+    }
+}
+
+impl ContentHash for Vec<&str> {
+    fn content_hash(&self) -> u64 {
+        readyset_util::hash::hash(self)
+    }
+}
+
+/// Order-insensitive hash of a result set: per-row hashes are combined with a commutative fold,
+/// so two result sets with the same rows in different orders hash equal. Queries without a total
+/// ORDER BY may legitimately return rows in a different order on each refresh; that must not
+/// read as a change.
+pub fn rows_content_hash<V>(rows: &[V]) -> u64
+where
+    V: ContentHash,
+{
+    rows.iter()
+        .map(ContentHash::content_hash)
+        .fold(readyset_util::hash::hash(&rows.len()), u64::wrapping_add)
 }
 
 #[derive(Debug, Clone, Copy)]

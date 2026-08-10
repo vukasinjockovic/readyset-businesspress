@@ -22,27 +22,28 @@ use readyset_sql::ast::{
     TableExprInner,
 };
 use readyset_sql::DialectDisplay;
-use readyset_sql_passes::{is_correlated, is_predicate, map_aggregates, LogicalOp};
-use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
+use readyset_sql_passes::{
+    const_eval_to_dfvalue, eval_constant_expr, is_correlated, is_predicate, map_aggregates,
+    LogicalOp,
+};
 
 use super::mir::{self, PAGE_NUMBER_COL};
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct LiteralColumn {
     pub name: SqlIdentifier,
     pub table: Option<Relation>,
     pub value: Literal,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ExprColumn {
     pub name: SqlIdentifier,
     pub table: Option<Relation>,
     pub expression: Expr,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum OutputColumn {
     Data {
         alias: SqlIdentifier,
@@ -129,7 +130,7 @@ impl PartialOrd for OutputColumn {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct WindowFunction {
     pub function: FunctionExpr,
     pub partition_by: Vec<Expr>,
@@ -137,39 +138,58 @@ pub struct WindowFunction {
     pub alias: SqlIdentifier,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct JoinRef {
     pub src: Relation,
     pub dst: Relation,
 }
 
 /// An equality predicate on two columns, used as the key for a join
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct JoinPredicate {
     pub left: Column,
     pub right: Column,
 }
 
 /// An individual column on which a query is parameterized
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Parameter {
     pub col: Column,
     pub op: BinaryOperator,
     pub placeholder_idx: Option<PlaceholderIdx>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Serialize, Deserialize)]
+/// The source of data for a query graph relation.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub enum RelationSource {
+    /// A base table — data comes from an existing table in the schema.
+    Table,
+    /// A subquery — data comes from an inline SELECT.
+    Subquery(Box<QueryGraph>),
+    /// A VALUES clause — data comes from inline constant rows.
+    Values(ValuesClause),
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub struct QueryGraphNode {
     pub relation: Relation,
     pub predicates: Vec<Expr>,
     pub columns: Vec<Column>,
     pub parameters: Vec<Parameter>,
-    /// If this query graph relation refers to a subquery, the graph of that subquery and the AST
-    /// for the query itself
-    pub subgraph: Option<Box<QueryGraph>>,
+    /// The source of data for this relation (base table, subquery, or VALUES clause)
+    pub source: RelationSource,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+/// Represents a VALUES clause with its rows and column aliases
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ValuesClause {
+    /// The constant rows (each row is a vector of expressions that evaluate to constants)
+    pub rows: Vec<Vec<Literal>>,
+    /// The column names (from the column aliases)
+    pub column_names: Vec<SqlIdentifier>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum QueryGraphEdge {
     Join {
         on: Vec<JoinPredicate>,
@@ -187,7 +207,7 @@ pub enum QueryGraphEdge {
     },
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Pagination {
     pub order: Option<Vec<(Expr, OrderType, NullOrder)>>,
     pub limit: usize,
@@ -205,8 +225,7 @@ pub struct ViewKey {
     pub index_type: IndexType,
 }
 
-#[serde_as]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 // NOTE: Keep in mind this struct has a custom Hash impl - when changing it, remember to update that
 // as well!
 // TODO(aspen): impl Arbitrary for this struct so we can make a proptest for that
@@ -214,7 +233,6 @@ pub struct QueryGraph {
     /// Relations mentioned in the query.
     pub relations: HashMap<Relation, QueryGraphNode>,
     /// Joins in the query.
-    #[serde_as(as = "Vec<(_, _)>")]
     pub edges: HashMap<(Relation, Relation), QueryGraphEdge>,
     /// Whether the query has a `DISTINCT` in the `SELECT` clause
     pub distinct: bool,
@@ -624,7 +642,23 @@ fn classify_conditionals(
                         }
                     }
 
-                    // Column from a specific table: Store locally
+                    // Cross-table non-equality predicate (e.g., s.sn != spj.sn):
+                    // must be classified as global, not local.
+                    (
+                        Expr::Column(Column {
+                            table: Some(lhs_table),
+                            ..
+                        }),
+                        Expr::Column(Column {
+                            table: Some(rhs_table),
+                            ..
+                        }),
+                    ) if lhs_table != rhs_table => {
+                        global.push(ce.clone());
+                    }
+
+                    // Column from a specific table vs non-column or same-table
+                    // column: store as a local predicate for that table.
                     (
                         Expr::Column(Column {
                             table: Some(table), ..
@@ -766,7 +800,9 @@ fn extract_having_aggregates(
 
         fn visit_expr(&mut self, expr: &'ast mut Expr) -> Result<(), Self::Error> {
             if matches!(expr, Expr::Call(fun) if is_aggregate(fun)) {
-                let name: SqlIdentifier = expr.display(self.dialect.into()).to_string().into();
+                let name: SqlIdentifier = expr
+                    .qualified_alias(self.dialect.into())
+                    .unwrap_or_else(|| expr.display(self.dialect.into()).to_string().into());
                 let col_expr = Expr::Column(ast::Column {
                     name: name.clone(),
                     table: None,
@@ -858,13 +894,50 @@ fn table_expr_name(table_expr: &TableExpr) -> ReadySetResult<Relation> {
             .ok_or_else(|| invalid_query_err!("All subqueries must have an alias"))?
             .clone()
             .into()),
+        TableExprInner::Values { .. } => Ok(table_expr
+            .alias
+            .as_ref()
+            .ok_or_else(|| invalid_query_err!("All VALUES clauses must have an alias"))?
+            .clone()
+            .into()),
     }
 }
 
-fn default_row_for_select(st: &SelectStatement) -> Option<Vec<DfValue>> {
-    // If this is an aggregated query AND it does not contain a GROUP BY clause,
-    // set default values based on the aggregation (or lack thereof) on each
-    // individual field
+/// Replace aggregate calls with their empty-input defaults: COUNT becomes `0`, all others
+/// become `NULL`. Window functions are left untouched (they have their own default handling).
+fn replace_aggregate_defaults(expr: &mut Expr) {
+    struct Visitor;
+
+    impl<'ast> VisitorMut<'ast> for Visitor {
+        type Error = std::convert::Infallible;
+
+        fn visit_expr(&mut self, expr: &'ast mut Expr) -> Result<(), Self::Error> {
+            match expr {
+                Expr::WindowFunction { .. } => Ok(()),
+                Expr::Call(func) if is_aggregate(func) => {
+                    *expr = if matches!(func, FunctionExpr::Count { .. } | FunctionExpr::CountStar)
+                    {
+                        Expr::Literal(Literal::Integer(0))
+                    } else {
+                        Expr::Literal(Literal::Null)
+                    };
+                    Ok(())
+                }
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+
+    let Ok(()) = Visitor.visit_expr(expr);
+}
+
+/// Replace aggregate function calls with their empty-input default values (COUNT gets 0, all
+/// others get NULL), then constant-fold the resulting expression to produce a concrete `DfValue`.
+///
+/// This handles expressions like `COALESCE(ARRAY_AGG(col), ARRAY['fallback'])`: after
+/// substitution the expression becomes `COALESCE(NULL, ARRAY['fallback'])`, which constant-folds
+/// to `ARRAY['fallback']`.
+fn default_row_for_select(st: &SelectStatement, dialect: Dialect) -> Option<Vec<DfValue>> {
     if !st.contains_aggregate_select() || st.group_by.is_some() {
         return None;
     }
@@ -872,15 +945,13 @@ fn default_row_for_select(st: &SelectStatement) -> Option<Vec<DfValue>> {
         st.fields
             .iter()
             .map(|f| match f {
-                FieldDefinitionExpr::Expr {
-                    expr: Expr::Call(func),
-                    ..
-                } => {
-                    if let FunctionExpr::CountStar | FunctionExpr::Count { .. } = func {
-                        DfValue::Int(0)
-                    } else {
+                FieldDefinitionExpr::Expr { expr, .. } => {
+                    let mut expr = expr.clone();
+                    replace_aggregate_defaults(&mut expr);
+                    const_eval_to_dfvalue(&expr, dialect).unwrap_or_else(|e| {
+                        tracing::warn!(%e, "default_row constant-folding failed");
                         DfValue::None
-                    }
+                    })
                 }
                 _ => DfValue::None,
             })
@@ -935,11 +1006,11 @@ pub fn to_query_graph(stmt: SelectStatement, dialect: Dialect) -> ReadySetResult
                 .flatten()
                 .collect(),
             parameters: Vec::new(),
-            subgraph: None,
+            source: RelationSource::Table,
         })
     };
 
-    let default_row = default_row_for_select(&stmt);
+    let default_row = default_row_for_select(&stmt, dialect);
     let is_correlated = is_correlated(&stmt);
 
     // Used later on to determine whether to classify predicates as "join predicates" or not
@@ -974,7 +1045,118 @@ pub fn to_query_graph(stmt: SelectStatement, dialect: Dialect) -> ReadySetResult
                 );
                 if let Entry::Vacant(e) = relations.entry(rel.clone()) {
                     let mut node = new_node(rel.clone(), vec![], &stmt.fields)?;
-                    node.subgraph = Some(Box::new(to_query_graph((**sq).clone(), dialect)?));
+                    node.source = RelationSource::Subquery(Box::new(to_query_graph(
+                        (**sq).clone(),
+                        dialect,
+                    )?));
+                    e.insert(node);
+                } else {
+                    invalid_query!(
+                        "Table name {} specified more than once",
+                        rel.display_unquoted()
+                    );
+                }
+
+                Ok(rel)
+            }
+            TableExprInner::Values { rows } => {
+                /// Maximum number of rows allowed in a VALUES clause
+                const MAX_VALUES_ROWS: usize = 2_000;
+
+                let rel = Relation::from(
+                    table_expr
+                        .alias
+                        .as_ref()
+                        .ok_or_else(|| invalid_query_err!("All VALUES clauses must have an alias"))?
+                        .clone(),
+                );
+
+                if rows.is_empty() {
+                    return Err(invalid_query_err!(
+                        "VALUES clause must have at least one row"
+                    ));
+                }
+
+                if rows.len() > MAX_VALUES_ROWS {
+                    return Err(unsupported_err!(
+                        "VALUES clause with {} rows exceeds maximum of {}",
+                        rows.len(),
+                        MAX_VALUES_ROWS
+                    ));
+                }
+
+                let expected_cols = rows[0].len();
+                for (i, row) in rows.iter().enumerate().skip(1) {
+                    if row.len() != expected_cols {
+                        return Err(invalid_query_err!(
+                            "VALUES row {} has {} columns, expected {}",
+                            i + 1,
+                            row.len(),
+                            expected_cols
+                        ));
+                    }
+                }
+
+                // Reject duplicate column aliases to avoid panics downstream.
+                // PostgreSQL allows this but Readyset requires unique column names.
+                {
+                    let mut seen = HashSet::new();
+                    for alias in &table_expr.column_aliases {
+                        if !seen.insert(alias) {
+                            return Err(unsupported_err!(
+                                "Duplicate column alias '{}' in VALUES clause",
+                                alias
+                            ));
+                        }
+                    }
+                }
+
+                // column_aliases must already be fully populated by
+                // populate_values_column_aliases in the SQL passes.
+                invariant_eq!(
+                    table_expr.column_aliases.len(),
+                    expected_cols,
+                    "VALUES column_aliases should have been populated by SQL passes"
+                );
+
+                // Convert expressions to literals, evaluating constant expressions
+                // (e.g. typed casts like '2023-01-15 10:30:45.123456'::TIMESTAMP).
+                let literal_rows: Vec<Vec<Literal>> = rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|expr| match expr {
+                                Expr::Literal(lit) => Ok(lit.clone()),
+                                other => {
+                                    eval_constant_expr(other.clone(), dialect).ok_or_else(|| {
+                                        unsupported_err!(
+                                            "Only constant expressions are supported in VALUES clause"
+                                        )
+                                    })
+                                }
+                            })
+                            .collect::<ReadySetResult<Vec<_>>>()
+                    })
+                    .collect::<ReadySetResult<Vec<_>>>()?;
+
+                if let Entry::Vacant(e) = relations.entry(rel.clone()) {
+                    let node = QueryGraphNode {
+                        relation: rel.clone(),
+                        predicates: vec![],
+                        columns: table_expr
+                            .column_aliases
+                            .iter()
+                            .map(|name| Column {
+                                name: name.clone(),
+                                table: Some(rel.clone()),
+                            })
+                            .collect(),
+                        parameters: Vec::new(),
+                        source: RelationSource::Values(ValuesClause {
+                            rows: literal_rows,
+                            column_names: table_expr.column_aliases.clone(),
+                        }),
+                    };
                     e.insert(node);
                 } else {
                     invalid_query!(
@@ -1003,6 +1185,26 @@ pub fn to_query_graph(stmt: SelectStatement, dialect: Dialect) -> ReadySetResult
             }
             JoinRightSide::Tables(_) => unsupported!("JoinRightSide::Tables not yet implemented"),
         };
+    }
+
+    // Reject queries where VALUES clauses are the only data sources.
+    // - Standalone VALUES (single VALUES, no other tables/joins): not useful without a join
+    // - All-VALUES queries (multiple VALUES, no base tables): ReadySet requires at least one
+    //   base table to track upstream changes for cache invalidation.
+    // Note: comma-style cross joins (e.g. `FROM vals, categories`) put both in `stmt.tables`
+    // not `stmt.join`, so we check `relations` not `stmt.join.is_empty()`.
+    if relations
+        .values()
+        .all(|node| matches!(node.source, RelationSource::Values(_)))
+    {
+        if relations.len() == 1 {
+            unsupported!("VALUES clauses must be used in a JOIN");
+        } else {
+            unsupported!(
+                "Queries with only VALUES clauses are not supported; \
+                 at least one base table is required"
+            );
+        }
     }
 
     // 2. Add edges for each pair of joined relations. Note that we must keep track of the join
@@ -1174,7 +1376,7 @@ pub fn to_query_graph(stmt: SelectStatement, dialect: Dialect) -> ReadySetResult
         )?;
     }
 
-    for (_, ces) in local_predicates.iter_mut() {
+    for ces in local_predicates.values_mut() {
         *ces = split_conjunctions(ces.iter());
     }
 
@@ -1251,9 +1453,14 @@ pub fn to_query_graph(stmt: SelectStatement, dialect: Dialect) -> ReadySetResult
                 internal!("Stars should have been expanded by now!")
             }
             FieldDefinitionExpr::Expr { expr, alias } => {
-                let name: SqlIdentifier = alias
-                    .clone()
-                    .unwrap_or_else(|| expr.display(dialect.into()).to_string().into());
+                let name: SqlIdentifier = alias.clone().unwrap_or_else(|| {
+                    if matches!(expr, Expr::Call(f) if is_aggregate(f)) {
+                        expr.qualified_alias(dialect.into())
+                            .unwrap_or_else(|| expr.display(dialect.into()).to_string().into())
+                    } else {
+                        expr.display(dialect.into()).to_string().into()
+                    }
+                });
                 match expr {
                     Expr::Literal(l) => columns.push(OutputColumn::Literal(LiteralColumn {
                         name,
@@ -1274,6 +1481,122 @@ pub fn to_query_graph(stmt: SelectStatement, dialect: Dialect) -> ReadySetResult
                         let fn_name: SqlIdentifier =
                             expr.display(dialect.into()).to_string().into();
 
+                        // Extract aggregate calls from WF sub-expressions, replacing
+                        // them with Expr::Column refs to the materialized aggregate
+                        // columns.  This is needed because SQL evaluates aggregates
+                        // BEFORE window functions — by the time the WF executes, each
+                        // aggregate result is already a column.
+                        //
+                        // Register extracted aggregates using `or_insert` semantics:
+                        // if the same aggregate already appears in the SELECT list
+                        // (e.g., `count(*) AS cnt`), reuse its registered name.
+                        // After map_aggregates rewrites, patch column names to
+                        // match the canonical registration.
+                        // Recursively rename column references in an expression tree.
+                        // Needed when map_aggregates writes a column name that
+                        // differs from the canonical registration (e.g., the same
+                        // aggregate appears aliased in the SELECT list).  The column
+                        // may be nested arbitrarily deep (e.g., inside CASE WHEN
+                        // sum(value) > 30 ...).
+                        struct RenameColumn {
+                            from: SqlIdentifier,
+                            to: SqlIdentifier,
+                        }
+                        impl<'ast> VisitorMut<'ast> for RenameColumn {
+                            type Error = std::convert::Infallible;
+                            fn visit_column(
+                                &mut self,
+                                column: &'ast mut Column,
+                            ) -> Result<(), Self::Error> {
+                                if column.table.is_none() && column.name == self.from {
+                                    column.name = self.to.clone();
+                                }
+                                Ok(())
+                            }
+                        }
+
+                        let merge_and_patch = |extracted: Vec<(FunctionExpr, SqlIdentifier)>,
+                                               expr: &mut Expr,
+                                               aggregates: &mut HashMap<
+                            FunctionExpr,
+                            SqlIdentifier,
+                        >| {
+                            for (func, new_name) in extracted {
+                                let canonical = aggregates
+                                    .entry(func)
+                                    .or_insert_with(|| new_name.clone())
+                                    .clone();
+                                if canonical != new_name {
+                                    let mut renamer = RenameColumn {
+                                        from: new_name,
+                                        to: canonical,
+                                    };
+                                    // Infallible — unwrap is safe.
+                                    let _ = renamer.visit_expr(expr);
+                                }
+                            }
+                        };
+
+                        let mut partition_by = partition_by.clone();
+                        for pb in partition_by.iter_mut() {
+                            let extracted = map_aggregates(pb, dialect.into());
+                            merge_and_patch(extracted, pb, &mut aggregates);
+                        }
+
+                        let mut order_by = order_by.clone();
+                        for (ob_expr, _, _) in order_by.iter_mut() {
+                            let extracted = map_aggregates(ob_expr, dialect.into());
+                            merge_and_patch(extracted, ob_expr, &mut aggregates);
+                        }
+
+                        // Extract aggregates from the WF function's arguments.
+                        // We cannot wrap the whole function in Expr::Call and run
+                        // map_aggregates, because that would treat the WF's own
+                        // function (e.g., SUM in `SUM(SUM(x)) OVER ()`) as a
+                        // regular aggregate.  Instead, process each argument
+                        // individually via into_arguments / reconstruction.
+                        let mut function = function.clone();
+                        let args: Vec<Expr> = function.arguments().cloned().collect();
+                        if !args.is_empty() {
+                            let mut new_args: Vec<Expr> = Vec::with_capacity(args.len());
+                            for mut arg in args {
+                                let extracted = map_aggregates(&mut arg, dialect.into());
+                                merge_and_patch(extracted, &mut arg, &mut aggregates);
+                                new_args.push(arg);
+                            }
+                            // Reconstruct the function with rewritten arguments.
+                            // WF functions have at most one argument in practice
+                            // (Sum/Count/Avg/Min/Max take one; Rank/RowNumber/
+                            // DenseRank/CountStar take none).
+                            match &mut function {
+                                FunctionExpr::Max(expr)
+                                | FunctionExpr::Min(expr)
+                                | FunctionExpr::Avg { expr, .. }
+                                | FunctionExpr::Sum { expr, .. }
+                                | FunctionExpr::Count { expr, .. } => {
+                                    let Some(new_arg) = new_args.into_iter().next() else {
+                                        internal!(
+                                            "WF aggregate function must have exactly one argument"
+                                        )
+                                    };
+                                    **expr = new_arg;
+                                }
+                                // Rank, RowNumber, DenseRank, CountStar have no args.
+                                // If a new WF function with arguments is added in the
+                                // future, it must be handled above — otherwise the
+                                // rewritten args are silently dropped.
+                                _ => {
+                                    debug_assert!(
+                                        new_args.iter().all(|a| {
+                                            !readyset_sql_passes::is_aggregated_expr(a)
+                                                .unwrap_or(true)
+                                        }),
+                                        "Unhandled WF function variant with aggregate arguments"
+                                    );
+                                }
+                            }
+                        }
+
                         columns.push(OutputColumn::Data {
                             alias: alias.clone().unwrap_or(fn_name.clone()),
                             column: Column {
@@ -1283,9 +1606,9 @@ pub fn to_query_graph(stmt: SelectStatement, dialect: Dialect) -> ReadySetResult
                         });
 
                         window_functions.push(WindowFunction {
-                            function: function.clone(),
-                            partition_by: partition_by.clone(),
-                            order_by: order_by.clone(),
+                            function,
+                            partition_by,
+                            order_by,
                             alias: alias.clone().unwrap_or(fn_name),
                         })
                     }
@@ -1371,14 +1694,18 @@ pub fn to_query_graph(stmt: SelectStatement, dialect: Dialect) -> ReadySetResult
                     // we don't necessarily need it projected in the result set of the query, and
                     // the pull_columns pass will make sure the topk/paginate node gets the
                     // aggregate result column
-                    aggregates
-                        .entry(func.clone())
-                        .or_insert_with(|| func.display(dialect.into()).to_string().into());
+                    aggregates.entry(func.clone()).or_insert_with(|| {
+                        Expr::Call(func.clone())
+                            .qualified_alias(dialect.into())
+                            .unwrap_or_else(|| func.display(dialect.into()).to_string().into())
+                    });
                 }
                 FieldReference::Expr(expr) => {
                     // This is an expression that we need to add to the list of projected columns
                     columns.push(OutputColumn::Expr(ExprColumn {
-                        name: expr.display(dialect.into()).to_string().into(),
+                        name: expr
+                            .qualified_alias(dialect.into())
+                            .unwrap_or_else(|| expr.display(dialect.into()).to_string().into()),
                         table: None,
                         expression: expr.clone(),
                     }));
@@ -1408,7 +1735,9 @@ pub fn to_query_graph(stmt: SelectStatement, dialect: Dialect) -> ReadySetResult
                             match field {
                                 FieldReference::Expr(Expr::Column(col)) => col,
                                 FieldReference::Expr(expr) => Column {
-                                    name: expr.display(dialect.into()).to_string().into(),
+                                    name: expr.qualified_alias(dialect.into()).unwrap_or_else(
+                                        || expr.display(dialect.into()).to_string().into(),
+                                    ),
                                     table: None,
                                 },
                                 FieldReference::Numeric(_) => {
@@ -1483,10 +1812,6 @@ pub fn to_query_graph(stmt: SelectStatement, dialect: Dialect) -> ReadySetResult
             .collect()
     };
 
-    if !window_functions.is_empty() && !group_by.is_empty() {
-        unsupported!("Mixing window functions and aggregates is not yet supported");
-    }
-
     if !group_by.is_empty() && aggregates.is_empty() {
         unsupported!("Using group by without aggregates is not yet supported");
     }
@@ -1541,7 +1866,7 @@ mod tests {
             qg.aggregates,
             HashMap::from([(
                 FunctionExpr::Max(Box::new(Expr::Column("t1.x".into()))),
-                "max(`t1`.`x`)".into()
+                "max(t1.x)".into()
             )])
         );
     }
@@ -1613,7 +1938,7 @@ mod tests {
         let mut b = vec![
             Expr::BinaryOp {
                 lhs: Box::new(Expr::Column(Column {
-                    name: "min(`t`.`y`)".into(),
+                    name: "min(t.y)".into(),
                     table: None,
                 })),
                 op: BinaryOperator::Greater,
@@ -1621,7 +1946,7 @@ mod tests {
             },
             Expr::BinaryOp {
                 lhs: Box::new(Expr::Column(Column {
-                    name: "sum(`t`.`y`)".into(),
+                    name: "sum(t.y)".into(),
                     table: None,
                 })),
                 op: BinaryOperator::Greater,
@@ -1637,7 +1962,7 @@ mod tests {
                     name: "y".into(),
                     table: Some("t".into()),
                 }))),
-                "min(`t`.`y`)".into(),
+                "min(t.y)".into(),
             ),
             (
                 FunctionExpr::Sum {
@@ -1647,7 +1972,7 @@ mod tests {
                     })),
                     distinct: false,
                 },
-                "sum(`t`.`y`)".into(),
+                "sum(t.y)".into(),
             ),
         ];
         assert_eq!(qg.aggregates, HashMap::from(expected_aggs));
@@ -1665,7 +1990,7 @@ mod tests {
         );
 
         let subquery_rel = qg.relations.get(&Relation::from("sq")).unwrap();
-        assert!(subquery_rel.subgraph.is_some());
+        assert!(matches!(subquery_rel.source, RelationSource::Subquery(_)));
     }
 
     #[test]
@@ -1696,9 +2021,9 @@ mod tests {
                     column: Column::from("t.b")
                 },
                 OutputColumn::Data {
-                    alias: "sum(`t`.`c`)".into(),
+                    alias: "sum(t.c)".into(),
                     column: Column {
-                        name: "sum(`t`.`c`)".into(),
+                        name: "sum(t.c)".into(),
                         table: None
                     }
                 }
@@ -1712,7 +2037,7 @@ mod tests {
                     expr: Box::new(Expr::Column("t.c".into())),
                     distinct: false,
                 },
-                "sum(`t`.`c`)".into()
+                "sum(t.c)".into()
             )])
         );
     }
@@ -2104,6 +2429,155 @@ mod tests {
                     )
                 ]
             );
+        }
+    }
+
+    /// REA-6339: Parameterized WHERE on right side of LEFT JOIN with aggregation.
+    mod left_join_right_side_params {
+        use super::*;
+
+        fn try_make_query_graph(sql: &str) -> ReadySetResult<QueryGraph> {
+            let query = match parse_query(Dialect::MySQL, sql).unwrap() {
+                SqlQuery::Select(stmt) => stmt,
+                q => panic!("Unexpected query type; expected SelectStatement but got {q:?}"),
+            };
+            to_query_graph(query, readyset_data::Dialect::DEFAULT_MYSQL)
+        }
+
+        #[test]
+        fn parameterized_where_on_left_join_right_side_with_agg_supported() {
+            // REA-6339: Parameterized WHERE on right-side column of LEFT JOIN with
+            // aggregation is supported. The parameter column becomes a GROUP BY column
+            // in the aggregation. The LEFT JOIN's replay handling skips the right-side
+            // count check when the replay key differs from the join key.
+            let result = try_make_query_graph(
+                "SELECT COUNT(*) FROM s \
+                 LEFT JOIN (SELECT sn, test_int FROM spj CROSS JOIN dt) sub \
+                 ON s.sn = sub.sn \
+                 WHERE sub.test_int = ?",
+            );
+            result.unwrap();
+        }
+
+        #[test]
+        fn parameterized_where_on_left_join_left_side_supported() {
+            let result = try_make_query_graph(
+                "SELECT COUNT(*) FROM s \
+                 LEFT JOIN t ON s.id = t.id \
+                 WHERE s.id = ?",
+            );
+            result.unwrap();
+        }
+
+        #[test]
+        fn literal_where_on_left_join_right_side_supported() {
+            let result = try_make_query_graph(
+                "SELECT COUNT(*) FROM s \
+                 LEFT JOIN (SELECT sn, test_int FROM spj CROSS JOIN dt) sub \
+                 ON s.sn = sub.sn \
+                 WHERE sub.test_int = 0",
+            );
+            result.unwrap();
+        }
+
+        #[test]
+        fn parameterized_where_on_left_join_right_side_without_agg_supported() {
+            // Without aggregation, the parameter is a simple view key lookup on
+            // the materialized LEFT JOIN output, which works correctly.
+            let result = try_make_query_graph(
+                "SELECT J.aid, J.other FROM B \
+                 LEFT JOIN (SELECT A.aid, A.other FROM A WHERE A.other = 5) AS J \
+                 ON J.aid = B.bid \
+                 WHERE J.aid = ?",
+            );
+            result.unwrap();
+        }
+    }
+
+    mod values_row_limit {
+        use super::*;
+
+        /// Build the query graph for a VALUES query using PostgreSQL dialect.
+        fn try_values_query_graph(num_rows: usize) -> ReadySetResult<QueryGraph> {
+            let rows: String = (1..=num_rows)
+                .map(|i| format!("({i})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT v.x, t.id FROM (VALUES {rows}) AS v(x) \
+                 JOIN t ON t.id = v.x"
+            );
+            let stmt = parse_select(Dialect::PostgreSQL, &sql).unwrap();
+            to_query_graph(stmt, readyset_data::Dialect::DEFAULT_MYSQL)
+        }
+
+        #[test]
+        fn values_at_max_rows_succeeds() {
+            try_values_query_graph(2_000).unwrap();
+        }
+
+        #[test]
+        fn values_exceeding_max_rows_fails() {
+            let err = try_values_query_graph(2_001).unwrap_err();
+            assert!(
+                err.to_string().contains("exceeds maximum of 2000"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    fn make_pg_query_graph(sql: &str) -> QueryGraph {
+        let stmt = readyset_sql_parsing::parse_select_with_config(
+            readyset_sql_parsing::ParsingPreset::OnlySqlparser,
+            Dialect::PostgreSQL,
+            sql,
+        )
+        .unwrap();
+        to_query_graph(stmt, readyset_data::Dialect::DEFAULT_POSTGRESQL).unwrap()
+    }
+
+    mod default_row {
+        use super::*;
+
+        #[test]
+        fn bare_count_returns_zero() {
+            let qg = make_query_graph("SELECT COUNT(*) FROM t");
+            assert_eq!(qg.default_row, Some(vec![DfValue::Int(0)]));
+        }
+
+        #[test]
+        fn bare_aggregate_returns_null() {
+            let qg = make_pg_query_graph("SELECT SUM(x) FROM t");
+            assert_eq!(qg.default_row, Some(vec![DfValue::None]));
+        }
+
+        // Verifies constant-folding produces the correct array contents,
+        // not just "some array". Logictests cover the end-to-end behavior;
+        // this unit test validates the internal DfValue structure.
+        #[test]
+        fn coalesce_array_agg_with_array_fallback() {
+            let qg = make_pg_query_graph(
+                "SELECT COALESCE(ARRAY_AGG(col), ARRAY['Empty String']) FROM t",
+            );
+            let row = qg.default_row.unwrap();
+            assert_eq!(row.len(), 1);
+            let DfValue::Array(arr) = &row[0] else {
+                panic!("expected Array, got {:?}", row[0]);
+            };
+            let elements: Vec<&DfValue> = arr.values().collect();
+            assert_eq!(elements, vec![&DfValue::from("Empty String")]);
+        }
+
+        #[test]
+        fn with_group_by_returns_none() {
+            let qg = make_query_graph("SELECT COUNT(*) FROM t GROUP BY x");
+            assert_eq!(qg.default_row, None);
+        }
+
+        #[test]
+        fn non_aggregate_returns_none() {
+            let qg = make_query_graph("SELECT x FROM t");
+            assert_eq!(qg.default_row, None);
         }
     }
 }

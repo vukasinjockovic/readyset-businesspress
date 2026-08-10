@@ -1,14 +1,13 @@
+use std::assert_matches;
 use std::env;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
-use assert_matches::assert_matches;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use mysql_async::prelude::*;
 use mysql_async::{params, Conn, Row, Value};
-use readyset_adapter::backend::noria_connector::ReadBehavior;
-use readyset_adapter::backend::{MigrationMode, QueryInfo};
+use readyset_adapter::backend::{AllowedUsers, MigrationMode, QueryInfo};
 use readyset_adapter::proxied_queries_reporter::ProxiedQueriesReporter;
 use readyset_adapter::query_status_cache::{MigrationStyle, QueryStatusCache};
 use readyset_adapter::BackendBuilder;
@@ -22,7 +21,8 @@ use readyset_telemetry_reporter::{TelemetryEvent, TelemetryInitializer, Telemetr
 use readyset_util::shutdown::ShutdownSender;
 use readyset_util::{eventually, retry_with_exponential_backoff};
 use regex::Regex;
-use test_utils::{skip_flaky_finder, tags};
+use test_utils::skip_flaky_finder;
+use test_utils::{tags, upstream};
 
 async fn setup_with_mysql_flags<F>(set: F) -> (mysql_async::Opts, Handle, ShutdownSender)
 where
@@ -35,7 +35,7 @@ where
     let builder = TestBuilder::new(
         BackendBuilder::new()
             .require_authentication(false)
-            .users(users),
+            .users(Arc::new(AllowedUsers::new(users, None))),
     );
 
     set(builder).build::<MySQLAdapter>().await
@@ -1904,11 +1904,12 @@ async fn show_caches_with_always() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn show_readyset_status() {
     let (opts, _handle, shutdown_tx) = setup_with_mysql().await;
     let mut conn = Conn::new(opts).await.unwrap();
-    let mut ret: Vec<Row> = conn.query("SHOW READYSET STATUS;").await.unwrap();
+    let ret: Vec<Row> = conn.query("SHOW READYSET STATUS;").await.unwrap();
 
     let valid_timestamp = |s: String| {
         if s == "NULL" {
@@ -1927,45 +1928,24 @@ async fn show_readyset_status() {
         }
     };
 
-    // NOTE: If this readyset extension has changed, verify the new behavior is correct then update
-    // the expected values below
-    assert_eq!(ret.len(), 9);
-    let row = ret.remove(0);
-    assert_eq!(row.get::<String, _>(0).unwrap(), "Database Connection");
-    assert_eq!(row.get::<String, _>(1).unwrap(), "Connected");
-    let row = ret.remove(0);
-    assert_eq!(row.get::<String, _>(0).unwrap(), "Connection Count");
-    assert_eq!(row.get::<String, _>(1).unwrap(), "0");
-    let row = ret.remove(0);
-    assert_eq!(row.get::<String, _>(0).unwrap(), "Status");
-    assert_eq!(
-        row.get::<String, _>(1).unwrap(),
-        CurrentStatus::Online.to_string()
-    );
-    let row = ret.remove(0);
-    assert_eq!(
-        row.get::<String, _>(0).unwrap(),
-        "Maximum Replication Offset"
-    );
-    assert!(valid_binlog(row.get::<String, _>(1).unwrap()));
-    let row = ret.remove(0);
-    assert_eq!(
-        row.get::<String, _>(0).unwrap(),
-        "Minimum Replication Offset"
-    );
-    assert!(valid_binlog(row.get::<String, _>(1).unwrap()));
-    let row = ret.remove(0);
-    assert_eq!(row.get::<String, _>(0).unwrap(), "Last started Controller");
-    assert!(valid_timestamp(row.get::<String, _>(1).unwrap()));
-    let row = ret.remove(0);
-    assert_eq!(row.get::<String, _>(0).unwrap(), "Last completed snapshot");
-    assert!(valid_timestamp(row.get::<String, _>(1).unwrap()));
-    let row = ret.remove(0);
-    assert_eq!(row.get::<String, _>(0).unwrap(), "Last started replication");
-    assert!(valid_timestamp(row.get::<String, _>(1).unwrap()));
-    let row = ret.remove(0);
-    assert_eq!(row.get::<String, _>(0).unwrap(), "Enabled Features");
-    assert_eq!(row.get::<String, _>(1).unwrap(), "None");
+    let status_value = |key: &str| -> String {
+        ret.iter()
+            .find(|r| r.get::<String, _>(0).unwrap() == key)
+            .unwrap_or_else(|| panic!("`{key}` row missing from SHOW READYSET STATUS"))
+            .get::<String, _>(1)
+            .unwrap()
+    };
+
+    assert_eq!(status_value("Database Connection"), "Connected");
+    assert_eq!(status_value("Connection Count"), "0");
+    assert_eq!(status_value("Status"), CurrentStatus::Online.to_string());
+    assert_eq!(status_value("Replication Status"), "Running");
+    assert!(valid_binlog(status_value("Maximum Replication Offset")));
+    assert!(valid_binlog(status_value("Minimum Replication Offset")));
+    assert!(valid_timestamp(status_value("Last started Controller")));
+    assert!(valid_timestamp(status_value("Last completed snapshot")));
+    assert!(valid_timestamp(status_value("Last started replication")));
+    assert_eq!(status_value("Enabled Features"), "None");
     readyset_maintenance_mode(&mut conn).await;
     shutdown_tx.shutdown().await;
 }
@@ -1976,7 +1956,6 @@ async fn readyset_maintenance_mode(conn: &mut Conn) {
         .unwrap();
     sleep().await;
     let ret: Vec<Row> = conn.query("SHOW READYSET STATUS;").await.unwrap();
-    assert_eq!(ret.len(), 9);
     // find the row with "Status"
     let row = ret
         .iter()
@@ -1991,7 +1970,6 @@ async fn readyset_maintenance_mode(conn: &mut Conn) {
         .unwrap();
     sleep().await;
     let ret: Vec<Row> = conn.query("SHOW READYSET STATUS;").await.unwrap();
-    assert_eq!(ret.len(), 9);
     let row = ret
         .iter()
         .find(|r| r.get::<String, _>(0).unwrap() == "Status")
@@ -2014,10 +1992,10 @@ async fn show_readyset_version() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn simple_nonblocking_select() {
+async fn select_falls_through_on_zero_upquery_timeout() {
     let (opts, _handle, shutdown_tx) = TestBuilder::default()
         .replicate(false)
-        .read_behavior(ReadBehavior::NonBlocking)
+        .upquery_timeout(Duration::ZERO)
         .build::<MySQLAdapter>()
         .await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -2033,9 +2011,10 @@ async fn simple_nonblocking_select() {
 
     let res: Result<Vec<mysql_async::Row>, _> =
         conn.exec("SELECT * FROM test WHERE x = 4", ()).await;
-    assert_eq!(
-        last_query_info(&mut conn).await.noria_error,
-        ReadySetError::ReaderMissingKey.to_string()
+    let reason = last_query_info(&mut conn).await.reason;
+    assert!(
+        reason.contains(&ReadySetError::UpqueryTimeout.to_string()),
+        "expected reason to mention upquery timeout, got: {reason}"
     );
     res.unwrap_err();
 
@@ -2199,7 +2178,8 @@ async fn test_proxied_queries_telemetry() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn datetime_nanosecond_precision_text_protocol() {
     let mut direct_mysql = connect().await;
     direct_mysql.query_drop("SET sql_mode='';
@@ -2259,7 +2239,8 @@ async fn datetime_nanosecond_precision_text_protocol() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn datetime_nanosecond_precision_binary_protocol() {
     let mut direct_mysql = connect().await;
     direct_mysql.query_drop("SET sql_mode='';
@@ -2320,7 +2301,8 @@ async fn datetime_nanosecond_precision_binary_protocol() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn datetime_binary_protocol() {
     let (opts, _handle, shutdown_tx) = setup_with_mysql_flags(|b| b.recreate_database(false)).await;
     let mut conn = Conn::new(opts).await.unwrap();
@@ -2359,7 +2341,8 @@ async fn datetime_binary_protocol() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn timestamp_binary_protocol() {
     let mut direct_mysql = connect().await;
     direct_mysql.query_drop("
@@ -2408,7 +2391,8 @@ async fn timestamp_binary_protocol() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn timestamp_text_protocol() {
     let mut direct_mysql = connect().await;
     direct_mysql.query_drop("
@@ -2455,8 +2439,318 @@ async fn timestamp_text_protocol() {
     shutdown_tx.shutdown().await;
 }
 
+/// Verifies that TIMESTAMP values returned via the binary (prepared statement) protocol respect
+/// the client's `@@time_zone` session variable. The data is inserted at UTC, then both the
+/// direct MySQL connection and the ReadySet connection are switched to `+05:00` before querying.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
+#[ignore = "REA-6600: re-enable when SessionTimezone is threaded into eval"]
+async fn timestamp_client_timezone_binary() {
+    let mut direct_mysql = connect().await;
+    // Insert data with the upstream connection in UTC so the stored value is unambiguous.
+    direct_mysql
+        .query_drop(
+            "SET SESSION time_zone = '+00:00';
+             DROP TABLE IF EXISTS ts_client_tz_bin CASCADE;
+             CREATE TABLE ts_client_tz_bin (id INT PRIMARY KEY, ts TIMESTAMP);
+             INSERT INTO ts_client_tz_bin VALUES (1, '2024-06-15 12:00:00');",
+        )
+        .await
+        .unwrap();
+
+    let (opts, _handle, shutdown_tx) =
+        setup_with_mysql_flags(|b| b.recreate_database(false)).await;
+    let mut conn = Conn::new(opts).await.unwrap();
+    sleep().await;
+
+    conn.query_drop("CREATE CACHE FROM SELECT * FROM ts_client_tz_bin WHERE id = ?")
+        .await
+        .unwrap();
+    sleep().await;
+
+    // Switch both connections to +05:00.
+    direct_mysql
+        .query_drop("SET SESSION time_zone = '+05:00'")
+        .await
+        .unwrap();
+    conn.query_drop("SET SESSION time_zone = '+05:00'")
+        .await
+        .unwrap();
+
+    eventually!(run_test: {
+        let my_row: Row = direct_mysql
+            .exec_first("SELECT * FROM ts_client_tz_bin WHERE id = ?", (1,))
+            .await
+            .unwrap()
+            .unwrap();
+        let rs_row: Row = conn
+            .exec_first("SELECT * FROM ts_client_tz_bin WHERE id = ?", (1,))
+            .await
+            .unwrap()
+            .unwrap();
+        AssertUnwindSafe(move || (rs_row, my_row))
+    }, then_assert: |results| {
+        let (rs_row, my_row) = results();
+        // MySQL returns 2024-06-15 17:00:00 (12:00 UTC + 5h).
+        // ReadySet must do the same.
+        assert_eq!(rs_row.unwrap_raw(), my_row.unwrap_raw());
+    });
+    shutdown_tx.shutdown().await;
+}
+
+/// Same as above but exercises the text protocol (`query` instead of `exec`).
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql, modern)]
+#[ignore = "REA-6600: re-enable when SessionTimezone is threaded into eval"]
+async fn timestamp_client_timezone_text() {
+    let mut direct_mysql = connect().await;
+    direct_mysql
+        .query_drop(
+            "SET SESSION time_zone = '+00:00';
+             DROP TABLE IF EXISTS ts_client_tz_text CASCADE;
+             CREATE TABLE ts_client_tz_text (id INT PRIMARY KEY, ts TIMESTAMP);
+             INSERT INTO ts_client_tz_text VALUES (1, '2024-06-15 12:00:00');",
+        )
+        .await
+        .unwrap();
+
+    let (opts, _handle, shutdown_tx) =
+        setup_with_mysql_flags(|b| b.recreate_database(false)).await;
+    let mut conn = Conn::new(opts).await.unwrap();
+    sleep().await;
+
+    conn.query_drop("CREATE CACHE FROM SELECT * FROM ts_client_tz_text WHERE id = ?")
+        .await
+        .unwrap();
+    sleep().await;
+
+    direct_mysql
+        .query_drop("SET SESSION time_zone = '+05:00'")
+        .await
+        .unwrap();
+    conn.query_drop("SET SESSION time_zone = '+05:00'")
+        .await
+        .unwrap();
+
+    eventually!(run_test: {
+        let my_rows: Vec<(i32, String)> = direct_mysql
+            .query("SELECT * FROM ts_client_tz_text WHERE id = 1")
+            .await
+            .unwrap();
+        let rs_rows: Vec<(i32, String)> = conn
+            .query("SELECT * FROM ts_client_tz_text WHERE id = 1")
+            .await
+            .unwrap();
+        AssertUnwindSafe(move || (rs_rows, my_rows))
+    }, then_assert: |results| {
+        let (rs_rows, my_rows) = results();
+        assert_eq!(rs_rows, my_rows);
+    });
+    shutdown_tx.shutdown().await;
+}
+
+/// Verifies that `SET time_zone = 'SYSTEM'` correctly resets TIMESTAMP conversion back to the
+/// server's local timezone after a fixed offset was previously active.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql, modern)]
+#[ignore = "REA-6600: re-enable when SessionTimezone is threaded into eval"]
+async fn timestamp_client_timezone_system_reset() {
+    let mut direct_mysql = connect().await;
+    direct_mysql
+        .query_drop(
+            "SET SESSION time_zone = '+00:00';
+             DROP TABLE IF EXISTS ts_sys_reset CASCADE;
+             CREATE TABLE ts_sys_reset (id INT PRIMARY KEY, ts TIMESTAMP);
+             INSERT INTO ts_sys_reset VALUES (1, '2024-06-15 12:00:00');",
+        )
+        .await
+        .unwrap();
+
+    let (opts, _handle, shutdown_tx) =
+        setup_with_mysql_flags(|b| b.recreate_database(false)).await;
+    let mut conn = Conn::new(opts).await.unwrap();
+    sleep().await;
+
+    conn.query_drop("CREATE CACHE FROM SELECT * FROM ts_sys_reset WHERE id = ?")
+        .await
+        .unwrap();
+    sleep().await;
+
+    // Set a fixed offset first, then reset to SYSTEM on both connections.
+    for c in [&mut direct_mysql, &mut conn] {
+        c.query_drop("SET SESSION time_zone = '+05:00'").await.unwrap();
+    }
+    for c in [&mut direct_mysql, &mut conn] {
+        c.query_drop("SET SESSION time_zone = 'SYSTEM'").await.unwrap();
+    }
+
+    eventually!(run_test: {
+        let my_rows: Vec<(i32, String)> = direct_mysql
+            .query("SELECT * FROM ts_sys_reset WHERE id = 1")
+            .await
+            .unwrap();
+        let rs_rows: Vec<(i32, String)> = conn
+            .query("SELECT * FROM ts_sys_reset WHERE id = 1")
+            .await
+            .unwrap();
+        AssertUnwindSafe(move || (rs_rows, my_rows))
+    }, then_assert: |results| {
+        let (rs_rows, my_rows) = results();
+        assert_eq!(rs_rows, my_rows);
+    });
+    shutdown_tx.shutdown().await;
+}
+
+/// Verifies that TIMESTAMP values respect an IANA named timezone (with DST) set via
+/// `SET time_zone = 'US/Eastern'`. Uses the binary protocol. The test inserts a row in summer
+/// (EDT, UTC-4) and one in winter (EST, UTC-5) to verify DST-dependent offsets are applied.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql, modern)]
+#[ignore = "REA-6600: re-enable when SessionTimezone is threaded into eval"]
+async fn timestamp_client_named_timezone_binary() {
+    let mut direct_mysql = connect().await;
+    direct_mysql
+        .query_drop(
+            "SET SESSION time_zone = '+00:00';
+             DROP TABLE IF EXISTS ts_named_tz_bin CASCADE;
+             CREATE TABLE ts_named_tz_bin (id INT PRIMARY KEY, ts TIMESTAMP);
+             INSERT INTO ts_named_tz_bin VALUES (1, '2024-06-15 12:00:00');
+             INSERT INTO ts_named_tz_bin VALUES (2, '2024-01-15 12:00:00');",
+        )
+        .await
+        .unwrap();
+
+    let (opts, _handle, shutdown_tx) =
+        setup_with_mysql_flags(|b| b.recreate_database(false)).await;
+    let mut conn = Conn::new(opts).await.unwrap();
+    sleep().await;
+
+    conn.query_drop("CREATE CACHE FROM SELECT * FROM ts_named_tz_bin WHERE id = ?")
+        .await
+        .unwrap();
+    sleep().await;
+
+    direct_mysql
+        .query_drop("SET SESSION time_zone = 'US/Eastern'")
+        .await
+        .unwrap();
+    conn.query_drop("SET SESSION time_zone = 'US/Eastern'")
+        .await
+        .unwrap();
+
+    for id in 1..=2 {
+        eventually!(run_test: {
+            let my_row: Row = direct_mysql
+                .exec_first("SELECT * FROM ts_named_tz_bin WHERE id = ?", (id,))
+                .await
+                .unwrap()
+                .unwrap();
+            let rs_row: Row = conn
+                .exec_first("SELECT * FROM ts_named_tz_bin WHERE id = ?", (id,))
+                .await
+                .unwrap()
+                .unwrap();
+            AssertUnwindSafe(move || (rs_row, my_row))
+        }, then_assert: |results| {
+            let (rs_row, my_row) = results();
+            assert_eq!(rs_row.unwrap_raw(), my_row.unwrap_raw());
+        });
+    }
+    shutdown_tx.shutdown().await;
+}
+
+/// Same as above but exercises the text protocol.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql, modern)]
+#[ignore = "REA-6600: re-enable when SessionTimezone is threaded into eval"]
+async fn timestamp_client_named_timezone_text() {
+    let mut direct_mysql = connect().await;
+    direct_mysql
+        .query_drop(
+            "SET SESSION time_zone = '+00:00';
+             DROP TABLE IF EXISTS ts_named_tz_text CASCADE;
+             CREATE TABLE ts_named_tz_text (id INT PRIMARY KEY, ts TIMESTAMP);
+             INSERT INTO ts_named_tz_text VALUES (1, '2024-06-15 12:00:00');
+             INSERT INTO ts_named_tz_text VALUES (2, '2024-01-15 12:00:00');",
+        )
+        .await
+        .unwrap();
+
+    let (opts, _handle, shutdown_tx) =
+        setup_with_mysql_flags(|b| b.recreate_database(false)).await;
+    let mut conn = Conn::new(opts).await.unwrap();
+    sleep().await;
+
+    conn.query_drop("CREATE CACHE FROM SELECT * FROM ts_named_tz_text WHERE id = ?")
+        .await
+        .unwrap();
+    sleep().await;
+
+    direct_mysql
+        .query_drop("SET SESSION time_zone = 'US/Eastern'")
+        .await
+        .unwrap();
+    conn.query_drop("SET SESSION time_zone = 'US/Eastern'")
+        .await
+        .unwrap();
+
+    for id in 1..=2 {
+        eventually!(run_test: {
+            let my_rows: Vec<(i32, String)> = direct_mysql
+                .query(format!("SELECT * FROM ts_named_tz_text WHERE id = {id}"))
+                .await
+                .unwrap();
+            let rs_rows: Vec<(i32, String)> = conn
+                .query(format!("SELECT * FROM ts_named_tz_text WHERE id = {id}"))
+                .await
+                .unwrap();
+            AssertUnwindSafe(move || (rs_rows, my_rows))
+        }, then_assert: |results| {
+            let (rs_rows, my_rows) = results();
+            assert_eq!(rs_rows, my_rows);
+        });
+    }
+    shutdown_tx.shutdown().await;
+}
+
+/// Pins `SET @@time_zone` rejection while dataflow-expression eval lacks a
+/// `SessionTimezone` parameter. Without the gate, a non-UTC session would
+/// silently get the stored UTC wallclock from cache — wrong. With default
+/// `Error` mode the SET itself must fail; UTC SETs continue to succeed.
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql, modern)]
+async fn set_time_zone_non_utc_errors() {
+    let (opts, _handle, shutdown_tx) =
+        setup_with_mysql_flags(|b| b.recreate_database(false)).await;
+    let mut conn = Conn::new(opts).await.unwrap();
+    sleep().await;
+
+    conn.query_drop("SET SESSION time_zone = '+00:00'")
+        .await
+        .expect("UTC session must be accepted");
+
+    let err = conn
+        .query_drop("SET SESSION time_zone = '+05:30'")
+        .await
+        .expect_err("non-UTC session must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.to_ascii_lowercase().contains("set"),
+        "error must mention the rejected SET, got: {msg}"
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn date_only_text_protocol() {
     readyset_tracing::init_test_logging();
     let mut direct_mysql = connect().await;
@@ -2522,7 +2816,8 @@ async fn date_only_text_protocol() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn test_char_column_padding_binary_collation() {
     readyset_tracing::init_test_logging();
     let mut my_conn = connect().await;
@@ -2571,7 +2866,7 @@ async fn test_char_column_padding_binary_collation() {
         // Test with text protocol
         eventually!(run_test: {
             let my_rows: Vec<Vec<u8>> = my_conn
-                .query(dbg!(format!("SELECT * FROM char_binary_padding WHERE col1 = '{val}'")))
+                .query(format!("SELECT * FROM char_binary_padding WHERE col1 = '{val}'"))
                 .await
                 .unwrap();
             let rs_rows: Vec<Vec<u8>> = rs_conn
@@ -2590,7 +2885,8 @@ async fn test_char_column_padding_binary_collation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn test_binary_column_padding() {
     readyset_tracing::init_test_logging();
     let mut my_conn = connect().await;
@@ -2658,7 +2954,8 @@ async fn test_binary_column_padding() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn test_case_expr_then_expr() {
     let mut direct_mysql = connect().await;
     let (opts, _handle, shutdown_tx) = setup_with_mysql_flags(|b| b.recreate_database(false)).await;
@@ -2888,7 +3185,8 @@ async fn test_column_definition_verify(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_column_definition_upstream_readyset_snapshot() {
     readyset_tracing::init_test_logging();
     let mut direct_mysql = connect().await;
@@ -2906,7 +3204,8 @@ async fn test_column_definition_upstream_readyset_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_column_definition_upstream_readyset_replication() {
     readyset_tracing::init_test_logging();
     let mut direct_mysql = connect().await;
@@ -2924,7 +3223,8 @@ async fn test_column_definition_upstream_readyset_replication() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn text_citext_default_coercion_minimal_row_base_replication() {
     readyset_tracing::init_test_logging();
     let mut direct_mysql = connect().await;
@@ -2973,7 +3273,8 @@ async fn text_citext_default_coercion_minimal_row_base_replication() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn test_default_value_not_null_for_replication() {
     readyset_tracing::init_test_logging();
     let (rs_opts, _rs_handle, tx) = TestBuilder::default()
@@ -3148,37 +3449,43 @@ async fn test_utf8(coll: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_utf8_ai_ci() {
     test_utf8("utf8mb4_0900_ai_ci").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_utf8_as_ci() {
     test_utf8("utf8mb4_0900_as_ci").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_utf8mb4_general_ci() {
     test_utf8("utf8mb4_general_ci").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_utf8mb4_unicode_ci() {
     test_utf8("utf8mb4_unicode_ci").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_utf8mb3_unicode_ci() {
     test_utf8("utf8mb3_unicode_ci").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn test_latin1_swedish_ci() {
     readyset_tracing::init_test_logging();
     let (rs_opts, _rs_handle, tx) = setup_with_mysql().await;
@@ -3241,7 +3548,8 @@ async fn test_latin1_swedish_ci() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_utf8mb4_bin() {
     readyset_tracing::init_test_logging();
     let (rs_opts, _rs_handle, tx) = setup_with_mysql().await;
@@ -3315,7 +3623,8 @@ async fn test_utf8mb4_bin() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn shallow_cache_protocol_crossing() {
     readyset_tracing::init_test_logging();
     let (opts, _handle, shutdown_tx) = TestBuilder::default()
@@ -3353,7 +3662,7 @@ async fn shallow_cache_protocol_crossing() {
         .await
         .unwrap();
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     // should hit
     let _: Vec<(i32, i32)> = conn
@@ -3361,7 +3670,7 @@ async fn shallow_cache_protocol_crossing() {
         .await
         .unwrap();
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     // should miss due to no metadata
     let _: Vec<(i32, i32)> = conn
@@ -3369,7 +3678,7 @@ async fn shallow_cache_protocol_crossing() {
         .await
         .unwrap();
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     // should hit
     let _: Vec<(i32, i32)> = conn
@@ -3377,7 +3686,7 @@ async fn shallow_cache_protocol_crossing() {
         .await
         .unwrap();
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     // should hit; metadata are present but unneeded
     let _: Vec<(i32, i32)> = conn
@@ -3385,13 +3694,14 @@ async fn shallow_cache_protocol_crossing() {
         .await
         .unwrap();
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     shutdown_tx.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn shallow_cache_prepared_statement_without_parameters() {
     readyset_tracing::init_test_logging();
     let (opts, _handle, shutdown_tx) = TestBuilder::default()
@@ -3417,17 +3727,18 @@ async fn shallow_cache_prepared_statement_without_parameters() {
 
     let _: Vec<i32> = conn.exec("SELECT a FROM shallow", ()).await.unwrap();
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     let _: Vec<i32> = conn.exec("SELECT a FROM shallow", ()).await.unwrap();
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     shutdown_tx.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn shallow_cache_equality_and_in_clause() {
     readyset_tracing::init_test_logging();
     let (opts, _handle, shutdown_tx) = TestBuilder::default()
@@ -3476,7 +3787,7 @@ async fn shallow_cache_equality_and_in_clause() {
     results.sort();
     assert_eq!(results, vec![(1, 10, 100), (1, 20, 200)]);
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     // Second identical query should hit
     let mut results: Vec<(i32, i32, i32)> = conn
@@ -3487,7 +3798,7 @@ async fn shallow_cache_equality_and_in_clause() {
     results.sort();
     assert_eq!(results, vec![(1, 10, 100), (1, 20, 200)]);
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     // In set contents should be normalized (sorted)
     let mut results: Vec<(i32, i32, i32)> = conn
@@ -3498,7 +3809,7 @@ async fn shallow_cache_equality_and_in_clause() {
     results.sort();
     assert_eq!(results, vec![(1, 10, 100), (1, 20, 200)]);
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     // Different IN values should miss
     let mut results: Vec<(i32, i32, i32)> = conn
@@ -3509,13 +3820,14 @@ async fn shallow_cache_equality_and_in_clause() {
     results.sort();
     assert_eq!(results, vec![(1, 20, 200), (1, 30, 300)]);
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     shutdown_tx.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn shallow_cache_in_clause_prepared() {
     readyset_tracing::init_test_logging();
     let (opts, _handle, shutdown_tx) = TestBuilder::default()
@@ -3565,7 +3877,7 @@ async fn shallow_cache_in_clause_prepared() {
     results.sort();
     assert_eq!(results, vec![(1, 10, 100), (1, 20, 200)]);
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     // Second identical query should hit
     let mut results: Vec<(i32, i32, i32)> = conn
@@ -3576,7 +3888,7 @@ async fn shallow_cache_in_clause_prepared() {
     results.sort();
     assert_eq!(results, vec![(1, 10, 100), (1, 20, 200)]);
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     // In set contents should be normalized (sorted)
     let mut results: Vec<(i32, i32, i32)> = conn
@@ -3587,7 +3899,7 @@ async fn shallow_cache_in_clause_prepared() {
     results.sort();
     assert_eq!(results, vec![(1, 10, 100), (1, 20, 200)]);
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     // Prepared statement should also hit cache
     let mut results: Vec<(i32, i32, i32)> = conn.exec(&stmt, (10, 20)).await.unwrap();
@@ -3595,7 +3907,7 @@ async fn shallow_cache_in_clause_prepared() {
     results.sort();
     assert_eq!(results, vec![(1, 10, 100), (1, 20, 200)]);
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::ReadysetShallow);
+    assert_matches!(info.destination, QueryDestination::ReadysetShallow(_));
 
     // Different IN values should miss
     let mut results: Vec<(i32, i32, i32)> = conn
@@ -3606,7 +3918,7 @@ async fn shallow_cache_in_clause_prepared() {
     results.sort();
     assert_eq!(results, vec![(1, 20, 200), (1, 30, 300)]);
     let info = last_query_info(&mut conn).await;
-    assert_matches!(info.destination, QueryDestination::Upstream);
+    assert_matches!(info.destination, QueryDestination::ReadysetThenUpstream(_));
 
     shutdown_tx.shutdown().await;
 }

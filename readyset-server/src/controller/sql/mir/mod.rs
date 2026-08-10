@@ -4,7 +4,6 @@ use std::fmt::Debug;
 use std::iter;
 use std::vec::Vec;
 
-use ::serde::{Deserialize, Serialize};
 use catalog_tables::is_catalog_table;
 use common::IndexType;
 use dataflow::ops::grouped::aggregate::Aggregation;
@@ -20,6 +19,7 @@ use mir::DfNodeIndex;
 pub use mir::{Column, NodeIndex};
 use petgraph::visit::Reversed;
 use petgraph::Direction;
+use readyset_client::post_processing::PostLookupAggregateFunction;
 use readyset_client::ViewPlaceholder;
 use readyset_data::Dialect;
 use readyset_errors::{
@@ -34,7 +34,7 @@ use readyset_sql::ast::{
     InValue, LimitClause, Literal, NonReplicatedRelation, NullOrder, OrderBy, OrderClause,
     OrderType, Relation, SelectStatement, SqlIdentifier, TableExprInner, TableKey, UnaryOperator,
 };
-use readyset_sql::DialectDisplay;
+use readyset_sql::{DialectDisplay, TryIntoDialect as _};
 use readyset_sql_passes::{is_correlated, outermost_table_exprs};
 use readyset_util::redacted::Sensitive;
 use tracing::{debug, trace};
@@ -47,7 +47,7 @@ use crate::controller::sql::mir::grouped::{
 };
 use crate::controller::sql::mir::join::{make_cross_joins, make_joins};
 use crate::controller::sql::query_graph::{
-    to_query_graph, ExprColumn, OutputColumn, Pagination, QueryGraph,
+    to_query_graph, ExprColumn, OutputColumn, Pagination, QueryGraph, RelationSource,
 };
 use crate::controller::sql::query_signature::Signature;
 use crate::sql::query_graph::WindowFunction;
@@ -147,7 +147,7 @@ impl LeafBehavior {
 }
 
 /// Configuration for how SQL is converted to MIR
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub(crate) struct Config {
     /// If set to `true`, a SQL `ORDER BY` with `LIMIT` will emit a [`TopK`][] node. If set to
     /// `false`, the SQL conversion process returns a [`ReadySetError::Unsupported`], causing the
@@ -170,15 +170,12 @@ pub(crate) struct Config {
 
     /// Enable support for post-lookup (queries which do extra work after the lookup into the
     /// reader)
-    #[serde(default)]
     pub(crate) allow_post_lookup: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub(super) struct SqlToMirConverter {
     pub(in crate::controller::sql) config: Config,
-    pub(in crate::controller::sql) base_schemas:
-        HashMap<Relation, Vec<(usize, Vec<ColumnSpecification>)>>,
     /// The graph containing all of the MIR base tables, views and cached queries.
     /// Each of them are a subgraph in the MIR Graph.
     pub(in crate::controller::sql) mir_graph: MirGraph,
@@ -206,7 +203,6 @@ impl SqlToMirConverter {
     pub(crate) fn new(dialect: Dialect) -> Self {
         Self {
             config: Default::default(),
-            base_schemas: Default::default(),
             mir_graph: Default::default(),
             relations: Default::default(),
             non_replicated_relations: Default::default(),
@@ -346,6 +342,7 @@ impl SqlToMirConverter {
                         .transpose()?,
                     limit,
                     make_topk,
+                    /* topk_buffer_multiplier */ None,
                     // TODO: we should have access to the output cols even if this is a compound query
                     None,
                 )?
@@ -402,8 +399,14 @@ impl SqlToMirConverter {
         &mut self,
         name: Relation,
         body: &CreateTableBody,
+        replica_identity_key: Option<&[SqlIdentifier]>,
     ) -> ReadySetResult<MirBase<'_>> {
-        let n = self.make_base_node(&name, &body.fields, body.keys.as_ref())?;
+        let n = self.make_base_node(
+            &name,
+            &body.fields,
+            body.keys.as_ref(),
+            replica_identity_key,
+        )?;
         Ok(MirBase {
             name,
             mir_node: n,
@@ -577,6 +580,7 @@ impl SqlToMirConverter {
         table_name: &Relation,
         cols: &[ColumnSpecification],
         keys: Option<&Vec<TableKey>>,
+        replica_identity_key: Option<&[SqlIdentifier]>,
     ) -> ReadySetResult<NodeIndex> {
         if let Some(ni) = self.get_relation(table_name) {
             match &self.mir_graph[ni].inner {
@@ -675,6 +679,23 @@ impl SqlToMirConverter {
 
                 (primary_key, unique_keys_vec.into_boxed_slice())
             }
+        };
+
+        // If a replica identity key override is specified, use it as the primary key
+        // and demote the original PK to a unique key.
+        let (primary_key, unique_keys) = if let Some(ri_cols) = replica_identity_key {
+            let ri_key: Box<[Column]> = ri_cols
+                .iter()
+                .map(|name| Column::new(Some(table_name.clone()), name.clone()))
+                .collect();
+
+            let mut uks = unique_keys.into_vec();
+            if let Some(old_pk) = primary_key {
+                uks.push(old_pk);
+            }
+            (Some(ri_key), uks.into_boxed_slice())
+        } else {
+            (primary_key, unique_keys)
         };
 
         // remember the schema for this version
@@ -848,16 +869,13 @@ impl SqlToMirConverter {
                 format!("{}_coalesce_over_col", name.display_unquoted()).into(),
                 parent,
                 vec![ProjectExpr::Expr {
-                    expr: Expr::Call(Call {
-                        name: "coalesce".into(),
-                        arguments: Some(vec![
-                            Expr::Column(ast::Column {
-                                table: over_col.table.clone(),
-                                name: over_col.name.clone(),
-                            }),
-                            Expr::Literal(0.into()),
-                        ]),
-                    }),
+                    expr: Expr::Call(FunctionExpr::Coalesce(vec![
+                        Expr::Column(ast::Column {
+                            table: over_col.table.clone(),
+                            name: over_col.name.clone(),
+                        }),
+                        Expr::Literal(0.into()),
+                    ])),
                     alias: coalesce_alias.clone(),
                 }],
             );
@@ -993,6 +1011,7 @@ impl SqlToMirConverter {
                         group_by,
                         output_column,
                         kind,
+                        skip_finalization: false,
                     },
                 ),
                 GroupedNodeType::Aggregation(kind) => MirNode::new(
@@ -1026,6 +1045,7 @@ impl SqlToMirConverter {
         left_node: NodeIndex,
         right_node: NodeIndex,
         kind: JoinKind,
+        left_local_preds: Vec<Expr>,
     ) -> ReadySetResult<NodeIndex> {
         // TODO(malte): this is where we overproject join columns in order to increase reuse
         // opportunities. Technically, we need to only project those columns here that the query
@@ -1078,9 +1098,17 @@ impl SqlToMirConverter {
 
         let inner = match kind {
             JoinKind::Inner => MirNodeInner::Join { on, project },
-            JoinKind::Left => MirNodeInner::LeftJoin { on, project },
+            JoinKind::Left => MirNodeInner::LeftJoin {
+                on,
+                project,
+                left_local_preds,
+            },
             JoinKind::DependentInner => MirNodeInner::DependentJoin { on, project },
-            JoinKind::DependentLeft => MirNodeInner::DependentLeftJoin { on, project },
+            JoinKind::DependentLeft => MirNodeInner::DependentLeftJoin {
+                on,
+                project,
+                left_local_preds,
+            },
         };
         trace!(?inner, "Added join node");
         Ok(self.add_query_node(
@@ -1127,6 +1155,7 @@ impl SqlToMirConverter {
             } else {
                 JoinKind::Left
             },
+            vec![],
         )?;
 
         Ok(self.make_filter_node(
@@ -1147,11 +1176,17 @@ impl SqlToMirConverter {
         name: Relation,
         left_parent: NodeIndex,
         right_parent: NodeIndex,
+        group_by: &[Column],
     ) -> ReadySetResult<NodeIndex> {
         trace!("Added join aggregates node");
         Ok(self.add_query_node(
             query_name.clone(),
-            MirNode::new(name, MirNodeInner::JoinAggregates),
+            MirNode::new(
+                name,
+                MirNodeInner::JoinAggregates {
+                    group_by: group_by.to_vec(),
+                },
+            ),
             &[left_parent, right_parent],
         ))
     }
@@ -1200,6 +1235,7 @@ impl SqlToMirConverter {
             &query_graph,
             &HashMap::new(),
             LeafBehavior::Anonymous,
+            None,
         )?;
 
         let cols = self.columns(subquery_leaf);
@@ -1246,6 +1282,7 @@ impl SqlToMirConverter {
             } else {
                 JoinKind::Left
             },
+            vec![],
         )?;
 
         Ok(self.make_project_node(
@@ -1310,6 +1347,7 @@ impl SqlToMirConverter {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn make_paginate_node(
         &mut self,
         query_name: &Relation,
@@ -1319,12 +1357,17 @@ impl SqlToMirConverter {
         order: &Option<Vec<(Expr, OrderType, NullOrder)>>,
         limit: usize,
         is_topk: bool,
+        topk_buffer_multiplier: Option<usize>,
         outputs: Option<&Vec<OutputColumn>>,
     ) -> ReadySetResult<Vec<NodeIndex>> {
         if !self.config.allow_topk && is_topk {
             unsupported!("TopK is not supported");
         } else if !self.config.allow_paginate && !is_topk {
             unsupported!("Paginate is not supported");
+        }
+
+        if limit == 0 {
+            unsupported!("LIMIT 0 is not supported");
         }
 
         // Gather a list of expressions we need to evaluate before the paginate node
@@ -1433,6 +1476,8 @@ impl SqlToMirConverter {
                         order,
                         group_by,
                         limit,
+                        topk_buffer_multiplier,
+                        query_name: query_name.clone(),
                     },
                 )
             } else {
@@ -1474,6 +1519,7 @@ impl SqlToMirConverter {
             &query_graph,
             &HashMap::new(),
             LeafBehavior::Anonymous,
+            None,
         )?;
 
         // -> π[lit: 0, lit: 0]
@@ -1561,6 +1607,7 @@ impl SqlToMirConverter {
                 } else {
                     JoinKind::Inner
                 },
+                vec![],
             )
         }
     }
@@ -1851,6 +1898,7 @@ impl SqlToMirConverter {
             &query_graph,
             &HashMap::new(),
             LeafBehavior::Anonymous,
+            None,
         )?;
 
         let cols = self.columns(subquery_leaf);
@@ -1900,6 +1948,7 @@ impl SqlToMirConverter {
                 } else {
                     JoinKind::Inner
                 },
+                vec![],
             )?
         };
 
@@ -2111,12 +2160,20 @@ impl SqlToMirConverter {
             .cloned()
             .collect::<Vec<_>>();
 
-        let has_agg = |e: &Expr| matches!(e, Expr::Call(f) if is_aggregate(f));
-        if partition_by.iter().any(has_agg)
-            || arguments.iter().any(has_agg)
-            || order_cols.iter().any(has_agg)
+        // Safety net: all aggregates should have been rewritten to Column refs
+        // during QueryGraph construction. If any survived (possibly nested
+        // inside CASE WHEN, BinaryOp, etc.), it means map_aggregates did not
+        // handle the expression shape — reject rather than produce wrong results.
+        let has_residual_agg =
+            |e: &Expr| readyset_sql_passes::is_aggregated_expr(e).unwrap_or(false);
+        if partition_by.iter().any(has_residual_agg)
+            || arguments.iter().any(has_residual_agg)
+            || order_cols.iter().any(has_residual_agg)
         {
-            unsupported!("Aggregates in window functions not yet supported");
+            unsupported!(
+                "Unresolved aggregate inside window function PARTITION BY, ORDER BY, \
+                 or arguments — the surrounding expression shape is not supported"
+            );
         }
 
         // if the partition, ordering cols, or args require projection,
@@ -2146,7 +2203,7 @@ impl SqlToMirConverter {
                     .map(|e| -> ReadySetResult<_> {
                         Ok(ProjectExpr::Expr {
                             alias: e
-                                .alias(dialect)
+                                .qualified_alias(dialect)
                                 // returns None if e is a placeholder or a variable
                                 .ok_or_else(|| {
                                     unsupported_err!("Placeholders not allowed in this context")
@@ -2165,7 +2222,7 @@ impl SqlToMirConverter {
             .iter()
             .map(|e| match e {
                 Expr::Column(c) => Column::from(c.clone()),
-                _ => Column::named(e.alias(dialect).unwrap()),
+                _ => Column::named(e.qualified_alias(dialect).unwrap()),
             })
             .collect();
 
@@ -2174,7 +2231,7 @@ impl SqlToMirConverter {
             .map(|(e, order, no)| {
                 let col = match e {
                     Expr::Column(c) => Column::from(c),
-                    _ => Column::named(e.alias(dialect).unwrap()),
+                    _ => Column::named(e.qualified_alias(dialect).unwrap()),
                 };
                 (col, order, no)
             })
@@ -2184,7 +2241,7 @@ impl SqlToMirConverter {
             .iter()
             .map(|e| match e {
                 Expr::Column(c) => Column::from(c.clone()),
-                _ => Column::named(e.alias(dialect).unwrap()),
+                _ => Column::named(e.qualified_alias(dialect).unwrap()),
             })
             .collect();
 
@@ -2302,6 +2359,7 @@ impl SqlToMirConverter {
         query_graph: &QueryGraph,
         anon_queries: &HashMap<Relation, NodeIndex>,
         leaf_behavior: LeafBehavior,
+        topk_buffer_multiplier: Option<usize>,
     ) -> Result<NodeIndex, ReadySetError> {
         // TODO(fran): We are not modifying the execution of this method with the implementation
         //  of petgraph, which causes us to create nodes that could now easily be reused:
@@ -2323,26 +2381,74 @@ impl SqlToMirConverter {
             let mut sorted_rels: Vec<&Relation> = query_graph.relations.keys().collect();
             sorted_rels.sort_unstable();
             for rel in &sorted_rels {
-                let base_for_rel = if let Some(subquery) = &query_graph.relations[*rel].subgraph {
-                    let correlated = subquery.is_correlated;
-                    let subquery_leaf = self.named_query_to_mir(
-                        query_name,
-                        subquery,
-                        &HashMap::new(),
-                        LeafBehavior::Anonymous,
-                    )?;
-                    if correlated {
-                        correlated_relations.insert(subquery_leaf);
+                let qg_node = &query_graph.relations[*rel];
+                let base_for_rel = match &qg_node.source {
+                    RelationSource::Subquery(subquery) => {
+                        let correlated = subquery.is_correlated;
+                        let subquery_leaf = self.named_query_to_mir(
+                            query_name,
+                            subquery,
+                            &HashMap::new(),
+                            LeafBehavior::Anonymous,
+                            None,
+                        )?;
+                        if correlated {
+                            correlated_relations.insert(subquery_leaf);
+                        }
+                        subquery_leaf
                     }
-                    subquery_leaf
-                } else {
-                    match self.get_relation(rel) {
+                    RelationSource::Values(values) => {
+                        // Convert VALUES clause to Constant MIR node
+                        // (Standalone VALUES are already rejected in query_graph.rs)
+                        let sql_dialect: readyset_sql::Dialect = self.dialect.into();
+
+                        let rows: Vec<Vec<readyset_data::DfValue>> = values
+                            .rows
+                            .iter()
+                            .map(|row| {
+                                row.iter()
+                                    .map(|lit| lit.try_into_dialect(sql_dialect))
+                                    .collect::<Result<Vec<_>, _>>()
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+
+                        // Infer column types from the converted values, scanning all
+                        // rows to find the first non-Unknown type for each column.
+                        //
+                        // Column aliases should have the exact same length as the
+                        // actual data because of the rewrite pass and the invariant
+                        // check in query_graph.rs.
+                        let num_cols = values.column_names.len();
+                        let mut column_types = vec![readyset_data::DfType::Unknown; num_cols];
+                        for row in &rows {
+                            for (i, val) in row.iter().enumerate() {
+                                if matches!(column_types[i], readyset_data::DfType::Unknown) {
+                                    let inferred = val.infer_dataflow_type();
+                                    if !matches!(inferred, readyset_data::DfType::Unknown) {
+                                        column_types[i] = inferred;
+                                    }
+                                }
+                            }
+                        }
+
+                        let constant_node = MirNode::new(
+                            (*rel).clone(),
+                            MirNodeInner::Constant {
+                                rows,
+                                column_names: values.column_names.clone(),
+                                column_types,
+                            },
+                        );
+
+                        self.add_query_node(query_name.clone(), constant_node, &[])
+                    }
+                    RelationSource::Table => match self.get_relation(rel) {
                         Some(node_idx) => node_idx,
                         None => anon_queries
                             .get(rel)
                             .copied()
                             .ok_or_else(|| self.table_not_found_err(rel))?,
-                    }
+                    },
                 };
 
                 self.mir_graph[base_for_rel].add_owner(query_name.clone());
@@ -2516,20 +2622,8 @@ impl SqlToMirConverter {
                 prev_node = subquery_leaf;
             }
 
-            // 8. Add window functions or grouped nodes (mutually exclusive for now)
-            if !query_graph.aggregates.is_empty() && !query_graph.window_functions.is_empty() {
-                unsupported!("Mixing window functions and aggregates is not yet supported")
-            };
-
+            // 8. Add grouped (aggregate) nodes
             let group_by: Vec<_> = view_key.columns.iter().map(|(c, _)| c.clone()).collect();
-
-            prev_node = self.make_window_node(
-                query_name,
-                format!("q_{:x}", query_graph.signature().hash).into(),
-                prev_node,
-                &query_graph.window_functions,
-                group_by,
-            )?;
 
             let mut func_nodes: Vec<NodeIndex> = make_grouped(
                 self,
@@ -2555,18 +2649,29 @@ impl SqlToMirConverter {
                 prev_node = subquery_leaf;
             }
 
+            // 9a. Add window function nodes (after aggregation and HAVING,
+            //     matching SQL evaluation order)
+            prev_node = self.make_window_node(
+                query_name,
+                format!("q_{:x}", query_graph.signature().hash).into(),
+                prev_node,
+                &query_graph.window_functions,
+                group_by,
+            )?;
+
             // 10. Get the final node
             let mut final_node = prev_node;
 
-            if let Some(Pagination {
-                order,
-                limit,
-                offset,
-            }) = query_graph.pagination.as_ref()
-            {
-                let make_topk = offset.is_none();
-                // view key will have the offset parameter if it exists. We must filter it out
-                // of the group by, because the column originates at this node
+            // Helper: build a TopK or Paginate node and wire it into the graph.
+            // Returns the last node created by make_paginate_node.
+            let mut add_topk_or_paginate = |this: &mut Self,
+                                            final_node: NodeIndex,
+                                            pagination: &Pagination|
+             -> ReadySetResult<NodeIndex> {
+                let make_topk = pagination.offset.is_none();
+                // view key will have the offset parameter if it exists. We must
+                // filter it out of the group by, because the column originates
+                // at this node.
                 let group_by: Vec<Column> = view_key
                     .columns
                     .iter()
@@ -2579,24 +2684,38 @@ impl SqlToMirConverter {
                     })
                     .collect();
 
-                // Order by expression projections and either a topk or paginate node
-                let paginate_nodes = self.make_paginate_node(
+                let paginate_nodes = this.make_paginate_node(
                     query_name,
                     format!(
                         "q_{:x}_n{}",
                         query_graph.signature().hash,
-                        self.mir_graph.node_count()
+                        this.mir_graph.node_count()
                     )
                     .into(),
                     final_node,
                     group_by,
-                    order,
-                    *limit,
+                    &pagination.order,
+                    pagination.limit,
                     make_topk,
+                    topk_buffer_multiplier,
                     Some(&query_graph.columns),
                 )?;
                 func_nodes.extend(paginate_nodes.clone());
-                final_node = *paginate_nodes.last().unwrap();
+                Ok(*paginate_nodes
+                    .last()
+                    .expect("make_paginate_node must return at least one node"))
+            };
+
+            // Correctness: When the query has both DISTINCT and pagination
+            // (ORDER BY + LIMIT), we must defer TopK creation until after the
+            // Distinct node. Otherwise TopK selects top K rows before
+            // deduplication, which can return fewer than K distinct values.
+            let defer_pagination = query_graph.distinct;
+
+            if let Some(pagination) = query_graph.pagination.as_ref() {
+                if !defer_pagination {
+                    final_node = add_topk_or_paginate(self, final_node, pagination)?;
+                }
             }
 
             // 10. Generate leaf views that expose the query result
@@ -2718,6 +2837,14 @@ impl SqlToMirConverter {
                     self.make_distinct_node(query_name, name, final_node, self.columns(final_node));
             }
 
+            // Now create the deferred TopK node after Distinct, so that
+            // TopK limits *distinct* rows rather than raw rows with duplicates.
+            if let Some(pagination) = query_graph.pagination.as_ref() {
+                if defer_pagination {
+                    final_node = add_topk_or_paginate(self, final_node, pagination)?;
+                }
+            }
+
             if leaf_behavior.should_make_leaf() {
                 // We are supposed to add a `Leaf` node keyed on the query parameters. For purely
                 // internal views (e.g., subqueries), this is not set.
@@ -2736,6 +2863,16 @@ impl SqlToMirConverter {
                                 expr: Expr::Column(c),
                                 ..
                             } => Ok(Column::from(c)),
+                            FieldDefinitionExpr::Expr {
+                                expr: Expr::Call(f),
+                                ..
+                            } if is_aggregate(f) => Ok(Column::named(
+                                Expr::Call(f.clone())
+                                    .qualified_alias(self.dialect.into())
+                                    .unwrap_or_else(|| {
+                                        f.display(self.dialect.into()).to_string().into()
+                                    }),
+                            )),
                             FieldDefinitionExpr::Expr { expr, .. } => {
                                 Ok(Column::named(expr.display(self.dialect.into()).to_string()))
                             }
@@ -2805,7 +2942,62 @@ impl SqlToMirConverter {
                     // Note: Post-lookup operations have performance overhead, so they're gated behind
                     // the allow_post_lookup config flag.
                     match post_lookup_aggregates(query_graph, query_name, self.dialect)? {
-                        Some(agg) if self.config.allow_post_lookup => Some(agg),
+                        Some(mut agg) if self.config.allow_post_lookup => {
+                            // For accumulation-type post-lookup aggregates, enable raw_values
+                            // and set skip_finalization on the corresponding upstream
+                            // Accumulator MIR nodes so that they emit raw arrays instead of
+                            // finalized strings. This avoids the lossy split() round-trip.
+                            for pla in &mut agg.aggregates {
+                                if pla.function.is_accumulation() {
+                                    // Walk ancestors of final_node to find the Accumulator
+                                    // whose output_column matches this post-lookup aggregate.
+                                    // Name-only comparison is sufficient because both sides
+                                    // derive from the same alias in query_graph.aggregates.
+                                    let mut stack = vec![final_node];
+                                    let mut visited = HashSet::new();
+                                    let mut found = false;
+                                    while let Some(n) = stack.pop() {
+                                        if !visited.insert(n) {
+                                            continue;
+                                        }
+                                        // Collect parents before mutably borrowing the node,
+                                        // since neighbors_directed borrows the graph immutably.
+                                        let parents: Vec<_> = self
+                                            .mir_graph
+                                            .neighbors_directed(n, Direction::Incoming)
+                                            .collect();
+                                        if let MirNodeInner::Accumulator {
+                                            output_column,
+                                            skip_finalization,
+                                            ..
+                                        } = &mut self.mir_graph[n].inner
+                                        {
+                                            if output_column.name == pla.column.name {
+                                                *skip_finalization = true;
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        stack.extend(parents);
+                                    }
+                                    if found {
+                                        pla.raw_values = true;
+                                    } else if matches!(
+                                        &pla.function,
+                                        PostLookupAggregateFunction::JsonObjectAgg { .. }
+                                    ) {
+                                        // json_object_agg cannot round-trip through split()
+                                        // when allow_duplicate_keys=true (serde_json::Map
+                                        // deduplicates). Require the raw path.
+                                        internal!(
+                                            "Failed to find Accumulator node for json_object_agg \
+                                             post-lookup; cannot fall back to split() path"
+                                        );
+                                    }
+                                }
+                            }
+                            Some(agg)
+                        }
                         Some(_) => {
                             unsupported!(
                                 "Queries which perform operations post-lookup are not supported"
@@ -2834,10 +3026,10 @@ impl SqlToMirConverter {
                 // In that case, limit is required for correctness.
                 if self.config.allow_topk && is_topk_query && !are_repeat_reads_required {
                     limit = None;
-                    // TODO: even though we are doing topk, we still need the reader
-                    // to order stuff. Becuase TopK communictes the diff,
-                    // and the reader keeps the values in ASC order if ORDER BY
-                    // is not specified. Please refer to [reader_map::Values] struct.
+                    // Even though we are doing topk, we still need the reader
+                    // to order results. Because TopK communicates the unordered
+                    // diff, and the reader auto-sorts values in ASC order if
+                    // ORDER BY is not specified. See reader_map::Values.
                     // order_by = None;
                 }
 
@@ -2854,6 +3046,10 @@ impl SqlToMirConverter {
                             returned_cols: Some(returned_cols),
                             default_row: query_graph.default_row.clone(),
                             aggregates: post_lookup_aggregates,
+                            distinct: are_repeat_reads_required && query_graph.distinct,
+                            // Strategy (Sorted vs HashBased) is decided during
+                            // lowering in make_reader_processing() based on whether
+                            // aggregates are present.
                         },
                     ),
                     &[leaf_project_reorder_node],
@@ -2941,13 +3137,14 @@ mod tests {
             ..Default::default()
         });
 
-        let _ = converter.make_base_node(&Relation::from(table_name), columns, keys)?;
+        let _ = converter.make_base_node(&Relation::from(table_name), columns, keys, None)?;
 
         let node = converter.named_query_to_mir(
             &Relation::from(name),
             &qg,
             &HashMap::new(),
             LeafBehavior::Leaf,
+            None,
         )?;
 
         Ok((converter, node))
@@ -2984,6 +3181,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                     ColumnSpecification {
                         column: Column::from("topk_test.b"),
@@ -2991,6 +3189,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                     ColumnSpecification {
                         column: Column::from("topk_test.c"),
@@ -2998,6 +3197,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                 ];
 
@@ -3147,6 +3347,75 @@ mod tests {
         expect_topk_node: true
     }
 
+    /// Verify that when a query has both DISTINCT and ORDER BY + LIMIT,
+    /// the TopK node is placed after the Distinct node in the MIR graph.
+    #[test]
+    fn topk_placed_after_distinct() -> ReadySetResult<()> {
+        let query = parse_select(
+            readyset_sql::Dialect::PostgreSQL,
+            "SELECT DISTINCT a FROM topk_test ORDER BY a LIMIT 3",
+        )
+        .expect("parse failed");
+
+        let table_name = "topk_test";
+        let columns = &[
+            ColumnSpecification {
+                column: Column::from("topk_test.a"),
+                sql_type: SqlType::Int(None),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+            ColumnSpecification {
+                column: Column::from("topk_test.b"),
+                sql_type: SqlType::Int(None),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+            ColumnSpecification {
+                column: Column::from("topk_test.c"),
+                sql_type: SqlType::Int(None),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+        ];
+
+        let qg = to_query_graph(query, Dialect::DEFAULT_MYSQL)?;
+        let (mut converter, node) =
+            sql_to_mir_test("q_distinct_topk", qg, table_name, columns, None)?;
+        let mir_query = converter.make_mir_query("q_distinct_topk".into(), node);
+
+        let topo = mir_query.topo_nodes();
+        let distinct_pos = topo.iter().position(|n| {
+            matches!(
+                &mir_query.get_node(*n).expect("node exists").inner,
+                MirNodeInner::Distinct { .. }
+            )
+        });
+        let topk_pos = topo.iter().position(|n| {
+            matches!(
+                &mir_query.get_node(*n).expect("node exists").inner,
+                MirNodeInner::TopK { .. }
+            )
+        });
+
+        let distinct_pos =
+            distinct_pos.expect("Distinct node must exist for SELECT DISTINCT query");
+        let topk_pos = topk_pos.expect("TopK node must exist for ORDER BY + LIMIT query");
+        assert!(
+            distinct_pos < topk_pos,
+            "Distinct (position {distinct_pos}) must come before TopK (position {topk_pos}) \
+             in the MIR graph so that TopK limits distinct rows, not raw duplicates"
+        );
+
+        Ok(())
+    }
+
     macro_rules! test_mir_with_config {
         (
             name: $test_name:ident,
@@ -3174,6 +3443,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                     ColumnSpecification {
                         column: Column::from("test_table.b"),
@@ -3181,6 +3451,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                     ColumnSpecification {
                         column: Column::from("test_table.c"),
@@ -3188,19 +3459,21 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                 ];
 
                 let mut converter = SqlToMirConverter::new(Dialect::DEFAULT_MYSQL);
                 converter.set_config($config);
                 let result = converter
-                    .make_base_node(&table_name.into(), columns, None)
+                    .make_base_node(&table_name.into(), columns, None, None)
                     .and_then(|_| {
                         converter.named_query_to_mir(
                             &"q1".into(),
                             &qg,
                             &HashMap::new(),
                             LeafBehavior::Leaf,
+                            None,
                         )
                     });
                 if $expect_success {
@@ -3288,6 +3561,30 @@ mod tests {
         expect_success: false
     }
 
+    // REA-6397: json_object_agg is now supported as a post-lookup aggregate
+    test_mir_with_config! {
+        name: json_object_agg_with_where_in_supported,
+        query: "SELECT json_object_agg(test_table.a, test_table.b) FROM test_table WHERE test_table.c = 5 GROUP BY test_table.c",
+        collapsed_where_in: true,
+        config: Config {
+            allow_post_lookup: true,
+            ..Default::default()
+        },
+        expect_success: true
+    }
+
+    // json_object_agg without collapsed WHERE IN should succeed (no post-lookup needed)
+    test_mir_with_config! {
+        name: json_object_agg_without_where_in_supported,
+        query: "SELECT json_object_agg(test_table.a, test_table.b) FROM test_table WHERE test_table.c = 5 GROUP BY test_table.c",
+        collapsed_where_in: false,
+        config: Config {
+            allow_post_lookup: true,
+            ..Default::default()
+        },
+        expect_success: true
+    }
+
     #[test]
     fn function_call_predicate_is_supported() {
         let query = parse_select(
@@ -3304,6 +3601,7 @@ mod tests {
                 generated: None,
                 constraints: vec![],
                 comment: None,
+                invisible: false,
             },
             ColumnSpecification {
                 column: Column::from("test_table.c"),
@@ -3311,14 +3609,21 @@ mod tests {
                 generated: None,
                 constraints: vec![],
                 comment: None,
+                invisible: false,
             },
         ];
 
         let mut converter = SqlToMirConverter::new(Dialect::DEFAULT_MYSQL);
         let result = converter
-            .make_base_node(&"test_table".into(), columns, None)
+            .make_base_node(&"test_table".into(), columns, None, None)
             .and_then(|_| {
-                converter.named_query_to_mir(&"q1".into(), &qg, &HashMap::new(), LeafBehavior::Leaf)
+                converter.named_query_to_mir(
+                    &"q1".into(),
+                    &qg,
+                    &HashMap::new(),
+                    LeafBehavior::Leaf,
+                    None,
+                )
             });
 
         assert!(
@@ -3344,6 +3649,7 @@ mod tests {
                 generated: None,
                 constraints: vec![],
                 comment: None,
+                invisible: false,
             },
             ColumnSpecification {
                 column: Column::from("test_table.b"),
@@ -3351,14 +3657,21 @@ mod tests {
                 generated: None,
                 constraints: vec![],
                 comment: None,
+                invisible: false,
             },
         ];
 
         let mut converter = SqlToMirConverter::new(Dialect::DEFAULT_MYSQL);
         let result = converter
-            .make_base_node(&"test_table".into(), columns, None)
+            .make_base_node(&"test_table".into(), columns, None, None)
             .and_then(|_| {
-                converter.named_query_to_mir(&"q1".into(), &qg, &HashMap::new(), LeafBehavior::Leaf)
+                converter.named_query_to_mir(
+                    &"q1".into(),
+                    &qg,
+                    &HashMap::new(),
+                    LeafBehavior::Leaf,
+                    None,
+                )
             });
 
         assert!(
@@ -3384,6 +3697,7 @@ mod tests {
                 generated: None,
                 constraints: vec![],
                 comment: None,
+                invisible: false,
             },
             ColumnSpecification {
                 column: Column::from("test_table.b"),
@@ -3391,14 +3705,21 @@ mod tests {
                 generated: None,
                 constraints: vec![],
                 comment: None,
+                invisible: false,
             },
         ];
 
         let mut converter = SqlToMirConverter::new(Dialect::DEFAULT_MYSQL);
         let result = converter
-            .make_base_node(&"test_table".into(), columns, None)
+            .make_base_node(&"test_table".into(), columns, None, None)
             .and_then(|_| {
-                converter.named_query_to_mir(&"q1".into(), &qg, &HashMap::new(), LeafBehavior::Leaf)
+                converter.named_query_to_mir(
+                    &"q1".into(),
+                    &qg,
+                    &HashMap::new(),
+                    LeafBehavior::Leaf,
+                    None,
+                )
             });
 
         assert!(
@@ -3424,6 +3745,7 @@ mod tests {
                 generated: None,
                 constraints: vec![],
                 comment: None,
+                invisible: false,
             },
             ColumnSpecification {
                 column: Column::from("test_table.b"),
@@ -3431,14 +3753,21 @@ mod tests {
                 generated: None,
                 constraints: vec![],
                 comment: None,
+                invisible: false,
             },
         ];
 
         let mut converter = SqlToMirConverter::new(Dialect::DEFAULT_POSTGRESQL);
         let result = converter
-            .make_base_node(&"test_table".into(), columns, None)
+            .make_base_node(&"test_table".into(), columns, None, None)
             .and_then(|_| {
-                converter.named_query_to_mir(&"q1".into(), &qg, &HashMap::new(), LeafBehavior::Leaf)
+                converter.named_query_to_mir(
+                    &"q1".into(),
+                    &qg,
+                    &HashMap::new(),
+                    LeafBehavior::Leaf,
+                    None,
+                )
             });
 
         assert!(
@@ -3477,33 +3806,483 @@ mod tests {
     }
 
     #[test]
-    fn udf_unqualified_parses_as_call() {
-        use readyset_sql::ast::FunctionExpr;
+    fn unknown_unqualified_function_parses_as_udf() {
+        use readyset_sql::ast::{Expr, FieldDefinitionExpr, FunctionExpr};
         use readyset_sql_parsing::{parse_select_with_config, ParsingPreset};
 
-        // Unqualified function calls that aren't recognized built-ins are parsed as
-        // FunctionExpr::Call (not Udf). The Udf variant is specifically for schema-qualified
-        // function calls. Unknown unqualified functions will be rejected during expression
-        // lowering with "Function X does not exist".
-        let query = parse_select_with_config(
+        // Unknown unqualified function calls are treated as user-defined functions (Udf).
+        // They succeed at parse time and fail later (at MIR lowering / query creation).
+        let result = parse_select_with_config(
             ParsingPreset::OnlySqlparser,
             readyset_sql::Dialect::PostgreSQL,
             "SELECT totally_unknown_function_xyz(1) FROM test_table",
+        );
+        let stmt = result.expect("Expected unknown function to parse as Udf");
+        assert!(
+            matches!(
+                stmt.fields.first(),
+                Some(FieldDefinitionExpr::Expr {
+                    expr: Expr::Call(FunctionExpr::Udf { name, .. }),
+                    ..
+                }) if name.as_str() == "totally_unknown_function_xyz"
+            ),
+            "Expected unknown function to produce a Udf variant with the correct name"
+        );
+    }
+
+    /// Helper: build a MIR query from SQL with collapsed_where_in + allow_post_lookup,
+    /// returning the converter and leaf node index.
+    fn mir_with_post_lookup(
+        dialect: readyset_sql::Dialect,
+        sql: &str,
+        table_name: &str,
+        columns: &[ColumnSpecification],
+    ) -> ReadySetResult<(SqlToMirConverter, NodeIndex)> {
+        let mut query = parse_select(dialect, sql).unwrap();
+        query.metadata.push(SelectMetadata::CollapsedWhereIn);
+
+        let qg = to_query_graph(query, Dialect::DEFAULT_MYSQL)?;
+
+        let mut converter = SqlToMirConverter::new(Dialect::DEFAULT_MYSQL);
+        converter.set_config(Config {
+            allow_post_lookup: true,
+            ..Default::default()
+        });
+
+        let _ = converter.make_base_node(&table_name.into(), columns, None, None)?;
+        let node = converter.named_query_to_mir(
+            &"q_test".into(),
+            &qg,
+            &HashMap::new(),
+            LeafBehavior::Leaf,
+            None,
+        )?;
+
+        Ok((converter, node))
+    }
+
+    fn test_table_columns() -> Vec<ColumnSpecification> {
+        vec![
+            ColumnSpecification {
+                column: Column::from("t.id"),
+                sql_type: SqlType::Int(None),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+            ColumnSpecification {
+                column: Column::from("t.grp"),
+                sql_type: SqlType::Int(None),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+            ColumnSpecification {
+                column: Column::from("t.val"),
+                sql_type: SqlType::VarChar(Some(255)),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn skip_finalization_set_on_group_concat_with_where_in() {
+        let cols = test_table_columns();
+        let (mut converter, node) = mir_with_post_lookup(
+            readyset_sql::Dialect::MySQL,
+            "SELECT group_concat(t.val) FROM t WHERE t.id = 1 GROUP BY t.grp",
+            "t",
+            &cols,
         )
         .unwrap();
 
-        let has_call = query.fields.iter().any(|field| {
-            matches!(
-                field,
-                readyset_sql::ast::FieldDefinitionExpr::Expr {
-                    expr: readyset_sql::ast::Expr::Call(FunctionExpr::Call { name, .. }),
-                    ..
-                } if name.as_str() == "totally_unknown_function_xyz"
-            )
+        let query = converter.make_mir_query("q_test".into(), node);
+
+        // Find the Accumulator node and verify skip_finalization is set
+        let mut found_accumulator = false;
+        for n in query.topo_nodes() {
+            if let MirNodeInner::Accumulator {
+                skip_finalization, ..
+            } = &query.get_node(n).unwrap().inner
+            {
+                assert!(
+                    *skip_finalization,
+                    "Accumulator should have skip_finalization=true"
+                );
+                found_accumulator = true;
+            }
+        }
+        assert!(found_accumulator, "Expected to find an Accumulator node");
+
+        // Verify the leaf has raw_values set on the aggregate
+        if let MirNodeInner::Leaf { aggregates, .. } = &query.get_node(node).unwrap().inner {
+            let agg = aggregates
+                .as_ref()
+                .expect("should have post-lookup aggregates");
+            let accum_aggs: Vec<_> = agg
+                .aggregates
+                .iter()
+                .filter(|a| a.function.is_accumulation())
+                .collect();
+            assert!(
+                !accum_aggs.is_empty(),
+                "should have accumulation aggregates"
+            );
+            for a in accum_aggs {
+                assert!(
+                    a.raw_values,
+                    "accumulation aggregate should have raw_values=true"
+                );
+            }
+        } else {
+            panic!("Expected leaf node");
+        }
+    }
+
+    #[test]
+    fn skip_finalization_not_set_on_sum_with_where_in() {
+        let cols = test_table_columns();
+        let (mut converter, node) = mir_with_post_lookup(
+            readyset_sql::Dialect::MySQL,
+            "SELECT sum(t.grp) FROM t WHERE t.id = 1",
+            "t",
+            &cols,
+        )
+        .unwrap();
+
+        let query = converter.make_mir_query("q_test".into(), node);
+
+        // Sum uses Aggregation, not Accumulator, so no skip_finalization to check.
+        // Verify the leaf has aggregates but none have raw_values set.
+        if let MirNodeInner::Leaf { aggregates, .. } = &query.get_node(node).unwrap().inner {
+            let agg = aggregates
+                .as_ref()
+                .expect("should have post-lookup aggregates");
+            for a in &agg.aggregates {
+                assert!(
+                    !a.raw_values,
+                    "non-accumulation aggregate should not have raw_values"
+                );
+            }
+        } else {
+            panic!("Expected leaf node");
+        }
+    }
+
+    #[test]
+    fn skip_finalization_only_on_matching_accumulator() {
+        // Query with both an accumulation (group_concat) and a non-accumulation (sum)
+        let cols = test_table_columns();
+        let (mut converter, node) = mir_with_post_lookup(
+            readyset_sql::Dialect::MySQL,
+            "SELECT group_concat(t.val), sum(t.grp) FROM t WHERE t.id = 1 GROUP BY t.grp",
+            "t",
+            &cols,
+        )
+        .unwrap();
+
+        let query = converter.make_mir_query("q_test".into(), node);
+
+        // The Accumulator (group_concat) should have skip_finalization=true
+        let mut found_accumulator = false;
+        for n in query.topo_nodes() {
+            if let MirNodeInner::Accumulator {
+                skip_finalization, ..
+            } = &query.get_node(n).unwrap().inner
+            {
+                assert!(
+                    *skip_finalization,
+                    "Accumulator should have skip_finalization=true"
+                );
+                found_accumulator = true;
+            }
+        }
+        assert!(found_accumulator, "Expected to find an Accumulator node");
+
+        // Verify leaf: accumulation aggregate has raw_values, sum does not
+        if let MirNodeInner::Leaf { aggregates, .. } = &query.get_node(node).unwrap().inner {
+            let agg = aggregates
+                .as_ref()
+                .expect("should have post-lookup aggregates");
+            for a in &agg.aggregates {
+                if a.function.is_accumulation() {
+                    assert!(
+                        a.raw_values,
+                        "accumulation aggregate should have raw_values=true"
+                    );
+                } else {
+                    assert!(
+                        !a.raw_values,
+                        "non-accumulation aggregate should not have raw_values"
+                    );
+                }
+            }
+        } else {
+            panic!("Expected leaf node");
+        }
+    }
+
+    #[test]
+    fn make_base_node_with_replica_identity_override() {
+        use readyset_sql::ast::{IndexKeyPart, SqlIdentifier};
+
+        let table_name: Relation = "test_table".into();
+        let columns = &[
+            ColumnSpecification {
+                column: Column::from("test_table.id"),
+                sql_type: SqlType::Int(None),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+            ColumnSpecification {
+                column: Column::from("test_table.email"),
+                sql_type: SqlType::VarChar(Some(255)),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+            ColumnSpecification {
+                column: Column::from("test_table.name"),
+                sql_type: SqlType::VarChar(Some(255)),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+        ];
+        let keys = vec![
+            TableKey::PrimaryKey {
+                constraint_name: None,
+                constraint_timing: None,
+                index_name: None,
+                columns: vec![IndexKeyPart::Column(Column {
+                    name: "id".into(),
+                    table: None,
+                })],
+            },
+            TableKey::UniqueKey {
+                constraint_name: None,
+                constraint_timing: None,
+                index_name: None,
+                columns: vec![
+                    IndexKeyPart::Column(Column {
+                        name: "id".into(),
+                        table: None,
+                    }),
+                    IndexKeyPart::Column(Column {
+                        name: "email".into(),
+                        table: None,
+                    }),
+                ],
+                index_type: None,
+                nulls_distinct: None,
+            },
+        ];
+
+        let ri_cols: Vec<SqlIdentifier> = vec!["id".into(), "email".into()];
+
+        let mut converter = SqlToMirConverter::new(Dialect::DEFAULT_POSTGRESQL);
+        let ni = converter
+            .make_base_node(&table_name, columns, Some(&keys), Some(&ri_cols))
+            .unwrap();
+
+        match &converter.mir_graph[ni].inner {
+            MirNodeInner::Base {
+                primary_key,
+                unique_keys,
+                ..
+            } => {
+                // Primary key should be the RI columns (id, email)
+                let pk = primary_key.as_ref().expect("should have primary key");
+                assert_eq!(pk.len(), 2);
+                assert_eq!(pk[0].name, "id");
+                assert_eq!(pk[1].name, "email");
+
+                // The original PK (id) should be demoted to a unique key,
+                // plus the original UK (id, email) should also be present
+                assert_eq!(unique_keys.len(), 2);
+                // First UK: original (id, email) from the table definition
+                assert_eq!(unique_keys[0].len(), 2);
+                assert_eq!(unique_keys[0][0].name, "id");
+                assert_eq!(unique_keys[0][1].name, "email");
+                // Second UK: demoted original PK (id)
+                assert_eq!(unique_keys[1].len(), 1);
+                assert_eq!(unique_keys[1][0].name, "id");
+            }
+            other => panic!("expected Base node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn make_base_node_without_replica_identity_override() {
+        use readyset_sql::ast::IndexKeyPart;
+
+        let table_name: Relation = "test_table".into();
+        let columns = &[
+            ColumnSpecification {
+                column: Column::from("test_table.id"),
+                sql_type: SqlType::Int(None),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+            ColumnSpecification {
+                column: Column::from("test_table.email"),
+                sql_type: SqlType::VarChar(Some(255)),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+        ];
+        let keys = vec![TableKey::PrimaryKey {
+            constraint_name: None,
+            constraint_timing: None,
+            index_name: None,
+            columns: vec![IndexKeyPart::Column(Column {
+                name: "id".into(),
+                table: None,
+            })],
+        }];
+
+        let mut converter = SqlToMirConverter::new(Dialect::DEFAULT_POSTGRESQL);
+        let ni = converter
+            .make_base_node(&table_name, columns, Some(&keys), None)
+            .unwrap();
+
+        match &converter.mir_graph[ni].inner {
+            MirNodeInner::Base {
+                primary_key,
+                unique_keys,
+                ..
+            } => {
+                // PK should remain (id) — no override
+                let pk = primary_key.as_ref().expect("should have primary key");
+                assert_eq!(pk.len(), 1);
+                assert_eq!(pk[0].name, "id");
+                // No unique keys besides the PK
+                assert_eq!(unique_keys.len(), 0);
+            }
+            other => panic!("expected Base node, got {other:?}"),
+        }
+    }
+
+    /// Verify that MIR compilation sets `skip_finalization=true` on the Accumulator node
+    /// and `raw_values=true` on the Leaf aggregate for json_object_agg with collapsed
+    /// WHERE IN. This is a critical invariant: json_object_agg (allow_duplicate_keys=true)
+    /// *cannot* fall back to the split() path because serde_json::Map would silently
+    /// deduplicate keys. The logictest proves the end-to-end behavior, but only this
+    /// test distinguishes "worked via raw path" from "worked via split path" (the latter
+    /// being silently wrong for json_object_agg).
+    ///
+    /// Note: this test manually builds column specs instead of using `test_mir_with_config!`
+    /// because the macro only checks compilation success/failure — it doesn't expose the
+    /// MIR graph for node inspection.
+    #[test]
+    fn skip_finalization_set_on_json_object_agg_with_where_in() {
+        let cols = vec![
+            ColumnSpecification {
+                column: Column::from("t.id"),
+                sql_type: SqlType::Int(None),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+            ColumnSpecification {
+                column: Column::from("t.k"),
+                sql_type: SqlType::VarChar(Some(255)),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+            ColumnSpecification {
+                column: Column::from("t.v"),
+                sql_type: SqlType::VarChar(Some(255)),
+                generated: None,
+                constraints: vec![],
+                comment: None,
+                invisible: false,
+            },
+        ];
+        let mut query = parse_select(
+            readyset_sql::Dialect::PostgreSQL,
+            "SELECT json_object_agg(t.k, t.v) FROM t WHERE t.id = 1",
+        )
+        .unwrap();
+        query.metadata.push(SelectMetadata::CollapsedWhereIn);
+
+        let qg = to_query_graph(query, Dialect::DEFAULT_POSTGRESQL).unwrap();
+
+        let mut converter = SqlToMirConverter::new(Dialect::DEFAULT_POSTGRESQL);
+        converter.set_config(Config {
+            allow_post_lookup: true,
+            ..Default::default()
         });
-        assert!(
-            has_call,
-            "Expected unqualified unknown function call to be parsed as FunctionExpr::Call"
-        );
+
+        let _ = converter
+            .make_base_node(&"t".into(), &cols, None, None)
+            .unwrap();
+        let node = converter
+            .named_query_to_mir(
+                &"q_test".into(),
+                &qg,
+                &HashMap::new(),
+                LeafBehavior::Leaf,
+                None,
+            )
+            .unwrap();
+
+        let query = converter.make_mir_query("q_test".into(), node);
+
+        // Find the Accumulator node and verify skip_finalization is set
+        let mut found_accumulator = false;
+        for n in query.topo_nodes() {
+            if let MirNodeInner::Accumulator {
+                skip_finalization, ..
+            } = &query.get_node(n).unwrap().inner
+            {
+                assert!(
+                    *skip_finalization,
+                    "Accumulator should have skip_finalization=true for json_object_agg"
+                );
+                found_accumulator = true;
+            }
+        }
+        assert!(found_accumulator, "Expected to find an Accumulator node");
+
+        // Verify the leaf has raw_values set on the aggregate
+        if let MirNodeInner::Leaf { aggregates, .. } = &query.get_node(node).unwrap().inner {
+            let agg = aggregates
+                .as_ref()
+                .expect("should have post-lookup aggregates");
+            let accum_aggs: Vec<_> = agg
+                .aggregates
+                .iter()
+                .filter(|a| a.function.is_accumulation())
+                .collect();
+            assert!(
+                !accum_aggs.is_empty(),
+                "should have accumulation aggregates"
+            );
+            for a in accum_aggs {
+                assert!(
+                    a.raw_values,
+                    "json_object_agg aggregate should have raw_values=true"
+                );
+            }
+        } else {
+            panic!("Expected leaf node");
+        }
     }
 }

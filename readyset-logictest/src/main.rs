@@ -1,6 +1,7 @@
+use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
 use std::fmt::{self, Display};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ use readyset_sql_parsing::ParsingPreset;
 use readyset_tracing::init_test_logging;
 use serde_json::json;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use walkdir::WalkDir;
 
 pub mod ast;
@@ -32,6 +33,7 @@ pub mod from_query_log;
 pub mod generate;
 pub mod parser;
 pub mod permute;
+pub mod rewrite;
 pub mod runner;
 
 #[cfg(feature = "in-process-readyset")]
@@ -44,8 +46,6 @@ use crate::from_query_log::FromQueryLog;
 use crate::generate::Generate;
 use crate::permute::Permute;
 use crate::runner::{RunOptions, TestScript};
-
-const REPORT_HANG: Duration = Duration::from_secs(20 * 60);
 
 #[derive(Parser)]
 struct Opts {
@@ -86,10 +86,6 @@ impl Command {
 #[derive(Parser)]
 struct InputFileOptions {
     /// Files or directories containing test scripts to run. If `-`, will read from standard input
-    ///
-    /// Any files whose name ends in `.fail.test` will be run, but will be expected to *fail* for
-    /// some reason - if any of them pass, the overall run will fail (and noria-logictest will exit
-    /// with a non-zero status code)
     paths: Vec<PathBuf>,
 
     /// Load input files from subdirectories of the given paths recursively
@@ -100,11 +96,7 @@ struct InputFileOptions {
 /// The set of input files we are going to run over
 #[derive(Default)]
 struct InputFiles {
-    /// The files we expect to pass
-    expected_passes: Vec<(PathBuf, Box<dyn io::Read>)>,
-
-    /// The files we expect to fail
-    expected_failures: Vec<(PathBuf, Box<dyn io::Read>)>,
+    files: Vec<(PathBuf, Box<dyn io::Read>)>,
 }
 
 impl TryFrom<&'_ InputFileOptions> for InputFiles {
@@ -113,11 +105,10 @@ impl TryFrom<&'_ InputFileOptions> for InputFiles {
     fn try_from(opts: &InputFileOptions) -> Result<Self, Self::Error> {
         if opts.paths == vec![Path::new("-")] {
             Ok(InputFiles {
-                expected_passes: vec![("stdin".to_string().into(), Box::new(io::stdin()))],
-                ..Default::default()
+                files: vec![("stdin".to_string().into(), Box::new(io::stdin()))],
             })
         } else {
-            let (expected_failures, expected_passes) = opts
+            let files = opts
                 .paths
                 .iter()
                 .map(
@@ -150,27 +141,9 @@ impl TryFrom<&'_ InputFileOptions> for InputFiles {
                 .collect::<anyhow::Result<Vec<_>>>()?
                 .into_iter()
                 .flatten()
-                .partition(|(name, _)| name.to_string_lossy().as_ref().ends_with(".fail.test"));
+                .collect();
 
-            Ok(InputFiles {
-                expected_passes,
-                expected_failures,
-            })
-        }
-    }
-}
-
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum ExpectedResult {
-    Pass,
-    Fail,
-}
-
-impl Display for ExpectedResult {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ExpectedResult::Pass => write!(f, "pass"),
-            ExpectedResult::Fail => write!(f, "fail"),
+            Ok(InputFiles { files })
         }
     }
 }
@@ -178,7 +151,6 @@ impl Display for ExpectedResult {
 struct InputFile {
     name: PathBuf,
     data: Box<dyn io::Read>,
-    expected_result: ExpectedResult,
 }
 
 impl IntoIterator for InputFiles {
@@ -188,22 +160,9 @@ impl IntoIterator for InputFiles {
 
     fn into_iter(self) -> Self::IntoIter {
         Box::new(
-            self.expected_passes
+            self.files
                 .into_iter()
-                .map(|(name, data)| InputFile {
-                    name,
-                    data,
-                    expected_result: ExpectedResult::Pass,
-                })
-                .chain(
-                    self.expected_failures
-                        .into_iter()
-                        .map(|(name, data)| InputFile {
-                            name,
-                            data,
-                            expected_result: ExpectedResult::Fail,
-                        }),
-                ),
+                .map(|(name, data)| InputFile { name, data }),
         )
     }
 }
@@ -304,15 +263,6 @@ struct Verify {
     #[arg(long, short = 't', default_value = "32", env = "NORIA_LOGICTEST_TASKS")]
     tasks: usize,
 
-    /// When tests are encountered that are expected to fail but do not, rename the test file from
-    /// .fail.test to .test
-    #[arg(long)]
-    rename_passing: bool,
-
-    /// When tests that are expected to pass fail, rename the test file from .test to .fail.test
-    #[arg(long)]
-    rename_failing: bool,
-
     /// Collect timing of all named queries
     #[arg(long)]
     time: bool,
@@ -320,6 +270,48 @@ struct Verify {
     /// Enable verbose log output
     #[arg(long, short = 'v')]
     verbose: bool,
+
+    /// Continue running after query failures, reporting all failures at the end.
+    /// Statement failures still bail immediately since subsequent records depend on them.
+    #[arg(long, alias = "nff", env = "LOGICTEST_NO_FAIL_FAST")]
+    no_fail_fast: bool,
+
+    /// Ignore the `error:` pattern on every query — execute the query, compare its rows
+    /// against the recorded result section as normal, and report success or failure based
+    /// on the row comparison instead of whether the error pattern matched.
+    ///
+    /// Generated logictests use `error:` directives to record Readyset-specific rejection
+    /// messages (e.g. unsupported-query errors). When verifying recorded results against a
+    /// pure upstream database those patterns are not meaningful, but the recorded row
+    /// section still is: an upstream that returns different rows than what was recorded is
+    /// exactly the divergence we want to detect.
+    ///
+    /// Statement-level `statement error` records and queries without `error:` directives
+    /// are unaffected.
+    #[arg(long, env = "LOGICTEST_IGNORE_ERROR_TAGS")]
+    ignore_error_tags: bool,
+
+    /// Re-run each query against the target database and rewrite its recorded result section in
+    /// place with the actual results, instead of comparing. Requires an upstream `--database-url`.
+    ///
+    /// Comments, blank lines, SQL, and `error:` tags are preserved verbatim; only the recorded
+    /// result block after each `----` is replaced, and the existing hash-vs-inline form is kept.
+    /// Queries carrying an `error:` tag (unless `--ignore-error-tags` is set) or that error against
+    /// the target keep their existing recorded results, and `statement error` records run only for
+    /// their side effects. Use this to record expected values for a new test, or to refresh
+    /// recordings after upstream behavior changes.
+    #[arg(long)]
+    rewrite: bool,
+
+    /// Per-query timeout in seconds. If a single query or statement execution takes longer than
+    /// this, it will be aborted with a timeout error. Prevents hangs when domain threads panic.
+    #[arg(long, default_value = "60")]
+    query_timeout: u64,
+
+    /// Per-script timeout in seconds. If an entire test script takes longer than this, it will be
+    /// aborted.
+    #[arg(long, default_value = "2700")]
+    script_timeout: u64,
 
     /// Logging/tracing options
     #[command(flatten)]
@@ -329,13 +321,12 @@ struct Verify {
 #[derive(Default)]
 struct VerifyResult {
     pub failures: Vec<String>,
-    pub unexpected_passes: Vec<String>,
     pub passes: usize,
 }
 
 impl VerifyResult {
     pub fn is_success(&self) -> bool {
-        self.failures.is_empty() && self.unexpected_passes.is_empty()
+        self.failures.is_empty()
     }
 }
 
@@ -354,34 +345,6 @@ impl Display for VerifyResult {
             writeln!(f, "{} failed:\n", n_scripts(self.failures.len()))?;
             for script in &self.failures {
                 writeln!(f, "    {script}")?;
-            }
-        }
-
-        if !self.unexpected_passes.is_empty() {
-            writeln!(
-                f,
-                "{} {} expected to fail, but did not:\n",
-                n_scripts(self.unexpected_passes.len()),
-                if self.unexpected_passes.len() == 1 {
-                    "was"
-                } else {
-                    "were"
-                }
-            )?;
-            for script in &self.unexpected_passes {
-                writeln!(f, "    {script}")?;
-            }
-            writeln!(
-                f,
-                "TIP: To rectify this, copy and paste the following commands in the relevant directory:"
-            )?;
-            for script in &self.unexpected_passes {
-                writeln!(
-                    f,
-                    "    mv {} {}",
-                    script,
-                    script.replace(".fail.test", ".test")
-                )?;
             }
         }
 
@@ -415,7 +378,7 @@ impl Verify {
     #[tokio::main]
     async fn run(&self) -> anyhow::Result<()> {
         let result = Arc::new(Mutex::new(VerifyResult::default()));
-        let mut tasks = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<tokio::task::JoinHandle<()>> = FuturesUnordered::new();
 
         let max_tasks = if self.replication_url.is_some() {
             // Cannot parallelize tests when replicating because each test reuses the same db
@@ -424,110 +387,71 @@ impl Verify {
             self.tasks
         };
 
-        for InputFile {
-            name,
-            data,
-            expected_result,
-        } in InputFiles::try_from(&self.input_opts)?
-        {
+        // Pool of free task indices, used to derive per-task upstream database names so concurrent
+        // scripts do not race on DROP/CREATE DATABASE. Each spawned task takes one index on entry
+        // and returns it on exit.
+        let free_slots: Arc<Mutex<VecDeque<usize>>> =
+            Arc::new(Mutex::new((0..max_tasks).collect()));
+
+        for InputFile { name, data } in InputFiles::try_from(&self.input_opts)? {
+            if tasks.len() >= max_tasks {
+                // Wait for one of the in-flight tasks to finish (and return its slot) before
+                // claiming a new index for the next script.
+                tasks.select_next_some().await.unwrap();
+            }
+
+            let task_idx = free_slots
+                .lock()
+                .await
+                .pop_front()
+                .expect("a slot must be free after awaiting on FuturesUnordered");
+
             let mut script = TestScript::read(name.clone(), data)
                 .with_context(|| format!("Reading {}", name.to_string_lossy()))?;
-            let run_opts: RunOptions = self.into();
+            let mut run_opts: RunOptions = self.into();
+            run_opts.task_idx = task_idx;
             let result = Arc::clone(&result);
-            let rename_passing = self.rename_passing;
-            let rename_failing = self.rename_failing;
+            let free_slots = Arc::clone(&free_slots);
 
             tasks.push(tokio::spawn(async move {
                 let test_started = Instant::now();
 
                 let script_name = script.name().to_string();
-                let hang_notifier = tokio::spawn(async move {
-                    tokio::time::sleep(REPORT_HANG).await;
-                    info!(
-                        script_name,
-                        "Test has been running for {REPORT_HANG:?}; it may be stuck"
-                    );
-                });
 
                 let script_result = script
                     .run(run_opts)
                     .await
-                    .with_context(|| format!("Running test script {}", script.name()));
-
-                hang_notifier.abort();
+                    .with_context(|| format!("Running test script {}", script_name));
 
                 info!(
                     script_name = %script.name(),
                     operations = script.len(),
                     duration = test_started.elapsed().as_secs_f64(),
-                    expected_result = %expected_result,
                     succeeded = %script_result.is_ok(),
                     "script finished",
                 );
 
                 match script_result {
-                    Ok(_) if expected_result == ExpectedResult::Fail => {
-                        result
-                            .lock()
-                            .await
-                            .unexpected_passes
-                            .push(script.name().into_owned());
-
-                        let failing_fname = script.path().to_str().unwrap();
-                        let passing_fname = failing_fname.replace(".fail.test", ".test");
-                        if rename_passing {
-                            warn!(script_name = %script.name(), "Renaming {} to {}", failing_fname, passing_fname);
-                            fs::rename(Path::new(failing_fname), Path::new(&passing_fname))
-                                .unwrap();
-                        } else {
-                            error!(
-                                script_name = %script.name(),
-                                "Script {} didn't fail, but was expected to (maybe rename it to {}?)",
-                                failing_fname, passing_fname,
-                            );
-                        }
+                    Ok(_) => {
+                        result.lock().await.passes += 1;
                     }
-                    Err(err) if expected_result == ExpectedResult::Pass => {
+                    Err(err) => {
+                        error!(
+                            script_name = %script.name(),
+                            ?err,
+                            "Script {} failed",
+                            script.name(),
+                        );
                         result
                             .lock()
                             .await
                             .failures
                             .push(script.name().into_owned());
-                        let passing_fname = script.path().to_str().unwrap();
-                        let failing_fname = passing_fname.replace(".test", ".fail.test");
-                        if rename_failing {
-                            warn!(script_name = %script.name(), "Renaming {} to {}", passing_fname, failing_fname);
-                            fs::rename(Path::new(passing_fname), Path::new(&failing_fname))
-                                .unwrap();
-                        } else {
-                            error!(
-                                script_name = %script.name(),
-                                ?err,
-                                "Script {} failed, but was expected to pass (maybe rename it to {}?)",
-                                passing_fname, failing_fname,
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        info!(
-                            script_name = %script.name(),
-                            %err,
-                            "Test script {} failed as expected",
-                            script.name(),
-                        );
-                        result.lock().await.passes += 1;
-                    }
-                    _ => {
-                        result.lock().await.passes += 1;
                     }
                 }
-            }));
 
-            if tasks.len() >= max_tasks {
-                // We want to limit the number of concurrent tests, so we wait for one of the
-                // current tasks to finish first
-                tasks.select_next_some().await.unwrap();
-            }
+                free_slots.lock().await.push_back(task_idx);
+            }));
         }
 
         while !tasks.is_empty() {
@@ -555,6 +479,12 @@ impl From<&Verify> for RunOptions {
             replication_url: verify.replication_url.clone(),
             time: verify.time,
             verbose: verify.verbose,
+            no_fail_fast: verify.no_fail_fast,
+            ignore_error_tags: verify.ignore_error_tags,
+            rewrite: verify.rewrite,
+            query_timeout: Duration::from_secs(verify.query_timeout),
+            script_timeout: Some(Duration::from_secs(verify.script_timeout)),
+            task_idx: 0,
         }
     }
 }
@@ -580,7 +510,7 @@ impl FromStr for Seed {
 }
 
 /// Fuzz-test noria by randomly generating queries and seed data, and ensuring that both ReadySet
-/// and a reference database return the same results
+/// and a reference database return the same results.
 #[derive(Parser, Debug, Clone)]
 pub struct Fuzz {
     /// Number of test cases to generate
@@ -622,6 +552,10 @@ pub struct Fuzz {
         hide = true
     )]
     parsing_preset: ParsingPreset,
+
+    /// Per-query timeout in seconds.
+    #[arg(long, default_value = "60")]
+    query_timeout: u64,
 }
 
 impl Fuzz {
@@ -660,6 +594,7 @@ impl Fuzz {
                 upstream_database_is_readyset: readyset_url.is_some(),
                 replication_url: Some(self.compare_to.clone()),
                 parsing_preset: self.parsing_preset,
+                query_timeout: Duration::from_secs(self.query_timeout),
                 ..RunOptions::default_for_database(self.dialect().into())
             }))
             .map_err(|err| TestCaseError::fail(format!("{:#}\n{:?}", err.root_cause(), err)))

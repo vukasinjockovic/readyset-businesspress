@@ -1,0 +1,126 @@
+# Test that reproduces #286 (REA-3336): weak index deduplication when multiple
+# strict partial indexes have overlapping rows.
+#
+# This logictest covers the insert/dedup path — filling overlapping holes via
+# queries triggers insert_row, which must avoid duplicating rows in the weak
+# index.
+#
+# The eviction-side dual (handle_evicted_row must not remove rows that are still
+# reachable via another strict index) is NOT testable from SQL — key-level
+# eviction is driven by memory pressure internally, not by DROP CACHE (which
+# removes the entire query graph).  That path is covered by the unit test
+# evict_key_preserves_overlapping_rows_in_weak_index in memory_state.rs.
+
+statement ok
+create table tb (x int, y text)
+
+statement ok
+insert into tb (x, y)
+values
+(1, 'a'),
+(2, 'b'),
+(3, 'c')
+
+statement ok
+create table ta (x int, y text, z int)
+
+statement ok
+insert into ta (x, y, z)
+values
+(1, 'a', 3),
+(1, 'b', 3),
+(1, 'c', 3),
+(2, 'a', 3),
+(3, 'a', 3);
+
+
+onlyif readyset
+statement ok
+create cache from
+select tb.x
+from ta
+join tb
+on tb.x = ta.x
+where tb.x = ?
+
+onlyif readyset
+statement ok
+create cache from
+select tb.x
+from ta
+join tb
+on tb.y = ta.y
+where tb.x = 1
+
+onlyif readyset
+statement ok
+create cache from
+select tb.x
+from ta
+join tb
+on tb.x = ta.z
+where ta.y = 'a'
+
+
+query I nosort
+select tb.x
+from ta
+join tb
+on tb.x = ta.x
+where tb.x = ?
+? = 1
+----
+1
+1
+1
+
+# Now we have a strict partial index on [0] with a filled hole on [0] = [1]
+
+query I nosort
+select tb.x
+from ta
+join tb
+on tb.y = ta.y
+where tb.x = 1
+----
+1
+1
+1
+
+# Now we have a strict partial index on [1] with a filled hole on [1] = ['a']
+
+
+query I nosort
+select tb.x
+from ta
+join tb
+on tb.x = ta.z
+where ta.y = 'a'
+----
+3
+3
+3
+
+# Now we have a filled hole in the ingress on `[1] = ['a']`
+# and also our weak index on [2] has some rows  for [3]
+
+graphviz
+
+# (try to) do a regular write that does a weak lookup on [2] = [3]
+
+statement ok
+insert into tb (x, y) values (3, 'c');
+
+query I nosort
+select tb.x
+from ta
+join tb
+on tb.x = ta.z
+where ta.y = 'a'
+----
+3
+3
+3
+3
+3
+3

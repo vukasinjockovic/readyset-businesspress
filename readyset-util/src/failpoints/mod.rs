@@ -71,3 +71,50 @@ pub const CONTROLLER_EVENTS_SSE_CONNECT_DELAY: &str = "controller-events-sse-con
 /// extract the delay value and performs a `std::thread::sleep` outside the lock scope. Configure
 /// with e.g. `"1*return(3000)"` to delay one broadcast by 3 seconds.
 pub const CONTROLLER_EVENTS_SSE_SEND_DELAY: &str = "controller-events-sse-send-delay";
+/// A failpoint after processing a row event in MySQL GTID replication.
+/// Use with "Nx*off->panic" to crash after N events within a transaction.
+pub const MYSQL_GTID_ROW_EVENT: &str = "mysql-gtid-row-event";
+/// A failpoint before snapshotting each individual table in MySQL.
+pub const MYSQL_SNAPSHOT_TABLE: &str = "mysql-snapshot-table";
+
+/// Failpoint: triggers after OIB snapshot scan completes but before WAL catch-up.
+/// Used to test behavior when WAL catch-up fails after a successful scan.
+pub const ONLINE_INDEX_BUILD_POST_SCAN: &str = "online-index-build-post-scan";
+
+/// Failpoint: triggers after sidekick->primary transfer but before index activation.
+/// Used to test cleanup when activation fails.
+pub const ONLINE_INDEX_BUILD_PRE_ACTIVATE: &str = "online-index-build-pre-activate";
+
+/// Failpoint: triggers at the start of build_indices, before any work begins.
+/// Used to test immediate failure and cleanup.
+pub const ONLINE_INDEX_BUILD_START: &str = "online-index-build-start";
+
+/// Triggers inside the `caching_sha2_password` fast-auth branch, just before
+/// the server sends `FAST_AUTH_SUCCESS`. Used to assert that the fast-auth
+/// path was (or was not) taken for a given connection.
+pub const CACHING_SHA2_FAST_AUTH_SUCCESS: &str = "caching-sha2-fast-auth-success";
+
+/// Triggers at the top of `caching_sha2_password`'s full-auth exchange,
+/// before any packet is sent. Used to assert that the full-auth path was
+/// (or was not) taken for a given connection.
+pub const CACHING_SHA2_FULL_AUTH_BEGIN: &str = "caching-sha2-full-auth-begin";
+
+/// Injects an async sleep into the replication lag reporter's MySQL upstream
+/// connect. Uses `fail::eval` with `return(delay_ms)`, e.g. `"1*return(10000)"`
+/// to simulate a wedged handshake on the next connect attempt. Used by tests of
+/// the connect-timeout bound around `setup_heartbeat_table` and the per-poll
+/// MySQL connects in `replicators::replication_lag_reporter`.
+pub const REPLICATION_LAG_CONNECT: &str = "replication-lag-connect";
+
+/// Injects an `Err` return from the controller-level
+/// `min_persisted_replication_offset` RPC the Postgres replicator uses when
+/// computing the next standby status update. With `set_failpoint_return_err!`
+/// semantics, the wrapper returns `Err` without ever calling the controller,
+/// driving the cache-fallback path in `select_ack_lsn` so end-to-end tests
+/// can verify the replicator stays alive across RPC failures.
+pub const POSTGRES_MIN_PERSISTED_RPC: &str = "postgres-min-persisted-rpc";
+
+/// Source-domain full-replay chunker, after the snapshot is taken but before any ReplayPiece is
+/// sent. Tests hold a reader-migration replay open here so a racing write lands mid-window
+/// (REA-6688).
+pub const FULL_REPLAY_POST_SNAPSHOT: &str = "full-replay-post-snapshot";

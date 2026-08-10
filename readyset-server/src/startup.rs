@@ -30,9 +30,6 @@
 //! All control plane communications go via server instances' `NoriaServer`s, which are just HTTP
 //! servers. The endpoints exposed by this HTTP server are:
 //!
-//! - requests sent from the `Leader` to workers (including those workers' domains)
-//!   - the `WorkerRequestKind` enum, mapped to `POST /worker_request`
-//!   - ...which can contain a `DomainRequest`
 //! - requests sent from clients to the `Leader`
 //!   - see `Leader::external_request`
 //! - other misc. endpoints for things like metrics (see the `NoriaServer` implementation for more)
@@ -52,12 +49,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{process, time};
 
+use dataflow::prelude::ChannelCoordinator;
 use dataflow::Readers;
 use failpoint_macros::set_failpoint;
 use futures_util::future::{Either, TryFutureExt};
 use health_reporter::{HealthReporter, State as ServerState};
 use readyset_alloc_metrics::report_allocator_metrics;
 use readyset_client::consensus::{Authority, WorkerSchedulingConfig};
+use readyset_client::internal::DomainIndex;
 use readyset_client::{
     ControllerConnectionPool, ControllerDescriptor, ReadySetHandle, TableStatus, WorkerDescriptor,
 };
@@ -121,8 +120,8 @@ fn start_worker(
     worker_rx: Receiver<WorkerRequest>,
     listen_addr: IpAddr,
     external_addr: SocketAddr,
-    url: Url,
-    controller_http: ControllerConnectionPool,
+    channel_coordinator: Arc<ChannelCoordinator>,
+    domain_exited_tx: UnboundedSender<DomainIndex>,
     abort_on_task_failure: bool,
     readers: Readers,
     memory_limit: Option<usize>,
@@ -136,8 +135,8 @@ fn start_worker(
         worker_rx,
         listen_addr,
         external_addr,
-        url.join("worker_request")?,
-        controller_http,
+        channel_coordinator,
+        domain_exited_tx,
         readers,
         memory_limit,
         memory_check_frequency,
@@ -150,6 +149,7 @@ fn start_worker(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_controller(
     authority: Arc<Authority>,
     http_uri: Url,
@@ -158,6 +158,9 @@ fn start_controller(
     handle_rx: Receiver<HandleRequest>,
     controller_http: ControllerConnectionPool,
     controller_rx: Receiver<ControllerRequest>,
+    domain_exited_rx: UnboundedReceiver<DomainIndex>,
+    channel_coordinator: Arc<ChannelCoordinator>,
+    worker_tx: Sender<WorkerRequest>,
     abort_on_task_failure: bool,
     domain_scheduling_config: WorkerSchedulingConfig,
     parsing_preset: ParsingPreset,
@@ -187,6 +190,9 @@ fn start_controller(
         controller_http,
         controller_rx,
         handle_rx,
+        domain_exited_rx,
+        channel_coordinator,
+        worker_tx,
         our_descriptor.clone(),
         worker_descriptor,
         telemetry_sender,
@@ -215,7 +221,6 @@ fn start_controller(
 async fn start_request_router(
     listen_addr: IpAddr,
     external_addr: SocketAddr,
-    worker_tx: Sender<WorkerRequest>,
     controller_tx: Sender<ControllerRequest>,
     events_handle: EventsHandle,
     abort_on_task_failure: bool,
@@ -226,7 +231,6 @@ async fn start_request_router(
     let http_server = NoriaServerHttpRouter {
         listen_addr,
         port: external_addr.port(),
-        worker_tx,
         controller_tx,
         events_handle,
         health_reporter: health_reporter.clone(),
@@ -312,7 +316,6 @@ pub(crate) async fn start_instance_inner(
     let http_uri = start_request_router(
         listen_addr,
         external_addr,
-        worker_tx.clone(),
         controller_tx,
         events_handle.clone(),
         abort_on_task_failure,
@@ -328,12 +331,20 @@ pub(crate) async fn start_instance_inner(
     maybe_wait_for_failpoint(rx).await;
 
     let controller_http = ReadySetHandle::make_pool();
+    let (domain_exited_tx, domain_exited_rx) =
+        tokio::sync::mpsc::unbounded_channel::<DomainIndex>();
+
+    // Single coord shared by the in-process Worker and Controller. The worker registers
+    // local domain senders + bind addresses here; the controller's DfState reads them
+    // (TableBuilder, eviction routing) directly without an RPC round-trip.
+    let channel_coordinator = Arc::new(ChannelCoordinator::new());
+
     start_worker(
         worker_rx,
         listen_addr,
         external_addr,
-        http_uri.clone(),
-        controller_http.clone(),
+        channel_coordinator.clone(),
+        domain_exited_tx,
         abort_on_task_failure,
         readers,
         memory_limit,
@@ -351,6 +362,9 @@ pub(crate) async fn start_instance_inner(
         handle_rx,
         controller_http,
         controller_rx,
+        domain_exited_rx,
+        channel_coordinator,
+        worker_tx,
         abort_on_task_failure,
         domain_scheduling_config,
         parsing_preset,

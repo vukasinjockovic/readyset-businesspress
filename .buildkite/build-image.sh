@@ -61,24 +61,22 @@ fi
 docker_repo="$AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com"
 image="$docker_repo/$image_name"
 
-# Pull the latest image to populate the cache layers.  This can make the container build go much
-# faster.  We only want to pull an image for the current architecture; but unfortunately if only one
-# architecture is available, docker will pull it quietly without an error.  So before pulling the
-# image, we must get the manifest first to verify that a version exists for this architecture.
+# Pull the latest image to populate the cache layers. This can make the container build go much
+# faster. We attempt to pull the image, then inspect it to verify the architecture matches
+# before using it for cache.
 cache_from=""
 echo "--- :docker: Pulling $image:latest"
-if manifest=$(docker manifest inspect "$image:latest" 2>/dev/null); then
-    if echo "$manifest" | grep -q "\"architecture\": \"$arch\""; then
-        if docker pull --platform "$platform" --quiet "$image:latest"; then
-            cache_from="--cache-from=$image:latest"
-        else
-            echo "Warning: Failed to pull $image:latest for $arch"
-        fi
+if docker pull --platform "$platform" --quiet "$image:latest" 2>/dev/null; then
+    # Pull succeeded - now check if the architecture matches
+    pulled_arch=$(docker image inspect "$image:latest" --format='{{.Architecture}}' 2>/dev/null)
+    if [ "$pulled_arch" = "$arch" ]; then
+        cache_from="--cache-from=$image:latest"
     else
-        echo "No $arch build available in manifest for $image:latest"
+        echo "Warning: $image:latest is for $pulled_arch, not $arch (removing)"
+        docker rmi "$image:latest" >/dev/null 2>&1
     fi
 else
-    echo "No manifest found for $image:latest (first build?)"
+    echo "No $image:latest found (first build?)"
 fi
 
 build_cmd_prefix=(
@@ -92,12 +90,24 @@ build_cmd_prefix=(
     "--build-arg" "BUILDKITE_COMMIT=$BUILDKITE_COMMIT"
 )
 
+# Add a label with the week number so that we don't run out of ECR image tags. We are limited to
+# 1000 tags per image. An "image" here means an image digest. Adding a label to an image changes the
+# metadata portion of the image, which changes the digest without changing or adding any layers. We
+# may have to make this more frequent if we ever hit the 1000 tag limit within a week, but that
+# seems like it would be a pathological situation.
+build_cmd_prefix+=("--label" "build.week=$(date +%Y%W)")
+
 if [[ -n "${SCCACHE_BUCKET-}" ]] && [[ -n "${SCCACHE_REGION-}" ]]; then
     build_cmd_prefix+=(
         "--build-arg" "SCCACHE_BUCKET"
         "--build-arg" "SCCACHE_REGION"
     )
 fi
+
+if [[ -n "${TCV_IMAGE_TAG-}" ]]; then
+    build_cmd_prefix+=("--build-arg" "TCV_IMAGE_TAG")
+fi
+
 
 build_cmd_suffix=(
     "$@"

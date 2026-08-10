@@ -89,6 +89,14 @@ pub struct UpstreamConfig {
     #[serde(default = "default_replication_enabled")]
     pub replication_enabled: bool,
 
+    /// Program/application name reported to the upstream database when this config opens a
+    /// connection. Set internally for connections that should be identifiable on the upstream
+    /// (e.g. the shallow cache refresher). Maps to the MySQL `_program_name` connect attribute
+    /// and the PostgreSQL `application_name` runtime parameter.
+    #[arg(skip)]
+    #[serde(default)]
+    pub program_name: Option<String>,
+
     /// Server ID to use when registering as a replication follower with the upstream db
     ///
     /// This can be used to differentiate different Readyset deployments connected to the same
@@ -109,6 +117,53 @@ pub struct UpstreamConfig {
     #[arg(long, env = "REPLICATION_SERVER_UUID", value_parser = parse_repl_uuid)]
     #[serde(default)]
     pub replication_server_uuid: Option<Uuid>,
+
+    /// Require GTID-based replication for MySQL. When set, Readyset uses GTID
+    /// (Global Transaction Identifiers) instead of traditional binlog file/position
+    /// tracking. Requires the upstream MySQL server to have gtid_mode=ON.
+    /// If the server does not support GTID, replication will fail rather than
+    /// falling back to binlog file/position.
+    #[arg(long, env = "REQUIRE_GTID")]
+    #[serde(default)]
+    pub require_gtid: bool,
+
+    /// Maximum number of row events to skip during GTID crash recovery. When
+    /// Readyset restarts after a crash mid-transaction, it replays from the
+    /// pending GTID and skips row events that were already applied within that
+    /// transaction. If the pending event index exceeds this limit, replication
+    /// fails assuming the persisted state is corrupt.
+    #[arg(long, env = "MAX_GTID_ROWS_TO_SKIP", default_value = "10000")]
+    #[serde(default = "default_max_gtid_rows_to_skip")]
+    pub max_gtid_rows_to_skip: u64,
+
+    /// Maximum number of row events to accumulate in memory before flushing a
+    /// batch during replication. This bounds memory usage for large transactions.
+    /// When a transaction contains more rows than this limit, intermediate
+    /// batches are flushed with the current replication offset.
+    #[arg(long, env = "REPLICATION_BATCH_SIZE", default_value = "50000",
+          value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[serde(default = "default_replication_batch_size")]
+    pub replication_batch_size: usize,
+
+    /// Maximum number of committed transactions to coalesce into a single
+    /// replication batch (group commit). After the first transaction commits,
+    /// additional transactions arriving within the group commit window are
+    /// batched together into a single RPC. Set to 1 to disable group commit.
+    /// Default: 20.
+    #[arg(long, env = "GROUP_COMMIT_MAX_TRX", default_value = "20",
+          value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(0..))]
+    #[serde(default = "default_group_commit_max_trx")]
+    pub group_commit_max_trx: usize,
+
+    /// Microsecond budget for group commit. After the first transaction in a
+    /// group commits, we wait up to this duration for additional transactions
+    /// before flushing the batch. Lower values reduce replication latency,
+    /// higher values improve throughput under high write volume.
+    /// Default: 500us (0.5ms).
+    #[arg(long, env = "GROUP_COMMIT_WAIT_US", default_value = "500",
+          value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(0..))]
+    #[serde(default = "default_group_commit_wait_us")]
+    pub group_commit_wait_us: u64,
 
     /// Hostname to report when registering as a replica with the upstream database (MySQL only).
     /// If not set, no hostname will be reported.
@@ -214,6 +269,29 @@ pub struct UpstreamConfig {
     #[arg(long, env = "SNAPSHOT_QUERY_COMMENT", default_value = "")]
     #[serde(default)]
     pub snapshot_query_comment: Option<String>,
+
+    /// Polling interval in seconds for the replication lag reporter. Controls how
+    /// often ReadySet queries the upstream's replication position and (if heartbeat
+    /// is enabled) writes a heartbeat timestamp.
+    #[arg(
+        long,
+        env = "REPLICATION_LAG_INTERVAL",
+        default_value = "1",
+        value_parser = clap::value_parser!(u16).range(1..=30)
+    )]
+    #[serde(default = "default_replication_lag_interval")]
+    pub replication_lag_interval: u16,
+
+    /// Enable pt-heartbeat-style time-based replication lag measurement. When enabled,
+    /// ReadySet writes a timestamp to a heartbeat table in the upstream database and
+    /// measures the delay before seeing it through replication. Requires write access
+    /// to the upstream.
+    ///
+    /// If the heartbeat table cannot be created (e.g. no write permission), a warning
+    /// is logged and heartbeat is disabled — byte/transaction lag still works.
+    #[arg(long, env = "REPLICATION_HEARTBEAT")]
+    #[serde(default)]
+    pub replication_heartbeat: bool,
 }
 
 impl UpstreamConfig {
@@ -264,12 +342,10 @@ impl UpstreamConfig {
     }
 
     pub fn default_schema_search_path(&self) -> Vec<SqlIdentifier> {
-        if self.upstream_db_url.is_some()
-            && let Ok(ref db_url) = self
-                .upstream_db_url
-                .as_ref()
-                .unwrap()
-                .parse::<DatabaseURL>()
+        if let Some(Ok(ref db_url)) = self
+            .upstream_db_url
+            .as_ref()
+            .map(|u| u.parse::<DatabaseURL>())
         {
             return db_url.default_schema_search_path();
         }
@@ -349,6 +425,26 @@ fn default_status_update_interval_secs() -> u16 {
     UpstreamConfig::default().status_update_interval_secs
 }
 
+fn default_replication_lag_interval() -> u16 {
+    UpstreamConfig::default().replication_lag_interval
+}
+
+fn default_max_gtid_rows_to_skip() -> u64 {
+    10_000
+}
+
+fn default_replication_batch_size() -> usize {
+    50_000
+}
+
+fn default_group_commit_max_trx() -> usize {
+    20
+}
+
+fn default_group_commit_wait_us() -> u64 {
+    500
+}
+
 fn duration_from_seconds(i: &str) -> Result<Duration, ParseIntError> {
     i.parse::<u64>().map(Duration::from_secs)
 }
@@ -362,8 +458,14 @@ impl Default for UpstreamConfig {
             disable_setup_ddl_replication: false,
             disable_create_publication: false,
             replication_enabled: true,
+            program_name: None,
             replication_server_id: Default::default(),
             replication_server_uuid: Default::default(),
+            require_gtid: false,
+            max_gtid_rows_to_skip: default_max_gtid_rows_to_skip(),
+            replication_batch_size: default_replication_batch_size(),
+            group_commit_max_trx: default_group_commit_max_trx(),
+            group_commit_wait_us: default_group_commit_wait_us(),
             replica_report_host: Default::default(),
             replica_report_port: Default::default(),
             replica_report_user: Default::default(),
@@ -378,6 +480,8 @@ impl Default for UpstreamConfig {
             status_update_interval_secs: 10,
             max_parallel_snapshot_tables: default_max_parallel_snapshot_tables(),
             snapshot_query_comment: Default::default(),
+            replication_lag_interval: 1,
+            replication_heartbeat: false,
         }
     }
 }

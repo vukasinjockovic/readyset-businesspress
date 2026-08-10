@@ -1,16 +1,17 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
+use std::sync::Arc;
 use std::{iter, mem};
 
 use crate::node::Column;
 use dataflow_state::PointKey;
 use derive_more::From;
-use readyset_client::KeyComparison;
-use readyset_data::{Bound, DfType};
+use readyset_client::{KeyComparison, ReplayKeys};
+use readyset_data::DfType;
 use readyset_errors::ReadySetResult;
-use readyset_util::ranges::RangeBounds;
 use readyset_util::Indices;
+use readyset_util::ranges::RangeBounds;
 use serde::{Deserialize, Serialize};
 use vec1::Vec1;
 
@@ -18,38 +19,8 @@ use crate::prelude::*;
 
 // TODO: make a Key type that is an ArrayVec<DfValue>
 
-/// Indication, for a [`Miss`], for how to derive the replay key that was being processed during
-/// that miss
-#[derive(PartialEq, Eq, Debug, Clone, From)]
-pub(crate) enum MissReplayKey {
-    /// A point replay was being performed, meaning we can get the values for the key out of the
-    /// miss record with these column indices
-    ///
-    /// # Invariants
-    ///
-    /// * The column indices here must be in-bounds for the miss's [`record`][Miss::record]
-    /// * The column indices cannot be empty
-    RecordColumns(Vec<usize>),
-
-    /// A range replay was being performed, with the given range key
-    ///
-    /// # Invariants
-    ///
-    /// * The endpoints of the range must be the same length
-    /// * The endpoints of the range may not be empty
-    Range((Bound<Vec1<DfValue>>, Bound<Vec1<DfValue>>)),
-
-    /// An explicit point key for replays that span multiple sources (e.g., straddled joins)
-    /// where the key cannot be extracted from a single record
-    ///
-    /// # Invariants
-    ///
-    /// * The values cannot be empty
-    Explicit(Vec1<DfValue>),
-}
-
-/// Indication, for a [`Miss`], for how to derive the key that was used for the lookup that resulted
-/// in the miss.
+/// Indication, for a [`MissBuilder`], for how to derive the key that was used for the lookup that
+/// resulted in the miss. Resolved eagerly to a [`KeyComparison`] in [`MissBuilder::build`].
 #[derive(PartialEq, Eq, Debug, Clone, From)]
 pub(crate) enum MissLookupKey {
     /// The columns of the miss's [`record`][] we were using for a point lookup
@@ -100,10 +71,12 @@ pub(crate) struct Miss {
     pub(crate) on: LocalNodeIndex,
     /// The columns of `on` we were looking up on.
     pub(crate) lookup_idx: Vec<usize>,
-    /// The key that we used to do the lookup that resulted in this miss
-    pub(crate) lookup_key: MissLookupKey,
-    /// The replay key that was being processed during the lookup (if any)
-    pub(crate) replay_key: Option<MissReplayKey>,
+    /// The key that we used to do the lookup that resulted in this miss, eagerly resolved at build
+    /// time.
+    pub(crate) lookup_key: KeyComparison,
+    /// The replay key that was being processed during the lookup (if any), eagerly resolved at
+    /// build time.
+    pub(crate) replay_key: Option<KeyComparison>,
     /// The record we were processing when we missed.
     pub(crate) record: Vec<DfValue>,
 }
@@ -177,25 +150,22 @@ impl<'a> MissBuilder<'a> {
         let replay_key = match self.replay.take().unwrap() {
             ReplayContext::Partial { key_cols, keys, .. } => {
                 let replay_key_cols = self.replay_key_cols.take().unwrap_or(*key_cols);
-                // Does `keys` contain a range that covers `record`?
-                // Since we unfortunately have to do some cloning to answer that question due to the
-                // limiting type signature of `RangeBounds::contains`, avoid doing that cloning if
-                // we don't find any ranges by inserting into a memo (`record_key_memo`).
+                // Does any range in `keys` cover `record`? The record's key columns are
+                // cloned lazily into `record_key_memo` only when a range is actually found.
                 let mut record_key_memo = None;
                 let range = keys
-                    .iter()
-                    .filter_map(|k| k.range())
-                    // NOTE: Since overlapping range queries will be deduplicated by the domain, we
-                    // can be assured that we will find at most one range that covers our record
-                    // here.
+                    .ranges()
+                    // Since overlapping range queries will be deduplicated by the domain, we can
+                    // be assured that we will find at most one range that covers our record here.
                     .find(|(lower, upper)| {
                         (
                             lower.as_ref().map(|b| b.as_ref()),
                             upper.as_ref().map(|b| b.as_ref()),
                         )
                             .contains(record_key_memo.get_or_insert_with(
-                                // TODO(aspen): This clone shouldn't be necessary, but comparing
-                                // Vec<&DfValue> with &Vec<DfValue> is surprisingly difficult
+                                // TODO(aspen): This clone shouldn't be necessary, but
+                                // comparing Vec<&DfValue> with &Vec<DfValue> is
+                                // surprisingly difficult
                                 || {
                                     record
                                         .cloned_indices(replay_key_cols.iter().copied())
@@ -203,18 +173,43 @@ impl<'a> MissBuilder<'a> {
                                 },
                             ))
                     });
+                // Eagerly resolve the replay key to a KeyComparison so that replay_key() is a
+                // trivial accessor and never re-derives from the record.
                 Some(match range {
-                    Some(k) => MissReplayKey::Range(k.clone()),
-                    None => MissReplayKey::RecordColumns(replay_key_cols.to_vec()),
+                    Some(k) => KeyComparison::Range(k.clone()),
+                    None => {
+                        let values = record_key_memo.unwrap_or_else(|| {
+                            record
+                                .cloned_indices(replay_key_cols.iter().copied())
+                                .expect("replay key columns must be in-bounds for record")
+                        });
+                        KeyComparison::Equal(
+                            values
+                                .try_into()
+                                .expect("replay key columns must not be empty"),
+                        )
+                    }
                 })
             }
             _ => None,
         };
 
+        // Eagerly resolve lookup_key so that lookup_key() is a trivial accessor.
+        let lookup_key = match self.lookup_key.take().unwrap() {
+            MissLookupKey::RecordColumns(cols) => KeyComparison::Equal(
+                record
+                    .cloned_indices(cols.iter().copied())
+                    .expect("lookup key columns must be in-bounds for record")
+                    .try_into()
+                    .expect("lookup key columns must not be empty"),
+            ),
+            MissLookupKey::Key(kc) => kc,
+        };
+
         Miss {
             on: self.on.take().unwrap(),
             lookup_idx: self.lookup_idx.take().unwrap(),
-            lookup_key: self.lookup_key.take().unwrap(),
+            lookup_key,
             replay_key,
             record,
         }
@@ -227,37 +222,16 @@ impl Miss {
         MissBuilder::default()
     }
 
-    /// Return a reference to the keys for the replay that were being performed during the miss, if
-    /// any
-    #[allow(clippy::unwrap_used)] // invariants on the fields
-    pub(crate) fn replay_key(&self) -> Option<KeyComparison> {
-        self.replay_key.as_ref().map(|rk| match rk {
-            MissReplayKey::RecordColumns(cols) => self
-                .record
-                .cloned_indices(cols.iter().copied())
-                .unwrap()
-                .try_into()
-                .unwrap(),
-            MissReplayKey::Range((lower, upper)) => {
-                KeyComparison::Range((lower.clone(), upper.clone()))
-            }
-            MissReplayKey::Explicit(values) => KeyComparison::Equal(values.clone()),
-        })
+    /// Return a reference to the replay key that was being processed during the miss, if any.
+    /// The key is eagerly resolved at build time, so this is a trivial accessor.
+    pub(crate) fn replay_key(&self) -> Option<&KeyComparison> {
+        self.replay_key.as_ref()
     }
 
-    /// Return a reference to the key used to perform the lookup that resulted in this miss
-    #[allow(clippy::unwrap_used)] // invariants on the fields
-    pub(crate) fn lookup_key(&self) -> Cow<'_, KeyComparison> {
-        match &self.lookup_key {
-            MissLookupKey::Key(lk) => Cow::Borrowed(lk),
-            MissLookupKey::RecordColumns(cols) => Cow::Owned(
-                self.record
-                    .cloned_indices(cols.iter().copied())
-                    .unwrap()
-                    .try_into()
-                    .unwrap(),
-            ),
-        }
+    /// Return a reference to the lookup key that resulted in this miss.
+    /// The key is eagerly resolved at build time, so this is a trivial accessor.
+    pub(crate) fn lookup_key(&self) -> &KeyComparison {
+        &self.lookup_key
     }
 }
 
@@ -308,8 +282,8 @@ pub(crate) enum RawProcessingResult {
     CapturedFull,
     ReplayPiece {
         rows: Records,
-        keys: HashSet<KeyComparison>,
-        captured: HashSet<KeyComparison>,
+        keys: ReplayKeys,
+        captured: ReplayKeys,
     },
 }
 
@@ -318,16 +292,18 @@ pub(crate) enum ReplayContext<'a> {
     None,
     Partial {
         key_cols: &'a [usize],
-        keys: &'a HashSet<KeyComparison>,
-        /// The index of the shard that originally requested the replay.
-        requesting_shard: usize,
-        /// The index of the replica that originally requested the replay.
-        requesting_replica: usize,
+        keys: &'a ReplayKeys,
         tag: Tag,
-        unishard: bool,
     },
     Full {
         last: bool,
+        tag: Tag,
+    },
+    /// The replay-start barrier (REA-6688): an empty, non-terminal piece emitted ahead of the
+    /// replay data to flip the target domain to `Replaying`. Distinct from [`Full`] so a
+    /// deduplicating union forwards it straight through rather than folding it into its full-replay
+    /// accounting, which would consume the shared dedup state before any data arrives.
+    FullStart {
         tag: Tag,
     },
 }
@@ -349,7 +325,7 @@ impl<'a> ReplayContext<'a> {
     ///
     /// This is only valid for [`ReplayContext::Partial`], and will return `None` for
     /// other variants.
-    pub(crate) fn keys(&self) -> Option<&'a HashSet<KeyComparison>> {
+    pub(crate) fn keys(&self) -> Option<&'a ReplayKeys> {
         if let ReplayContext::Partial { keys, .. } = *self {
             Some(keys)
         } else {
@@ -362,6 +338,7 @@ impl<'a> ReplayContext<'a> {
         match self {
             Self::Partial { tag, .. } => Some(*tag),
             Self::Full { tag, .. } => Some(*tag),
+            Self::FullStart { tag } => Some(*tag),
             _ => None,
         }
     }
@@ -391,7 +368,7 @@ pub struct ColumnMiss {
     /// The column indices that the lookup was performed in
     ///
     /// Invariant: this will have the same length as all the keys in `missed_keys`
-    pub column_indices: Vec<usize>,
+    pub column_indices: Arc<[usize]>,
     /// The keys that we missed on.
     ///
     /// Invariant: These keys will have the same length as `column_indices`
@@ -780,6 +757,10 @@ where
     /// yet.
     fn on_connected(&mut self, _graph: &Graph) {}
 
+    /// Called on a freshly-deserialized ingredient, before any other method. Override to rebuild
+    /// any `#[serde(skip)]` state that is derivable from serialized fields.
+    fn post_deserialize(&mut self) {}
+
     /// Swap out the given `from_idx` with `to_idx` in any state stored within this node.
     ///
     /// This method may be called any number of times after `on_connected` is called. If it is
@@ -825,14 +806,17 @@ where
     }
 
     /// Triggered whenever an eviction occurs, to allow the operator to react by evicting from any
-    /// auxiliary state other than what is stored in its materialization.
+    /// auxiliary state other than what is stored in its materialization. Returns the number of
+    /// auxiliary bytes freed, so the domain can subtract them from its memory accounting the same
+    /// way it subtracts the bytes freed from materialized state.
     fn on_eviction(
         &mut self,
         _from: LocalNodeIndex,
         _tag: Tag,
         _keys: &[KeyComparison],
         _auxiliary_node_states: &mut AuxiliaryNodeStateMap,
-    ) {
+    ) -> usize {
+        0
     }
 
     fn can_query_through(&self) -> bool {
@@ -883,8 +867,11 @@ where
             Ok(Some(coerced_key)) => coerced_key,
             // Coercion did not happen, use the original key.
             Ok(None) => key,
-            // Coercion happened, but was not successful, return empty result.
-            Err(_) => return Ok(IngredientLookupResult::Miss),
+            // Coercion happened, but was not successful — the key can never match
+            // any records in the indexed column (e.g. TEXT vs INT), so return empty.
+            // Returning Miss here would trigger a replay for a key that can never
+            // exist, which causes a "no tag found" panic in the domain.
+            Err(_) => return Ok(IngredientLookupResult::empty()),
         };
 
         match states.get(parent_index) {
@@ -915,5 +902,41 @@ where
     /// Returns true if this operator requires a full materialization
     fn requires_full_materialization(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vec1::vec1;
+
+    use super::*;
+
+    /// Regression test for when a partial replay carries only `Equal` keys,
+    /// `MissBuilder::build` never enters the range-cover loop. The resulting miss's replay
+    /// key is derived from the record columns as an `Equal`, matching the partition routing.
+    #[test]
+    fn miss_builder_no_range_iteration_for_equals_only_replay() {
+        let keys: ReplayKeys = (0..1000)
+            .map(|k| KeyComparison::Equal(vec1![k.into()]))
+            .collect();
+        assert_eq!(keys.ranges().count(), 0);
+
+        let replay = ReplayContext::Partial {
+            key_cols: &[0],
+            keys: &keys,
+            tag: Tag::new(0),
+        };
+        let miss = Miss::builder()
+            .on(LocalNodeIndex::make(0))
+            .lookup_idx(vec![0])
+            .lookup_key(MissLookupKey::RecordColumns(vec![0]))
+            .replay(&replay)
+            .record(vec![42.into()])
+            .build();
+
+        // No range covers the record, so the resolved replay key is the record's
+        // projected columns as `KeyComparison::Equal`. A regression where ranges() was
+        // iterated would either pick up the wrong variant or panic on the empty iterator.
+        assert!(matches!(miss.replay_key(), Some(KeyComparison::Equal(_))));
     }
 }

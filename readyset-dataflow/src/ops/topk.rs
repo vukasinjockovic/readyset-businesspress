@@ -1,24 +1,22 @@
-/// Please note that the ordering for TopK and Pagination is reversed during MIR lowering.
-/// This is why every single use of `cmp` is reversed here.
-/// Why this MIR reversal was done is still unknown to me and this moment.
+/// Note: The ordering for TopK and Pagination is reversed during MIR lowering.
+/// All comparisons in this module use `.reverse()` to compensate for that reversal.
 ///
-/// Ideally, that MIR reversal should be removed and all reversals here should be removed
-/// as well.
+/// TODO: Remove the MIR reversal and simplify the comparison logic here.
 use std::borrow::Cow;
-use std::cmp::{min, Ordering};
+use std::cmp::{Ordering, min};
 use std::collections::HashMap;
 use std::convert::TryInto;
 
 use dataflow_state::PointKey;
 use itertools::Itertools;
-use readyset_client::{internal, KeyComparison};
-use readyset_data::{Bound, DfValue};
-use readyset_errors::{internal, internal_err, ReadySetResult};
-use readyset_sql::ast::{NullOrder, OrderType};
-use readyset_util::Indices;
+use metrics::counter;
+use readyset_client::{KeyComparison, internal};
+use readyset_data::DfValue;
+use readyset_errors::{ReadySetResult, internal, internal_err};
+use readyset_sql::ast::{NullOrder, OrderType, Relation};
+use readyset_util::{Indices, SizeOf};
 use serde::{Deserialize, Serialize};
-use tracing::trace;
-use vec1::Vec1;
+use tracing::{error, trace};
 
 use crate::node::AuxiliaryNodeState;
 use crate::ops::utils::Order;
@@ -32,55 +30,27 @@ use crate::processing::{ColumnSource, IngredientLookupResult, LookupIndex, Looku
 pub type TopKState = HashMap<Vec<DfValue>, Vec<Vec<DfValue>>>;
 
 /// Data structure used internally by TopK to track rows within a group.
-/// Holds a reference to the `order` of the TopK operator to allow for a
-/// custom `Ord` implementation, which compares records in reverse order
-/// to support maintaining a sorted `Vec` for efficient binary search and
-/// insertion/removal.
+/// Sorted and searched using [`TopK::total_cmp`], not the standard `Ord` trait.
 #[derive(Debug)]
-struct CurrentRecord<'topk, 'state> {
+struct CurrentRecord<'state> {
     row: Cow<'state, [DfValue]>,
-    order: &'topk Order,
-    // If the key wasn't in Top K (or buffer) then it's a new entry
-    // and `original_index` will be `None`.
+    /// `original_index` records the row's position in the persisted aux state
+    /// at the start of the current batch. It encodes whether downstream has
+    /// the row: positions `[0, k)` were the persisted top-k slice (downstream
+    /// has them), positions `[k, k + buffered)` were buffer-only (downstream
+    /// does not), and `None` means the row was newly added in this batch.
+    /// Use the helpers below rather than comparing the index directly.
     original_index: Option<usize>,
 }
 
-impl Ord for CurrentRecord<'_, '_> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        debug_assert_eq!(self.order, other.order);
-        self.order
-            .cmp(self.row.as_ref(), other.row.as_ref())
-            .reverse()
+impl<'state> CurrentRecord<'state> {
+    /// True iff this row was in the persisted top-k slice at the start of
+    /// this batch — i.e., downstream's main state currently holds it and
+    /// any removal must emit a Negative.
+    fn was_in_downstream_top_k(&self, k: usize) -> bool {
+        matches!(self.original_index, Some(i) if i < k)
     }
 }
-
-impl PartialOrd for CurrentRecord<'_, '_> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for CurrentRecord<'_, '_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl PartialOrd<[DfValue]> for CurrentRecord<'_, '_> {
-    fn partial_cmp(&self, other: &[DfValue]) -> Option<Ordering> {
-        Some(self.order.cmp(self.row.as_ref(), other).reverse())
-    }
-}
-
-impl PartialEq<[DfValue]> for CurrentRecord<'_, '_> {
-    fn eq(&self, other: &[DfValue]) -> bool {
-        self.partial_cmp(other)
-            .iter()
-            .any(|c| *c == Ordering::Equal)
-    }
-}
-
-impl Eq for CurrentRecord<'_, '_> {}
 
 /// TopK provides an operator that will produce the top k elements for each group.
 ///
@@ -104,10 +74,21 @@ pub struct TopK {
     /// This is used to reduce the number of lookups that need to be
     /// made in case of deletions from top k rows.
     buffered: usize,
+
+    /// Name of the cache this operator serves, used to label the backfill counter
+    /// ([`metric::TOPK_BACKFILL_REQUESTS`]) so backfills can be attributed per cache.
+    ///
+    /// This is the `CREATE CACHE <name>` name (the `name` column in `SHOW CACHES`), set during
+    /// MIR lowering via [`TopK::with_cache_name`]. It is carried on the operator because an
+    /// operator can't borrow its own node out of `DomainNodes` while being processed. `None` only
+    /// when never set (e.g. test constructors), in which case the counter reports
+    /// `cache_name="unknown"`.
+    #[serde(default)]
+    cache_name: Option<Relation>,
 }
 
 impl TopK {
-    /// Construct a new TopK operator.
+    /// Construct a new TopK operator with the default buffer size (`buffered = k`).
     ///
     /// # Arguments
     ///
@@ -121,14 +102,49 @@ impl TopK {
         group_by: Vec<usize>,
         k: usize,
     ) -> Self {
+        Self::with_buffer_multiplier(src, order, group_by, k, None)
+    }
+
+    /// Construct a new TopK operator, optionally overriding the buffer size with a multiplier.
+    ///
+    /// `topk_buffer_multiplier` is the factor applied to `k` when sizing the backup buffer used
+    /// to avoid backwards queries on negative records (`buffered = k * multiplier`). `None`
+    /// preserves the legacy default of `buffered = k`. `Some(0)` disables buffering entirely.
+    pub fn with_buffer_multiplier(
+        src: NodeIndex,
+        order: Vec<(usize, OrderType, NullOrder)>,
+        group_by: Vec<usize>,
+        k: usize,
+        topk_buffer_multiplier: Option<usize>,
+    ) -> Self {
+        let buffered = match topk_buffer_multiplier {
+            Some(m) => k.saturating_mul(m),
+            None => k,
+        };
         TopK {
             src: src.into(),
             our_index: None,
             group_by,
             order: order.into(),
             k,
-            buffered: k,
+            buffered,
+            cache_name: None,
         }
+    }
+
+    /// Record the cache this operator serves (the `CREATE CACHE` name), so the backfill counter
+    /// can be labeled with it. Set during MIR lowering, where the cache name is known.
+    pub fn with_cache_name(mut self, cache_name: Relation) -> Self {
+        self.cache_name = Some(cache_name);
+        self
+    }
+
+    /// Total capacity per group (`k + buffered`), saturated to avoid overflow when `buffered`
+    /// is at `usize::MAX`. Used as the `Vec::with_capacity` argument and as the comparison
+    /// threshold for the trim path.
+    #[inline]
+    fn total_capacity(&self) -> usize {
+        self.k.saturating_add(self.buffered)
     }
 
     /// Project the columns we are grouping by out of the given record
@@ -160,19 +176,20 @@ impl TopK {
     /// `original_group_len` contains the length of the group before we started making updates to
     /// it.
     #[allow(clippy::too_many_arguments)]
-    fn post_group<'topk, 'state>(
-        &'topk self,
+    fn post_group<'state>(
+        &self,
         out: &mut Vec<Record>,
-        current: &mut Vec<CurrentRecord<'topk, 'state>>,
-        current_group_key: &[DfValue],
+        current: &mut Vec<CurrentRecord<'state>>,
+        current_group_key: Option<&[DfValue]>,
         original_group_len: usize,
         state: &'state StateMap,
         nodes: &DomainNodes,
         buffered_state: &mut TopKState,
     ) -> ReadySetResult<Option<Lookup>> {
-        if current_group_key.is_empty() {
-            return Ok(None);
-        }
+        let current_group_key = match current_group_key {
+            Some(key) => key,
+            None => return Ok(None),
+        };
 
         let mut lookup = None;
 
@@ -190,6 +207,13 @@ impl TopK {
             //
             // The push/no-push decision is simplified here, please refer to the loops
             // below and their comments.
+            let cache_name = self
+                .cache_name
+                .as_ref()
+                .map(|n| n.display_unquoted().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            counter!(metric::TOPK_BACKFILL_REQUESTS, "cache_name" => cache_name).increment(1);
+
             let IngredientLookupResult::Records(parent_records) = self.lookup(
                 *self.src,
                 &self.group_by,
@@ -202,104 +226,107 @@ impl TopK {
                 internal!("We shouldn't have been able to get this record if the parent would miss")
             };
 
-            let mut old_current = current
+            let mut old_current: Vec<_> = current
                 .drain(..)
                 .map(|r| (r.row, r.original_index))
-                .collect::<HashMap<_, _>>();
+                .collect();
 
-            let mut rs = parent_records.collect::<Result<Vec<_>, _>>()?;
-            rs.sort_unstable_by(|a, b| self.total_cmp(a, b));
+            // Stream parent rows into a sorted Vec bounded at `k + buffered`
+            // so groups with millions of rows do not materialize fully here.
+            // We use a sorted Vec rather than a `BinaryHeap` because the
+            // heap takes no custom comparator: each row would have to be
+            // wrapped in a struct that captures `&self.order` to satisfy
+            // `Ord`. For typical small k the asymptotic win of the heap
+            // is not worth the per-row wrapper allocation and the extra
+            // boilerplate.
+            let cap = self.total_capacity();
+            let mut rs: Vec<Cow<'_, [DfValue]>> = Vec::with_capacity(cap.saturating_add(1));
+            for row in parent_records {
+                let row = row?;
+                // Once full, reject rows that don't beat the current worst
+                // before paying for `binary_search_by` + `Vec::insert`.
+                if rs.len() == cap
+                    && rs
+                        .last()
+                        .is_some_and(|worst| !self.total_cmp(worst, &row).is_gt())
+                {
+                    continue;
+                }
+                let pos = rs
+                    .binary_search_by(|existing| self.total_cmp(existing, &row))
+                    .unwrap_or_else(|p| p);
+                rs.insert(pos, row);
+                if rs.len() > cap {
+                    rs.pop();
+                }
+            }
 
-            current.extend(
-                rs.into_iter()
-                    .take(self.k + self.buffered)
-                    .map(|row| CurrentRecord {
-                        original_index: old_current.remove(&row).unwrap_or_default(),
-                        row,
-                        order: &self.order,
-                    }),
-            );
+            current.extend(rs.into_iter().map(|row| {
+                // Find and remove the first matching entry from old_current
+                // to correctly handle duplicate rows. Order of old_current
+                // doesn't matter (it's a lookup bag), so use swap_remove
+                // to avoid O(k) element shifting.
+                let original_index = match old_current
+                    .iter()
+                    .position(|(old_row, _)| old_row.as_ref() == row.as_ref())
+                {
+                    Some(pos) => old_current.swap_remove(pos).1,
+                    None => None,
+                };
+                CurrentRecord {
+                    original_index,
+                    row,
+                }
+            }));
 
-            lookup = Some(Lookup {
-                on: *self.src,
-                cols: self.group_by.clone(),
-                key: current_group_key.to_vec().try_into().expect("Empty group"),
-            })
-        }
-
-        let k = min(current.len(), self.k);
-        let end = min(current.len(), self.k + self.buffered);
-
-        // check top k records first
-        for r in current[..k].iter() {
-            match r.original_index {
-                // new entry in top k rows; push positive
-                None => out.push(Record::Positive(r.row.to_vec())),
-                // was in the buffer zone, now in top k; push positive
-                Some(i) if i >= self.k => out.push(Record::Positive(r.row.to_vec())),
-                // was in top k, still in top k; do nothing
-                _ => (),
+            // Only construct the Lookup when the group key is non-empty, since
+            // KeyComparison::Equal requires Vec1 (at least one element).
+            // Empty group_by means a single global group — no key-based lookup needed.
+            if let Ok(key) = current_group_key.to_vec().try_into() {
+                lookup = Some(Lookup {
+                    on: *self.src,
+                    cols: self.group_by.clone(),
+                    key,
+                })
+            } else {
+                debug_assert!(
+                    self.group_by.is_empty(),
+                    "Failed to construct Lookup with non-empty group_by"
+                );
             }
         }
 
-        // now check the buffer zone
-        for r in current[k..end].iter() {
-            // was in top k, now is in buffer; push negative
-            if matches!(r.original_index, Some(i) if i < k) {
+        let top_end = min(current.len(), self.k);
+        let buffer_end = min(current.len(), self.total_capacity());
+
+        // Top-k slice: emit a Positive for any row downstream doesn't yet have.
+        for r in current[..top_end].iter() {
+            if !r.was_in_downstream_top_k(self.k) {
+                out.push(Record::Positive(r.row.to_vec()));
+            }
+        }
+
+        // Buffer slice: emit a Negative for any row downstream still has but
+        // that has been demoted out of top-k.
+        for r in current[top_end..buffer_end].iter() {
+            if r.was_in_downstream_top_k(self.k) {
                 out.push(Record::Negative(r.row.to_vec()));
             }
         }
 
-        // update the buffered (auxiliary) state of this group.
-        let _ = buffered_state.insert(
+        // Update the buffered (auxiliary) state of this group.
+        debug_assert!(
+            current.len() <= self.total_capacity(),
+            "current exceeded capacity: {} > {}",
+            current.len(),
+            self.total_capacity()
+        );
+        buffered_state.insert(
             current_group_key.to_vec(),
-            // Since we're done processing this group, we must clear the current
-            // group to prepare for the next group, so we use drain instead of iter
-            current
-                .drain(..)
-                .take(self.k + self.buffered)
-                .map(|r| r.row.to_vec())
-                .collect(),
+            current.drain(..).map(|r| r.row.to_vec()).collect(),
         );
 
         Ok(lookup)
-    }
-
-    /// Helper method to check if a group key falls within a given range
-    /// Mainly used for ranged evictions
-    fn key_in_range(
-        &self,
-        group_key: &[DfValue],
-        start: &Bound<Vec1<DfValue>>,
-        end: &Bound<Vec1<DfValue>>,
-    ) -> bool {
-        let compare_with_bound = |key: &[DfValue], bound_vec: &Vec1<DfValue>| -> Ordering {
-            for (key_val, bound_val) in key.iter().zip(bound_vec.iter()) {
-                match key_val.cmp(bound_val) {
-                    Ordering::Equal => continue,
-                    other => return other,
-                }
-            }
-            Ordering::Equal
-        };
-
-        let start_ok = match start {
-            Bound::Included(start_key) => {
-                compare_with_bound(group_key, start_key) >= Ordering::Equal
-            }
-            Bound::Excluded(start_key) => {
-                compare_with_bound(group_key, start_key) > Ordering::Equal
-            }
-        };
-
-        if !start_ok {
-            return false;
-        }
-
-        match end {
-            Bound::Included(end_key) => compare_with_bound(group_key, end_key) <= Ordering::Equal,
-            Bound::Excluded(end_key) => compare_with_bound(group_key, end_key) < Ordering::Equal,
-        }
     }
 }
 
@@ -324,33 +351,40 @@ impl Ingredient for TopK {
         _tag: Tag,
         keys: &[KeyComparison],
         auxiliary_node_states: &mut AuxiliaryNodeStateMap,
-    ) {
-        let aux_state = match auxiliary_node_states.get_mut(*self.our_index.unwrap()) {
-            Some(AuxiliaryNodeState::TopK(state)) => state,
-            _ => panic!("topk operators got the wrong auxiliary node state"),
+    ) -> usize {
+        let us = self
+            .our_index
+            .expect("TopK node index must be set after on_commit");
+        let Some(AuxiliaryNodeState::TopK(aux_state)) = auxiliary_node_states.get_mut(*us) else {
+            error!("TopK operator received wrong auxiliary node state during eviction");
+            return 0;
         };
 
+        let mut freed = 0;
         for key in keys {
             match key {
                 KeyComparison::Equal(exact) => {
-                    aux_state.remove(&exact.clone().into_vec());
-                }
-                KeyComparison::Range((start, end)) => {
-                    // For range evictions, we need to find all keys that fall within the range
-                    // and remove them. Since we're dealing with group keys, we need to check
-                    // which group keys fall within the specified range.
-                    let keys_to_remove: Vec<_> = aux_state
-                        .keys()
-                        .filter(|group_key| self.key_in_range(group_key, start, end))
-                        .cloned()
-                        .collect();
-
-                    for key in keys_to_remove {
-                        aux_state.remove(&key);
+                    if let Some((group_key, rows)) = aux_state.remove_entry(exact.as_slice()) {
+                        freed += group_key.deep_size_of() + rows.deep_size_of();
                     }
+                }
+                KeyComparison::Range(_) => {
+                    // Range evictions don't normally reach here: TopK is
+                    // hash-indexed and sits near leaves, so memory pressure
+                    // produces point evictions for it. We handle Range
+                    // defensively in case a future dataflow shape routes
+                    // one through.
+                    aux_state.retain(|group_key, rows| {
+                        let keep = !key.contains(group_key.iter());
+                        if !keep {
+                            freed += group_key.deep_size_of() + rows.deep_size_of();
+                        }
+                        keep
+                    });
                 }
             }
         }
+        freed
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -372,16 +406,20 @@ impl Ingredient for TopK {
             });
         }
 
-        // First, we want to be smart about multiple added/removed rows with same group.
-        // For example, if we get a -, then a +, for the same group, we don't want to
-        // execute two queries. We'll do this by sorting the batch by our group by.
-        rs.sort_by(|a: &Record, b: &Record| {
-            self.project_group(&***a)
-                .unwrap_or_default()
-                .cmp(&self.project_group(&***b).unwrap_or_default())
-        });
+        // Sort records by group key so that records for the same group are contiguous.
+        // Skip the sort when group_by is empty (single global group).
+        if !self.group_by.is_empty() {
+            rs.sort_by(|a: &Record, b: &Record| {
+                self.group_by
+                    .iter()
+                    .map(|&col| &a.rec()[col])
+                    .cmp(self.group_by.iter().map(|&col| &b.rec()[col]))
+            });
+        }
 
-        let us = self.our_index.unwrap();
+        let us = self
+            .our_index
+            .expect("TopK node index must be set after on_commit");
         let db = state.get(*us).ok_or_else(|| {
             internal_err!("topk operators must have their own state materialized")
         })?;
@@ -396,7 +434,7 @@ impl Ingredient for TopK {
 
         let mut out = Vec::with_capacity(rs.len());
         // the lookup key of the group currently being processed
-        let mut current_group_key = Vec::new();
+        let mut current_group_key: Option<Vec<DfValue>> = None;
         // the original length of the group currently being processed before we started doing
         // anything to it. We need to keep track of this so that we can lookup into our parent to
         // backfill a group if processing drops us below `k` records when we were originally at `k`
@@ -407,32 +445,38 @@ impl Ingredient for TopK {
         let mut misses = Vec::new();
         let mut lookups = Vec::new();
         // +1 so insertions after reaching capacity don't cause a reallocation
-        let current_capacity = self.k + self.buffered + 1;
+        let current_capacity = self.total_capacity().saturating_add(1);
         let mut current: Vec<CurrentRecord> = Vec::with_capacity(current_capacity);
 
         // records are now chunked by group
         for r in &rs {
+            let projected_refs = self.project_group(r.rec())?;
+
             // Does this record belong to the same group or did we start processing a new group?
-            if current_group_key.iter().cmp(self.project_group(r.rec())?) != Ordering::Equal {
+            // Compare using borrowed references to avoid allocating on every record.
+            let is_same_group = current_group_key.as_deref().is_some_and(|key: &[DfValue]| {
+                key.len() == projected_refs.len()
+                    && key.iter().zip(projected_refs.iter()).all(|(a, b)| a == *b)
+            });
+            if !is_same_group {
                 // new group!
 
                 // first, tidy up the old one
                 if let Some(lookup) = self.post_group(
                     &mut out,
                     &mut current,
-                    &current_group_key,
+                    current_group_key.as_deref(),
                     original_group_len,
                     state,
                     nodes,
                     buffered_state,
-                )? {
-                    if replay.is_partial() {
-                        lookups.push(lookup)
-                    }
+                )? && replay.is_partial()
+                {
+                    lookups.push(lookup)
                 }
 
-                // make ready for the new one
-                current_group_key = self.project_group(r.rec())?.into_iter().cloned().collect();
+                // make ready for the new one — only clone into owned values on group change
+                current_group_key.replace(projected_refs.into_iter().cloned().collect());
 
                 // We can’t check for misses against `buffered_state` (the aux state), even though
                 // evictions affect both main and aux.
@@ -440,25 +484,42 @@ impl Ingredient for TopK {
                 // Only the main state marks missing keys as "filled" when an upquery resolves a hole.
                 // If we relied on the aux state instead, we’d never see those fills and could loop
                 // forever reporting misses.
+                // Invariant: current_group_key was just set to Some above
+                let group_key_ref = current_group_key
+                    .as_ref()
+                    .expect("current_group_key must be Some after assignment");
                 missed = if let LookupResult::Some(r) =
-                    db.lookup(&self.group_by, &PointKey::from(current_group_key.clone()))
+                    db.lookup(&self.group_by, &PointKey::from(group_key_ref.clone()))
                 {
                     if replay.is_partial() {
-                        lookups.push(Lookup {
-                            on: *us,
-                            cols: self.group_by.clone(),
-                            key: current_group_key.clone().try_into().expect("Empty group"),
-                        });
+                        // Empty group_by means a single global group — no key-based
+                        // lookup needed since Vec1 requires at least one element.
+                        if let Ok(key) = group_key_ref.clone().try_into() {
+                            lookups.push(Lookup {
+                                on: *us,
+                                cols: self.group_by.clone(),
+                                key,
+                            });
+                        } else {
+                            debug_assert!(
+                                self.group_by.is_empty(),
+                                "Failed to construct Lookup with non-empty group_by"
+                            );
+                        }
                     }
 
-                    // verify that the states match and that the eviction affected both states
+                    // Verify aux state agrees with main state. Debug-only by design:
+                    // release-mode detection of divergence (e.g. via a partial-replay
+                    // or restart-recovery race) is delegated to the upstream query
+                    // sampler, which catches wrong results at the system level. Do
+                    // not add a release-mode check here without coordinating with it.
                     debug_assert_eq!(
                         r.into_iter()
                             .map(|r| r.to_vec())
-                            .sorted_by(|a, b| self.order.cmp(a, b).reverse().then(a.cmp(b)))
+                            .sorted_by(|a, b| self.total_cmp(a, b))
                             .collect::<Vec<_>>(),
                         buffered_state
-                            .get(&current_group_key)
+                            .get(group_key_ref)
                             .unwrap_or(&Vec::new())
                             .iter()
                             .take(self.k)
@@ -471,27 +532,40 @@ impl Ingredient for TopK {
                     true
                 };
 
-                current = match buffered_state.get(&current_group_key) {
+                // Reuse `current`'s allocation across group transitions. Its
+                // capacity was set at the top of `on_input` and stays valid
+                // for every group; clear+extend avoids a malloc per group.
+                current.clear();
+                match buffered_state.get(group_key_ref) {
                     Some(records) => {
+                        // The aux state for a group must hold at most k +
+                        // buffered rows. The first k define downstream's
+                        // top-k slice and the rest define the buffer; the
+                        // `original_index < k` predicate (encoded by the
+                        // CurrentRecord helpers) depends on this shape.
+                        if records.len() > self.total_capacity() {
+                            internal!(
+                                "topk aux state for group has {} rows, exceeds k + buffered ({} + {})",
+                                records.len(),
+                                self.k,
+                                self.buffered,
+                            );
+                        }
+
                         original_group_len = records.len();
 
-                        records
-                            .iter()
-                            .cloned()
-                            .enumerate()
-                            .map(|(i, r)| CurrentRecord {
+                        current.extend(records.iter().cloned().enumerate().map(|(i, r)| {
+                            CurrentRecord {
                                 row: Cow::Owned(r),
-                                order: &self.order,
                                 original_index: Some(i),
-                            })
-                            .collect()
+                            }
+                        }));
                     }
                     None => {
-                        // New group or was previously evicted. Either way, we need to start fresh
+                        // New group or was previously evicted. Either way, we start fresh.
                         original_group_len = 0;
-                        Vec::with_capacity(current_capacity)
                     }
-                };
+                }
             }
 
             if missed {
@@ -509,53 +583,92 @@ impl Ingredient for TopK {
 
             match r {
                 Record::Positive(r) => {
-                    // If we're at capacity we can't consider positive records worse than our
-                    // worst element, because it's possible that there are *other* records
-                    // *between* our worst element and that positive record which we wouldn't
-                    // know about. If we drop below k records during processing and it turns out
-                    // that this positive record would have been in the topk, we'll figure that
-                    // out in post_group when we query our parent.
-                    if current.len() >= (self.k + self.buffered) {
-                        if let Some(worst) = current.last() {
-                            if worst <= r.as_slice() {
-                                trace!(row = ?r, "topk skipping positive worse than worst");
-                                continue;
-                            }
-                        }
+                    // If the group started this batch already at >= k, skip
+                    // any positive that is not strictly better than our
+                    // current worst. The buffer is bounded at k + buffered,
+                    // so the parent may hold rows between our worst and this
+                    // positive that we have never seen; admitting it would
+                    // risk promoting it to top-k later (via deletes) ahead
+                    // of those better rows.
+                    //
+                    // If deletes drain the group below k by end of batch,
+                    // post_group backfills from the parent and recovers any
+                    // skipped positive that does belong in top-k. An
+                    // under-filled group (original_group_len < k) has no
+                    // downstream-visible top-k to protect and no hidden
+                    // parent rows in dataflow, so we admit everything.
+                    if original_group_len >= self.k
+                        && let Some(worst) = current.last()
+                        && !self.total_cmp(&worst.row, r).is_gt()
+                    {
+                        trace!(row = ?r, "topk skipping positive worse than worst");
+                        continue;
                     }
 
-                    let record = CurrentRecord {
-                        row: Cow::Borrowed(r),
-                        order: &self.order,
-                        // New entry to the topk
-                        original_index: None,
-                    };
-
+                    // `Err` is a non-duplicate insertion; `Ok` means a
+                    // byte-identical row already exists in `current` (under
+                    // `total_cmp`, equality requires full-row equality). In
+                    // the `Ok` case we insert a duplicate intentionally; the
+                    // negative handler below resolves it via the smallest
+                    // `original_index` tiebreak when the row is later removed.
                     match current.binary_search_by(|cr| self.total_cmp(&cr.row, r)) {
                         Ok(idx) | Err(idx) => {
-                            // we already know that this record is within bounds and
-                            // at least better than our worst element
-                            current.insert(idx, record);
-                            // Immediately enforce size bound to prevent unbounded growth
-                            // and vec reallocation
-                            if current.len() > self.k + self.buffered {
-                                current.truncate(self.k + self.buffered);
+                            current.insert(
+                                idx,
+                                CurrentRecord {
+                                    row: Cow::Borrowed(r),
+                                    original_index: None, // New entry to top-k
+                                },
+                            );
+
+                            // Enforce size bound. The popped row is worse than every
+                            // survivor; it can only matter to a future top-k once they
+                            // are all deleted, which triggers backfill in post_group.
+                            // If the popped row was in the original top-k, emit a
+                            // Negative since downstream has it.
+                            if current.len() > self.total_capacity() {
+                                let dropped =
+                                    current.pop().expect("current is non-empty after insert");
+                                if dropped.was_in_downstream_top_k(self.k) {
+                                    out.push(Record::Negative(dropped.row.into_owned()));
+                                }
                             }
                         }
                     };
                 }
                 Record::Negative(r) => {
-                    let _ = current
-                        .binary_search_by(|cr| self.total_cmp(&cr.row, r))
-                        .map(|idx| {
-                            // This record was already in the topk
-                            if matches!(current[idx].original_index, Some(i) if i < self.k) {
+                    match current.binary_search_by(|cr| self.total_cmp(&cr.row, r)) {
+                        Ok(idx) => {
+                            // binary_search found *an* equal element. When there are
+                            // duplicates, prefer removing the one with the smallest
+                            // original_index (most likely in top-k) so we correctly
+                            // emit a Negative if it was materialized downstream.
+                            let mut best = idx;
+                            for i in (0..idx).rev() {
+                                if self.total_cmp(&current[i].row, r) != Ordering::Equal {
+                                    break;
+                                }
+                                if current[i].original_index < current[best].original_index {
+                                    best = i;
+                                }
+                            }
+                            for i in (idx + 1)..current.len() {
+                                if self.total_cmp(&current[i].row, r) != Ordering::Equal {
+                                    break;
+                                }
+                                if current[i].original_index < current[best].original_index {
+                                    best = i;
+                                }
+                            }
+                            if current[best].was_in_downstream_top_k(self.k) {
                                 out.push(Record::Negative(r.clone()));
                             }
-                            // Shifting sucks, we can use a deletion marker, but that
-                            // will make the group-posting logic more complex
-                            current.remove(idx);
-                        });
+                            current.remove(best);
+                        }
+                        Err(_) => {
+                            trace!(row = ?r, "topk negative for row not in buffer, ignoring");
+                        }
+                    }
                 }
             }
         }
@@ -563,15 +676,14 @@ impl Ingredient for TopK {
         if let Some(lookup) = self.post_group(
             &mut out,
             &mut current,
-            &current_group_key,
+            current_group_key.as_deref(),
             original_group_len,
             state,
             nodes,
             buffered_state,
-        )? {
-            if replay.is_partial() {
-                lookups.push(lookup)
-            }
+        )? && replay.is_partial()
+        {
+            lookups.push(lookup)
         }
 
         Ok(ProcessingResult {
@@ -719,7 +831,7 @@ mod tests {
         assert!(
             delta.iter().any(|r| r == &(r10.clone(), true).into()),
             "a = {:?} does not contain ({:?}, true)",
-            &delta,
+            delta,
             r10
         );
     }
@@ -758,7 +870,7 @@ mod tests {
         assert!(
             delta.iter().any(|r| r == &(r12.clone(), true).into()),
             "a = {:?} does not contain ({:?}, true)",
-            &delta,
+            delta,
             r12
         );
     }
@@ -794,6 +906,26 @@ mod tests {
     }
 
     #[test]
+    fn with_buffer_multiplier_sets_buffered() {
+        // Default (None) keeps the legacy behavior: buffered == k.
+        let topk = TopK::new(NodeIndex::new(0), vec![], vec![], 10);
+        assert_eq!(topk.k, 10);
+        assert_eq!(topk.buffered, 10);
+
+        // Some(1) is explicitly equivalent to the default.
+        let topk = TopK::with_buffer_multiplier(NodeIndex::new(0), vec![], vec![], 10, Some(1));
+        assert_eq!(topk.buffered, 10);
+
+        // Some(3) scales the buffer: buffered = k * multiplier.
+        let topk = TopK::with_buffer_multiplier(NodeIndex::new(0), vec![], vec![], 10, Some(3));
+        assert_eq!(topk.buffered, 30);
+
+        // Some(0) disables buffering past k.
+        let topk = TopK::with_buffer_multiplier(NodeIndex::new(0), vec![], vec![], 10, Some(0));
+        assert_eq!(topk.buffered, 0);
+    }
+
+    #[test]
     fn it_suggests_indices() {
         let (g, _) = setup(false);
         let me = 2.into();
@@ -812,23 +944,6 @@ mod tests {
 
     #[test]
     fn it_resolves() {
-        let (g, _) = setup(false);
-        assert_eq!(
-            g.node().resolve(0),
-            Some(vec![(g.narrow_base_id().as_global(), 0)])
-        );
-        assert_eq!(
-            g.node().resolve(1),
-            Some(vec![(g.narrow_base_id().as_global(), 1)])
-        );
-        assert_eq!(
-            g.node().resolve(2),
-            Some(vec![(g.narrow_base_id().as_global(), 2)])
-        );
-    }
-
-    #[test]
-    fn it_parent_columns() {
         let (g, _) = setup(false);
         assert_eq!(
             g.node().resolve(0),
@@ -963,5 +1078,287 @@ mod tests {
 
         let emit = g.narrow_one(vec![(ra3.clone(), false), (ra0, true)], true);
         assert_eq!(emit, vec![(ra3, false), (ra1, true)].into());
+    }
+
+    /// Test that empty group_by with duplicate values handles deletes correctly.
+    ///
+    /// Exercises two bugs:
+    /// 1. Empty group key (`group_by = []`) collided with the `Vec::new()` sentinel
+    ///    used for "no group selected yet", causing `post_group` to skip processing.
+    /// 2. HashMap in backfill collapsed duplicate rows (same value) into one entry,
+    ///    causing spurious Positive emissions that inflated the row count.
+    #[test]
+    fn empty_group_by_with_duplicate_values() {
+        let mut g = ops::test::MockGraph::new();
+        let s = g.add_base("source", &["x", "val"]);
+
+        // group_by = [] means all rows are in one group; k = 3
+        g.set_op(
+            "topk",
+            &["x", "val"],
+            TopK::new(
+                s.as_global(),
+                vec![(1, OrderType::OrderAscending, NullOrder::NullsFirst)],
+                vec![],
+                3,
+            ),
+            true,
+        );
+
+        let ni = g.node().local_addr();
+
+        // 4 rows all with val = 1, distinguished by x
+        let r1: Vec<DfValue> = vec![1.into(), 1.into()];
+        let r2: Vec<DfValue> = vec![2.into(), 1.into()];
+        let r3: Vec<DfValue> = vec![3.into(), 1.into()];
+        let r4: Vec<DfValue> = vec![4.into(), 1.into()];
+
+        // Seed the parent with all 4 rows (needed for backfill lookups)
+        g.seed(s, r1.clone());
+        g.seed(s, r2.clone());
+        g.seed(s, r3.clone());
+        g.seed(s, r4.clone());
+
+        // Insert all 4 rows into topk
+        g.narrow_one_row(r1.clone(), true);
+        g.narrow_one_row(r2.clone(), true);
+        g.narrow_one_row(r3.clone(), true);
+        g.narrow_one_row(r4, true);
+
+        // With k=3, top-k state should have exactly 3 rows
+        assert_eq!(g.states[ni].row_count(), 3);
+
+        // Delete 2 rows. Negatives for r1 and r2.
+        let emit = g.narrow_one(vec![(r1, false), (r2, false)], true);
+
+        // Should have emitted negatives for r1 and r2 (they were in top-k)
+        assert!(
+            emit.iter().any(|r| !r.is_positive() && r[0] == 1.into()),
+            "expected negative for r1, got: {:?}",
+            emit
+        );
+        assert!(
+            emit.iter().any(|r| !r.is_positive() && r[0] == 2.into()),
+            "expected negative for r2, got: {:?}",
+            emit
+        );
+
+        // After backfill from parent (which still has all 4 rows in seed state),
+        // topk should maintain 3 rows in state
+        assert_eq!(
+            g.states[ni].row_count(),
+            3,
+            "state should have 3 rows after backfill"
+        );
+    }
+
+    /// When the buffer is full and a new row ties on ORDER BY columns but
+    /// beats the worst element under total_cmp, it must be inserted.
+    #[test]
+    fn skip_optimization_ordering_mismatch() {
+        let (mut g, s) = setup(false);
+        let ni = g.node().local_addr();
+
+        // All rows have the same ORDER BY value (z=10), differ only in x.
+        // total_cmp tiebreaks on full row, so x matters for position.
+        // k=3, buffered=3, capacity=6.
+        let r1: Vec<DfValue> = vec![1.into(), "z".into(), 10.into()];
+        let r2: Vec<DfValue> = vec![2.into(), "z".into(), 10.into()];
+        let r3: Vec<DfValue> = vec![3.into(), "z".into(), 10.into()];
+        let r4: Vec<DfValue> = vec![4.into(), "z".into(), 10.into()];
+        let r5: Vec<DfValue> = vec![5.into(), "z".into(), 10.into()];
+        let r6: Vec<DfValue> = vec![6.into(), "z".into(), 10.into()];
+
+        // Seed parent with all rows for backfill
+        for r in [&r1, &r2, &r3, &r4, &r5, &r6] {
+            g.seed(s, r.clone());
+        }
+
+        // Fill buffer to capacity (6 entries)
+        g.narrow_one_row(r1, true);
+        g.narrow_one_row(r2, true);
+        g.narrow_one_row(r3.clone(), true);
+        g.narrow_one_row(r4, true);
+        g.narrow_one_row(r5, true);
+        g.narrow_one_row(r6, true);
+        assert_eq!(g.states[ni].row_count(), 3);
+
+        // Now insert a row with same ORDER BY value but x=0, which sorts
+        // BEFORE all existing rows under total_cmp. It should enter the
+        // buffer and displace the worst.
+        let r0: Vec<DfValue> = vec![0.into(), "z".into(), 10.into()];
+        g.seed(s, r0.clone());
+        let emit = g.narrow_one_row(r0.clone(), true);
+
+        // r0 sorts before all existing rows under total_cmp, so it should
+        // enter the top-k and displace the worst element.
+        assert!(
+            emit.iter().any(|r| r.is_positive()),
+            "r0 should have been inserted but was incorrectly skipped. emit={:?}",
+            emit
+        );
+    }
+
+    /// When a batch of positives displaces records that were in the original
+    /// top-k, Negatives must be emitted for the displaced entries.
+    #[test]
+    fn truncation_drops_topk_without_negative() {
+        let (mut g, s) = setup(false);
+        let ni = g.node().local_addr();
+
+        // k=3, buffered=3, capacity=6. Effective ordering is DESC.
+        // Fill with scores 100-600; top-k (DESC) = [600, 500, 400], buffer = [300, 200, 100]
+        let r1: Vec<DfValue> = vec![1.into(), "z".into(), 100.into()];
+        let r2: Vec<DfValue> = vec![2.into(), "z".into(), 200.into()];
+        let r3: Vec<DfValue> = vec![3.into(), "z".into(), 300.into()];
+        let r4: Vec<DfValue> = vec![4.into(), "z".into(), 400.into()];
+        let r5: Vec<DfValue> = vec![5.into(), "z".into(), 500.into()];
+        let r6: Vec<DfValue> = vec![6.into(), "z".into(), 600.into()];
+
+        for r in [&r1, &r2, &r3, &r4, &r5, &r6] {
+            g.seed(s, r.clone());
+        }
+
+        g.narrow_one_row(r1, true);
+        g.narrow_one_row(r2, true);
+        g.narrow_one_row(r3, true);
+        g.narrow_one_row(r4, true);
+        g.narrow_one_row(r5, true);
+        g.narrow_one_row(r6, true);
+        assert_eq!(g.states[ni].row_count(), 3);
+
+        // Send 7 positives in a SINGLE BATCH with scores 700-706 (all better
+        // than existing in DESC). These should displace the old top-k entries
+        // [600, 500, 400] and Negatives must be emitted for them.
+        let new_rows: Vec<Record> = (700..=706)
+            .enumerate()
+            .map(|(i, score)| {
+                let r: Vec<DfValue> = vec![(10 + i as i32).into(), "z".into(), score.into()];
+                g.seed(s, r.clone());
+                Record::Positive(r)
+            })
+            .collect();
+
+        let emit = g.narrow_one(new_rows, true);
+
+        let neg_count = emit.iter().filter(|r| !r.is_positive()).count();
+        let pos_count = emit.iter().filter(|r| r.is_positive()).count();
+
+        // 3 negatives for displaced top-k entries [400, 500, 600]
+        // 3 positives for new top-k entries
+        assert_eq!(
+            neg_count, 3,
+            "Should have 3 negatives for displaced top-k entries, \
+             got {} negatives. Full emit: {:?}",
+            neg_count, emit
+        );
+        assert_eq!(
+            pos_count, 3,
+            "Should have 3 positives for new top-k entries, got {}. Full emit: {:?}",
+            pos_count, emit
+        );
+
+        assert_eq!(g.states[ni].row_count(), 3);
+    }
+
+    /// Duplicate positives (byte-identical rows re-sent) must not grow
+    /// state beyond k.
+    #[test]
+    fn duplicate_positive_does_not_grow_state() {
+        let (mut g, _) = setup(false);
+        let ni = g.node().local_addr();
+
+        let r1: Vec<DfValue> = vec![1.into(), "z".into(), 10.into()];
+        let r2: Vec<DfValue> = vec![2.into(), "z".into(), 11.into()];
+        let r3: Vec<DfValue> = vec![3.into(), "z".into(), 12.into()];
+        let r4: Vec<DfValue> = vec![4.into(), "z".into(), 13.into()];
+
+        // Fill top k (k=3)
+        g.narrow_one_row(r1.clone(), true);
+        g.narrow_one_row(r2.clone(), true);
+        g.narrow_one_row(r3.clone(), true);
+        g.narrow_one_row(r4, true);
+        assert_eq!(g.states[ni].row_count(), 3);
+
+        // Re-send identical positives for rows already in top k.
+        // State must stay at k=3.
+        g.narrow_one_row(r1, true);
+        g.narrow_one_row(r2, true);
+        g.narrow_one_row(r3, true);
+        assert_eq!(g.states[ni].row_count(), 3);
+    }
+
+    /// A worse-than-worst positive must not be admitted to the buffer when
+    /// the parent has hidden rows: later deletes can promote it to top-k
+    /// ahead of a better parent row, since `current.len() == k` post-delete
+    /// does not trigger backfill.
+    #[test]
+    fn worse_than_worst_positive_promotes_stale_buffer_row() {
+        let (mut g, s) = setup(false);
+        let ni = g.node().local_addr();
+
+        let r100: Vec<DfValue> = vec![1.into(), "z".into(), 100.into()];
+        let r90: Vec<DfValue> = vec![2.into(), "z".into(), 90.into()];
+        let r80: Vec<DfValue> = vec![3.into(), "z".into(), 80.into()];
+        let r70: Vec<DfValue> = vec![4.into(), "z".into(), 70.into()];
+        let r60: Vec<DfValue> = vec![5.into(), "z".into(), 60.into()];
+        let r50: Vec<DfValue> = vec![6.into(), "z".into(), 50.into()];
+        let r40: Vec<DfValue> = vec![7.into(), "z".into(), 40.into()];
+        let r30: Vec<DfValue> = vec![8.into(), "z".into(), 30.into()];
+        let r20: Vec<DfValue> = vec![9.into(), "z".into(), 20.into()];
+
+        // Parent state at backfill time: r100/r90/r80/r70 have been
+        // deleted and r20 inserted.
+        g.seed(s, r60.clone());
+        g.seed(s, r50.clone());
+        g.seed(s, r40.clone());
+        g.seed(s, r30.clone());
+        g.seed(s, r20.clone());
+
+        // Ascending arrival ensures r40 and r30 are popped during fill
+        // and remain hidden from the operator.
+        for r in [&r30, &r40, &r50, &r60, &r70, &r80, &r90, &r100] {
+            g.narrow_one_row(r.clone(), true);
+        }
+
+        g.narrow_one(
+            vec![
+                Record::Negative(r100.clone()),
+                Record::Positive(r20.clone()),
+            ],
+            true,
+        );
+
+        g.narrow_one_row((r90.clone(), false), true);
+        g.narrow_one_row((r80.clone(), false), true);
+        let final_emit = g.narrow_one_row((r70.clone(), false), true);
+
+        assert!(
+            final_emit.iter().any(|r| r == &(r40.clone(), true).into()),
+            "expected +r40 in final emit; got {:?}",
+            final_emit,
+        );
+        assert!(
+            !final_emit.iter().any(|r| r == &(r20.clone(), true).into()),
+            "r20 must not be promoted to top-k; got {:?}",
+            final_emit,
+        );
+
+        assert_eq!(g.states[ni].row_count(), 3);
+        let LookupResult::Some(rows) = g.states[ni].lookup(&[1], &PointKey::from(["z".into()]))
+        else {
+            panic!("expected materialized rows for group 'z'");
+        };
+        let vals: Vec<DfValue> = rows.into_iter().map(|r| r[2].clone()).collect();
+        assert!(
+            vals.contains(&60.into()) && vals.contains(&50.into()) && vals.contains(&40.into()),
+            "expected state to contain {{60, 50, 40}}; got {:?}",
+            vals,
+        );
+        assert!(
+            !vals.contains(&20.into()),
+            "state must not contain stale r20; got {:?}",
+            vals,
+        );
     }
 }

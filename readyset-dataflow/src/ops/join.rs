@@ -1,15 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::{TryFrom, TryInto};
+use std::mem;
 
 use dataflow_state::PointKey;
 use itertools::Itertools;
 use readyset_client::KeyComparison;
-use readyset_errors::{internal_err, ReadySetResult};
+use readyset_errors::{ReadySetResult, internal_err};
 use readyset_util::intervals::into_bound_endpoint;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use tracing::debug;
-use vec1::{vec1, Vec1};
+use vec1::{Vec1, vec1};
+
+use dataflow_expression::Expr;
 
 use super::Side;
 use crate::prelude::*;
@@ -37,6 +40,15 @@ pub enum JoinExecutionMode {
     StraddledRegularLookup,
 }
 
+/// A mapping from an output column position to a source column index.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct EmitColumn {
+    /// Index in the output row.
+    output: usize,
+    /// Column index in the source (left or right) row.
+    source: usize,
+}
+
 /// Join rows between two nodes based on a (compound) equal join key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Join {
@@ -48,10 +60,6 @@ pub struct Join {
 
     // Which columns to emit
     emit: Vec<(Side, usize)>,
-
-    // Which columns to emit when the left/right row is being modified in place.
-    in_place_left_emit: Vec<(Side, usize)>,
-    in_place_right_emit: Vec<(Side, usize)>,
 
     /// Buffered records from one half of a remapped upquery. The key is (column index,
     /// side).
@@ -69,6 +77,27 @@ pub struct Join {
     // We skip serde since we don't want the state of the node, just the configuration.
     #[serde(skip)]
     pub missing_upqueries: HashMap<(Vec<KeyComparison>, Side), Vec<ColumnMiss>>,
+
+    /// Optional filter expression evaluated on left rows for LEFT JOINs.
+    /// When present and the filter evaluates to false for a left row,
+    /// the join skips the right-side lookup and directly emits a NULL-extended row.
+    /// This implements correct LEFT JOIN semantics for ON-clause predicates
+    /// that reference only the left side of the join.
+    left_filter: Option<Expr>,
+
+    /// Whether `generate_row_move` is safe to use (no duplicate columns from the same side
+    /// in `emit`). Precomputed at construction time; recomputed in `post_deserialize`.
+    #[serde(skip)]
+    emit_move_safe: bool,
+
+    /// Pre-split emit indices for left-side columns.
+    /// Avoids per-column `Side` branching in the hot path.
+    #[serde(skip)]
+    emit_left: Vec<EmitColumn>,
+
+    /// Pre-split emit indices for right-side columns.
+    #[serde(skip)]
+    emit_right: Vec<EmitColumn>,
 }
 
 impl Join {
@@ -85,60 +114,28 @@ impl Join {
         on: Vec<(usize, usize)>,
         emit: Vec<(Side, usize)>,
         rhs_full_mat: bool,
+        left_filter: Option<Expr>,
     ) -> Self {
-        let (in_place_left_emit, in_place_right_emit) = {
-            let compute_in_place_emit = |side| {
-                let num_columns = emit
-                    .iter()
-                    .filter(|&&(from_side, _)| from_side == side)
-                    .map(|&(_, c)| c + 1)
-                    .max()
-                    .unwrap_or(0);
-
-                // Tracks how columns have moved. At any point during the iteration, column i in
-                // the original row will be located at position remap[i].
-                let mut remap: Vec<_> = (0..num_columns).collect();
-                emit.iter()
-                    .enumerate()
-                    .map(|(i, &(from_side, c))| {
-                        if from_side == side {
-                            let remapped = remap[c];
-                            let other = remap.iter().position(|&c| c == i);
-
-                            remap[c] = i;
-                            if let Some(other) = other {
-                                remap[other] = remapped;
-                            }
-
-                            (from_side, remapped)
-                        } else {
-                            (from_side, c)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            };
-
-            (
-                compute_in_place_emit(Side::Left),
-                compute_in_place_emit(Side::Right),
-            )
-        };
         debug!(
             "Join::new: left: {:?}, right: {:?}, kind: {:?}, on: {:?}, rhs_full_mat: {:?}",
             left, right, kind, on, rhs_full_mat
         );
-        Self {
+        let mut join = Self {
             left: left.into(),
             right: right.into(),
             on,
             emit,
-            in_place_left_emit,
-            in_place_right_emit,
             generated_column_buffer: Default::default(),
             kind,
             rhs_full_mat,
             missing_upqueries: Default::default(),
-        }
+            left_filter,
+            emit_move_safe: false,
+            emit_left: Vec::new(),
+            emit_right: Vec::new(),
+        };
+        join.recompute_emit_metadata();
+        join
     }
 
     pub fn node_is_lhs(&self, node: LocalNodeIndex) -> bool {
@@ -147,6 +144,39 @@ impl Join {
 
     pub fn node_is_rhs(&self, node: LocalNodeIndex) -> bool {
         node == *self.right
+    }
+
+    /// Recompute all `#[serde(skip)]` emit-related metadata from `self.emit`.
+    /// Called from `new()` and `post_deserialize()`.
+    fn recompute_emit_metadata(&mut self) {
+        self.emit_left = self
+            .emit
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(side, _))| side == Side::Left)
+            .map(|(i, &(_, col))| EmitColumn {
+                output: i,
+                source: col,
+            })
+            .collect();
+        self.emit_right = self
+            .emit
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(side, _))| side == Side::Right)
+            .map(|(i, &(_, col))| EmitColumn {
+                output: i,
+                source: col,
+            })
+            .collect();
+        self.emit_move_safe = {
+            let mut left_cols = HashSet::new();
+            let mut right_cols = HashSet::new();
+            self.emit.iter().all(|&(side, col)| match side {
+                Side::Left => left_cols.insert(col),
+                Side::Right => right_cols.insert(col),
+            })
+        };
     }
 
     pub fn on_left(&self) -> Vec<usize> {
@@ -158,13 +188,53 @@ impl Join {
     }
 
     fn generate_row(&self, left: &[DfValue], right: &[DfValue]) -> Vec<DfValue> {
-        self.emit
-            .iter()
-            .map(|&(side, col)| match side {
-                Side::Left => left[col].clone(),
-                Side::Right => right[col].clone(),
-            })
-            .collect()
+        let len = self.emit.len();
+        let mut result = Vec::with_capacity(len);
+        let vals = result.spare_capacity_mut();
+        let mut c = 0;
+        for &EmitColumn { output, source } in &self.emit_left {
+            vals[output].write(left[source].clone());
+            c += 1;
+        }
+        for &EmitColumn { output, source } in &self.emit_right {
+            vals[output].write(right[source].clone());
+            c += 1;
+        }
+        assert_eq!(c, len);
+        // SAFETY: all `len` slots written via emit_left ∪ emit_right; assert above confirms.
+        unsafe {
+            result.set_len(len);
+        }
+        result
+    }
+
+    /// Like [`generate_row`], but moves values from the owned side instead of cloning.
+    /// The caller must not read from `owned` after this call.
+    fn generate_row_move(
+        &self,
+        owned: &mut [DfValue],
+        borrowed: &[DfValue],
+        owned_is_left: bool,
+    ) -> Vec<DfValue> {
+        let len = self.emit.len();
+        let mut result = Vec::with_capacity(len);
+        let vals = result.spare_capacity_mut();
+        let (move_cols, clone_cols) = if owned_is_left {
+            (&self.emit_left, &self.emit_right)
+        } else {
+            (&self.emit_right, &self.emit_left)
+        };
+        for &EmitColumn { output, source } in move_cols {
+            vals[output].write(mem::take(&mut owned[source]));
+        }
+        for &EmitColumn { output, source } in clone_cols {
+            vals[output].write(borrowed[source].clone());
+        }
+        // SAFETY: all `len` slots written via move_cols ∪ clone_cols.
+        unsafe {
+            result.set_len(len);
+        }
+        result
     }
 
     /// Build a hash map from one of the sides of the join.
@@ -187,8 +257,8 @@ impl Join {
     fn hash_join(&self, left: Records, right: Records) -> ReadySetResult<Records> {
         let mut probe_keys = vec![];
         let mut build_keys = vec![];
-        let mut ret: Vec<Record> = vec![];
         let probe_is_left = left.len() > right.len();
+        let mut ret: Vec<Record> = Vec::with_capacity(left.len().max(right.len()));
         for (left_key, right_key) in &self.on {
             match probe_is_left {
                 true => {
@@ -208,10 +278,64 @@ impl Join {
         let hm = self.build_join_hash_map(build_side, &build_keys);
 
         let mut key: Vec<&DfValue> = vec![&DfValue::None; probe_keys.len()];
+
+        if self.kind == JoinType::Left && !probe_is_left {
+            // When probe is right and build is left for a LEFT JOIN,
+            // we need to handle this differently: iterate left (build) side
+            // and look up right (probe) side.
+            // For correctness, iterate left records directly.
+            let right_keys: Vec<usize> = self.on.iter().map(|(_, r)| *r).collect();
+            let left_keys: Vec<usize> = self.on.iter().map(|(l, _)| *l).collect();
+            let right_hm = self.build_join_hash_map(&right, &right_keys);
+
+            let mut rkey: Vec<&DfValue> = vec![&DfValue::None; left_keys.len()];
+            for left_rec in left.iter() {
+                invariant!(
+                    left_rec.is_positive(),
+                    "replays should only include positive records"
+                );
+                if !self.left_filter_passes(left_rec.row())? {
+                    ret.push(Record::Positive(self.generate_null(left_rec.row())));
+                    continue;
+                }
+                for i in 0..left_keys.len() {
+                    rkey[i] = &left_rec[left_keys[i]];
+                }
+                if let Some(right_recs) = right_hm.get(&rkey) {
+                    for right_rec in right_recs {
+                        ret.push(Record::Positive(
+                            self.generate_row(left_rec.row(), right_rec.row()),
+                        ));
+                    }
+                } else {
+                    ret.push(Record::Positive(self.generate_null(left_rec.row())));
+                }
+            }
+            return Ok(ret.into());
+        }
+
         for prob_rec in probe_side {
             for i in 0..probe_keys.len() {
                 key[i] = &prob_rec[probe_keys[i]];
             }
+
+            // For LEFT JOINs where probe is left, check the filter
+            let filter_passes = if self.kind == JoinType::Left && probe_is_left {
+                self.left_filter_passes(prob_rec.row())?
+            } else {
+                true
+            };
+
+            if !filter_passes {
+                // Left row fails filter — emit NULL-extended
+                invariant!(
+                    prob_rec.is_positive(),
+                    "replays should only include positive records"
+                );
+                ret.push(Record::Positive(self.generate_null(prob_rec.row())));
+                continue;
+            }
+
             if let Some(build_recs) = hm.get(&key) {
                 invariant!(
                     prob_rec.is_positive(),
@@ -232,23 +356,36 @@ impl Join {
                         )),
                     }
                 }
-            };
+            } else if self.kind == JoinType::Left && probe_is_left {
+                // Left row with no right match — emit NULL-extended
+                invariant!(
+                    prob_rec.is_positive(),
+                    "replays should only include positive records"
+                );
+                ret.push(Record::Positive(self.generate_null(prob_rec.row())));
+            }
         }
         Ok(ret.into())
     }
 
-    // TODO: make non-allocating
     fn generate_null(&self, left: &[DfValue]) -> Vec<DfValue> {
-        self.emit
-            .iter()
-            .map(|&(side, col)| {
-                if side == Side::Left {
-                    left[col].clone()
-                } else {
-                    DfValue::None
-                }
-            })
-            .collect()
+        let len = self.emit.len();
+        let mut result = vec![DfValue::None; len];
+        for &EmitColumn { output, source } in &self.emit_left {
+            result[output] = left[source].clone();
+        }
+        result
+    }
+
+    /// Returns `true` if the left row passes the `left_filter`, or if no filter is set.
+    ///
+    /// # Errors
+    /// Propagates any evaluation error from the filter expression.
+    fn left_filter_passes(&self, row: &[DfValue]) -> ReadySetResult<bool> {
+        match &self.left_filter {
+            Some(filter) => Ok(filter.eval(row)?.is_truthy()),
+            None => Ok(true),
+        }
     }
 
     /// Given a column index, check if it comes from the left or the right side of the join.
@@ -349,16 +486,10 @@ impl Join {
                             (Side::Left, l) if from == *self.left => return Ok(l),
                             (Side::Right, r) if from == *self.right => return Ok(r),
                             (Side::Left, l) => {
-                                if let Some(r) =
-                                    self.on.iter().find_map(
-                                        |(on_l, r)| {
-                                            if *on_l == l {
-                                                Some(r)
-                                            } else {
-                                                None
-                                            }
-                                        },
-                                    )
+                                if let Some(r) = self
+                                    .on
+                                    .iter()
+                                    .find_map(|(on_l, r)| if *on_l == l { Some(r) } else { None })
                                 {
                                     // since we didn't hit the case above, we know that the
                                     // message
@@ -367,16 +498,10 @@ impl Join {
                                 }
                             }
                             (Side::Right, r) => {
-                                if let Some(l) =
-                                    self.on.iter().find_map(
-                                        |(l, on_r)| {
-                                            if *on_r == r {
-                                                Some(l)
-                                            } else {
-                                                None
-                                            }
-                                        },
-                                    )
+                                if let Some(l) = self
+                                    .on
+                                    .iter()
+                                    .find_map(|(l, on_r)| if *on_r == r { Some(l) } else { None })
                                 {
                                     // same
                                     return Ok(*l);
@@ -401,9 +526,11 @@ impl Join {
             .entry((key_cols, side))
             .and_modify(|entry| {
                 // Ensure all existing entries have the same column indices as the new one
-                debug_assert!(entry
-                    .iter()
-                    .all(|miss| { miss.column_indices == missed_keys.column_indices }));
+                debug_assert!(
+                    entry
+                        .iter()
+                        .all(|miss| { miss.column_indices == missed_keys.column_indices })
+                );
                 entry.push(missed_keys.clone());
             })
             .or_insert_with(|| vec![missed_keys.clone()]);
@@ -434,7 +561,8 @@ impl Join {
             let (on_cols_os, on_cols_ts) = self.on.iter().copied().unzip();
             (on_cols_ts, on_cols_os)
         };
-        let replay_key_cols = replay_key_cols.unwrap();
+        let replay_key_cols =
+            replay_key_cols.expect("replay columns must map through emit for regular lookup");
         if rs.is_empty() {
             return Ok(ProcessingResult {
                 results: rs,
@@ -455,8 +583,13 @@ impl Join {
         // Only do a lookup into a weak index if we're processing regular updates,
         // not if we're processing a replay, since regular updates should represent
         // all rows that won't hit holes downstream but replays need to have *all*
-        // rows
-        let lookup_mode = if is_replay {
+        // rows.
+        // Also use Strict mode if the other side is a Constant node, since Constant
+        // nodes are fully materialized and don't support weak indices.
+        let from_is_constant = nodes[from].borrow().is_constant();
+        let other_is_constant = nodes[other].borrow().is_constant();
+
+        let lookup_mode = if is_replay || from_is_constant || other_is_constant {
             LookupMode::Strict
         } else {
             LookupMode::Weak
@@ -505,16 +638,40 @@ impl Join {
                         new_right_count = Some(rc);
                     }
                     IngredientLookupResult::Miss => {
-                        // we got something from right, but that row's key is not in right??
+                        // We got something from right, but that row's join key is not in
+                        // right's state. This can happen in two cases:
                         //
-                        // this *can* happen! imagine if you have two partial indices on right,
-                        // one on column a and one on column b. imagine that a is the join key.
-                        // we get a replay request for b = 4, which must then be replayed from
-                        // right (since left doesn't have b). say right replays (a=1,b=4). we
-                        // will hit this case, since a=1 is not in right. the correct thing to
-                        // do here is to replay a=1 first, and *then* replay b=4 again
-                        // (possibly several times over for each a).
-                        continue;
+                        // 1. Two partial indices on right (e.g., on column `a` = join key and
+                        //    column `b` = non-join key). A replay for b=4 brings (a=1,b=4),
+                        //    but a=1 is a hole in the [a] index. We should skip this record
+                        //    so the system can fill a=1 first, then retry b=4.
+                        //
+                        // 2. The replay is for a non-join-key column (e.g., test_int) while
+                        //    the right side is only indexed on that column, not the join key.
+                        //    The join-key lookup misses because the join-key index was never
+                        //    filled by this replay. In this case, the NULL emission/retraction
+                        //    count is irrelevant — the replay is filling a downstream hole
+                        //    from scratch — so we proceed without the count. (REA-6339)
+                        if let Some(ref rkc) = replay_key_cols {
+                            // Compare as sets: rkc is ordered by replay.cols()
+                            // (downstream index), while on_cols_ts is ordered by
+                            // self.on declaration.  For compound keys these can
+                            // differ, so a plain slice comparison would give a
+                            // false negative.
+                            let replay_is_join_key = rkc.len() == on_cols_ts.len()
+                                && rkc.iter().all(|c| on_cols_ts.contains(c));
+                            if replay_is_join_key {
+                                // Case 1: replay key IS the join key, skip and retry later.
+                                continue;
+                            }
+                            // Case 2: replay key differs from join key, proceed without
+                            // the right-side count (disables NULL emission/retraction).
+                            // (REA-6339)
+                        } else {
+                            // Non-replay update: right-side join-key index is a hole,
+                            // skip this record (picked up on a future replay).
+                            continue;
+                        }
                     }
                 }
             }
@@ -562,18 +719,43 @@ impl Join {
 
             let mut rc_diff = 0isize;
             for r in group {
-                let (row, positive) = r.extract();
+                let (mut row, positive) = r.extract();
 
                 rc_diff += if positive { 1 } else { -1 };
 
-                if other_rows.is_empty() {
+                // For LEFT JOINs from the left side, check the left_filter.
+                // If it fails, this row should be NULL-extended regardless of matches.
+                let left_filter_passes = if from_left && self.kind == JoinType::Left {
+                    self.left_filter_passes(&row)?
+                } else {
+                    true
+                };
+
+                if !left_filter_passes {
+                    // ON-clause LHS predicate failed - emit NULL-extended row
+                    ret.push((self.generate_null(&row), positive).into());
+                } else if other_rows.is_empty() {
                     if self.kind == JoinType::Left && from_left {
                         // left join, got a thing from left, no rows in right == NULL
                         ret.push((self.generate_null(&row), positive).into());
                     }
                 } else {
-                    for other in other_rows.iter() {
-                        if from == *self.left {
+                    let last_other = other_rows.len() - 1;
+                    for (idx, other) in other_rows.iter().enumerate() {
+                        // When processing from the right side, check if the left row
+                        // passes the filter
+                        if !from_left && !self.left_filter_passes(other)? {
+                            continue;
+                        }
+
+                        if self.emit_move_safe && idx == last_other {
+                            // Move values from the owned row on the last iteration
+                            // to avoid cloning "this side" columns.
+                            ret.push(
+                                (self.generate_row_move(&mut row, other, from_left), positive)
+                                    .into(),
+                            );
+                        } else if from_left {
                             ret.push((self.generate_row(&row, other), positive).into());
                         } else {
                             ret.push((self.generate_row(other, &row), positive).into());
@@ -588,10 +770,19 @@ impl Join {
                 let old_rc = new_rc as isize - rc_diff;
                 if new_rc == 0 && old_rc != 0 {
                     for other in other_rows.iter() {
+                        // Skip left rows where the left_filter currently fails — while the
+                        // filter does not pass, these rows remain NULL-extended and should
+                        // not be affected by right-side match count changes.
+                        if !self.left_filter_passes(other)? {
+                            continue;
+                        }
                         ret.push((self.generate_null(other), true).into());
                     }
                 } else if new_rc != 0 && old_rc == 0 {
                     for other in other_rows.iter() {
+                        if !self.left_filter_passes(other)? {
+                            continue;
+                        }
                         ret.push((self.generate_null(other), false).into());
                     }
                 }
@@ -700,7 +891,7 @@ impl Join {
         for key in replay_keys {
             let other_predicate = self
                 .missing_upqueries
-                .remove(&(vec![key.clone()], side))
+                .remove(&(vec![key.to_owned()], side))
                 .ok_or_else(|| internal_err!("No missing keys found for key {:?}", key))?;
 
             let mut os_key_col_idx = SmallVec::<[usize; 8]>::from_slice(&on_cols_idx_os);
@@ -732,10 +923,52 @@ impl Join {
                         &on_cols_idx_os,
                     )?;
 
-                    for other_row in &other_side_records {
+                    if self.kind == JoinType::Left && side == Side::Left {
+                        // Records come from left side; check left_filter on each left row
                         for row in group_records {
-                            results
-                                .push((self.generate_row(row.row(), other_row.row()), true).into());
+                            if !self.left_filter_passes(row.row())? {
+                                results.push((self.generate_null(row.row()), true).into());
+                                continue;
+                            }
+                            if other_side_records.is_empty() {
+                                results.push((self.generate_null(row.row()), true).into());
+                            } else {
+                                for other_row in &other_side_records {
+                                    results.push(
+                                        (self.generate_row(row.row(), other_row.row()), true)
+                                            .into(),
+                                    );
+                                }
+                            }
+                        }
+                    } else if self.kind == JoinType::Left && side == Side::Right {
+                        // Records come from right side; other_side_records are left rows
+                        for other_row in &other_side_records {
+                            if !self.left_filter_passes(other_row.row())? {
+                                // Left row fails filter — skip matched rows
+                                continue;
+                            }
+                            for row in group_records {
+                                results.push(
+                                    (self.generate_row(other_row.row(), row.row()), true).into(),
+                                );
+                            }
+                        }
+                    } else {
+                        for other_row in &other_side_records {
+                            for row in group_records {
+                                if side == Side::Left {
+                                    results.push(
+                                        (self.generate_row(row.row(), other_row.row()), true)
+                                            .into(),
+                                    );
+                                } else {
+                                    results.push(
+                                        (self.generate_row(other_row.row(), row.row()), true)
+                                            .into(),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -911,7 +1144,9 @@ impl Ingredient for Join {
         Some(Some(self.left.as_global()).into_iter().collect())
     }
 
-    fn on_connected(&mut self, _g: &Graph) {}
+    fn post_deserialize(&mut self) {
+        self.recompute_emit_metadata();
+    }
 
     impl_replace_sibling!(left, right);
 
@@ -933,7 +1168,11 @@ impl Ingredient for Join {
         let join_execution_mode = self.execution_type_for_replay(replay, from);
         debug!(
             "on_input join_execution_mode: {:?} for from: {:?} for replay: {:?}, records: {:?}, rhs_full_mat: {:?}",
-            join_execution_mode, from, replay, rs.len(), self.rhs_full_mat
+            join_execution_mode,
+            from,
+            replay,
+            rs.len(),
+            self.rhs_full_mat
         );
         match join_execution_mode {
             JoinExecutionMode::RegularLookup => {
@@ -1010,7 +1249,7 @@ impl Ingredient for Join {
         let mut left_cols = vec![];
         let mut right_cols = vec![];
         let mut col_sides = vec![];
-        for col in miss.column_indices {
+        for &col in miss.column_indices.iter() {
             let (left_idx, right_idx) = self.resolve_col(col);
             if let Some(li) = left_idx {
                 left_cols.push(li);
@@ -1102,12 +1341,12 @@ impl Ingredient for Join {
         Ok(vec![
             ColumnMiss {
                 node: *self.left,
-                column_indices: left_cols,
+                column_indices: left_cols.into(),
                 missed_keys: Vec1::try_from(left_keys).unwrap(),
             },
             ColumnMiss {
                 node: *self.right,
-                column_indices: right_cols,
+                column_indices: right_cols.into(),
                 missed_keys: Vec1::try_from(right_keys).unwrap(),
             },
         ])
@@ -1206,6 +1445,7 @@ mod tests {
             vec![(0, 0)],
             vec![(Side::Left, 0), (Side::Left, 1), (Side::Right, 1)],
             true,
+            None,
         );
 
         g.set_op("join", &["j0", "j1", "j2"], j, false);
@@ -1374,6 +1614,8 @@ mod tests {
     }
 
     mod handle_upquery {
+        use std::sync::Arc;
+
         use readyset_data::{Bound, IntoBoundedRange};
 
         use super::*;
@@ -1386,7 +1628,7 @@ mod tests {
                 .node_mut()
                 .handle_upquery(ColumnMiss {
                     node,
-                    column_indices: vec![0, 1, 2],
+                    column_indices: Arc::from([0, 1, 2]),
                     missed_keys: vec1![
                         vec1![DfValue::from(1), DfValue::from(2), DfValue::from(3)].into()
                     ],
@@ -1396,8 +1638,8 @@ mod tests {
             let left_miss = res.iter().find(|miss| miss.node == *l).unwrap();
             let right_miss = res.iter().find(|miss| miss.node == *r).unwrap();
 
-            assert_eq!(left_miss.column_indices, vec![0, 1]);
-            assert_eq!(right_miss.column_indices, vec![1]);
+            assert_eq!(*left_miss.column_indices, [0, 1]);
+            assert_eq!(*right_miss.column_indices, [1]);
 
             assert_eq!(
                 left_miss.missed_keys,
@@ -1417,7 +1659,7 @@ mod tests {
                 .node_mut()
                 .handle_upquery(ColumnMiss {
                     node,
-                    column_indices: vec![0, 1, 2],
+                    column_indices: Arc::from([0, 1, 2]),
                     missed_keys: vec1![
                         vec1![DfValue::from(1), DfValue::from(2), DfValue::from(3)].into(),
                         vec1![DfValue::from(4), DfValue::from(5), DfValue::from(6)].into()
@@ -1428,8 +1670,8 @@ mod tests {
             let left_miss = res.iter().find(|miss| miss.node == *l).unwrap();
             let right_miss = res.iter().find(|miss| miss.node == *r).unwrap();
 
-            assert_eq!(left_miss.column_indices, vec![0, 1]);
-            assert_eq!(right_miss.column_indices, vec![1]);
+            assert_eq!(*left_miss.column_indices, [0, 1]);
+            assert_eq!(*right_miss.column_indices, [1]);
 
             assert_eq!(
                 left_miss.missed_keys,
@@ -1455,7 +1697,7 @@ mod tests {
                 .node_mut()
                 .handle_upquery(ColumnMiss {
                     node,
-                    column_indices: vec![0, 1, 2],
+                    column_indices: Arc::from([0, 1, 2]),
                     missed_keys: vec1![KeyComparison::Range((
                         Bound::Included(vec1![
                             DfValue::from(1),
@@ -1474,8 +1716,8 @@ mod tests {
             let left_miss = res.iter().find(|miss| miss.node == *l).unwrap();
             let right_miss = res.iter().find(|miss| miss.node == *r).unwrap();
 
-            assert_eq!(left_miss.column_indices, vec![0, 1]);
-            assert_eq!(right_miss.column_indices, vec![1]);
+            assert_eq!(*left_miss.column_indices, [0, 1]);
+            assert_eq!(*right_miss.column_indices, [1]);
 
             assert_eq!(
                 left_miss.missed_keys,
@@ -1501,7 +1743,7 @@ mod tests {
                 .node_mut()
                 .handle_upquery(ColumnMiss {
                     node,
-                    column_indices: vec![0, 1, 2],
+                    column_indices: Arc::from([0, 1, 2]),
                     missed_keys: vec1![KeyComparison::Range(
                         vec1![DfValue::from(1), DfValue::from(2), DfValue::from(3)]
                             .range_from_inclusive()
@@ -1512,8 +1754,8 @@ mod tests {
             let left_miss = res.iter().find(|miss| miss.node == *l).unwrap();
             let right_miss = res.iter().find(|miss| miss.node == *r).unwrap();
 
-            assert_eq!(left_miss.column_indices, vec![0, 1]);
-            assert_eq!(right_miss.column_indices, vec![1]);
+            assert_eq!(*left_miss.column_indices, [0, 1]);
+            assert_eq!(*right_miss.column_indices, [1]);
 
             assert_eq!(
                 left_miss.missed_keys,
@@ -1530,10 +1772,81 @@ mod tests {
         }
     }
 
+    /// REA-6339: When a LEFT JOIN replay is keyed on a non-join-key column
+    /// (e.g. column 2 = Right.r1) and the right-side join-key lookup misses
+    /// (because the partial index on the join key has a hole for that value),
+    /// the record must NOT be dropped. The old code treated this as Case 1
+    /// (replay-key == join-key) and issued `continue`, discarding the row.
+    #[test]
+    fn left_join_replay_non_join_key_miss_proceeds() {
+        use readyset_client::ReplayKeys;
+
+        use dataflow_state::MaterializedNodeState;
+        use readyset_client::KeyComparison;
+
+        // Standard left-join setup:
+        //   left  [l0, l1]       right [r0, r1]
+        //   join on (l0 = r0)
+        //   emit  [L0, L1, R1]  →  output columns j0, j1, j2
+        let (mut g, l, r) = setup();
+
+        // ---- make right's join-key index PARTIAL ----
+        // Replace right's state so that column-0 (the join key) is a partial
+        // index with tag 0. Keys that haven't been explicitly filled are holes.
+        let tag = Tag::new(0);
+        let mut partial_state = MemoryState::default();
+        partial_state.add_index(Index::hash_map(vec![0]), Some(vec![tag]));
+        // Also need the weak index that suggest_indexes added, so the
+        // non-replay weak-lookup path still works.
+        partial_state.add_weak_index(Index::hash_map(vec![0]));
+        g.states
+            .insert(*r, MaterializedNodeState::Memory(partial_state));
+
+        // ---- seed left (non-partial) with a row whose join key = 5 ----
+        g.seed(l, vec![5.into(), "left_val".into()]);
+
+        // ---- build the partial replay context ----
+        // Replay key is emitted column 2, which maps to Right.r1.
+        // trace_replay_column_source will return [1] (right col 1),
+        // which differs from on_cols_ts = [0] (right col 0).
+        let replay_key: KeyComparison = vec1!["rval".into()].into();
+        let replay_keys: ReplayKeys = [replay_key].into_iter().collect();
+        let replay_ctx = ReplayContext::Partial {
+            key_cols: &[2], // emitted column 2 = Right.r1
+            keys: &replay_keys,
+            tag,
+        };
+
+        // ---- send a right-side record during the replay ----
+        // join-key = 5, r1 = "rval". The partial index on right col 0
+        // does NOT have key=5 filled, so the self-lookup at line 482
+        // returns Miss. With the fix (Case 2), we proceed anyway.
+        let right_record: Record = vec![5.into(), "rval".into()].into();
+        let res = g.input_raw(r, vec![right_record], replay_ctx, false);
+
+        // The Join operator returns Regular (not ReplayPiece) — replay
+        // buffering happens at a higher layer. Verify the rows are present.
+        match res {
+            RawProcessingResult::Regular(ref pr) => {
+                assert!(
+                    !pr.results.is_empty(),
+                    "replay records should not be dropped when replay key != join key"
+                );
+                assert!(
+                    pr.results
+                        .has_positive(&[5.into(), "left_val".into(), "rval".into()][..]),
+                    "expected joined row (5, left_val, rval), got: {:?}",
+                    pr.results
+                );
+            }
+            other => panic!("expected Regular processing result, got: {:?}", other),
+        }
+    }
+
     mod compound_keys {
         use super::*;
 
-        fn setup() -> (ops::test::MockGraph, IndexPair, IndexPair) {
+        pub(super) fn setup() -> (ops::test::MockGraph, IndexPair, IndexPair) {
             let mut g = ops::test::MockGraph::new();
             let l = g.add_base("left", &["l0", "l1", "l2"]);
             let r = g.add_base("right", &["r0", "r1", "r2"]);
@@ -1550,6 +1863,7 @@ mod tests {
                     (Side::Right, 2),
                 ],
                 true,
+                None,
             );
 
             g.set_op("join", &["j0", "j1", "j2", "j3"], j, false);
@@ -1570,9 +1884,10 @@ mod tests {
 
             // Both of the keys have to match to give us a match
             j.seed(r, vec![3.into(), 3.into(), "w".into()]);
-            assert!(j
-                .one_row(r, vec![3.into(), 3.into(), "w".into()], false)
-                .is_empty());
+            assert!(
+                j.one_row(r, vec![3.into(), 3.into(), "w".into()], false)
+                    .is_empty()
+            );
 
             // Once we get a match, we should revoke the nulls and replace it with a full row
             j.seed(r, vec![3.into(), 4.into(), "w".into()]);
@@ -1621,5 +1936,352 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// Compound-key variant of left_join_replay_non_join_key_miss_proceeds.
+    /// Replay key columns ARE the join key but listed in reversed order
+    /// (downstream index chose [j1, j0] instead of [j0, j1]).  The
+    /// set-equality check must still recognise this as Case 1 (skip).
+    /// A plain slice comparison would give a false negative, incorrectly
+    /// taking Case 2 (proceed without count).
+    #[test]
+    fn compound_join_key_reversed_order_is_case1() {
+        use readyset_client::ReplayKeys;
+
+        use dataflow_state::MaterializedNodeState;
+        use readyset_client::KeyComparison;
+
+        // Compound left-join setup:
+        //   left  [l0, l1, l2]     right [r0, r1, r2]
+        //   join ON (l0=r0, l1=r1)
+        //   emit  [L0, L1, L2, R2]  →  output columns j0, j1, j2, j3
+        let (mut g, l, r) = compound_keys::setup();
+
+        // Make right's compound join-key index PARTIAL.
+        let tag = Tag::new(0);
+        let mut partial_state = MemoryState::default();
+        partial_state.add_index(Index::hash_map(vec![0, 1]), Some(vec![tag]));
+        partial_state.add_weak_index(Index::hash_map(vec![0, 1]));
+        g.states
+            .insert(*r, MaterializedNodeState::Memory(partial_state));
+
+        // Seed left with a matching row.
+        g.seed(l, vec![5.into(), 6.into(), "left_val".into()]);
+
+        // Replay key_cols = [1, 0] (emitted columns j1, j0) — these map to
+        // the join key columns but in REVERSED order relative to self.on
+        // which declares [(0,0),(1,1)].
+        //
+        // trace_replay_column_source resolves:
+        //   emit[1] = (Left,1) → right col 1 (via on)
+        //   emit[0] = (Left,0) → right col 0 (via on)
+        // So rkc = [1, 0], while on_cols_ts = [0, 1].
+        // These represent the same set of columns → Case 1 (skip).
+        let replay_key: KeyComparison = vec1![6.into(), 5.into()].into();
+        let replay_keys: ReplayKeys = [replay_key].into_iter().collect();
+        let replay_ctx = ReplayContext::Partial {
+            key_cols: &[1, 0], // reversed order
+            keys: &replay_keys,
+            tag,
+        };
+
+        // Send a right-side record whose compound join key (5,6) is a HOLE
+        // in right's partial index.  Case 1 should `continue` (skip it).
+        let right_record: Record = vec![5.into(), 6.into(), "rval".into()].into();
+        let res = g.input_raw(r, vec![right_record], replay_ctx, false);
+
+        match res {
+            RawProcessingResult::Regular(ref pr) => {
+                // Case 1 skips the record, so output must be empty.
+                assert!(
+                    pr.results.is_empty(),
+                    "replay key == join key (reversed order) should be Case 1 (skip), \
+                     but got results: {:?}",
+                    pr.results
+                );
+            }
+            other => panic!("expected Regular processing result, got: {:?}", other),
+        }
+    }
+
+    /// Compound-key join where the replay is on a non-join-key column.
+    /// Should take Case 2 (proceed without right-side count).
+    #[test]
+    fn compound_join_non_join_key_replay_proceeds() {
+        use readyset_client::ReplayKeys;
+
+        use dataflow_state::MaterializedNodeState;
+        use readyset_client::KeyComparison;
+
+        // Compound left-join setup:
+        //   left  [l0, l1, l2]     right [r0, r1, r2]
+        //   join ON (l0=r0, l1=r1)
+        //   emit  [L0, L1, L2, R2]  →  output columns j0, j1, j2, j3
+        let (mut g, l, r) = compound_keys::setup();
+
+        // Make right's compound join-key index PARTIAL.
+        let tag = Tag::new(0);
+        let mut partial_state = MemoryState::default();
+        partial_state.add_index(Index::hash_map(vec![0, 1]), Some(vec![tag]));
+        partial_state.add_weak_index(Index::hash_map(vec![0, 1]));
+        g.states
+            .insert(*r, MaterializedNodeState::Memory(partial_state));
+
+        // Seed left with a matching row.
+        g.seed(l, vec![5.into(), 6.into(), "left_val".into()]);
+
+        // Replay key_cols = [3] (emitted column j3 = Right.r2).
+        // trace_replay_column_source resolves emit[3] = (Right,2) → right col 2.
+        // rkc = [2], on_cols_ts = [0, 1] → different set → Case 2 (proceed).
+        let replay_key: KeyComparison = vec1!["rval".into()].into();
+        let replay_keys: ReplayKeys = [replay_key].into_iter().collect();
+        let replay_ctx = ReplayContext::Partial {
+            key_cols: &[3], // emitted column 3 = Right.r2 (non-join-key)
+            keys: &replay_keys,
+            tag,
+        };
+
+        // Send a right-side record.  Compound join key (5,6) is a HOLE in
+        // right's partial index, but replay key != join key → Case 2,
+        // proceed and produce the joined row.
+        let right_record: Record = vec![5.into(), 6.into(), "rval".into()].into();
+        let res = g.input_raw(r, vec![right_record], replay_ctx, false);
+
+        match res {
+            RawProcessingResult::Regular(ref pr) => {
+                assert!(
+                    !pr.results.is_empty(),
+                    "non-join-key replay on compound join should proceed (Case 2)"
+                );
+                assert!(
+                    pr.results
+                        .has_positive(&[5.into(), 6.into(), "left_val".into(), "rval".into()][..]),
+                    "expected joined row, got: {:?}",
+                    pr.results
+                );
+            }
+            other => panic!("expected Regular processing result, got: {:?}", other),
+        }
+    }
+
+    mod left_filter {
+        use dataflow_expression::{BinaryOperator, Expr};
+        use readyset_data::DfType;
+
+        use super::*;
+
+        /// Build a filter expression: left_column[col_idx] = literal_val
+        fn eq_filter(col_idx: usize, literal_val: DfValue) -> Expr {
+            Expr::Op {
+                op: BinaryOperator::Equal,
+                left: Box::new(Expr::Column {
+                    index: col_idx,
+                    ty: DfType::Int,
+                }),
+                right: Box::new(Expr::Literal {
+                    val: literal_val,
+                    ty: DfType::Int,
+                }),
+                ty: DfType::Bool,
+            }
+        }
+
+        /// Setup a LEFT JOIN with a left_filter that checks l0 == 1.
+        /// Columns: left (l0, l1), right (r0, r1)
+        /// Emit: [l0, l1, r1]
+        /// Join ON: l0 = r0
+        fn setup_with_filter() -> (ops::test::MockGraph, IndexPair, IndexPair) {
+            let mut g = ops::test::MockGraph::new();
+            let l = g.add_base("left", &["l0", "l1"]);
+            let r = g.add_base("right", &["r0", "r1"]);
+
+            // Filter: left column 0 must equal 1
+            let filter = eq_filter(0, DfValue::from(1));
+
+            let j = Join::new(
+                l.as_global(),
+                r.as_global(),
+                JoinType::Left,
+                vec![(0, 0)],
+                vec![(Side::Left, 0), (Side::Left, 1), (Side::Right, 1)],
+                true,
+                Some(filter),
+            );
+
+            g.set_op("join", &["j0", "j1", "j2"], j, false);
+            (g, l, r)
+        }
+
+        #[test]
+        fn left_row_passes_filter_normal_join_match() {
+            let (mut j, l, r) = setup_with_filter();
+
+            // Seed right side with a matching row (r0=1)
+            let r_row = vec![1.into(), "x".into()];
+            j.seed(r, r_row.clone());
+            j.one_row(r, r_row, false);
+
+            // Insert left row with l0=1 (passes filter l0==1), should match right
+            let l_row = vec![1.into(), "a".into()];
+            j.seed(l, l_row.clone());
+            let rs = j.one_row(l, l_row, false);
+
+            assert_eq!(
+                rs,
+                vec![(vec![1.into(), "a".into(), "x".into()], true)].into()
+            );
+        }
+
+        #[test]
+        fn left_row_fails_filter_null_extended() {
+            let (mut j, l, r) = setup_with_filter();
+
+            // Seed right side with a matching row (r0=2)
+            let r_row = vec![2.into(), "x".into()];
+            j.seed(r, r_row.clone());
+            j.one_row(r, r_row, false);
+
+            // Insert left row with l0=2 (fails filter l0==1).
+            // Even though right has a matching row for key 2, it should be NULL-extended.
+            let l_row = vec![2.into(), "b".into()];
+            j.seed(l, l_row.clone());
+            let rs = j.one_row(l, l_row, false);
+
+            assert_eq!(
+                rs,
+                vec![(vec![2.into(), "b".into(), DfValue::None], true)].into()
+            );
+        }
+
+        #[test]
+        fn right_insert_left_passes_filter_matched() {
+            let (mut j, l, r) = setup_with_filter();
+
+            // Seed left side with a row that passes filter (l0=1)
+            let l_row = vec![1.into(), "a".into()];
+            j.seed(l, l_row.clone());
+            j.one_row(l, l_row, false);
+
+            // Now insert a matching right row
+            let r_row = vec![1.into(), "x".into()];
+            j.seed(r, r_row.clone());
+            let rs = j.one_row(r, r_row, false);
+
+            // Should emit the matched row plus revoke the null-extended row
+            assert_eq!(
+                rs,
+                vec![
+                    (vec![1.into(), "a".into(), "x".into()], true),
+                    (vec![1.into(), "a".into(), DfValue::None], false),
+                ]
+                .into()
+            );
+        }
+
+        #[test]
+        fn right_insert_left_fails_filter_no_change() {
+            let (mut j, l, r) = setup_with_filter();
+
+            // Seed left side with a row that fails filter (l0=2)
+            let l_row = vec![2.into(), "b".into()];
+            j.seed(l, l_row.clone());
+            j.one_row(l, l_row, false);
+
+            // Insert a matching right row for key 2
+            let r_row = vec![2.into(), "y".into()];
+            j.seed(r, r_row.clone());
+            let rs = j.one_row(r, r_row, false);
+
+            // Left row fails filter, so no matched rows should be emitted
+            assert_eq!(rs.len(), 0);
+        }
+
+        #[test]
+        fn right_delete_left_passes_filter() {
+            let (mut j, l, r) = setup_with_filter();
+
+            // Seed right side with two rows for key 1
+            j.seed(r, vec![1.into(), "x".into()]);
+            j.one_row(r, vec![1.into(), "x".into()], false);
+            j.seed(r, vec![1.into(), "y".into()]);
+            j.one_row(r, vec![1.into(), "y".into()], false);
+
+            // Seed left side (passes filter, l0=1)
+            j.seed(l, vec![1.into(), "a".into()]);
+            j.one_row(l, vec![1.into(), "a".into()], false);
+
+            // Delete one right row — left row passes filter so matched row is revoked
+            let rs = j.one_row(r, (vec![1.into(), "x".into()], false), false);
+            assert!(rs.has_negative(&[1.into(), "a".into(), "x".into()][..]));
+        }
+
+        #[test]
+        fn right_delete_left_fails_filter() {
+            let (mut j, l, r) = setup_with_filter();
+
+            // Seed right side with two rows for key 2
+            j.seed(r, vec![2.into(), "x".into()]);
+            j.one_row(r, vec![2.into(), "x".into()], false);
+            j.seed(r, vec![2.into(), "y".into()]);
+            j.one_row(r, vec![2.into(), "y".into()], false);
+
+            // Seed left side (fails filter, l0=2)
+            j.seed(l, vec![2.into(), "b".into()]);
+            j.one_row(l, vec![2.into(), "b".into()], false);
+
+            // Delete one right row — left row fails filter so no matched row
+            // existed; the delete should not produce any output for this left row
+            let rs = j.one_row(r, (vec![2.into(), "x".into()], false), false);
+            assert_eq!(rs.len(), 0);
+        }
+    }
+
+    #[test]
+    fn post_deserialize_restores_emit_move_safe() {
+        let l = NodeIndex::new(0);
+        let r = NodeIndex::new(1);
+        // Emit has no duplicate columns per side, so `emit_move_safe` should be true.
+        let j = Join::new(
+            l,
+            r,
+            JoinType::Left,
+            vec![(0, 0)],
+            vec![(Side::Left, 0), (Side::Left, 1), (Side::Right, 1)],
+            true,
+            None,
+        );
+        assert!(j.emit_move_safe, "new() should set emit_move_safe");
+
+        let bytes = bincode::serialize(&j).unwrap();
+        let mut round_tripped: Join = bincode::deserialize(&bytes).unwrap();
+        assert!(
+            !round_tripped.emit_move_safe,
+            "deserialize should leave emit_move_safe at its Default (false)"
+        );
+
+        round_tripped.post_deserialize();
+        assert!(
+            round_tripped.emit_move_safe,
+            "post_deserialize should recompute emit_move_safe"
+        );
+    }
+
+    #[test]
+    fn post_deserialize_leaves_emit_move_safe_false_when_duplicates() {
+        let l = NodeIndex::new(0);
+        let r = NodeIndex::new(1);
+        // Emit contains (Left, 0) twice, so `emit_move_safe` must stay false.
+        let mut j = Join::new(
+            l,
+            r,
+            JoinType::Left,
+            vec![(0, 0)],
+            vec![(Side::Left, 0), (Side::Left, 0), (Side::Right, 1)],
+            true,
+            None,
+        );
+        assert!(!j.emit_move_safe);
+        j.post_deserialize();
+        assert!(!j.emit_move_safe);
     }
 }

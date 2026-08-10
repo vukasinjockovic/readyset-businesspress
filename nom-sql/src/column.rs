@@ -155,6 +155,7 @@ pub fn column_specification(
                 generated,
                 constraints,
                 comment,
+                invisible: false,
             },
         ))
     }
@@ -179,7 +180,8 @@ fn generated_column(
         Ok((
             i,
             GeneratedColumn {
-                expr,
+                expr: Some(expr),
+                kind: GeneratedKind::Always,
                 stored: stored.unwrap_or(false),
             },
         ))
@@ -198,11 +200,12 @@ mod tests {
         #[test]
         fn multiple_generated_column() {
             let mut default_gen_col = GeneratedColumn {
-                expr: Expr::BinaryOp {
+                expr: Some(Expr::BinaryOp {
                     lhs: Box::new(Expr::Literal(Literal::Integer(1))),
                     op: BinaryOperator::Add,
                     rhs: Box::new(Expr::Literal(Literal::Integer(1))),
-                },
+                }),
+                kind: GeneratedKind::Always,
                 stored: true,
             };
 
@@ -243,6 +246,7 @@ mod tests {
                 sql_type: SqlType::Int(None),
                 generated: Some(default_gen_col),
                 comment: None,
+                invisible: false,
                 constraints: vec![ColumnConstraint::NotNull],
             };
             let (_, res) = column_specification(Dialect::MySQL)(LocatedSpan::new(
@@ -276,12 +280,12 @@ mod tests {
                     sql_type: SqlType::Timestamp,
                     generated: None,
                     comment: None,
+                    invisible: false,
                     constraints: vec![
                         ColumnConstraint::NotNull,
-                        ColumnConstraint::DefaultValue(Expr::Call(FunctionExpr::Call {
-                            name: "current_timestamp".into(),
-                            arguments: Some(vec![])
-                        })),
+                        ColumnConstraint::DefaultValue(Expr::Call(FunctionExpr::CurrentTimestamp(
+                            None
+                        ))),
                     ]
                 }
             );
@@ -332,12 +336,12 @@ mod tests {
                 sql_type: SqlType::DateTime(Some(6)),
                 generated: None,
                 comment: None,
+                invisible: false,
                 constraints: vec![
                     ColumnConstraint::NotNull,
-                    ColumnConstraint::DefaultValue(Expr::Call(FunctionExpr::Call {
-                        name: "current_timestamp".into(),
-                        arguments: Some(vec![Expr::Literal(Literal::Integer(6))]),
-                    })),
+                    ColumnConstraint::DefaultValue(Expr::Call(FunctionExpr::CurrentTimestamp(
+                        Some(Box::new(Expr::Literal(Literal::Integer(6)))),
+                    ))),
                     ColumnConstraint::OnUpdateCurrentTimestamp(None),
                 ],
             };
@@ -368,12 +372,12 @@ mod tests {
                     sql_type: SqlType::DateTime(Some(6)),
                     generated: None,
                     comment: None,
+                    invisible: false,
                     constraints: vec![
                         ColumnConstraint::NotNull,
-                        ColumnConstraint::DefaultValue(Expr::Call(FunctionExpr::Call {
-                            name: "current_timestamp".into(),
-                            arguments: Some(vec![Expr::Literal(Literal::Integer(6))]),
-                        })),
+                        ColumnConstraint::DefaultValue(Expr::Call(FunctionExpr::CurrentTimestamp(
+                            Some(Box::new(Expr::Literal(Literal::Integer(6)))),
+                        ))),
                         ColumnConstraint::OnUpdateCurrentTimestamp(Some(Literal::Integer(6))),
                     ],
                 };
@@ -399,6 +403,7 @@ mod tests {
                     sql_type: SqlType::VarChar(Some(255)),
                     generated: None,
                     comment: None,
+                    invisible: false,
                     constraints: vec![
                         ColumnConstraint::CharacterSet(CollationName {
                             name: "utf8mb4".into(),
@@ -433,12 +438,12 @@ mod tests {
                     sql_type: SqlType::Timestamp,
                     generated: None,
                     comment: None,
+                    invisible: false,
                     constraints: vec![
                         ColumnConstraint::NotNull,
-                        ColumnConstraint::DefaultValue(Expr::Call(FunctionExpr::Call {
-                            name: "current_timestamp".into(),
-                            arguments: Some(vec![])
-                        })),
+                        ColumnConstraint::DefaultValue(Expr::Call(FunctionExpr::CurrentTimestamp(
+                            None
+                        ))),
                     ]
                 }
             );
@@ -461,12 +466,12 @@ mod tests {
                     sql_type: SqlType::Timestamp,
                     generated: None,
                     comment: None,
+                    invisible: false,
                     constraints: vec![
                         ColumnConstraint::NotNull,
-                        ColumnConstraint::DefaultValue(Expr::Call(FunctionExpr::Call {
-                            name: "now".into(),
-                            arguments: Some(vec![])
-                        })),
+                        ColumnConstraint::DefaultValue(Expr::Call(FunctionExpr::CurrentTimestamp(
+                            None
+                        ))),
                     ]
                 }
             );

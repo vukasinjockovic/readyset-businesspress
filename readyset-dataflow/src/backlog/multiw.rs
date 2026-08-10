@@ -1,11 +1,13 @@
-use ahash::RandomState;
-use dataflow_expression::PreInsertion;
-use reader_map::EvictionQuantity;
-use readyset_data::Bound;
-use readyset_util::ranges::RangeBounds;
-use readyset_util::SizeOf;
+use std::collections::HashMap;
 
-use super::{key_to_single, Key};
+use ahash::RandomState;
+use reader_map::{BatchEntry, BatchSegment, EvictionQuantity};
+use readyset_data::Bound;
+use readyset_util::SizeOf;
+use readyset_util::ranges::RangeBounds;
+
+use super::{Key, key_to_single};
+use crate::PreInsertion;
 use crate::prelude::*;
 
 pub(super) enum Handle {
@@ -94,7 +96,7 @@ impl Handle {
     ) {
         let base_value_size = self.base_value_size();
         match self {
-            Handle::Single(ref mut h) => {
+            Handle::Single(h) => {
                 let (bytes, keys) = h.evict_keys(keys_to_evict, |k, v| {
                     // Each row's state is composed of: The key, the set of Values in the row
                     // (DfValues) and the bytes required to hold the Row data
@@ -106,7 +108,7 @@ impl Handle {
                 let keys = keys.map(|(x, y)| (vec![x], y.map(|y| vec![y])));
                 (bytes, Box::new(keys))
             }
-            Handle::Many(ref mut h) => h.evict_keys(keys_to_evict, |k, v| {
+            Handle::Many(h) => h.evict_keys(keys_to_evict, |k, v| {
                 k.deep_size_of()
                     + v.iter().map(|r| r.deep_size_of()).sum::<usize>()
                     + base_value_size
@@ -116,56 +118,33 @@ impl Handle {
 
     pub fn publish(&mut self) {
         match self {
-            Handle::Single(ref mut h) => {
+            Handle::Single(h) => {
                 h.publish();
             }
-            Handle::Many(ref mut h) => {
+            Handle::Many(h) => {
                 h.publish();
             }
         }
     }
 
-    pub fn add<I>(&mut self, key: &[usize], cols: usize, rs: I) -> isize
+    pub fn add<I>(&mut self, key_columns: &[usize], cols: usize, records: I) -> isize
     where
         I: IntoIterator<Item = Record>,
     {
         let mut memory_delta = 0isize;
         match self {
-            Handle::Single(ref mut h) => {
-                assert_eq!(key.len(), 1);
-                for r in rs {
-                    debug_assert!(r.len() >= cols);
-                    match r {
-                        Record::Positive(r) => {
-                            memory_delta += r.deep_size_of() as isize;
-                            h.insert(r[key[0]].clone(), r.into_boxed_slice());
-                        }
-                        Record::Negative(r) => {
-                            // TODO: reader_map will remove the empty vec for a key if we remove the
-                            // last record. this means that future lookups will fail, and cause a
-                            // replay, which will produce an empty result. this will work, but is
-                            // somewhat inefficient.
-                            memory_delta -= r.deep_size_of() as isize;
-                            h.remove_value(r[key[0]].clone(), r.into_boxed_slice());
-                        }
-                    }
-                }
+            Handle::Single(h) => {
+                assert_eq!(key_columns.len(), 1);
+                let key_col = key_columns[0];
+                let entries =
+                    collect_batch(records, cols, &mut memory_delta, |r| r[key_col].clone());
+                h.batch(entries);
             }
-            Handle::Many(ref mut h) => {
-                for r in rs {
-                    debug_assert!(r.len() >= cols);
-                    let key = key.iter().map(|&k| &r[k]).cloned().collect();
-                    match r {
-                        Record::Positive(r) => {
-                            memory_delta += r.deep_size_of() as isize;
-                            h.insert(key, r.into_boxed_slice());
-                        }
-                        Record::Negative(r) => {
-                            memory_delta -= r.deep_size_of() as isize;
-                            h.remove_value(key, r.into_boxed_slice());
-                        }
-                    }
-                }
+            Handle::Many(h) => {
+                let entries = collect_batch(records, cols, &mut memory_delta, |r| {
+                    key_columns.iter().map(|&k| r[k].clone()).collect()
+                });
+                h.batch(entries);
             }
         }
         memory_delta
@@ -200,4 +179,59 @@ impl Handle {
             Handle::Many(h) => super::multir::Handle::Many((*h).clone()),
         }
     }
+}
+
+/// Collect records into batch entries keyed by `extract_key`. Consecutive adds/removes for the
+/// same key are grouped into a single `BatchSegment`.
+fn collect_batch<K, F>(
+    records: impl IntoIterator<Item = Record>,
+    cols: usize,
+    memory_delta: &mut isize,
+    extract_key: F,
+) -> Vec<BatchEntry<K, Box<[DfValue]>>>
+where
+    K: Eq + std::hash::Hash + Clone,
+    F: Fn(&[DfValue]) -> K,
+{
+    // Map from key to index in `entries`.
+    let mut key_index: HashMap<K, usize> = HashMap::new();
+    let mut entries: Vec<BatchEntry<K, Box<[DfValue]>>> = Vec::new();
+
+    for record in records {
+        debug_assert!(record.len() >= cols);
+        let (is_add, row) = match record {
+            Record::Positive(r) => {
+                *memory_delta += r.deep_size_of() as isize;
+                (true, r)
+            }
+            Record::Negative(r) => {
+                *memory_delta -= r.deep_size_of() as isize;
+                (false, r)
+            }
+        };
+
+        let key = extract_key(&row);
+        let value = row.into_boxed_slice();
+
+        let idx = *key_index.entry(key.clone()).or_insert_with(|| {
+            let idx = entries.len();
+            entries.push(BatchEntry::new(key));
+            idx
+        });
+        let entry = &mut entries[idx];
+
+        // Append to the last segment if it's the same type, otherwise start a new one.
+        match (is_add, entry.segments.last_mut()) {
+            (true, Some(BatchSegment::Adds(recs))) | (false, Some(BatchSegment::Removes(recs))) => {
+                recs.push(value)
+            }
+            _ => entry.segments.push(if is_add {
+                BatchSegment::Adds(vec![value])
+            } else {
+                BatchSegment::Removes(vec![value])
+            }),
+        }
+    }
+
+    entries
 }

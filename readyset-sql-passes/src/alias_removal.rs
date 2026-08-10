@@ -171,7 +171,10 @@ impl<'ast> VisitorMut<'ast> for RemoveAliasesVisitor<'_> {
             table_expr.inner = TableExprInner::Table(table.clone());
         }
 
-        if !matches!(&table_expr.inner, TableExprInner::Subquery(_)) {
+        if !matches!(
+            &table_expr.inner,
+            TableExprInner::Subquery(_) | TableExprInner::Values { .. }
+        ) {
             table_expr.alias = None;
         }
 
@@ -272,6 +275,7 @@ mod tests {
                     schema: None,
                 }),
                 alias: Some("t".into()),
+                column_aliases: vec![],
             }],
             fields: vec![FieldDefinitionExpr::from(Column::from("t.id"))],
             where_clause: Some(Expr::BinaryOp {
@@ -312,6 +316,7 @@ mod tests {
                             name: "PaperTag".into(),
                         }),
                         alias: None,
+                        column_aliases: vec![],
                     }]
                 );
             }
@@ -347,6 +352,7 @@ mod tests {
                     name: "PaperTag".into(),
                 }),
                 alias: Some("t".into()),
+                column_aliases: vec![],
             }],
             fields: vec![FieldDefinitionExpr::from(col_small.clone())],
             where_clause: Some(Expr::BinaryOp {
@@ -384,6 +390,7 @@ mod tests {
                             name: "PaperTag".into(),
                         }),
                         alias: None,
+                        column_aliases: vec![],
                     }]
                 );
             }
@@ -427,6 +434,7 @@ mod tests {
                             name: "__query_name__t1".into(),
                         }),
                         alias: None,
+                        column_aliases: vec![],
                     }]
                 );
                 assert_eq!(
@@ -439,6 +447,7 @@ mod tests {
                                 name: "__query_name__t2".into(),
                             }),
                             alias: None,
+                            column_aliases: vec![],
                         }),
                         constraint: JoinConstraint::On(Expr::BinaryOp {
                             op: BinaryOperator::Equal,

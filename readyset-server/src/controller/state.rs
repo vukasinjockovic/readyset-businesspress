@@ -13,14 +13,13 @@
 //! to manipulate it in a thread-safe way.
 
 use std::cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use array2::Array2;
 use common::{IndexPair, Tag};
 use dataflow::domain::replay_paths::ReplayPath;
 use dataflow::node::{self, Column};
@@ -28,7 +27,7 @@ use dataflow::payload::{packets::Evict, Eviction};
 use dataflow::prelude::{ChannelCoordinator, DomainIndex, DomainNodes, Graph, NodeIndex};
 use dataflow::{
     BaseTableState, DomainBuilder, DomainConfig, DomainRequest, DurabilityMode, NodeMap, Packet,
-    PersistenceParameters, Sharding,
+    PersistenceParameters,
 };
 use failpoint_macros::set_failpoint;
 use futures::stream::{self, FuturesUnordered, StreamExt, TryStreamExt};
@@ -36,21 +35,20 @@ use futures::{FutureExt, TryFutureExt, TryStream};
 use metrics::{counter, gauge, histogram};
 use petgraph::visit::{Bfs, IntoNodeReferences};
 use petgraph::Direction;
-use rand::Rng;
+use rand::RngExt;
 use readyset_client::builders::{
     ReaderHandleBuilder, ReusedReaderHandleBuilder, TableBuilder, ViewBuilder,
 };
 use readyset_client::consensus::{Authority, AuthorityControl};
 use readyset_client::debug::info::{GraphInfo, MaterializationInfo, NodeSize};
 use readyset_client::debug::stats::{DomainStats, GraphStats, NodeStats};
-use readyset_client::internal::{MaterializationStatus, ReplicaAddress};
-use readyset_client::metrics::recorded;
+use readyset_client::internal::MaterializationStatus;
 use readyset_client::query::QueryId;
 use readyset_client::recipe::changelist::{Change, ChangeList};
 use readyset_client::recipe::{CacheExpr, ExprInfo, ExtendRecipeSpec};
+use readyset_client::schema::ViewSchema;
 use readyset_client::{
     PersistencePoint, SingleKeyEviction, TableStatus, ViewCreateRequest, ViewFilter, ViewRequest,
-    ViewSchema,
 };
 use readyset_data::{DfValue, Dialect};
 use readyset_errors::{
@@ -62,28 +60,19 @@ use readyset_util::failpoints;
 use replication_offset::{ReplicationOffset, ReplicationOffsets};
 use schema_catalog::SchemaGeneration;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
 use tokio::fs;
 use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use tracing::{debug, error, info, trace, warn};
 use vec1::{vec1, Vec1};
 
-use super::migrate::DomainSettings;
-use super::replication::ReplicationStrategy;
 use super::sql::Recipe;
 use crate::controller::domain_handle::DomainHandle;
 use crate::controller::migrate::materialization::Materializations;
-use crate::controller::migrate::scheduling::Scheduler;
+use crate::controller::migrate::scheduling::schedule_domain;
 use crate::controller::migrate::{routing, DomainMigrationMode, DomainMigrationPlan, Migration};
 use crate::controller::sql::{RecipeExpr, Schema};
-use crate::controller::{
-    schema, ControllerState, DomainPlacementRestriction, NodeRestrictionKey, Worker,
-    WorkerIdentifier,
-};
-use crate::coordination::{DomainDescriptor, RunDomainResponse};
+use crate::controller::{schema, Worker, WorkerIdentifier};
 use crate::internal::LocalNodeIndex;
-use crate::worker::WorkerRequestKind;
 mod graphviz;
 
 pub(in crate::controller) use self::graphviz::Graphviz;
@@ -92,22 +81,45 @@ pub(in crate::controller) use self::graphviz::Graphviz;
 /// for replication offsets)
 const CONCURRENT_REQUESTS: usize = 16;
 
+/// Collect all nodes reachable from `start` by traversing edges in the given `direction`.
+fn reachable_from(graph: &Graph, start: NodeIndex, direction: Direction) -> HashSet<NodeIndex> {
+    let mut reachable = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(node) = stack.pop() {
+        if reachable.insert(node) {
+            for next in graph.neighbors_directed(node, direction) {
+                if !reachable.contains(&next) {
+                    stack.push(next);
+                }
+            }
+        }
+    }
+    reachable
+}
+
 /// This structure holds all the dataflow state.
 /// It's meant to be handled exclusively by the [`DfStateHandle`], which is the structure
 /// that guarantees thread-safe access to it.
-#[serde_as]
-#[derive(Clone, Serialize, Deserialize)]
+///
+/// # Wire format
+///
+/// Persisted to the Authority's RocksDB via `rmp_serde::to_vec`. Removing or
+/// reordering any serde-included field breaks decoding of every older
+/// payload. See the matching warning above `Config` in
+/// `readyset-server/src/lib.rs` for the full policy and the compat-shim
+/// recipe.
+#[derive(Clone)]
 pub struct DfState {
     pub(super) ingredients: Graph,
 
     /// ID for the root node in the graph. This is used to retrieve a list of base tables.
     pub(super) source: NodeIndex,
+    /// Monotonic counter used to allocate fresh [`DomainIndex`] values. Never decremented, even
+    /// when domains are reclaimed via [`Self::reclaim_orphaned_domains`]; `next_domain()` always
+    /// hands out a new index.
     pub(super) ndomains: usize,
-    pub(super) sharding: Option<usize>,
 
     pub(super) domain_config: DomainConfig,
-
-    pub(super) replication_strategy: ReplicationStrategy,
 
     /// Controls the persistence mode, and parameters related to persistence.
     ///
@@ -137,27 +149,18 @@ pub struct DfState {
     /// - `None` in `CreateCache::schema_generation_used` indicates "missing/unset"
     /// - Wraps from u64::MAX back to 1 (never 0)
     schema_generation: SchemaGeneration,
-    /// Placement restrictions for nodes and the domains they are placed into.
-    #[serde_as(as = "Vec<(_, _)>")]
-    pub(super) node_restrictions: HashMap<NodeRestrictionKey, DomainPlacementRestriction>,
 
-    #[serde_as(as = "Vec<(_, _)>")]
     /// Map from local to global node index for each domain
     pub(super) domain_nodes: HashMap<DomainIndex, NodeMap<NodeIndex>>,
     /// Map from global node index to index pair for each domain
-    #[serde_as(as = "Vec<(_, _)>")]
     pub(super) domain_node_index_pairs: HashMap<DomainIndex, HashMap<NodeIndex, IndexPair>>,
 
-    #[serde(skip)]
     pub(super) domains: HashMap<DomainIndex, DomainHandle>,
 
-    #[serde(skip)]
     pub(super) channel_coordinator: Arc<ChannelCoordinator>,
 
     /// Map from worker URI to the address the worker is listening on for reads.
-    #[serde(skip)]
     pub(super) read_addrs: HashMap<WorkerIdentifier, SocketAddr>,
-    #[serde(skip)]
     pub(super) workers: HashMap<WorkerIdentifier, Worker>,
 }
 
@@ -167,40 +170,45 @@ impl DfState {
         ingredients: Graph,
         source: NodeIndex,
         ndomains: usize,
-        sharding: Option<usize>,
         domain_config: DomainConfig,
         persistence: PersistenceParameters,
         materializations: Materializations,
         recipe: Recipe,
         schema_replication_offset: Option<ReplicationOffset>,
-        node_restrictions: HashMap<NodeRestrictionKey, DomainPlacementRestriction>,
         channel_coordinator: Arc<ChannelCoordinator>,
-        replication_strategy: ReplicationStrategy,
     ) -> Self {
         Self {
             ingredients,
             source,
             ndomains,
-            sharding,
             domain_config,
             persistence,
             materializations,
             recipe,
             schema_replication_offset,
             schema_generation: SchemaGeneration::INITIAL,
-            node_restrictions,
             domains: Default::default(),
             domain_nodes: Default::default(),
             channel_coordinator,
             read_addrs: Default::default(),
             workers: Default::default(),
             domain_node_index_pairs: Default::default(),
-            replication_strategy,
         }
     }
 
     pub(super) fn schema_replication_offset(&self) -> &Option<ReplicationOffset> {
         &self.schema_replication_offset
+    }
+
+    fn reader_node_index(&self, query: &Relation) -> ReadySetResult<NodeIndex> {
+        self.recipe
+            .node_addr_for(query)
+            .ok()
+            .or_else(|| self.views().get(query).copied())
+            .and_then(|leaf| self.find_reader_for(leaf, query, &Default::default()))
+            .ok_or_else(|| ReadySetError::QueryNotFound {
+                name: query.display_unquoted().to_string(),
+            })
     }
 
     /// Retrieve the current schema generation number, incremented when DDL or other changes are
@@ -216,29 +224,20 @@ impl DfState {
     pub(super) fn get_info(&self) -> ReadySetResult<GraphInfo> {
         let mut worker_info = HashMap::new();
         for (di, dh) in self.domains.iter() {
-            for (shard, replicas) in dh.shards().enumerate() {
-                for (replica, url) in replicas.iter().enumerate() {
-                    let Some(url) = url else {
-                        continue;
-                    };
-                    worker_info
-                        .entry(url.clone())
-                        .or_insert_with(HashMap::new)
-                        .entry(ReplicaAddress {
-                            domain_index: *di,
-                            shard,
-                            replica,
-                        })
-                        .or_insert_with(Vec::new)
-                        .extend(
-                            self.domain_nodes
-                                .get(di)
-                                .ok_or_else(|| {
-                                    internal_err!("{:?} in domains but not in domain_nodes", di)
-                                })?
-                                .values(),
-                        )
-                }
+            for (addr, url) in dh.assignments() {
+                worker_info
+                    .entry(url.clone())
+                    .or_insert_with(HashMap::new)
+                    .entry(addr)
+                    .or_insert_with(Vec::new)
+                    .extend(
+                        self.domain_nodes
+                            .get(di)
+                            .ok_or_else(|| {
+                                internal_err!("{:?} in domains but not in domain_nodes", di)
+                            })?
+                            .values(),
+                    );
             }
         }
         Ok(GraphInfo {
@@ -252,13 +251,13 @@ impl DfState {
         self.ingredients
             .neighbors_directed(self.source, petgraph::EdgeDirection::Outgoing)
             .filter_map(|n| {
-                let base = &self.ingredients[n];
+                let node = &self.ingredients[n];
 
-                if base.is_dropped() {
+                if node.is_dropped() || node.is_constant() {
                     None
                 } else {
-                    assert!(base.is_base());
-                    Some((base.name().clone(), n))
+                    assert!(node.is_base());
+                    Some((node.name().clone(), n))
                 }
             })
             .collect()
@@ -316,10 +315,11 @@ impl DfState {
                         RecipeExpr::Cache {
                             name,
                             statement,
-                            always,
+                            trx_cache_policy,
                             cache_type,
                             policy,
                             query_id,
+                            topk_buffer_multiplier,
                         } if (search_query_id.is_none() && search_name.is_none())
                             || (Some(query_id) == search_query_id)
                             || (Some(&name) == search_name) =>
@@ -327,10 +327,11 @@ impl DfState {
                             Some(CacheExpr {
                                 name,
                                 statement,
-                                always,
+                                trx_cache_policy,
                                 cache_type,
                                 policy,
                                 query_id,
+                                topk_buffer_multiplier,
                             })
                         }
                         _ => None,
@@ -363,11 +364,11 @@ impl DfState {
         name: &Relation,
         filter: &Option<ViewFilter>,
     ) -> Option<NodeIndex> {
-        // reader should be a child of the given node. however, due to sharding, it may not be an
-        // *immediate* child. furthermore, once we go beyond depth 1, we may accidentally hit an
-        // *unrelated* reader node. to account for this, readers keep track of what node they are
-        // "for", and we simply search for the appropriate reader by that metric. since we know
-        // that the reader must be relatively close, a BFS search is the way to go.
+        // reader should be a child of the given node. once we go beyond depth 1, we may
+        // accidentally hit an *unrelated* reader node. to account for this, readers keep track of
+        // what node they are "for", and we simply search for the appropriate reader by that
+        // metric. since we know that the reader must be relatively close, a BFS search is the way
+        // to go.
         let mut bfs = Bfs::new(&self.ingredients, node);
         while let Some(child) = bfs.next(&self.ingredients) {
             if self.ingredients[child].is_reader_for(node) && self.ingredients[child].name() == name
@@ -442,32 +443,24 @@ impl DfState {
                     domain_index: domain_index.index(),
                 })?;
 
-        let replicas = (0..domain.num_replicas())
-            .map(|replica| {
-                (0..domain.num_shards())
-                    .map(|shard| {
-                        domain
-                            .assignment(shard, replica)
-                            .map(|worker| {
-                                self.read_addrs
-                                    .get(worker)
-                                    .ok_or_else(|| ReadySetError::UnmappableDomain {
-                                        domain_index: domain_index.index(),
-                                    })
-                                    .copied()
-                            })
-                            .transpose()
+        let read_addr = domain
+            .worker()
+            .map(|worker| {
+                self.read_addrs
+                    .get(worker)
+                    .ok_or_else(|| ReadySetError::UnmappableDomain {
+                        domain_index: domain_index.index(),
                     })
-                    .collect::<ReadySetResult<Vec<_>>>()
+                    .copied()
             })
-            .collect::<ReadySetResult<Vec<_>>>()?;
+            .transpose()?;
 
         Ok(Some(ReaderHandleBuilder {
             name: name.clone(),
             node: reader_node,
             columns: columns.into(),
             schema,
-            replica_shard_addrs: Array2::from_rows(replicas),
+            read_addr,
             key_mapping,
             view_request_timeout: self.domain_config.view_request_timeout,
         }))
@@ -617,7 +610,7 @@ impl DfState {
 
         trace!(base = %base.display_unquoted(), "creating table");
 
-        let mut key = node
+        let key = node
             .get_base()
             .ok_or_else(|| ReadySetError::InvalidNodeType {
                 node_index: node.local_addr().id(),
@@ -627,42 +620,23 @@ impl DfState {
             .map(|k| k.to_owned())
             .unwrap_or_default();
 
-        let mut is_primary = false;
-        if key.is_empty() {
-            if let Sharding::ByColumn(col, _) = node.sharded_by() {
-                key = vec![col];
-            }
-        } else {
-            is_primary = true;
-        }
+        let is_primary = !key.is_empty();
 
-        let domain =
-            self.domains
-                .get(&node.domain())
-                .ok_or_else(|| ReadySetError::UnknownDomain {
-                    domain_index: node.domain().index(),
-                })?;
+        let dh = self
+            .domains
+            .get(&node.domain())
+            .ok_or_else(|| ReadySetError::UnknownDomain {
+                domain_index: node.domain().index(),
+            })?;
 
-        invariant_eq!(
-            domain.num_replicas(),
-            1,
-            "Base table domains can't be replicated"
-        );
+        // Standalone Readyset has at most one worker per domain.
+        debug_assert!(dh.is_placed() || dh.worker().is_none());
 
-        let txs = (0..domain.num_shards())
-            .map(|shard| {
-                let replica_addr = ReplicaAddress {
-                    domain_index: node.domain(),
-                    shard,
-                    replica: 0, // Base tables can't currently be replicated
-                };
-                self.channel_coordinator
-                    .get_addr(&replica_addr)
-                    .ok_or_else(|| {
-                        internal_err!("failed to get channel coordinator for {}", replica_addr)
-                    })
-            })
-            .collect::<ReadySetResult<Vec<_>>>()?;
+        let domain = node.domain();
+        let tx = self
+            .channel_coordinator
+            .get_addr(&domain)
+            .ok_or_else(|| internal_err!("failed to get channel coordinator for {}", domain))?;
 
         let base_operator = node
             .get_base()
@@ -699,7 +673,7 @@ impl DfState {
             .transpose()?;
 
         Ok(Some(TableBuilder {
-            txs,
+            tx,
             ni: node.global_addr(),
             addr: node.local_addr(),
             key,
@@ -719,21 +693,9 @@ impl DfState {
         let mut domains = HashMap::new();
         for (&domain_index, s) in self.domains.iter() {
             trace!(domain = %domain_index.index(), "requesting stats from domain");
-            domains.extend(
-                s.send_to_healthy(DomainRequest::GetStatistics, workers)
-                    .await?
-                    .into_entries()
-                    .map(|((shard, replica), stats)| {
-                        (
-                            ReplicaAddress {
-                                domain_index,
-                                shard,
-                                replica,
-                            },
-                            stats,
-                        )
-                    }),
-            );
+            if let Some(stats) = s.try_send(DomainRequest::GetStatistics, workers).await? {
+                domains.insert(domain_index, stats);
+            }
         }
 
         Ok(GraphStats { domains })
@@ -762,15 +724,7 @@ impl DfState {
         query: &Relation,
         node_sizes: Option<HashMap<NodeIndex, NodeSize>>,
     ) -> ReadySetResult<String> {
-        let ni = self
-            .recipe
-            .node_addr_for(query)
-            .ok()
-            .or_else(|| self.views().get(query).copied())
-            .and_then(|leaf| self.find_reader_for(leaf, query, &Default::default()))
-            .ok_or_else(|| ReadySetError::QueryNotFound {
-                name: query.display_unquoted().to_string(),
-            })?;
+        let ni = self.reader_node_index(query)?;
 
         Ok(Graphviz {
             graph: &self.ingredients,
@@ -813,10 +767,45 @@ impl DfState {
     /// Return a list of information about materializations in the graph
     pub(super) async fn materialization_info(&self) -> ReadySetResult<Vec<MaterializationInfo>> {
         let sizes = self.node_sizes().await?;
+        Ok(self.collect_materialization_info(&sizes, None))
+    }
 
-        Ok(self
-            .materializations
+    /// Return materialization info filtered to only nodes in the subgraph for the given cache.
+    ///
+    /// Traverses the dataflow graph upstream from the cache's reader node (via incoming edges)
+    /// to collect all ancestor nodes, then queries only the domains containing those nodes for
+    /// size information.
+    pub(super) async fn materialization_info_for_cache(
+        &self,
+        cache: &Relation,
+    ) -> ReadySetResult<Vec<MaterializationInfo>> {
+        let reader_ni = self.reader_node_index(cache)?;
+        let reachable = reachable_from(&self.ingredients, reader_ni, Direction::Incoming);
+
+        // Perf: only RPC domains that contain reachable nodes
+        let sizes = self
+            .node_sizes_for(
+                self.domain_node_index_pairs
+                    .iter()
+                    .filter(|(_, nodes)| nodes.keys().any(|ni| reachable.contains(ni)))
+                    .map(|(di, _)| *di),
+            )
+            .await?;
+
+        Ok(self.collect_materialization_info(&sizes, Some(&reachable)))
+    }
+
+    /// Build [`MaterializationInfo`] for materialized nodes, optionally restricted to `filter`.
+    fn collect_materialization_info(
+        &self,
+        sizes: &HashMap<NodeIndex, NodeSize>,
+        filter: Option<&HashSet<NodeIndex>>,
+    ) -> Vec<MaterializationInfo> {
+        let dominated = |ni: &NodeIndex| filter.is_none_or(|f| f.contains(ni));
+
+        self.materializations
             .materialized_non_reader_nodes()
+            .filter(dominated)
             .map(|ni| {
                 (
                     ni,
@@ -828,16 +817,21 @@ impl DfState {
                         .clone(),
                 )
             })
-            .chain(self.ingredients.node_references().filter_map(|(ni, n)| {
-                n.as_reader().and_then(|r| r.index()).map(|idx| {
-                    (
-                        ni,
-                        n.name().clone(),
-                        n.description(),
-                        HashSet::from([idx.clone()]),
-                    )
-                })
-            }))
+            .chain(
+                self.ingredients
+                    .node_references()
+                    .filter(move |(ni, _)| dominated(ni))
+                    .filter_map(|(ni, n)| {
+                        n.as_reader().and_then(|r| r.index()).map(|idx| {
+                            (
+                                ni,
+                                n.name().clone(),
+                                n.description(),
+                                HashSet::from([idx.clone()]),
+                            )
+                        })
+                    }),
+            )
             .map(
                 |(node_index, node_name, node_description, indexes)| MaterializationInfo {
                     // TODO(marce): This index might be out of sync if we run readyset distributed
@@ -860,12 +854,11 @@ impl DfState {
                     indexes,
                 },
             )
-            .collect())
+            .collect()
     }
 
     /// Issue all of `requests` to their corresponding domains asynchronously, and return a stream
-    /// of the results, consisting of shard, then replica, then result (potentially in a different
-    /// order).
+    /// of the results, consisting of one result per domain (potentially in a different order).
     ///
     /// If any domains are not running on a worker, this method will return an error.
     ///
@@ -875,7 +868,7 @@ impl DfState {
     fn query_domains<'a, I, R>(
         &'a self,
         requests: I,
-    ) -> impl TryStream<Ok = (DomainIndex, Array2<R>), Error = ReadySetError> + 'a
+    ) -> impl TryStream<Ok = (DomainIndex, R), Error = ReadySetError> + 'a
     where
         I: IntoIterator<Item = (DomainIndex, DomainRequest)>,
         I::IntoIter: 'a,
@@ -884,7 +877,7 @@ impl DfState {
         stream::iter(requests)
             .map(move |(domain, request)| {
                 self.domains[&domain]
-                    .send_to_all::<R>(request, &self.workers)
+                    .send::<R>(request, &self.workers)
                     .map(move |r| -> ReadySetResult<_> { Ok((domain, r?)) })
             })
             .buffer_unordered(CONCURRENT_REQUESTS)
@@ -908,24 +901,22 @@ impl DfState {
 
         let mut cur_min = PersistencePoint::Persisted;
 
-        while let Some((_idx, replicas)) = min_persisted_offsets.try_next().await? {
-            for offset in replicas.into_cells() {
-                let min_persisted_offset_for_domain = match offset {
-                    BaseTableState::Initialized(persisted_offset) => persisted_offset,
-                    BaseTableState::Pending => internal!(
-                        "At least one table does not have a replication offset because it is \
-                        not ready yet. The caller should wait for all tables to be ready before \
-                        requesting replication offsets",
-                    ),
-                };
+        while let Some((_idx, offset)) = min_persisted_offsets.try_next().await? {
+            let min_persisted_offset_for_domain = match offset {
+                BaseTableState::Initialized(persisted_offset) => persisted_offset,
+                BaseTableState::Pending => internal!(
+                    "At least one table does not have a replication offset because it is \
+                    not ready yet. The caller should wait for all tables to be ready before \
+                    requesting replication offsets",
+                ),
+            };
 
-                match (&cur_min, &min_persisted_offset_for_domain) {
-                    (PersistencePoint::Persisted, _) => cur_min = min_persisted_offset_for_domain,
-                    (PersistencePoint::UpTo(_), PersistencePoint::Persisted) => {}
-                    (PersistencePoint::UpTo(min), PersistencePoint::UpTo(persisted_offset)) => {
-                        if persisted_offset.try_partial_cmp(min)?.is_lt() {
-                            cur_min = PersistencePoint::UpTo(persisted_offset.clone());
-                        }
+            match (&cur_min, &min_persisted_offset_for_domain) {
+                (PersistencePoint::Persisted, _) => cur_min = min_persisted_offset_for_domain,
+                (PersistencePoint::UpTo(_), PersistencePoint::Persisted) => {}
+                (PersistencePoint::UpTo(min), PersistencePoint::UpTo(persisted_offset)) => {
+                    if persisted_offset.try_partial_cmp(min)?.is_lt() {
+                        cur_min = PersistencePoint::UpTo(persisted_offset.clone());
                     }
                 }
             }
@@ -950,34 +941,27 @@ impl DfState {
         .try_fold(
             ReplicationOffsets::with_schema_offset(self.schema_replication_offset.clone()),
             |mut acc, (domain, domain_offs)| async move {
-                for replica in domain_offs.into_cells() {
-                    for (lni, offset) in replica {
-                        let ni = self.domain_nodes[&domain].get(lni).ok_or_else(|| {
-                            internal_err!(
-                                "Domain {} returned nonexistent local node {}",
-                                domain,
-                                lni
-                            )
-                        })?;
+                for (lni, offset) in domain_offs {
+                    let ni = self.domain_nodes[&domain].get(lni).ok_or_else(|| {
+                        internal_err!("Domain {} returned nonexistent local node {}", domain, lni)
+                    })?;
 
-                        if !self.ingredients[*ni].is_base() {
-                            continue;
+                    if !self.ingredients[*ni].is_base() {
+                        continue;
+                    }
+
+                    let table_name = self.ingredients[*ni].name();
+                    match offset {
+                        BaseTableState::Initialized(offset) => {
+                            acc.tables.insert(table_name.clone(), offset);
                         }
-
-                        let table_name = self.ingredients[*ni].name();
-                        match offset {
-                            BaseTableState::Initialized(offset) => {
-                                // TODO min of all shards
-                                acc.tables.insert(table_name.clone(), offset);
-                            }
-                            BaseTableState::Pending => {
-                                internal!(
-                                    "Table {} does not have a replication offset because it is \
-                                     not ready yet. The caller should wait for all tables to \
-                                     be ready before requesting replication offsets",
-                                    table_name.display_unquoted()
-                                );
-                            }
+                        BaseTableState::Pending => {
+                            internal!(
+                                "Table {} does not have a replication offset because it is \
+                                 not ready yet. The caller should wait for all tables to \
+                                 be ready before requesting replication offsets",
+                                table_name.display_unquoted()
+                            );
                         }
                     }
                 }
@@ -987,19 +971,8 @@ impl DfState {
         .await
     }
 
-    pub(super) fn domain_settings(&self) -> HashMap<DomainIndex, DomainSettings> {
-        self.domains
-            .iter()
-            .map(|(idx, hdl)| {
-                (
-                    *idx,
-                    DomainSettings {
-                        num_shards: hdl.num_shards(),
-                        num_replicas: hdl.num_replicas(),
-                    },
-                )
-            })
-            .collect()
+    pub(super) fn known_domains(&self) -> HashSet<DomainIndex> {
+        self.domains.keys().copied().collect()
     }
 
     /// Collects a unique list of domains that might contain base tables. Errors out if a domain
@@ -1013,10 +986,8 @@ impl DfState {
 
         for di in domains.iter() {
             if !self.domains.contains_key(di) {
-                return Err(ReadySetError::NoSuchReplica {
+                return Err(ReadySetError::DomainNotFound {
                     domain_index: di.index(),
-                    shard: 0,
-                    replica: 0,
                 });
             }
         }
@@ -1024,45 +995,18 @@ impl DfState {
         Ok(domains)
     }
 
-    /// Returns a vector of [`DomainDescriptor`] giving information about the addresses of all
-    /// running domains within the cluster
-    pub(super) fn domain_addresses(&self) -> Vec<DomainDescriptor> {
-        let mut domain_addresses = Vec::new();
-        for (domain_index, handle) in &self.domains {
-            for shard in 0..handle.num_shards() {
-                for replica in 0..handle.num_replicas() {
-                    let replica_address = ReplicaAddress {
-                        domain_index: *domain_index,
-                        shard,
-                        replica,
-                    };
-
-                    if let Some(socket_addr) = self.channel_coordinator.get_addr(&replica_address) {
-                        domain_addresses.push(DomainDescriptor::new(replica_address, socket_addr));
-                    }
-                }
-            }
-        }
-
-        domain_addresses
-    }
-
-    /// Have all domain replicas been placed onto workers in the cluster?
-    pub(super) fn all_replicas_placed(&self) -> bool {
+    /// Have all domains been placed onto workers in the cluster?
+    pub(super) fn all_domains_placed(&self) -> bool {
         self.domain_nodes
             .keys()
-            .all(|d| self.domains.get(d).is_some_and(|h| h.all_replicas_placed()))
+            .all(|d| self.domains.get(d).is_some_and(|h| h.is_placed()))
     }
 
     /// Returns a map of nodes for domains which have not yet been placed onto a worker
     pub(super) fn unplaced_domain_nodes(&self) -> HashMap<DomainIndex, HashSet<NodeIndex>> {
         self.domain_nodes
             .iter()
-            .filter(|(d, _)| {
-                self.domains
-                    .get(d)
-                    .is_none_or(|dh| !dh.all_replicas_placed())
-            })
+            .filter(|(d, _)| self.domains.get(d).is_none_or(|dh| !dh.is_placed()))
             .map(|(k, v)| (*k, v.values().copied().collect()))
             .collect()
     }
@@ -1079,9 +1023,7 @@ impl DfState {
             .map_ok(|(di, local_indices)| {
                 stream::iter(
                     local_indices
-                        .into_cells()
                         .into_iter()
-                        .flatten()
                         .map(move |li| -> ReadySetResult<_> { Ok((di, li)) }),
                 )
             })
@@ -1110,7 +1052,7 @@ impl DfState {
                     .into_iter()
                     .map(|domain| (domain, DomainRequest::AllTablesCompacted)),
             )
-            .map_ok(|(_, compacted)| compacted.cells().iter().all(|finished| *finished));
+            .map_ok(|(_, compacted)| compacted);
         while let Some(finished) = stream.next().await {
             if !finished? {
                 return Ok(false);
@@ -1121,21 +1063,36 @@ impl DfState {
 
     /// Return a map of node indices to key counts.
     pub(super) async fn node_sizes(&self) -> ReadySetResult<HashMap<NodeIndex, NodeSize>> {
+        self.node_sizes_for(self.domains.keys().copied()).await
+    }
+
+    /// Like [`Self::node_sizes`], but only queries the given domains.
+    async fn node_sizes_for(
+        &self,
+        domains: impl Iterator<Item = DomainIndex>,
+    ) -> ReadySetResult<HashMap<NodeIndex, NodeSize>> {
         // Copying the keys into a vec here is a workaround for a higher order
         // lifetime compile error in `external_request` that occurs if we simply
         // use keys().map() to pass into query_domains directly.
-        let counts_per_domain: Vec<(DomainIndex, Array2<Option<Vec<(NodeIndex, NodeSize)>>>)> = {
-            let requests = self
-                .domains
-                .keys()
-                .map(|di| (*di, DomainRequest::RequestNodeSizes))
+        let counts_per_domain: Vec<(DomainIndex, Option<Vec<(NodeIndex, NodeSize)>>)> = {
+            let requests = domains
+                .map(|di| (di, DomainRequest::RequestNodeSizes))
                 .collect::<Vec<_>>();
 
             stream::iter(requests)
                 .map(move |(domain, request)| {
-                    self.domains[&domain]
-                        .send_to_healthy::<Vec<(NodeIndex, NodeSize)>>(request, &self.workers)
-                        .map(move |r| -> ReadySetResult<_> { Ok((domain, r?)) })
+                    let handle = self.domains.get(&domain).ok_or_else(|| {
+                        internal_err!(
+                            "Domain {domain:?} is not yet available \
+                                 — the server may still be recovering"
+                        )
+                    });
+                    async move {
+                        let r = handle?
+                            .try_send::<Vec<(NodeIndex, NodeSize)>>(request, &self.workers)
+                            .await?;
+                        Ok::<_, ReadySetError>((domain, r))
+                    }
                 })
                 .buffer_unordered(CONCURRENT_REQUESTS)
         }
@@ -1143,21 +1100,12 @@ impl DfState {
         .await?;
 
         let mut res = HashMap::new();
-        let flat_counts = counts_per_domain
-            .into_iter()
-            .flat_map(|(_domain, per_shard_counts)| {
-                per_shard_counts
-                    .into_cells()
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-            });
-        for (node_index, count) in flat_counts {
-            // We may have multiple entries for the same node in the case of sharding, so this code
-            // adds together the key counts for any duplicate nodes we come across:
-            res.entry(node_index)
-                .and_modify(|s| *s += count)
-                .or_insert(count);
+        for (_domain, counts) in counts_per_domain {
+            for (node_index, count) in counts.into_iter().flatten() {
+                res.entry(node_index)
+                    .and_modify(|s| *s += count)
+                    .or_insert(count);
+            }
         }
         Ok(res)
     }
@@ -1175,12 +1123,12 @@ impl DfState {
         F: FnOnce(&mut Migration<'_>) -> ReadySetResult<T>,
     {
         debug!("starting migration");
-        gauge!(recorded::CONTROLLER_MIGRATION_IN_PROGRESS).set(1.0);
+        gauge!(metric::CONTROLLER_MIGRATION_IN_PROGRESS).set(1.0);
         let mut m = Migration::new(self, dialect);
         let r = f(&mut m)?;
         m.commit(dry_run).await?;
         debug!("finished migration");
-        gauge!(recorded::CONTROLLER_MIGRATION_IN_PROGRESS).set(0.0);
+        gauge!(metric::CONTROLLER_MIGRATION_IN_PROGRESS).set(0.0);
         Ok(r)
     }
 
@@ -1204,7 +1152,7 @@ impl DfState {
     pub(in crate::controller) async fn place_domain(
         &mut self,
         idx: DomainIndex,
-        shard_replica_workers: Array2<Option<WorkerIdentifier>>,
+        worker: Option<WorkerIdentifier>,
         nodes: Vec<NodeIndex>,
     ) -> ReadySetResult<DomainHandle> {
         // Reader nodes are always assigned to their own domains, so it's good enough to see
@@ -1234,124 +1182,47 @@ impl DfState {
             .map(|nd| (nd.local_addr(), cell::RefCell::new(nd)))
             .collect();
 
-        let num_shards = shard_replica_workers.num_rows();
+        let mut assigned_worker = None;
 
-        let mut domain_addresses = vec![];
-        let mut assignments = Vec::with_capacity(num_shards);
-        let mut new_domain_restrictions = vec![];
+        if let Some(worker_id) = worker {
+            let domain = idx;
 
-        for (shard, replicas) in shard_replica_workers.rows().enumerate() {
-            let num_replicas = replicas.len();
-            let mut shard_assignments = Vec::with_capacity(num_replicas);
-            for (replica, worker_id) in replicas.iter().enumerate() {
-                let Some(worker_id) = worker_id else {
-                    shard_assignments.push(None);
-                    continue;
-                };
+            let builder = DomainBuilder {
+                index: idx,
+                shard: None,
+                nshards: 1,
+                config: self.domain_config.clone(),
+                nodes: domain_nodes.clone(),
+                persistence_parameters: self.persistence.clone(),
+            };
 
-                let replica_address = ReplicaAddress {
-                    domain_index: idx,
-                    shard,
-                    replica,
-                };
+            let w = self.workers.get(&worker_id).ok_or_else(|| {
+                internal_err!("Domain {domain} scheduled onto nonexistent worker {worker_id}")
+            })?;
 
-                let domain = DomainBuilder {
-                    index: idx,
-                    shard: if num_shards > 1 { Some(shard) } else { None },
-                    replica,
-                    nshards: num_shards,
-                    config: self.domain_config.clone(),
-                    nodes: domain_nodes.clone(),
-                    persistence_parameters: self.persistence.clone(),
-                };
+            let idx = builder.index;
 
-                let w = self.workers.get(worker_id).ok_or_else(|| {
-                    internal_err!(
-                        "Domain {replica_address} scheduled onto nonexistent worker {worker_id}"
-                    )
+            debug!("sending domain {} to worker {}", domain, w.uri);
+
+            w.run_domain(builder)
+                .await
+                .map_err(|e| ReadySetError::DomainCreationFailed {
+                    domain_index: idx.index(),
+                    shard: 0,
+                    replica: 0,
+                    worker_uri: w.uri.clone(),
+                    source: Box::new(e),
                 })?;
 
-                let idx = domain.index;
-
-                // send domain to worker
-                debug!("sending domain {} to worker {}", replica_address, w.uri);
-
-                let ret = w
-                    .rpc::<RunDomainResponse>(WorkerRequestKind::RunDomain(domain))
-                    .await
-                    .map_err(|e| ReadySetError::DomainCreationFailed {
-                        domain_index: idx.index(),
-                        shard,
-                        replica,
-                        worker_uri: w.uri.clone(),
-                        source: Box::new(e),
-                    })?;
-
-                // Update the domain placement restrictions on nodes in the placed
-                // domain if necessary.
-                for n in &nodes {
-                    let node = &self.ingredients[*n];
-
-                    if node.is_base() && w.domain_scheduling_config.volume_id.is_some() {
-                        new_domain_restrictions.push((
-                            node.name().to_owned(),
-                            shard,
-                            DomainPlacementRestriction {
-                                worker_volume: w.domain_scheduling_config.volume_id.clone(),
-                            },
-                        ));
-                    }
-                }
-
-                debug!(external_addr = %ret.external_addr, "worker booted domain");
-
-                self.channel_coordinator
-                    .insert_remote(replica_address, ret.external_addr);
-                domain_addresses.push(DomainDescriptor::new(replica_address, ret.external_addr));
-                shard_assignments.push(Some(w.uri.clone()));
-            }
-            assignments.push(shard_assignments);
+            // The worker registers `(domain, bind_external)` on the shared
+            // `ChannelCoordinator` as part of `RunDomain`, so we no longer need a
+            // `RunDomainResponse` round-trip to mirror that registration on the
+            // controller side.
+            debug!(%domain, "worker booted domain");
+            assigned_worker = Some(w.uri.clone());
         }
 
-        // Push all domain placement restrictions to the local controller state. We
-        // do this outside the loop to satisfy the borrow checker as this immutably
-        // borrows self.
-        for (node_name, shard, restrictions) in new_domain_restrictions {
-            self.set_domain_placement_local(node_name, shard, restrictions);
-        }
-
-        // Tell all workers about the new domain(s)
-        // TODO(jon): figure out how much of the below is still true
-        // TODO(malte): this is a hack, and not an especially neat one. In response to a
-        // domain boot message, we broadcast information about this new domain to all
-        // workers, which inform their ChannelCoordinators about it. This is required so
-        // that domains can find each other when starting up.
-        // Moreover, it is required for us to do this *here*, since this code runs on
-        // the thread that initiated the migration, and which will query domains to ask
-        // if they're ready. No domain will be ready until it has found its neighbours,
-        // so by sending out the information here, we ensure that we cannot deadlock
-        // with the migration waiting for a domain to become ready when trying to send
-        // the information. (We used to do this in the controller thread, with the
-        // result of a nasty deadlock.)
-        for (address, w) in self.workers.iter_mut() {
-            for &dd in &domain_addresses {
-                debug!(worker_uri = %w.uri, "informing worker about newly placed domain");
-                if let Err(e) = w
-                    .rpc::<()>(WorkerRequestKind::GossipDomainInformation(vec![dd]))
-                    .await
-                {
-                    // TODO(Fran): We need better error handling for workers
-                    //   that failed before the controller noticed.
-                    error!(
-                        %address,
-                        error = ?e,
-                        "Worker could not be reached and will be ignored",
-                    );
-                }
-            }
-        }
-
-        Ok(DomainHandle::new(idx, Array2::from_rows(assignments)))
+        Ok(DomainHandle::new(idx, assigned_worker))
     }
 
     pub(super) async fn remove_nodes(
@@ -1383,12 +1254,10 @@ impl DfState {
             match self
                 .domains
                 .get(&domain)
-                .ok_or_else(|| ReadySetError::NoSuchReplica {
+                .ok_or_else(|| ReadySetError::DomainNotFound {
                     domain_index: domain.index(),
-                    shard: 0,
-                    replica: 0,
                 })?
-                .send_to_healthy::<()>(DomainRequest::RemoveNodes { nodes }, &self.workers)
+                .try_send::<()>(DomainRequest::RemoveNodes { nodes }, &self.workers)
                 .await
             {
                 // The worker failing is an even more efficient way to remove nodes.
@@ -1398,16 +1267,6 @@ impl DfState {
         }
 
         Ok(())
-    }
-
-    pub(super) fn set_domain_placement_local(
-        &mut self,
-        node_name: Relation,
-        shard: usize,
-        node_restriction: DomainPlacementRestriction,
-    ) {
-        self.node_restrictions
-            .insert(NodeRestrictionKey { node_name, shard }, node_restriction);
     }
 
     pub(super) fn set_schema_replication_offset(&mut self, offset: Option<ReplicationOffset>) {
@@ -1421,14 +1280,13 @@ impl DfState {
         let mut to_evict = Vec::new();
         for (di, s) in &self.domains {
             let domain_to_evict: Vec<(NodeIndex, u64)> = s
-                .send_to_healthy::<(DomainStats, HashMap<NodeIndex, NodeStats>)>(
+                .try_send::<(DomainStats, HashMap<NodeIndex, NodeStats>)>(
                     DomainRequest::GetStatistics,
                     workers,
                 )
                 .await?
-                .into_cells()
+                // Discard results from non-running domains.
                 .into_iter()
-                .flatten(/* Discard results from non-running domains */)
                 .flat_map(move |(_, node_stats)| {
                     node_stats
                         .into_iter()
@@ -1453,15 +1311,13 @@ impl DfState {
                 self.domains
                     .get(&di)
                     .unwrap()
-                    .send_to_healthy::<()>(
+                    .try_send::<()>(
                         DomainRequest::Packet(Packet::Evict(Evict {
                             req: Eviction::Bytes {
                                 node: Some(na),
                                 num_bytes: bytes as usize,
                             },
-                            done: None,
-                            barrier: 0,
-                            credits: 0,
+                            barrier: None,
                         })),
                         workers,
                     )
@@ -1478,12 +1334,11 @@ impl DfState {
     /// List all replay paths from all domains
     pub(super) async fn replay_paths(
         &self,
-    ) -> ReadySetResult<Vec<(DomainIndex, Array2<Option<BTreeMap<Tag, ReplayPath>>>)>> {
-        let mut per_domain: Vec<(DomainIndex, Array2<Option<BTreeMap<Tag, ReplayPath>>>)> =
-            Vec::new();
+    ) -> ReadySetResult<Vec<(DomainIndex, Option<BTreeMap<Tag, ReplayPath>>)>> {
+        let mut per_domain: Vec<(DomainIndex, Option<BTreeMap<Tag, ReplayPath>>)> = Vec::new();
         for domain in self.domains.keys() {
             let res = self.domains[domain]
-                .send_to_healthy::<BTreeMap<Tag, ReplayPath>>(
+                .try_send::<BTreeMap<Tag, ReplayPath>>(
                     DomainRequest::RequestReplayPaths,
                     &self.workers,
                 )
@@ -1537,16 +1392,12 @@ impl DfState {
             .domains
             .get(&di)
             .ok_or_else(|| internal_err!())?
-            .send_to_healthy::<Option<Vec<DfValue>>>(
+            .try_send::<Option<Vec<DfValue>>>(
                 DomainRequest::Evict { req: Eviction::SingleKey { tag, key } },
                 &self.workers,
             )
             .await?
-            .into_cells()
-            .into_iter()
             .flatten(/* Discard results from non-running domains */)
-            .next()
-            .ok_or_else(|| internal_err!("expected a shard+replica"))?
             .map(|key| SingleKeyEviction {
                 domain_idx: di,
                 tag: u32::from(tag),
@@ -1582,6 +1433,12 @@ impl DfState {
         // are super entangled with the recipe and the graph.
         let mut new = self.recipe.clone();
 
+        // Only DROP-bearing migrations can produce orphaned domains. Skip the (read-only but
+        // O(N+E)) reachability scan for pure ADD/ALTER migrations.
+        let has_drops = changelist
+            .changes()
+            .any(|c| matches!(c, Change::Drop { .. }));
+
         let r = self
             .migrate(dry_run, changelist.dialect, |mig| {
                 new.activate(mig, changelist, table_statuses)
@@ -1591,6 +1448,22 @@ impl DfState {
         match r {
             Ok(res) => {
                 self.recipe = new;
+                if !dry_run && has_drops {
+                    // Domains whose nodes were all dropped by this migration (e.g. the readers
+                    // and shard mergers backing a `DROP CACHE`d query) keep their runtime OS
+                    // threads alive otherwise, exhausting tracing-subscriber's per-thread slot
+                    // pool over time. See REA-5827.
+                    //
+                    // Reclamation is OS-resource cleanup, not a correctness operation: never let
+                    // it demote a successful migration. Any kill failures are logged and the
+                    // orphaned controller bookkeeping is purged regardless.
+                    if let Err(e) = self.reclaim_orphaned_domains().await {
+                        warn!(
+                            error = %e,
+                            "reclaim_orphaned_domains failed; will retry next migration",
+                        );
+                    }
+                }
                 Ok(res)
             }
             Err(e) => {
@@ -1642,7 +1515,7 @@ impl DfState {
                 used: create_cache.schema_generation_used.map(|g| g.get()),
                 current: self.schema_generation.get(),
             };
-            counter!(recorded::SCHEMA_GENERATION_MISMATCH).increment(1);
+            counter!(metric::SCHEMA_GENERATION_MISMATCH).increment(1);
             warn!(%err, ?create_cache, "Schema generation mismatch");
             return Err(err);
         }
@@ -1663,7 +1536,7 @@ impl DfState {
                 }
                 if !dry_run && should_increment_schema_generation {
                     self.schema_generation = self.schema_generation.next();
-                    counter!(recorded::SCHEMA_CATALOG_GENERATION_INCREMENTED).increment(1);
+                    counter!(metric::SCHEMA_CATALOG_GENERATION_INCREMENTED).increment(1);
                     trace!(
                         schema_generation = %self.schema_generation,
                         "Incremented schema generation after successful migration"
@@ -1719,7 +1592,7 @@ impl DfState {
     }
 
     /// Reset the dataflow state to empty, removing all base tables, caches, views, and domain
-    /// state. Preserves configuration (dialect, sql/mir config, persistence, sharding, etc.).
+    /// state. Preserves configuration (dialect, sql/mir config, persistence, etc.).
     ///
     /// This bypasses the migration system entirely because no domains are running at this point
     /// (called on startup before worker recovery).
@@ -1743,19 +1616,20 @@ impl DfState {
         let mut materializations = Materializations::new();
         materializations.set_config(self.materializations.config.clone());
 
+        // Preserve the shared `Arc<ChannelCoordinator>` across the reset so the in-process
+        // Worker's registered domain senders stay reachable; the previous owner of `self`
+        // is dropped after this line, so cloning before the reassignment is required.
+        let channel_coordinator = self.channel_coordinator.clone();
         *self = DfState::new(
             g,
             source,
             0,
-            self.sharding,
             self.domain_config.clone(),
             self.persistence.clone(),
             materializations,
             recipe,
             None,
-            HashMap::new(),
-            Arc::new(ChannelCoordinator::new()),
-            self.replication_strategy,
+            channel_coordinator,
         );
 
         true
@@ -1822,16 +1696,15 @@ impl DfState {
     }
 
     /// Remove all references to the given [`WorkerIdentifier`] from the runtime state of the
-    /// dataflow graph, returning a list of replica addresses that were known to be running on those
-    /// workers
-    pub(super) fn remove_worker(&mut self, wi: &WorkerIdentifier) -> Vec<ReplicaAddress> {
+    /// dataflow graph, returning a list of domains that were known to be running on that worker.
+    pub(super) fn remove_worker(&mut self, wi: &WorkerIdentifier) -> Vec<DomainIndex> {
         self.workers.remove(wi);
         self.read_addrs.remove(wi);
         let mut res = vec![];
         for dh in self.domains.values_mut() {
-            for replica_addr in dh.remove_worker(wi) {
-                self.channel_coordinator.remove(replica_addr);
-                res.push(replica_addr);
+            if let Some(domain) = dh.remove_worker(wi) {
+                self.channel_coordinator.remove(domain);
+                res.push(domain);
             }
         }
         res
@@ -1866,13 +1739,13 @@ impl DfState {
         Ok(res)
     }
 
-    /// Send requests to whatever workers are running the given domain replicas to kill those
-    /// replicas, and remove them from runtime state.
+    /// Send requests to the workers running the given domains to kill them, and remove the domains
+    /// from runtime state.
     pub(super) async fn kill_domains<I>(&mut self, domains: I) -> ReadySetResult<()>
     where
         I: IntoIterator<Item = DomainIndex>,
     {
-        let mut workers_to_replicas: HashMap<_, Vec1<_>> = HashMap::new();
+        let mut workers_to_domains: HashMap<_, Vec1<_>> = HashMap::new();
         for di in domains {
             let Some(dh) = self.domains.get(&di) else {
                 debug!(domain = %di, "domain not running, not killing");
@@ -1880,7 +1753,7 @@ impl DfState {
             };
 
             for (addr, wi) in dh.assignments() {
-                workers_to_replicas
+                workers_to_domains
                     .entry(wi.clone())
                     .and_modify(|v| v.push(addr))
                     .or_insert_with(|| vec1![addr]);
@@ -1888,24 +1761,172 @@ impl DfState {
         }
 
         let mut futs = FuturesUnordered::new();
-        for (worker_url, replicas) in workers_to_replicas {
+        for (worker_url, domains) in workers_to_domains {
             let worker = self.workers.get(&worker_url).ok_or_else(|| {
                 internal_err!("Worker not found for url {worker_url} to kill domains")
             })?;
-            futs.push(
-                worker
-                    .rpc(WorkerRequestKind::KillDomains(replicas.clone()))
-                    .map_ok(|()| replicas),
-            );
+            futs.push(worker.kill_domains(domains.clone()).map_ok(|()| domains));
         }
         while let Some(r) = futs.next().await {
             for killed_addr in r? {
-                if let Some(dh) = self.domains.get_mut(&killed_addr.domain_index) {
-                    dh.remove_assignment(killed_addr.shard, killed_addr.replica);
+                if let Some(dh) = self.domains.get_mut(&killed_addr) {
+                    dh.clear_assignment();
                 }
             }
         }
 
+        Ok(())
+    }
+
+    /// Find domains whose nodes are all orphaned — that is, no non-dropped Reader or Base remains
+    /// that reaches them via incoming edges. Used to identify domains whose runtime threads can
+    /// be reclaimed after a drop migration (see REA-5827).
+    ///
+    /// We can't just check `is_dropped()` per node: when a cache is dropped, the drop path only
+    /// flags the Reader itself; routing nodes (Ingress, Egress) and Constant (`VALUES`) nodes
+    /// feeding that Reader stay un-flagged. So we instead compute reachability backwards from
+    /// every live Reader and Base, and consider any domain disjoint from that set as orphaned.
+    ///
+    /// Bases — but not Constants — anchor reachability even when no live Reader points to them.
+    /// A Base survives as long as its underlying table exists (`DROP TABLE` flags it dropped),
+    /// because tearing down a Base would force the whole table to be re-replicated from upstream.
+    /// Constants are per-query inline data with no such cost: when their owning query is gone,
+    /// they should be reclaimed alongside it.
+    pub(super) fn find_orphaned_domains(&self) -> HashSet<DomainIndex> {
+        let n_nodes = self.ingredients.node_count();
+        let mut needed: HashSet<NodeIndex> = HashSet::with_capacity(n_nodes);
+        let mut queue: VecDeque<NodeIndex> = VecDeque::with_capacity(n_nodes / 4 + 1);
+        for (ni, n) in self.ingredients.node_references() {
+            if n.is_dropped() {
+                continue;
+            }
+            if (n.is_reader() || n.is_base()) && needed.insert(ni) {
+                queue.push_back(ni);
+            }
+        }
+        while let Some(ni) = queue.pop_front() {
+            for parent in self
+                .ingredients
+                .neighbors_directed(ni, petgraph::Direction::Incoming)
+            {
+                if !self.ingredients[parent].is_dropped() && needed.insert(parent) {
+                    queue.push_back(parent);
+                }
+            }
+        }
+
+        self.domain_nodes
+            .iter()
+            .filter(|(_, nodes)| nodes.iter().all(|(_, ni)| !needed.contains(ni)))
+            .map(|(di, _)| *di)
+            .collect()
+    }
+
+    /// Kill the runtime threads of any orphaned domains and purge their bookkeeping from the
+    /// controller (`self.domains`, `self.domain_nodes`, `self.domain_node_index_pairs`,
+    /// [`ChannelCoordinator`], and [`Materializations`] entries) and flag any non-dropped
+    /// graph nodes that still belonged to those domains as dropped — closing the orphan loop the
+    /// upstream drop path leaves open for routing/Constant nodes (see REA-5827).
+    ///
+    /// This is best-effort by design: the kill RPCs may fail mid-fan-out (worker partitioned,
+    /// timed out, gone). We log and proceed — the migration's logical outcome has already
+    /// committed, and any controller-local bookkeeping must be purged regardless to avoid
+    /// re-issuing kill RPCs against the same dead domains on every subsequent migration.
+    pub(super) async fn reclaim_orphaned_domains(&mut self) -> ReadySetResult<()> {
+        let start = Instant::now();
+        let orphaned = self.find_orphaned_domains();
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+
+        // Snapshot the assigned domains to evict from the channel coordinator before
+        // `kill_domains` clears `DomainHandle::worker` via `remove_assignment`. Note that
+        // `dh.assignments()` already filters unscheduled domains, which is what we want —
+        // those were never registered with the coordinator.
+        let domains_to_evict: Vec<DomainIndex> = orphaned
+            .iter()
+            .filter_map(|di| self.domains.get(di))
+            .flat_map(|dh| dh.assignments().map(|(addr, _)| addr))
+            .collect();
+
+        if let Err(e) = self.kill_domains(orphaned.iter().copied()).await {
+            warn!(
+                error = %e,
+                ?orphaned,
+                "kill_domains partial failure during reclamation; purging local state anyway",
+            );
+        }
+
+        for addr in domains_to_evict {
+            self.channel_coordinator.remove(addr);
+        }
+
+        // Flag any non-dropped graph nodes that lived in the reclaimed domains. This handles
+        // routing nodes (Ingress, Egress) that the drop path didn't walk to, and Constant
+        // nodes whose only consumer was the dropped Reader. Without this, those nodes stay
+        // un-flagged in `self.ingredients` while their `domain()` references a domain that's
+        // about to be removed from `self.domains` — a "node has no living domain" invariant
+        // violation that breaks recovery and `materialization_info`.
+        //
+        // We also disconnect their edges to any non-dropped neighbor, otherwise the next
+        // migration's `routing::connect` walk would follow an Egress→Ingress edge into a
+        // freshly-dropped Ingress and trip the `is_ingress()` invariant.
+        let mut nodes_to_flag: Vec<NodeIndex> = Vec::new();
+        for di in &orphaned {
+            if let Some(nodes) = self.domain_nodes.get(di) {
+                nodes_to_flag.extend(nodes.iter().map(|(_, ni)| *ni));
+            }
+        }
+        for ni in &nodes_to_flag {
+            let neighbors: Vec<NodeIndex> = self
+                .ingredients
+                .neighbors_undirected(*ni)
+                .filter(|nbr| !self.ingredients[*nbr].is_dropped())
+                .collect();
+            for nbr in neighbors {
+                if let Some(edge) = self.ingredients.find_edge(*ni, nbr) {
+                    self.ingredients.remove_edge(edge);
+                }
+                if let Some(edge) = self.ingredients.find_edge(nbr, *ni) {
+                    self.ingredients.remove_edge(edge);
+                }
+            }
+            if let Some(node) = self.ingredients.node_weight_mut(*ni) {
+                if !node.is_dropped() {
+                    node.remove();
+                }
+            }
+            self.materializations.paths.remove(ni);
+            self.materializations.redundant_partial.remove(ni);
+        }
+        // `redundant_partial` maps partial-parent → full-duplicate; if either side is gone,
+        // drop the entry.
+        let stale_keys: Vec<NodeIndex> = self
+            .materializations
+            .redundant_partial
+            .iter()
+            .filter(|(k, v)| {
+                self.ingredients[**k].is_dropped() || self.ingredients[**v].is_dropped()
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for k in stale_keys {
+            self.materializations.redundant_partial.remove(&k);
+        }
+
+        for di in &orphaned {
+            self.domains.remove(di);
+            self.domain_nodes.remove(di);
+            self.domain_node_index_pairs.remove(di);
+        }
+
+        counter!(metric::CONTROLLER_RECLAIMED_DOMAINS).increment(orphaned.len() as u64);
+        info!(
+            count = orphaned.len(),
+            elapsed_us = start.elapsed().as_micros() as u64,
+            ?orphaned,
+            "Reclaimed orphaned domains",
+        );
         Ok(())
     }
 
@@ -1922,51 +1943,30 @@ impl DfState {
     ///   (except for `self.source`) must belong to a domain; and there must not be any overlap
     ///   between the nodes owned by each domain. All the invariants for Domain assignment from
     ///   [`crate::controller::migrate::assignment::assign`] must hold as well.
-    ///  - `self.remap` and `self.node_restrictions` must be valid.
+    ///  - `self.remap` must be valid.
     /// - All the other fields should be empty or `[Default::default()]`.
     pub(super) async fn plan_recovery(
         &mut self,
         domain_nodes: &HashMap<DomainIndex, HashSet<NodeIndex>>,
     ) -> ReadySetResult<DomainMigrationPlan> {
         info!("Planning recovery");
-        let mut dmp =
-            DomainMigrationPlan::new(DomainMigrationMode::Recover, self.domain_settings());
+        let mut dmp = DomainMigrationPlan::new(DomainMigrationMode::Recover, self.known_domains());
         let domain_nodes = domain_nodes
             .iter()
             .map(|(idx, nm)| (*idx, nm.iter().copied().collect::<Vec<_>>()))
             .collect::<HashMap<_, _>>();
         let mut new = HashSet::new();
         {
-            let mut scheduler = Scheduler::new(self, &None)?;
             for (domain, nodes) in domain_nodes {
-                let workers = scheduler.schedule_domain(domain, &nodes[..])?;
+                let worker = schedule_domain(self, &None, domain, &nodes[..])?;
 
-                for ((shard, replica), worker) in workers.entries() {
-                    let not_already_placed = self
-                        .domains
-                        .get(&domain)
-                        .and_then(|dh| dh.assignment(shard, replica))
-                        .is_none();
-
-                    if not_already_placed && worker.is_none() {
-                        dmp.replica_failed_placement(ReplicaAddress {
-                            domain_index: domain,
-                            shard,
-                            replica,
-                        });
-                    }
+                let already_placed = self.domains.get(&domain).is_some_and(|dh| dh.is_placed());
+                if !already_placed && worker.is_none() {
+                    dmp.domain_failed_placement(domain);
                 }
 
-                let num_shards = workers.num_rows();
-                let num_replicas = workers[0].len();
-                dmp.place_domain(domain, workers, nodes.clone());
-                dmp.set_domain_settings(
-                    domain,
-                    DomainSettings {
-                        num_shards,
-                        num_replicas,
-                    },
-                );
+                dmp.place_domain(domain, worker, nodes.clone());
+                dmp.register_domain(domain);
                 new.extend(nodes);
             }
         }
@@ -1980,33 +1980,6 @@ impl DfState {
             .commit(&mut self.ingredients, &new, &mut dmp)?;
 
         Ok(dmp)
-    }
-
-    /// This method is a hack to make sure the [`ControllerState`] "persisted" in the
-    /// [`LocalAuthority`] is stored similarly to the way it would be, if it were serialized and
-    /// then deserailized, but without paying the extreme performance penalty actually serializing
-    /// it costs. Essentially we either clear or assign defaults to the fields that are marked as
-    /// #[serde::skip], thus making sure things are consistent wherever they are stored after
-    /// serialization or after this method is applied.
-    /// If called prior to serialization or after desiarialization this would effectively be a noop,
-    /// so don't bother calling it in authorities that serialize.
-    pub(crate) fn touch_up(&mut self) {
-        self.domains = Default::default();
-        self.channel_coordinator = Default::default();
-        self.read_addrs = Default::default();
-        self.workers = Default::default();
-
-        let mut new_materializations = Materializations::new();
-        new_materializations
-            .paths
-            .clone_from(&self.materializations.paths);
-        new_materializations
-            .redundant_partial
-            .clone_from(&self.materializations.redundant_partial);
-        new_materializations.tag_generator = self.materializations.tag_generator;
-        new_materializations.config = self.materializations.config.clone();
-
-        self.materializations = new_materializations;
     }
 }
 
@@ -2116,8 +2089,7 @@ impl DfStateHandle {
         let start = Instant::now();
         let state_copy = read_guard.state.clone();
         let elapsed = start.elapsed();
-        histogram!(readyset_client::metrics::recorded::DATAFLOW_STATE_CLONE_TIME,)
-            .record(elapsed.as_micros() as f64);
+        histogram!(metric::DATAFLOW_STATE_CLONE_TIME,).record(elapsed.as_micros() as f64);
         DfStateWriter {
             state: state_copy,
             _guard: write_guard,
@@ -2136,64 +2108,65 @@ impl DfStateHandle {
             guard.state.schema_generation()
         };
         let new_state = &writer.state;
-        if let Some(local) = authority.as_local() {
-            local.update_controller_in_place(|state: Option<&mut ControllerState>| match state {
-                None => {
-                    eprintln!("There's no controller state to update");
-                    Err(())
-                }
-                Some(state) => {
-                    state.dataflow_state = new_state.clone();
-                    state.dataflow_state.touch_up();
-                    Ok(())
-                }
-            })
-        } else {
-            authority
-                .update_controller_state(
-                    |state: Option<ControllerState>| match state {
-                        None => {
-                            eprintln!("There's no controller state to update");
-                            Err(())
-                        }
-                        Some(mut state) => {
-                            state.dataflow_state = new_state.clone();
-                            Ok(state)
-                        }
-                    },
-                    |state: &ControllerState| {
-                        state.dataflow_state.schema_replication_offset().clone()
-                    },
-                    |state: &mut ControllerState| {
-                        state.dataflow_state.touch_up();
-                    },
-                )
-                .await?
-                .map(|_| ())
-        }
-        .map_err(|_| internal_err!("Unable to update state"))?;
 
         let mut state_guard = self.reader.write().await;
         state_guard.replace(new_state.clone());
         drop(state_guard);
 
-        if let Some(notifier) = &self.schema_change_notifier {
-            // The snapshot stored by `EventsHandle` is a complete `SchemaCatalog`, so partial
-            // deltas (if ever added) cannot be accidentally cached.
-            if new_state.schema_generation() != previous_generation {
+        // The schema replication offset says how far schema replication has progressed.  It
+        // must only advance after the schema catalog is durable.
+        let mut schema_persisted = true;
+
+        if new_state.schema_generation() != previous_generation {
+            if let Some(notifier) = &self.schema_change_notifier {
+                // The snapshot stored by `EventsHandle` is a complete `SchemaCatalog`, so partial
+                // deltas (if ever added) cannot be accidentally cached.
                 let catalog = new_state
                     .recipe
                     .schema_catalog(new_state.schema_generation());
                 match notifier.send_schema_catalog_update(catalog) {
                     Ok(()) => {
-                        counter!(recorded::SCHEMA_CATALOG_UPDATE_SENT).increment(1);
+                        counter!(metric::SCHEMA_CATALOG_UPDATE_SENT).increment(1);
                     }
                     Err(error) => {
-                        counter!(recorded::SCHEMA_CATALOG_UPDATE_SERIALIZATION_FAILED).increment(1);
+                        counter!(metric::SCHEMA_CATALOG_UPDATE_SERIALIZATION_FAILED).increment(1);
                         error!(%error, "Failed to serialize schema catalog update");
                     }
                 }
             }
+
+            // Dual-write the persistent schema catalog for future use in recovery.
+            let entries = new_state.recipe.to_schema_catalog_entries();
+            if let Err(error) = authority.overwrite_schema_catalog(entries).await {
+                error!(%error, "Failed to persist schema catalog");
+                schema_persisted = false;
+            }
+            let custom_types = new_state.recipe.to_persisted_custom_types();
+            if let Err(error) = authority.overwrite_custom_types(custom_types).await {
+                error!(%error, "Failed to persist custom types");
+                schema_persisted = false;
+            }
+            let non_replicated = new_state.recipe.to_persisted_non_replicated_relations();
+            if let Err(error) = authority
+                .overwrite_non_replicated_relations(non_replicated)
+                .await
+            {
+                error!(%error, "Failed to persist non-replicated relations");
+                schema_persisted = false;
+            }
+        }
+
+        if schema_persisted {
+            if let Some(offset) = new_state.schema_replication_offset() {
+                if let Err(error) = authority
+                    .overwrite_schema_replication_offset(offset.clone())
+                    .await
+                {
+                    error!(%error, "Failed to persist schema replication offset");
+                }
+            }
+        } else {
+            warn!("Skipping schema replication offset persist after failed schema catalog write");
         }
 
         Ok(())

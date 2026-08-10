@@ -1,10 +1,10 @@
 use criterion::{black_box, criterion_group, criterion_main, Bencher, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
-use readyset::query_logger::QueryLogger;
 use readyset_client::query::QueryId;
+use readyset_client_metrics::ReadysetExecutionEvent;
 use readyset_client_metrics::{EventType, QueryExecutionEvent, QueryLogMode, SqlQueryType};
-use readyset_client_metrics::{QueryIdWrapper, ReadysetExecutionEvent};
-use readyset_server::PrometheusBuilder;
+use readyset_metrics::PrometheusBuilder;
+use readyset_query_logger::QueryLogger;
 use readyset_sql::ast::SqlQuery;
 use readyset_sql::Dialect;
 use readyset_sql_passes::adapter_rewrites::AdapterRewriteParams;
@@ -30,14 +30,14 @@ fn create_event(
             _ => panic!("Error parsing query"),
         };
         let query_id = if with_query_id {
-            QueryIdWrapper::Calculated(QueryId::from_select(&query, &schema_search_path))
+            Some(QueryId::from_select(&query, &schema_search_path))
         } else {
-            QueryIdWrapper::Uncalculated(schema_search_path)
+            None
         };
 
         (Some(Arc::new(sql_stmt)), query_id)
     } else {
-        (None, QueryIdWrapper::None)
+        (None, None)
     };
 
     let readyset_event = if with_readyset_event {
@@ -68,6 +68,7 @@ fn create_event(
         },
         readyset_event,
         noria_error: None,
+        reason: None,
         destination: None,
     }
 }

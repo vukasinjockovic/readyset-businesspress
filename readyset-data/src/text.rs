@@ -1,10 +1,10 @@
 use std::cmp::Ordering;
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
+use std::mem::MaybeUninit;
 use std::num::{IntErrorKind, ParseIntError};
+use std::str;
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::Relaxed;
 
 use cidr::IpInet;
 use lazy_static::lazy_static;
@@ -12,7 +12,8 @@ use readyset_decimal::Decimal;
 use readyset_errors::{ReadySetError, ReadySetResult};
 use regex::Regex;
 
-use crate::{Array, Collation, DfType, DfValue};
+use crate::dialect::SqlEngine;
+use crate::{Array, Collation, DfType, DfValue, Dialect};
 
 pub(crate) const TINYTEXT_WIDTH: usize = 14;
 
@@ -46,20 +47,56 @@ impl LenAndCollation {
     }
 }
 
+/// A cached collation hash. Zero is reserved as a "not yet computed" sentinel for values built
+/// from a `const fn` context where the ICU-backed hash can't run. Real hashes equal to zero are
+/// stored as one to keep the sentinel unambiguous.
+#[repr(transparent)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct CachedCollationHash([u8; 8]);
+
+impl CachedCollationHash {
+    const UNINIT: Self = Self([0u8; 8]);
+
+    #[inline(always)]
+    const fn normalize(h: u64) -> u64 {
+        if h == 0 {
+            1
+        } else {
+            h
+        }
+    }
+
+    #[inline]
+    fn new(h: u64) -> Self {
+        Self(Self::normalize(h).to_ne_bytes())
+    }
+
+    #[inline]
+    fn get(self) -> Option<u64> {
+        let v = u64::from_ne_bytes(self.0);
+        if v == 0 {
+            None
+        } else {
+            Some(v)
+        }
+    }
+}
+
 /// An optimized storage for very short strings
 #[derive(Clone, Eq)]
 pub struct TinyText {
     len_and_collation: LenAndCollation,
     t: [u8; TINYTEXT_WIDTH],
+    collation_hash: CachedCollationHash,
 }
 
 #[derive(Debug)]
 struct TextHeader {
-    valid: AtomicBool,
     collation: Collation,
+    collation_hash: u64,
 }
 
-/// A thin pointer over an Arc<[u8]> with lazy UTF-8 validation
+/// A thin pointer over an `Arc<[u8]>`. Bytes are guaranteed to be valid UTF-8.
 #[derive(Clone)]
 pub struct Text {
     inner: triomphe::ThinArc<TextHeader, u8>,
@@ -76,11 +113,12 @@ impl TinyText {
         // than assigning an array of zeroes (which uses memset instead). Don't remove
         // this without benchmarking (or at least looking at godbolt first).
         // SAFETY: it is safe because u8 is a zeroable type
-        let mut t: [u8; TINYTEXT_WIDTH] = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        let mut t: [u8; TINYTEXT_WIDTH] = unsafe { MaybeUninit::zeroed().assume_init() };
         t[..s.len()].copy_from_slice(s.as_bytes());
         Ok(TinyText {
             len_and_collation: LenAndCollation::new(s.len() as _, collation),
             t,
+            collation_hash: CachedCollationHash::new(collation.key_hash(s)),
         })
     }
 
@@ -121,6 +159,7 @@ impl TinyText {
         TinyText {
             len_and_collation: LenAndCollation::new(i as u8, Collation::Utf8),
             t,
+            collation_hash: CachedCollationHash::UNINIT,
         }
     }
 
@@ -136,17 +175,43 @@ impl TinyText {
             return Err("slice too long");
         }
 
-        std::str::from_utf8(v).expect("Must always be UTF8");
+        let s = str::from_utf8(v).expect("Must always be UTF8");
 
         // For reasons I can't say using MaybeUninit::zeroed() is much faster
         // than assigning an array of zeroes (which uses memset instead). Don't remove
         // this without benchmarking (or at least looking at godbolt first).
         // SAFETY: it is safe because u8 is a zeroable type
-        let mut t: [u8; TINYTEXT_WIDTH] = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        let mut t: [u8; TINYTEXT_WIDTH] = unsafe { MaybeUninit::zeroed().assume_init() };
         t[..v.len()].copy_from_slice(v);
         Ok(TinyText {
             len_and_collation: LenAndCollation::new(v.len() as _, collation),
             t,
+            collation_hash: CachedCollationHash::new(collation.key_hash(s)),
+        })
+    }
+
+    /// Create a new `TinyText` from a precomputed collation hash and bytes. Used to reconstruct
+    /// a `TinyText` from a serialized form without recomputing the hash.
+    ///
+    /// # Safety
+    ///
+    /// `v` must contain valid UTF-8 and `collation_hash` must equal `collation.key_hash(v)`.
+    #[inline]
+    pub(crate) unsafe fn from_parts(
+        collation: Collation,
+        collation_hash: u64,
+        v: &[u8],
+    ) -> Result<Self, &'static str> {
+        if v.len() > TINYTEXT_WIDTH {
+            return Err("slice too long");
+        }
+        // SAFETY: it is safe because u8 is a zeroable type
+        let mut t: [u8; TINYTEXT_WIDTH] = unsafe { MaybeUninit::zeroed().assume_init() };
+        t[..v.len()].copy_from_slice(v);
+        Ok(TinyText {
+            len_and_collation: LenAndCollation::new(v.len() as _, collation),
+            t,
+            collation_hash: CachedCollationHash::new(collation_hash),
         })
     }
 
@@ -154,12 +219,27 @@ impl TinyText {
     #[inline]
     pub fn set_collation(&mut self, collation: Collation) {
         self.len_and_collation.set_collation(collation);
+        self.collation_hash = CachedCollationHash::new(collation.key_hash(self.as_str()));
     }
 
     /// Returns the configured collation for this [`TinyText`].
     #[inline]
     pub fn collation(&self) -> Collation {
         self.len_and_collation.collation()
+    }
+
+    /// Returns a hash of the collation sort key.
+    #[inline]
+    pub fn collation_hash(&self) -> u64 {
+        self.collation_hash.get().unwrap_or_else(|| {
+            CachedCollationHash::normalize(self.collation().key_hash(self.as_str()))
+        })
+    }
+
+    /// Compute the collation sort key for this text.  Keys compare bytewise the same as with
+    /// `Ord` on the original strings.
+    pub fn collation_key(&self) -> Box<[u8]> {
+        self.collation().key(self.as_str())
     }
 }
 
@@ -198,47 +278,51 @@ impl Text {
     /// Returns the underlying byte slice as an `str`
     #[inline]
     pub fn as_str(&self) -> &str {
-        // Check if already validated
-        if self.inner.header.header.valid.load(Relaxed) {
-            // SAFETY: Safe because we checked validation flag
-            unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
-        } else {
-            let validated = std::str::from_utf8(self.as_bytes()).expect("Must always be UTF8");
-            self.inner.header.header.valid.store(true, Relaxed);
-            validated
-        }
+        // SAFETY: every constructor validates UTF-8, so `as_bytes()` is always valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
     }
 
-    /// Create a new `Text` with the given collation by copying a byte slice
+    /// Create a new `Text` with the given collation by copying a byte slice.
     ///
-    /// This function does not check if the slice contains valid UTF-8 text, and may panic later if
-    /// `as_str` is called and it does not.
+    /// # Safety
+    ///
+    /// `v` must contain valid UTF-8.
     #[inline]
-    pub fn from_slice(v: &[u8], collation: Collation) -> Self {
-        // SAFETY: passing `false` to `valid`, which means we will validate later (i.e. in `as_str`)
-        unsafe { Self::new(false, collation, v) }
+    pub unsafe fn from_slice(v: &[u8], collation: Collation) -> Self {
+        // SAFETY: caller guarantees `v` is valid UTF-8.
+        let s = unsafe { std::str::from_utf8_unchecked(v) };
+        let collation_hash = collation.key_hash(s);
+        Self {
+            inner: triomphe::ThinArc::from_header_and_slice(
+                TextHeader {
+                    collation,
+                    collation_hash,
+                },
+                v,
+            ),
+        }
     }
 
     /// Create a new `Text` with the given collation by copying a str
     #[inline]
     pub fn from_str_with_collation(s: &str, collation: Collation) -> Self {
-        // SAFETY: `s` is guaranteed to contain valid UTF-8
-        unsafe { Self::new(true, collation, s.as_bytes()) }
+        // SAFETY: a `str` always contains valid UTF-8.
+        unsafe { Self::from_slice(s.as_bytes(), collation) }
     }
 
-    /// Construct a new possibly-valid `Text` value. If it has not been validated, it will be
-    /// validated on first use in [`Text::as_str`], which may panic if the text is not valid UTF-8
-    /// (regardless of whether it was initially marked as valid or not).
+    /// Create a new `Text` from a precomputed collation hash and bytes — used to reconstruct a
+    /// `Text` from a serialized form without recomputing the hash.
     ///
     /// # Safety
     ///
-    /// If `valid` is true, `v` must contain valid UTF-8.
-    unsafe fn new(valid: bool, collation: Collation, v: &[u8]) -> Self {
+    /// `v` must contain valid UTF-8 and `collation_hash` must equal `collation.key_hash(v)`.
+    #[inline]
+    pub(crate) unsafe fn from_parts(collation: Collation, collation_hash: u64, v: &[u8]) -> Self {
         Self {
             inner: triomphe::ThinArc::from_header_and_slice(
                 TextHeader {
-                    valid: AtomicBool::new(valid),
                     collation,
+                    collation_hash,
                 },
                 v,
             ),
@@ -248,6 +332,18 @@ impl Text {
     /// Return the configured collation on this [`Text`] value
     pub fn collation(&self) -> Collation {
         self.inner.header.header.collation
+    }
+
+    /// Return a 64-bit fingerprint of the collation sort key. Equal strings under the configured
+    /// collation produce the same fingerprint.
+    pub fn collation_hash(&self) -> u64 {
+        self.inner.header.header.collation_hash
+    }
+
+    /// Compute the collation sort key for this text.  Keys compare bytewise the same as with
+    /// `Ord` on the original strings.
+    pub fn collation_key(&self) -> Box<[u8]> {
+        self.collation().key(self.as_str())
     }
 }
 
@@ -261,8 +357,7 @@ impl TryFrom<&[u8]> for Text {
 
 impl From<&str> for Text {
     fn from(t: &str) -> Self {
-        // SAFETY: `t` is guaranteed to contain valid UTF-8
-        unsafe { Self::new(true, Collation::Utf8, t.as_bytes()) }
+        Self::from_str_with_collation(t, Collation::Utf8)
     }
 }
 
@@ -274,13 +369,13 @@ impl PartialOrd for Text {
 
 impl PartialEq for Text {
     fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
+        self.cmp(other) == Ordering::Equal
     }
 }
 
 impl Ord for Text {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.as_str().cmp(other.as_str())
+        self.collation().compare(self.as_str(), other.as_str())
     }
 }
 
@@ -360,6 +455,36 @@ pub(crate) trait TextCoerce: Sized + Clone + Into<DfValue> {
         }
     }
 
+    /// Parses text as a float. Postgres parses the whole string, accepting `Infinity` and `NaN`
+    /// along with their `inf`/`nan` abbreviations, and rejects anything it cannot parse in full.
+    /// MySQL, and an unknown dialect, take the leading numeric prefix and yield zero when there is
+    /// none.
+    fn parse_float<F>(str: &str, ty: &DfType, dialect: Option<Dialect>) -> ReadySetResult<F>
+    where
+        F: FromStr + Default,
+    {
+        if dialect.map(|d| d.engine()) == Some(SqlEngine::PostgreSQL) {
+            return str
+                .trim()
+                .parse::<F>()
+                .map_err(|_| Self::coerce_err(ty, "invalid input syntax"));
+        }
+
+        lazy_static! {
+            static ref FLOAT_PREFIX: Regex =
+                Regex::new(r"^[[:space:]]*([+-]?(\d+\.?\d*|\d*\.\d+)([eE][+-]?\d+)?)").unwrap();
+        }
+
+        let numeric_prefix = FLOAT_PREFIX
+            .captures(str)
+            .map(|caps| caps.get(1).expect("Regex has one capture group").as_str());
+
+        match numeric_prefix {
+            Some(prefix) => Ok(prefix.parse::<F>().unwrap_or_default()),
+            None => Ok(F::default()),
+        }
+    }
+
     fn check_mediumint_bounds(v: DfValue, ty: &DfType) -> ReadySetResult<DfValue> {
         match v {
             DfValue::Int(i) => {
@@ -381,7 +506,12 @@ pub(crate) trait TextCoerce: Sized + Clone + Into<DfValue> {
     }
 
     /// Coerce this type to a different DfValue.
-    fn coerce_to(&self, to_ty: &DfType, _from_ty: &DfType) -> ReadySetResult<DfValue> {
+    fn coerce_to(
+        &self,
+        to_ty: &DfType,
+        _from_ty: &DfType,
+        dialect: Option<Dialect>,
+    ) -> ReadySetResult<DfValue> {
         let str = self.try_str()?;
 
         match *to_ty {
@@ -461,7 +591,13 @@ pub(crate) trait TextCoerce: Sized + Clone + Into<DfValue> {
                     DfValue::TimestampTz(crate::TimestampTz::from(tmz.to_chrono().date_naive()))
                 }),
 
-            DfType::Timestamp { .. } | DfType::DateTime { .. } | DfType::TimestampTz { .. } => str
+            DfType::Timestamp { .. } | DfType::DateTime { .. } => str
+                .trim()
+                .parse::<crate::TimestampTz>()
+                .map_err(|e| Self::coerce_err(to_ty, e))
+                .and_then(|ts| ts.coerce_to(to_ty)),
+
+            DfType::TimestampTz { .. } => str
                 .trim()
                 .parse::<crate::TimestampTz>()
                 .map_err(|e| Self::coerce_err(to_ty, e))
@@ -551,15 +687,9 @@ pub(crate) trait TextCoerce: Sized + Clone + Into<DfValue> {
                 Err(e) => Err(Self::coerce_err(to_ty, e)),
             },
 
-            DfType::Float => str
-                .parse::<f32>()
-                .map_err(|e| Self::coerce_err(to_ty, e))?
-                .try_into(),
+            DfType::Float => Self::parse_float::<f32>(str, to_ty, dialect)?.try_into(),
 
-            DfType::Double => str
-                .parse::<f64>()
-                .map_err(|e| Self::coerce_err(to_ty, e))?
-                .try_into(),
+            DfType::Double => Self::parse_float::<f64>(str, to_ty, dialect)?.try_into(),
 
             DfType::Numeric { .. } => Ok(str
                 .parse::<Decimal>()
@@ -583,7 +713,7 @@ pub(crate) trait TextCoerce: Sized + Clone + Into<DfValue> {
 
             DfType::Bit(_)
             | DfType::VarBit(_)
-            | DfType::Row
+            | DfType::Row(_)
             | DfType::Point
             | DfType::PostgisPoint
             | DfType::PostgisPolygon
@@ -620,6 +750,80 @@ mod tests {
 
     use super::*;
     use crate::Collation;
+
+    fn coerce_double(text: &str, dialect: Dialect) -> ReadySetResult<DfValue> {
+        DfValue::from(text).coerce_to_with_dialect(&DfType::Double, &DfType::Unknown, dialect)
+    }
+
+    /// Verified against PostgreSQL 15.
+    #[test]
+    fn text_to_float_postgres_accepts_non_finite() {
+        for (text, expected) in [
+            ("NaN", f64::NAN),
+            ("nan", f64::NAN),
+            ("NAN", f64::NAN),
+            ("Infinity", f64::INFINITY),
+            ("infinity", f64::INFINITY),
+            ("INFINITY", f64::INFINITY),
+            ("inf", f64::INFINITY),
+            ("Inf", f64::INFINITY),
+            ("+inf", f64::INFINITY),
+            ("  inf  ", f64::INFINITY),
+            ("-inf", f64::NEG_INFINITY),
+            ("-Infinity", f64::NEG_INFINITY),
+        ] {
+            assert_eq!(
+                coerce_double(text, Dialect::DEFAULT_POSTGRESQL).unwrap(),
+                DfValue::Double(expected),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_to_float_postgres_rejects_unparseable() {
+        for text in ["hello", "12abc", "", "1.2.3"] {
+            assert!(
+                coerce_double(text, Dialect::DEFAULT_POSTGRESQL).is_err(),
+                "{text:?} should not parse"
+            );
+        }
+    }
+
+    /// Verified against MySQL 8.0.46.
+    #[test]
+    fn text_to_float_mysql_takes_numeric_prefix() {
+        for (text, expected) in [
+            ("12abc", 12.0),
+            ("hello", 0.0),
+            ("", 0.0),
+            ("NaN", 0.0),
+            ("Infinity", 0.0),
+            ("1.5", 1.5),
+        ] {
+            assert_eq!(
+                coerce_double(text, Dialect::DEFAULT_MYSQL).unwrap(),
+                DfValue::Double(expected),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_to_float_without_dialect_is_lenient() {
+        assert_eq!(
+            DfValue::from("hello")
+                .coerce_to(&DfType::Double, &DfType::Unknown)
+                .unwrap(),
+            DfValue::Double(0.0)
+        );
+        assert_eq!(
+            DfValue::from("12abc")
+                .coerce_to(&DfType::Double, &DfType::Unknown)
+                .unwrap(),
+            DfValue::Double(12.0)
+        );
+    }
 
     mod len_and_collation {
         use super::*;
@@ -673,14 +877,6 @@ mod tests {
     fn text_collation_round_trip(s: String, c: Collation) {
         let t = Text::from_str_with_collation(&s, c);
         assert_eq!(t.collation(), c);
-    }
-
-    #[test]
-    #[should_panic]
-    fn text_panics_non_utf8() {
-        let s = [255, 255, 255, 255];
-        let t = Text::from_slice(&s, Collation::Utf8);
-        t.as_str();
     }
 
     #[test]
@@ -880,6 +1076,58 @@ mod tests {
     }
 
     #[test]
+    fn coerce_non_numeric_text_to_float() {
+        // MySQL returns 0.0 for non-numeric strings cast to float/double
+        assert_eq!(
+            DfValue::from("hello")
+                .coerce_to(&DfType::Float, &DfType::Unknown)
+                .unwrap(),
+            DfValue::Float(0.0),
+        );
+        assert_eq!(
+            DfValue::from("hello")
+                .coerce_to(&DfType::Double, &DfType::Unknown)
+                .unwrap(),
+            DfValue::Double(0.0),
+        );
+        assert_eq!(
+            DfValue::from("")
+                .coerce_to(&DfType::Double, &DfType::Unknown)
+                .unwrap(),
+            DfValue::Double(0.0),
+        );
+    }
+
+    #[test]
+    fn coerce_prefix_numeric_text_to_float() {
+        // MySQL extracts the numeric prefix: "123abc" -> 123.0
+        assert_eq!(
+            DfValue::from("123abc")
+                .coerce_to(&DfType::Double, &DfType::Unknown)
+                .unwrap(),
+            DfValue::Double(123.0),
+        );
+        assert_eq!(
+            DfValue::from("  -45.67xyz")
+                .coerce_to(&DfType::Double, &DfType::Unknown)
+                .unwrap(),
+            DfValue::Double(-45.67),
+        );
+        assert_eq!(
+            DfValue::from("1.5e2junk")
+                .coerce_to(&DfType::Float, &DfType::Unknown)
+                .unwrap(),
+            DfValue::Float(150.0),
+        );
+        assert_eq!(
+            DfValue::from("+7.25rest")
+                .coerce_to(&DfType::Double, &DfType::Unknown)
+                .unwrap(),
+            DfValue::Double(7.25),
+        );
+    }
+
+    #[test]
     fn coerce_integer_prefix_text_to_integer() {
         assert_eq!(
             DfValue::from("5aaaa")
@@ -947,5 +1195,80 @@ mod tests {
         DfValue::from("16777216")
             .coerce_to(&DfType::UnsignedMediumInt, &DfType::DEFAULT_TEXT)
             .unwrap_err();
+    }
+
+    #[test]
+    fn text_to_timestamp_strips_timezone() {
+        // REA-4147: coercing text with a timezone offset to TIMESTAMP (without tz)
+        // should parse and then discard the timezone offset.
+        let ts_type = DfType::Timestamp {
+            subsecond_digits: 0,
+        };
+        let val = DfValue::from("2020-01-02 03:04:05+08:00")
+            .coerce_to(&ts_type, &DfType::DEFAULT_TEXT)
+            .unwrap();
+        // The timezone should be ignored — the naive datetime is preserved as-is.
+        assert_eq!(val.to_string(), "2020-01-02 03:04:05");
+
+        // Same value without timezone should produce the same result.
+        let val_no_tz = DfValue::from("2020-01-02 03:04:05")
+            .coerce_to(&ts_type, &DfType::DEFAULT_TEXT)
+            .unwrap();
+        assert_eq!(val, val_no_tz);
+    }
+
+    #[test]
+    fn text_to_datetime_converts_tz_to_utc() {
+        // REA-6487: MySQL converts timezone-aware literals to session timezone
+        // (assumed UTC) when storing as DATETIME.
+        let dt_type = DfType::DateTime {
+            subsecond_digits: 0,
+        };
+
+        // +08:00 offset: 03:04:05 in +08 = 19:04:05 UTC on the previous day.
+        let val = DfValue::from("2020-01-02 03:04:05+08:00")
+            .coerce_to(&dt_type, &DfType::DEFAULT_TEXT)
+            .unwrap();
+        assert_eq!(val.to_string(), "2020-01-01 19:04:05");
+
+        // -05:00 offset: 03:04:05 in -05 = 08:04:05 UTC.
+        let val = DfValue::from("2020-01-02 03:04:05-05:00")
+            .coerce_to(&dt_type, &DfType::DEFAULT_TEXT)
+            .unwrap();
+        assert_eq!(val.to_string(), "2020-01-02 08:04:05");
+
+        // +00:00 offset: already UTC, no change.
+        let val = DfValue::from("2020-01-02 03:04:05+00:00")
+            .coerce_to(&dt_type, &DfType::DEFAULT_TEXT)
+            .unwrap();
+        assert_eq!(val.to_string(), "2020-01-02 03:04:05");
+
+        // No offset: treated as session timezone (UTC), no change.
+        let val_no_tz = DfValue::from("2020-01-02 03:04:05")
+            .coerce_to(&dt_type, &DfType::DEFAULT_TEXT)
+            .unwrap();
+        assert_eq!(val_no_tz.to_string(), "2020-01-02 03:04:05");
+
+        // Subsecond digits + timezone offset + date/year boundary crossing.
+        let dt_type_6 = DfType::DateTime {
+            subsecond_digits: 6,
+        };
+        let val = DfValue::from("2020-01-01 00:30:00.123456+02:00")
+            .coerce_to(&dt_type_6, &DfType::DEFAULT_TEXT)
+            .unwrap();
+        assert_eq!(val.to_string(), "2019-12-31 22:30:00.123456");
+    }
+
+    #[test]
+    fn text_to_timestamptz_preserves_timezone() {
+        // TimestampTz text coercion preserves the parsed timezone offset.
+        let tstz_type = DfType::TimestampTz {
+            subsecond_digits: 0,
+        };
+        let val = DfValue::from("2020-01-02 03:04:05+08:00")
+            .coerce_to(&tstz_type, &DfType::DEFAULT_TEXT)
+            .unwrap();
+        // The offset is preserved in the parsed value.
+        assert_eq!(val.to_string(), "2020-01-02 03:04:05+08:00");
     }
 }

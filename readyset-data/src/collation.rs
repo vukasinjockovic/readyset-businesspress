@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::fmt::Display;
-use std::hash::Hash;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use icu::collator::options::{CollatorOptions, Strength};
 use icu::collator::{Collator, CollatorBorrowed};
@@ -74,7 +74,7 @@ pub enum Collation {
 }
 
 /// External collation names supported per SQL engine.
-#[derive(Clone, Copy, Debug, EnumIter)]
+#[derive(Clone, Copy, Debug, EnumIter, PartialEq, Eq)]
 enum ExternalCollation {
     // MySQL collations
     MySqlUtf8mb40900AiCi,
@@ -89,23 +89,59 @@ enum ExternalCollation {
     MySqlUtf8mb4GeneralCi,
     MySqlUtf8mb4UnicodeCi,
     MySqlUtf8mb3UnicodeCi,
+
+    // Postgres byte-order collations. The libc and PG 17+ builtin providers both
+    // expose `C` and `POSIX` as raw byte order, which matches `Collation::Binary`
+    // exactly.
+    PgC,
+    PgPosix,
+
+    // Postgres ICU collations. Readyset's `Collation::Utf8` is implemented via
+    // ICU UCA root (Tertiary), so these map onto it cleanly. Glibc-locale-based
+    // Postgres collations (e.g. `en_US.utf8`) are not equivalent and are
+    // intentionally not listed here.
+    PgUnd,
+    PgUndXIcu,
+
+    // Postgres "default" collation: the placeholder name (provider 'd') that PG
+    // assigns to columns that inherit the database `lc_collate`. Until Readyset
+    // plumbs `lc_collate` through, we silently approximate as `Utf8` (ICU root
+    // tertiary). This is wrong for databases created with `lc_collate = C`, but
+    // matches our previous behavior for everything else.
+    PgDefault,
 }
 
-// O(1) lookup for MySQL external collation names to internal Collation
-static MYSQL_COLLATION_LOOKUP: LazyLock<HashMap<&'static str, Collation>> = LazyLock::new(|| {
-    ExternalCollation::iter()
-        .filter(|e| e.engine() == SqlEngine::MySQL)
-        .map(|e| (e.name(), e.internal()))
-        .collect()
-});
+static MYSQL_COLLATION_LOOKUP: LazyLock<HashMap<&'static str, ExternalCollation>> =
+    LazyLock::new(|| {
+        ExternalCollation::iter()
+            .filter(|e| e.engine() == SqlEngine::MySQL)
+            .map(|e| (e.name(), e))
+            .collect()
+    });
+
+static POSTGRES_COLLATION_LOOKUP: LazyLock<HashMap<&'static str, ExternalCollation>> =
+    LazyLock::new(|| {
+        ExternalCollation::iter()
+            .filter(|e| e.engine() == SqlEngine::PostgreSQL)
+            .map(|e| (e.name(), e))
+            .collect()
+    });
 
 impl ExternalCollation {
     /// Lookup an external collation name to our internal collation.
     fn lookup(engine: SqlEngine, name: &str) -> Option<Collation> {
-        match engine {
+        let ext = match engine {
             SqlEngine::MySQL => MYSQL_COLLATION_LOOKUP.get(name).copied(),
-            SqlEngine::PostgreSQL => None,
+            SqlEngine::PostgreSQL => POSTGRES_COLLATION_LOOKUP.get(name).copied(),
+        }?;
+        if ext == Self::PgDefault {
+            warn_once!(
+                "column declares PostgreSQL \"default\" collation (inherits the database \
+                 lc_collate); approximating as utf8 (ICU root tertiary). This may produce \
+                 incorrect ordering for databases created with lc_collate = C."
+            );
         }
+        Some(ext.internal())
     }
 
     /// Return the engine of the external collation.
@@ -123,6 +159,9 @@ impl ExternalCollation {
             | Self::MySqlUtf8mb4GeneralCi
             | Self::MySqlUtf8mb4UnicodeCi
             | Self::MySqlUtf8mb3UnicodeCi => SqlEngine::MySQL,
+            Self::PgC | Self::PgPosix | Self::PgUnd | Self::PgUndXIcu | Self::PgDefault => {
+                SqlEngine::PostgreSQL
+            }
         }
     }
 
@@ -141,6 +180,11 @@ impl ExternalCollation {
             Self::MySqlUtf8mb4GeneralCi => "utf8mb4_general_ci",
             Self::MySqlUtf8mb4UnicodeCi => "utf8mb4_unicode_ci",
             Self::MySqlUtf8mb3UnicodeCi => "utf8mb3_unicode_ci",
+            Self::PgC => "C",
+            Self::PgPosix => "POSIX",
+            Self::PgUnd => "und",
+            Self::PgUndXIcu => "und-x-icu",
+            Self::PgDefault => "default",
         }
     }
 
@@ -158,6 +202,8 @@ impl ExternalCollation {
             Self::MySqlUtf8mb4GeneralCi
             | Self::MySqlUtf8mb4UnicodeCi
             | Self::MySqlUtf8mb3UnicodeCi => Collation::Utf8AiCiPad,
+            Self::PgC | Self::PgPosix => Collation::Binary,
+            Self::PgUnd | Self::PgUndXIcu | Self::PgDefault => Collation::Utf8,
         }
     }
 }
@@ -219,9 +265,17 @@ impl Collation {
         }
     }
 
+    /// Compute a 64-bit fingerprint of the collation sort key for a string.  Equal strings under
+    /// this collation produce the same fingerprint.
+    pub(crate) fn key_hash(&self, s: &str) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.key(s).hash(&mut h);
+        h.finish()
+    }
+
     /// Compute a collation key for a string.  This key may be compared bytewise with another
     /// key or hashed.
-    pub(crate) fn key<S>(&self, s: S) -> Vec<u8>
+    pub fn key<S>(&self, s: S) -> Box<[u8]>
     where
         S: AsRef<str>,
     {
@@ -259,7 +313,7 @@ impl Collation {
             }
         };
 
-        out
+        out.into_boxed_slice()
     }
 
     /// The default collation for a dialect.
@@ -311,6 +365,25 @@ impl Collation {
     pub fn unwrap_or_default(collation: Option<Collation>, dialect: Dialect) -> Collation {
         collation.unwrap_or_else(|| Self::default_for(dialect))
     }
+
+    /// Returns the character set family for this collation.
+    pub fn charset_family(&self) -> CharsetFamily {
+        match self {
+            Self::Latin1SwedishCi => CharsetFamily::Latin1,
+            Self::Binary => CharsetFamily::Binary,
+            Self::Utf8 | Self::Utf8Ci | Self::Utf8AiCi | Self::Utf8Binary | Self::Utf8AiCiPad => {
+                CharsetFamily::Utf8
+            }
+        }
+    }
+}
+
+/// The character set family of a [`Collation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharsetFamily {
+    Latin1,
+    Utf8,
+    Binary,
 }
 
 fn collator_options(strength: Option<Strength>) -> CollatorOptions {
@@ -396,6 +469,26 @@ mod tests {
         assert_eq!(col.key("A "), col.key("a"));
         assert_eq!(col.compare("a", "b "), Ordering::Less);
         assert_eq!(col.compare("b", "a "), Ordering::Greater);
+    }
+
+    #[test]
+    fn pg_collation_name_dispatch() {
+        let pg = Dialect::DEFAULT_POSTGRESQL;
+        assert_eq!(Collation::get_or_default(pg, "C"), Collation::Binary);
+        assert_eq!(Collation::get_or_default(pg, "POSIX"), Collation::Binary);
+        assert_eq!(Collation::get_or_default(pg, "und"), Collation::Utf8);
+        assert_eq!(Collation::get_or_default(pg, "und-x-icu"), Collation::Utf8);
+        assert_eq!(Collation::get_or_default(pg, "default"), Collation::Utf8);
+        // Unknown ICU locales fall back to Utf8 with an error_once log.
+        assert_eq!(
+            Collation::get_or_default(pg, "en-US-x-icu"),
+            Collation::Utf8
+        );
+        // Unknown libc collations also fall back.
+        assert_eq!(
+            Collation::get_or_default(pg, "en_US.UTF-8"),
+            Collation::Utf8
+        );
     }
 
     #[test]

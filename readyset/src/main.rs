@@ -1,26 +1,34 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::exit;
 
 use clap::Parser;
-use database_utils::DatabaseType;
 #[cfg(feature = "failure_injection")]
 use fail::FailScenario;
+use mysql_srv::{AuthCache, AuthKeys};
+use tracing::{error, info};
+
+use database_utils::DatabaseType;
 use readyset::mysql::MySqlHandler;
 use readyset::psql::PsqlHandler;
 use readyset::verify::verify;
 use readyset::{init_adapter_runtime, init_adapter_tracing, NoriaAdapter, Options};
-use tracing::{error, info};
+use readyset_client::CacheMode;
 
 fn main() -> anyhow::Result<()> {
+    antithesis_sdk::antithesis_init();
+
     #[cfg(feature = "failure_injection")]
     let _fail_scenario = FailScenario::setup();
 
     let mut options = Options::parse();
+    options.resolve_auto_cache();
+    options.resolve_parsing_preset();
+    options.resolve_shallow_cache_allow_all();
     let rt = init_adapter_runtime()?;
 
     // When cache_mode is shallow, replication and the query sampler are not needed
     // since shallow caches don't use dataflow.
-    if options.cache_mode == readyset_client::CacheMode::Shallow {
+    if options.cache_mode == CacheMode::Shallow {
         options
             .server_worker_options
             .replicator_config
@@ -56,22 +64,34 @@ fn main() -> anyhow::Result<()> {
     };
 
     match options.database_type()? {
-        DatabaseType::MySQL => NoriaAdapter {
-            description: "MySQL adapter for Readyset.",
-            default_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3307),
-            connection_handler: MySqlHandler {
-                enable_statement_logging: options.tracing.statement_logging,
-                tls_acceptor: options.tls_acceptor()?,
-                tls_mode: options.tls_mode,
-            },
-            database_type: DatabaseType::MySQL,
-            parse_dialect: readyset_sql::Dialect::MySQL,
-            expr_dialect: readyset_data::Dialect::DEFAULT_MYSQL,
+        DatabaseType::MySQL => {
+            let deployment_dir = options
+                .server_worker_options
+                .storage_dir(&options.deployment);
+            AuthKeys::initialize(Some(deployment_dir)).expect("failed to initialize auth RSA keys");
+
+            NoriaAdapter {
+                description: "MySQL adapter for Readyset.",
+                default_addresses: vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 3307)],
+                connection_handler: MySqlHandler {
+                    enable_statement_logging: options.tracing.statement_logging,
+                    tls_acceptor: options.tls_acceptor()?,
+                    tls_mode: options.tls_mode,
+                    auth_cache: AuthCache::new(),
+                    mysql_authentication_method: options.mysql_options.mysql_authentication_method,
+                },
+                database_type: DatabaseType::MySQL,
+                parse_dialect: readyset_sql::Dialect::MySQL,
+                expr_dialect: readyset_data::Dialect::DEFAULT_MYSQL,
+            }
+            .run(rt, options)
         }
-        .run(rt, options),
         DatabaseType::PostgreSQL => NoriaAdapter {
             description: "PostgreSQL adapter for Readyset.",
-            default_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5433),
+            default_addresses: vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5433),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5433),
+            ],
             connection_handler: PsqlHandler::new(readyset::psql::Config {
                 options: options.psql_options.clone(),
                 enable_statement_logging: options.tracing.statement_logging,

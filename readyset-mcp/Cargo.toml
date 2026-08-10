@@ -1,0 +1,44 @@
+[package]
+name = "readyset-mcp"
+version = "0.1.0"
+publish = false
+authors = ["Readyset Technology, Inc. <info@readyset.io>"]
+edition = "2024"
+
+description = "MCP (Model Context Protocol) server for Readyset"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "readyset-mcp"
+path = "src/main.rs"
+
+# To get a statically-linked bin for readyset-mcp, we need to use the musl target to include openssl
+# with "vendored" set.  However, if we set "vendored" directly in the dependencies list, it will
+# apply universally across the entire workspace, which we do not want.  This maneuver hides the
+# "vendored" feature behind another optional feature flag, "vendored-openssl" which should be set
+# when building the readyset-mcp server.
+[features]
+vendored-openssl = ["openssl/vendored"]
+
+[dependencies]
+anyhow = { workspace = true }
+mysql_async = { workspace = true }
+native-tls = { workspace = true }
+openssl = { version = "0.10" }
+pem = { workspace = true }
+postgres-native-tls = { workspace = true }
+
+rmcp = { version = "2.2", features = ["server", "transport-io"] }
+schemars = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-postgres = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[lints]
+workspace = true

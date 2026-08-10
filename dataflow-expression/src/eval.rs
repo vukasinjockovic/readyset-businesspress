@@ -1,7 +1,7 @@
 use std::borrow::Borrow;
 use std::sync::Arc;
 
-use cached::proc_macro::cached;
+use cached::cached;
 use readyset_data::{Array, ArrayD, DfValue, IxDyn, TimestampTz};
 use readyset_errors::{
     internal_err, invalid_query_err, unsupported, ReadySetError, ReadySetResult,
@@ -23,7 +23,7 @@ macro_rules! non_null {
 pub(crate) mod builtins;
 pub mod json;
 
-#[cached(size = 1000)]
+#[cached(max_size = 1000)]
 fn like_pattern(pattern: String, case_sensitivity: CaseSensitivityMode) -> Arc<LikePattern> {
     Arc::new(LikePattern::new(&pattern, case_sensitivity))
 }
@@ -235,6 +235,11 @@ fn eval_binary_op(op: BinaryOperator, left: &DfValue, right: &DfValue) -> ReadyS
             let right_arr = non_null!(right).as_array()?;
             Ok(DfValue::from(left_arr.concat(right_arr)))
         }
+        ArrayOverlap => {
+            let left_arr = non_null!(left).as_array()?;
+            let right_arr = non_null!(right).as_array()?;
+            Ok(DfValue::from(left_arr.overlaps(right_arr)))
+        }
         StringConcat => {
             let left_str = <&str>::try_from(non_null!(left))?;
             let right_str = <&str>::try_from(non_null!(right))?;
@@ -263,7 +268,7 @@ impl Expr {
     {
         match self {
             // At this point, `Array`s are no longer homogenous and therefore there is no difference
-            Expr::Row { elements } => Ok(DfValue::from(Array::from(
+            Expr::Row { elements, .. } => Ok(DfValue::from(Array::from(
                 elements
                     .iter()
                     .map(|expr| expr.eval(record))
@@ -314,8 +319,11 @@ impl Expr {
                 expr,
                 ty,
                 null_on_failure,
+                dialect,
             } => {
-                let res = expr.eval(record)?.coerce_to(ty, expr.ty());
+                let res = expr
+                    .eval(record)?
+                    .coerce_to_with_dialect(ty, expr.ty(), *dialect);
                 if *null_on_failure {
                     Ok(res.unwrap_or(DfValue::None))
                 } else {
@@ -472,6 +480,7 @@ mod tests {
                 subsecond_digits: Dialect::DEFAULT_MYSQL.default_subsecond_digits(),
             },
             null_on_failure: true,
+            dialect: Dialect::DEFAULT_MYSQL,
         };
         assert_eq!(expr.eval::<DfValue>(&[]).unwrap(), DfValue::None);
     }
@@ -1102,6 +1111,7 @@ mod tests {
             expr: Box::new(make_column(0)),
             ty: DfType::Int,
             null_on_failure: false,
+            dialect: Dialect::DEFAULT_MYSQL,
         };
         assert_eq!(
             expr.eval::<DfValue>(&["1".into(), "2".into()]).unwrap(),
@@ -1673,6 +1683,26 @@ mod tests {
             assert_eq!(
                 eval_expr("'hello' || null", readyset_sql::Dialect::PostgreSQL),
                 DfValue::None
+            );
+        }
+
+        /// `ARRAY[1,2,3] IN (ARRAY[1,2,3], ARRAY[4,5,6])` should evaluate to true via
+        /// element-wise equality, not string comparison (REA-6335).
+        #[test]
+        fn eval_array_in_list() {
+            assert_eq!(
+                eval_expr(
+                    "ARRAY[1,2,3] IN (ARRAY[1,2,3], ARRAY[4,5,6])",
+                    readyset_sql::Dialect::PostgreSQL
+                ),
+                true.into()
+            );
+            assert_eq!(
+                eval_expr(
+                    "ARRAY[1,2,3] IN (ARRAY[4,5,6], ARRAY[7,8,9])",
+                    readyset_sql::Dialect::PostgreSQL
+                ),
+                false.into()
             );
         }
     }

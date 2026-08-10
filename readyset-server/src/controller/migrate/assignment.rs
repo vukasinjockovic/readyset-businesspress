@@ -4,22 +4,13 @@ use dataflow::prelude::*;
 use tracing::debug;
 
 use crate::controller::state::DfState;
-use crate::controller::NodeRestrictionKey;
 
 /// Assigns domains to all the new nodes.
 ///
 /// # Domain assignment heuristics
-/// The main idea is to have as few domains as possible.
-/// However, domains are assigned or created depending on the type of each node, heuristically.
-/// There are some nodes that have special invariants that must be held. See the Invariants section
-/// below
-///
-/// ## Shard Merger
-/// Shard Mergers (nodes that are of type [`dataflow::node::NodeType::Internal`] with a
-/// [`dataflow::ops::NodeOperator::Union`] operator, where the union has a
-/// [`dataflow::ops::union::Emit::AllFrom`]), need their own separate domain from their
-/// sharded ancestors.
-/// A Shard Merger is then assigned a new domain.
+/// The main idea is to have as few domains as possible, but with one structural exception: each
+/// base table is assigned its own domain. Constants (`VALUES`) are placed in a deferred second
+/// pass; see [`dataflow::node::NodeType::Constant`] below.
 ///
 /// ## [`dataflow::node::NodeType::Reader`]
 /// Since readers always re-materialize, sharing a domain doesn't help them much. Having them in
@@ -28,65 +19,58 @@ use crate::controller::NodeRestrictionKey;
 /// A reader node is then assigned a new domain.
 ///
 /// ## [`dataflow::node::NodeType::Base`]
-/// Base nodes are assigned domains depending on sharding.
+/// Each base table is assigned its own domain.
 ///
-/// ### Sharding disabled
-/// All base nodes are assigned to the same domain.
-///
-/// ### Sharding enabled
-/// In this situation, the following happens:
-/// 1. We traverse down the graph and gather all the children nodes from the base node, until we hit
-///    a sharder or shard merger.
-/// 2. From all of those children, we traverse the graph up until we encounter another base node
-///    without traversing any sharders or shard mergers.
-///
-/// The set of those base node will be grouped together in the same domain, as long as their shards
-/// are compatible with each other (based on the [`DfState::node_restrictions`]).
+/// ## [`dataflow::node::NodeType::Constant`]
+/// Constants (`VALUES` clauses) are co-located with their consumer's domain in a deferred
+/// second pass. Structurally a Constant looks like a Base: both originate data and have only
+/// the graph root as a parent. But operationally a Constant does no ongoing work; it receives
+/// no writes, owns no I/O, and just emits a fixed set of rows once at materialization time.
+/// Giving it its own domain costs an OS thread for no benefit and forces cross-domain message
+/// passing for static rows the consumer needs. Co-locating turns Constant -> Join row delivery
+/// into intra-domain message passing and eliminates the Egress/Ingress pair between them.
 ///
 /// ## Node name starts with 'BOUNDARY_'
 /// It is assigned a new domain.
 ///
 /// ## Any other case
-/// The node is assigned the same domain as its first non-source, non-sharder parent.
+/// The node is assigned the same domain as its first non-source parent.
 /// If no such parent exists, it is assigned a new domain.
-///
-/// # Invariants
-/// ## Shard Mergers
-/// Shard Mergers are the only nodes that MUST be assigned to a different node than their sharded
-/// ancestors.
-/// The reason behind this is that it is not possible to change the shard key of the dataflow
-/// except at a domain boundary.
 pub fn assign(dataflow_state: &mut DfState, new_nodes: &[NodeIndex]) -> ReadySetResult<()> {
-    // we need to walk the data flow graph and assign domains to all new nodes.
-    // we generally want as few domains as possible, but in *some* cases we must make new ones.
-    // specifically:
-    //
-    //  - the child of a Sharder is always in a different domain from the sharder
-    //  - shard merge nodes are never in the same domain as their sharded ancestors
-    let mut ndomains = dataflow_state.ndomains;
+    assign_inner(
+        &mut dataflow_state.ingredients,
+        &mut dataflow_state.ndomains,
+        new_nodes,
+    )
+}
 
-    let mut next_domain = || -> ReadySetResult<usize> {
-        ndomains += 1;
-        Ok(ndomains - 1)
+/// Inner implementation of [`assign`] that takes only the graph and domain counter directly,
+/// so it can be exercised by unit tests without standing up a full [`DfState`].
+fn assign_inner(
+    graph: &mut Graph,
+    ndomains: &mut usize,
+    new_nodes: &[NodeIndex],
+) -> ReadySetResult<()> {
+    let mut next_domain = || -> usize {
+        *ndomains += 1;
+        *ndomains - 1
     };
 
+    // Constants are deferred to pass 2 (see below) so they can co-locate with their consumer.
+    let mut deferred_constants: Vec<NodeIndex> = Vec::new();
+
     for &node in new_nodes {
+        if graph[node].is_constant() {
+            deferred_constants.push(node);
+            continue;
+        }
+
         #[allow(clippy::cognitive_complexity)]
         let assignment = (|| {
-            let graph = &dataflow_state.ingredients;
-            let node_restrictions = &dataflow_state.node_restrictions;
+            // Shared reborrow so the `move` closure below can capture `&Graph` (Copy) instead
+            // of consuming our `&mut Graph`.
+            let graph: &Graph = &*graph;
             let n = &graph[node];
-
-            // TODO: the code below is probably _too_ good at keeping things in one domain.
-            // having all bases in one domain (e.g., if sharding is disabled) isn't great because
-            // write performance will suffer terribly.
-
-            if n.is_shard_merger() {
-                // shard mergers are always in their own domain.
-                // we *could* use the same domain for multiple separate shard mergers
-                // but it's unlikely that would do us any good.
-                return next_domain();
-            }
 
             if n.is_reader() {
                 // readers always re-materialize, so sharing a domain doesn't help them much.
@@ -97,127 +81,8 @@ pub fn assign(dataflow_state: &mut DfState, new_nodes: &[NodeIndex]) -> ReadySet
             }
 
             if n.is_base() {
-                // bases are in a little bit of an awkward position becuase they can't just blindly
-                // join in domains of other bases in the face of sharding. consider the case of two
-                // bases, A and B, where A is sharded by A[0] and B by B[0]. Can they share a
-                // domain? The way we deal with this is that we walk *down* from the base until we
-                // hit any sharders or shard mergers, and then we walk *up* from each node visited
-                // on the way down until we hit a base without traversing a sharding.
-                // XXX: maybe also do this extended walk for non-bases?
-                let mut children_same_shard = Vec::new();
-                let mut frontier: Vec<_> = graph
-                    .neighbors_directed(node, petgraph::EdgeDirection::Outgoing)
-                    .collect();
-                while !frontier.is_empty() {
-                    for cni in frontier.split_off(0) {
-                        let c = &graph[cni];
-                        if !c.is_sharder() && !c.is_shard_merger() {
-                            invariant_eq!(n.sharded_by().is_none(), c.sharded_by().is_none());
-                            children_same_shard.push(cni);
-                            frontier.extend(
-                                graph.neighbors_directed(cni, petgraph::EdgeDirection::Outgoing),
-                            );
-                        }
-                    }
-                }
-
-                let mut friendly_base = None;
-                frontier = children_same_shard;
-
-                // We search to see if there's another base with the same shard constraints.
-                // TODO(fran): Why are we looking for a single base? Couldn't we group more bases
-                //  together? Or maybe not group bases at all, since having too many bases in one
-                //  domain can hurt write performance.
-                'search: while !frontier.is_empty() {
-                    for pni in frontier.split_off(0) {
-                        if pni == node {
-                            continue;
-                        }
-
-                        let p = &graph[pni];
-                        if p.is_base() && p.has_domain() {
-                            friendly_base = Some(p);
-                            break 'search;
-                        } else if !p.is_source() && !p.is_sharder() && !p.is_shard_merger() {
-                            invariant_eq!(n.sharded_by().is_none(), p.sharded_by().is_none());
-                            frontier.extend(
-                                graph.neighbors_directed(pni, petgraph::EdgeDirection::Incoming),
-                            );
-                        }
-                    }
-                }
-
-                // A base table is only friendly with another if their shards also
-                // do not have conflicting domain placement restrictions. If a node
-                // has more shards than another, these shards will be placed
-                // in a separate domain shard and placement restrictions do not
-                // overlap.
-                return Ok(if let Some(friendly_base) = friendly_base {
-                    let num_shards = std::cmp::min(
-                        n.sharded_by().shards().unwrap_or(1),
-                        friendly_base.sharded_by().shards().unwrap_or(1),
-                    );
-
-                    // TODO(fran): Is it possible that to have a scenario in which we have two nodes
-                    // N1 and N2  with shards N1S1, N1S2 and N2S1, N2S2 and N2S3
-                    // where:
-                    //   - N1S1 is compatible with N2S2
-                    //   - N1S2 is compatible with N2S3
-                    //   - Any other combination is incompatible
-                    //  There is a valid combination there, by leaving N2S1 into it's own domain,
-                    // but  we are not contemplating that here.
-                    let compatible = |new_node: &Node, existing_node: &Node| {
-                        for i in 0..num_shards {
-                            let new_node_key = NodeRestrictionKey {
-                                node_name: new_node.name().clone(),
-                                shard: i,
-                            };
-                            let existing_node_key = NodeRestrictionKey {
-                                node_name: existing_node.name().clone(),
-                                shard: i,
-                            };
-
-                            let compatible = match (
-                                node_restrictions.get(&new_node_key),
-                                node_restrictions.get(&existing_node_key),
-                            ) {
-                                // If two nodes each have domain placement restrictions.
-                                // The two need to be compatible to be placed in the
-                                // same domain. Otherwise, the domain would not be placed
-                                // on a valid server.
-                                (Some(new_node), Some(existing_node)) => {
-                                    // A server can only have one worker_volume, as a
-                                    // result, these two nodes should require the same
-                                    // worker_volume.
-                                    new_node.worker_volume == existing_node.worker_volume
-                                }
-                                // If we have placement restrictions, don't place the node
-                                // in a domain without. We technically can if the worker
-                                // matches, but requires more checks.
-                                (Some(_), None) => false,
-                                // If we have no domain placemnet restrictions, we can
-                                // be placed anywhere.
-                                (None, Some(_)) => true,
-                                (None, None) => true,
-                            };
-
-                            if !compatible {
-                                return false;
-                            }
-                        }
-
-                        true
-                    };
-
-                    if compatible(n, friendly_base) {
-                        friendly_base.domain().index()
-                    } else {
-                        next_domain()?
-                    }
-                } else {
-                    // there are no bases like us, so we need a new domain :'(
-                    next_domain()?
-                });
+                // Each base table gets its own domain.
+                return next_domain();
             }
 
             if graph[node].name().name.starts_with("BOUNDARY_") {
@@ -231,7 +96,7 @@ pub fn assign(dataflow_state: &mut DfState, new_nodes: &[NodeIndex]) -> ReadySet
                     .filter(move |&p| prime(&graph[p]))
                     .collect();
                 while let Some(p) = stack.pop() {
-                    if graph[p].is_source() {
+                    if graph[p].is_graph_root() {
                         continue;
                     }
                     if check(&graph[p]) {
@@ -249,22 +114,12 @@ pub fn assign(dataflow_state: &mut DfState, new_nodes: &[NodeIndex]) -> ReadySet
 
             let mut assignment = None;
             for &(_, p) in &parents {
-                if p.is_source() {
+                if p.is_graph_root() {
                     // the source isn't a useful source of truth
                     continue;
                 }
-                if p.is_sharder() {
-                    // we're a child of a sharder (which currently has to be unsharded). we
-                    // can't be in the same domain as the sharder (because we're starting a new
-                    // sharding)
-                    invariant!(p.sharded_by().is_none());
-                } else if assignment.is_none() {
-                    // the key may move to a different column, so we can't actually check for
-                    // ByColumn equality. this'll do for now.
-                    invariant_eq!(p.sharded_by().is_none(), n.sharded_by().is_none());
-                    if p.has_domain() {
-                        assignment = Some(p.domain().index())
-                    }
+                if assignment.is_none() && p.has_domain() {
+                    assignment = Some(p.domain().index())
                 }
 
                 if let Some(candidate) = assignment {
@@ -291,9 +146,6 @@ pub fn assign(dataflow_state: &mut DfState, new_nodes: &[NodeIndex]) -> ReadySet
                         if !s.has_domain() {
                             continue;
                         }
-                        if s.sharded_by().is_none() != n.sharded_by().is_none() {
-                            continue;
-                        }
                         let candidate = s.domain().index();
                         if any_parents(
                             &|p| p.has_domain() && p.domain().index() != candidate,
@@ -307,20 +159,210 @@ pub fn assign(dataflow_state: &mut DfState, new_nodes: &[NodeIndex]) -> ReadySet
                 }
             }
 
-            Ok(assignment.unwrap_or_else(|| {
+            assignment.unwrap_or_else(|| {
                 // no other options left -- we need a new domain
-                next_domain().unwrap()
-            }))
-        })()?;
+                next_domain()
+            })
+        })();
 
         debug!(
             node = node.index(),
-            node_type = ?dataflow_state.ingredients[node],
+            node_type = ?graph[node],
             domain = ?assignment,
+            placement = "primary",
             "node added to domain"
         );
-        dataflow_state.ingredients[node].add_to(assignment.into());
+        graph[node].add_to(assignment.into());
     }
-    dataflow_state.ndomains = ndomains;
+
+    // Pass 2: place each deferred Constant in its consumer's domain. By processing every
+    // non-Constant in pass 1, every consumer of a Constant has been assigned a domain by
+    // the time pass 2 runs, regardless of where the Constant fell in topo order.
+    // MIR-to-graph compilation always wires a Constant to at least one downstream operator
+    // before this function runs; if neither holds, the graph is malformed and we bail.
+    //
+    // Multi-consumer Constants are not produced by the current MIR pipeline. If that
+    // changes, the placement policy below (pick the first consumer) needs revisiting:
+    // unchosen consumers would pay a cross-domain hop, partially undoing this fix.
+    for node in deferred_constants {
+        debug_assert!(
+            graph
+                .neighbors_directed(node, petgraph::EdgeDirection::Outgoing)
+                .count()
+                <= 1,
+            "Constant {} has multiple consumers; placement policy is undefined for that case",
+            node.index()
+        );
+        let assignment = graph
+            .neighbors_directed(node, petgraph::EdgeDirection::Outgoing)
+            .find(|&c| graph[c].has_domain())
+            .map(|c| graph[c].domain().index())
+            .ok_or_else(|| {
+                internal_err!(
+                    "Constant node {} has no downstream consumer with an assigned domain",
+                    node.index()
+                )
+            })?;
+        debug!(
+            node = node.index(),
+            node_type = ?graph[node],
+            domain = ?assignment,
+            placement = "deferred_constant",
+            "node added to domain"
+        );
+        graph[node].add_to(assignment.into());
+    }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use dataflow::node::{self, Column, Node};
+    use dataflow::ops::join::{Join, JoinType};
+    use dataflow::ops::{NodeOperator, Side};
+    use dataflow::prelude::DfValue;
+    use dataflow::utils::make_columns;
+
+    use super::*;
+
+    /// Build an empty graph with the singular graph-root node, mirroring how `DfState`
+    /// initializes `ingredients`. Returns the graph and the root node index so callers can
+    /// wire base/constant nodes under it.
+    fn graph_with_source() -> (Graph, NodeIndex) {
+        let mut graph: Graph = petgraph::Graph::new();
+        let source = graph.add_node(Node::new::<_, _, Vec<Column>, _>(
+            "source",
+            Vec::new(),
+            node::special::Source,
+        ));
+        (graph, source)
+    }
+
+    /// Two base tables connected by a join in a single migration must land in distinct
+    /// domains. Pre-REA-6610 the `friendly-base` search co-located them, which serialized
+    /// their writes through a shared message queue. Regression test for the failure mode
+    /// that hit `it_works_basic` and `correct_nested_view_schema`.
+    #[test]
+    fn joined_base_tables_get_distinct_domains() {
+        let (mut graph, source) = graph_with_source();
+
+        let a = graph.add_node(Node::new(
+            "a",
+            make_columns(&["a0", "a1"]),
+            node::special::Base::new(),
+        ));
+        let b = graph.add_node(Node::new(
+            "b",
+            make_columns(&["b0", "b1"]),
+            node::special::Base::new(),
+        ));
+        graph.add_edge(source, a, ());
+        graph.add_edge(source, b, ());
+
+        let join: NodeOperator = Join::new(
+            a,
+            b,
+            JoinType::Inner,
+            vec![(0, 0)],
+            vec![(Side::Left, 0), (Side::Right, 1)],
+            false,
+            None,
+        )
+        .into();
+        let j = graph.add_node(Node::new("j", make_columns(&["a0", "b1"]), join));
+        graph.add_edge(a, j, ());
+        graph.add_edge(b, j, ());
+
+        let mut ndomains = 0;
+        assign_inner(&mut graph, &mut ndomains, &[a, b, j]).unwrap();
+
+        assert_ne!(
+            graph[a].domain(),
+            graph[b].domain(),
+            "two base tables joined together must land in distinct domains",
+        );
+    }
+
+    /// The REA-6688 barrier separates pre- from post-snapshot writes using FIFO ordering in the
+    /// reader domain's egress, which requires the reader in a domain of its own. Co-locating it
+    /// with its base would reopen the drop window; this test trips if a planner change does that.
+    #[test]
+    fn reader_lands_in_own_domain_distinct_from_base() {
+        let (mut graph, source) = graph_with_source();
+
+        let base = graph.add_node(Node::new(
+            "base",
+            make_columns(&["id"]),
+            node::special::Base::new(),
+        ));
+        graph.add_edge(source, base, ());
+
+        let reader = graph.add_node(Node::new(
+            "reader",
+            make_columns(&["id"]),
+            node::special::Reader::new(base, Default::default()),
+        ));
+        graph.add_edge(base, reader, ());
+
+        let mut ndomains = 0;
+        assign_inner(&mut graph, &mut ndomains, &[base, reader]).unwrap();
+
+        assert_ne!(
+            graph[base].domain(),
+            graph[reader].domain(),
+            "reader must land in a domain distinct from its base (REA-6688)",
+        );
+    }
+
+    /// A Constant feeding a Join must land in the Join's domain rather than its own. The
+    /// previous behavior, driven by `is_source()` returning true for both Bases and
+    /// Constants, gave every VALUES clause an OS thread for a node that does no ongoing
+    /// work, and forced cross-domain message passing for static rows the Join needed.
+    #[test]
+    fn constant_inherits_consumer_domain() {
+        let (mut graph, source) = graph_with_source();
+
+        let t = graph.add_node(Node::new(
+            "t",
+            make_columns(&["id"]),
+            node::special::Base::new(),
+        ));
+        let v = graph.add_node(Node::new(
+            "v",
+            make_columns(&["x"]),
+            node::special::Constant::new(vec![
+                vec![DfValue::from(1)],
+                vec![DfValue::from(2)],
+                vec![DfValue::from(3)],
+            ]),
+        ));
+        graph.add_edge(source, t, ());
+        graph.add_edge(source, v, ());
+
+        let join: NodeOperator = Join::new(
+            t,
+            v,
+            JoinType::Inner,
+            vec![(0, 0)],
+            vec![(Side::Left, 0), (Side::Right, 0)],
+            false,
+            None,
+        )
+        .into();
+        let j = graph.add_node(Node::new("j", make_columns(&["id"]), join));
+        graph.add_edge(t, j, ());
+        graph.add_edge(v, j, ());
+
+        let mut ndomains = 0;
+        // Real topo order places the Constant `v` before its consumer `j`. Pass 2 handles
+        // this by deferring Constant placement until after pass 1 assigns every non-Constant.
+        assign_inner(&mut graph, &mut ndomains, &[t, v, j]).unwrap();
+
+        assert_eq!(
+            graph[v].domain(),
+            graph[j].domain(),
+            "Constant must inherit the consuming Join's domain, not get its own",
+        );
+    }
 }

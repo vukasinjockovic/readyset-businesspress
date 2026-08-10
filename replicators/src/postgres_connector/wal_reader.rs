@@ -104,23 +104,6 @@ pub(crate) enum WalEvent {
     },
 }
 
-impl WalEvent {
-    /// Returns the `Lsn` associated with `self` if `self` is an event that includes a data
-    /// modification.
-    pub(crate) fn lsn(&self) -> Option<Lsn> {
-        match self {
-            Self::Insert { lsn, .. }
-            | Self::DeleteRow { lsn, .. }
-            | Self::DeleteByKey { lsn, .. }
-            | Self::UpdateRow { lsn, .. }
-            | Self::UpdateByKey { lsn, .. }
-            | Self::Truncate { lsn, .. }
-            | Self::DdlEvent { lsn, .. } => Some(*lsn),
-            Self::Begin { .. } | Self::Commit { .. } | Self::WantsKeepaliveResponse { .. } => None,
-        }
-    }
-}
-
 impl WalReader {
     pub(crate) fn new(wal: pgsql::client::Responses, table_filter: TableFilter) -> Self {
         WalReader {
@@ -129,6 +112,10 @@ impl WalReader {
             wal,
             table_filter,
         }
+    }
+
+    pub(crate) fn deny_replication(&mut self, schema: &str, table: &str) {
+        self.table_filter.deny_replication(schema, table);
     }
 
     pub(crate) async fn next_event(&mut self) -> Result<WalEvent, ReadySetError> {
@@ -679,28 +666,17 @@ impl wal::TupleData {
                                         schema: relation.schema_name_lossy(),
                                     })?
                                     .try_into()?,
-                                PGType::NUMERIC => match str.as_ref() {
-                                    "NaN" | "Infinity" | "-Infinity" => {
-                                        return Err(WalError::TableError {
-                                            kind: TableErrorKind::NumericParseError(
-                                                NumericParseErrorKind::UnsupportedValue(
-                                                    str.to_string(),
-                                                ),
-                                            ),
-                                            table: relation.relation_name_lossy(),
-                                            schema: relation.schema_name_lossy(),
-                                        });
-                                    }
-                                    s => Decimal::from_str(s)
-                                        .map_err(|e| WalError::TableError {
-                                            kind: TableErrorKind::NumericParseError(
-                                                NumericParseErrorKind::DecimalError(e),
-                                            ),
-                                            table: relation.relation_name_lossy(),
-                                            schema: relation.schema_name_lossy(),
-                                        })
-                                        .map(DfValue::from)?,
-                                },
+                                // `Decimal` carries NaN and +/-Infinity, which the snapshot path
+                                // also accepts.
+                                PGType::NUMERIC => Decimal::from_str(str.as_ref())
+                                    .map_err(|e| WalError::TableError {
+                                        kind: TableErrorKind::NumericParseError(
+                                            NumericParseErrorKind::DecimalError(e),
+                                        ),
+                                        table: relation.relation_name_lossy(),
+                                        schema: relation.schema_name_lossy(),
+                                    })
+                                    .map(DfValue::from)?,
                                 PGType::CHAR => match text.as_ref() {
                                     [] => DfValue::None,
                                     [c] => DfValue::Int(i8::from_ne_bytes([*c]).into()),

@@ -4,26 +4,34 @@ use readyset_errors::{ReadySetResult, internal};
 use readyset_sql::analysis::visit_mut::{self, VisitorMut};
 use readyset_sql::ast::{Column, Expr, Literal, Relation};
 
+#[derive(Clone)]
+struct ConstEvalLowerContext;
+impl LowerContext for ConstEvalLowerContext {
+    fn resolve_column(&self, _col: Column) -> ReadySetResult<(usize, DfType)> {
+        internal!("Can't resolve column")
+    }
+
+    fn resolve_type(&self, _ty: Relation) -> Option<DfType> {
+        // TODO(aspen): Support custom types in constant folding
+        None
+    }
+}
+
 /// Statically evaluate the given expression, returning a literal value representing the result.
 ///
 /// Returns an error if the expression evaluation failed, or if the expression is not constant
 fn const_eval(expr: &Expr, dialect: Dialect) -> ReadySetResult<Literal> {
-    #[derive(Clone)]
-    struct ConstEvalLowerContext;
-    impl LowerContext for ConstEvalLowerContext {
-        fn resolve_column(&self, _col: Column) -> ReadySetResult<(usize, DfType)> {
-            internal!("Can't resolve column")
-        }
-
-        fn resolve_type(&self, _ty: Relation) -> Option<DfType> {
-            // TODO(aspen): Support custom types in constant folding
-            None
-        }
-    }
-
-    let dataflow_expr = DataflowExpr::lower(expr.clone(), dialect, &ConstEvalLowerContext)?;
-    let res = dataflow_expr.eval::<DfValue>(&[])?;
+    let res = const_eval_to_dfvalue(expr, dialect)?;
     res.try_into()
+}
+
+/// Statically evaluate the given expression and return the result as a [`DfValue`].
+///
+/// Unlike [`const_eval`], this avoids the round-trip through [`Literal`] and can represent types
+/// that have no literal equivalent (e.g. arrays).
+pub fn const_eval_to_dfvalue(expr: &Expr, dialect: Dialect) -> ReadySetResult<DfValue> {
+    let dataflow_expr = DataflowExpr::lower(expr.clone(), dialect, &ConstEvalLowerContext)?;
+    dataflow_expr.eval::<DfValue>(&[])
 }
 
 struct ConstantFoldVisitor {
@@ -47,6 +55,13 @@ impl<'ast> VisitorMut<'ast> for ConstantFoldVisitor {
         // `CAST(1 + 2 AS INT)` becomes `CAST(3 AS INT)`).
         if self.preserve_casts && matches!(expr, Expr::Cast { .. }) {
             return visit_mut::walk_expr(self, expr);
+        }
+
+        if let Expr::Row { exprs, .. } = expr {
+            for e in exprs {
+                self.visit_expr(e)?;
+            }
+            return Ok(());
         }
 
         // Since we have to recursively traverse the expression's AST to convert it into a dataflow
@@ -191,6 +206,37 @@ mod tests {
         pg_preserving_casts_rewrites_to(
             "CAST(CAST(1 + 2 AS int) AS text)",
             "CAST(CAST(3 AS int) AS text)",
+        );
+    }
+
+    /// PostgreSQL helper for non-preserving constant folding tests.
+    fn pg_rewrites_to(input: &str, expected: &str) {
+        let mut expr = parse_expr(readyset_sql::Dialect::PostgreSQL, input).unwrap();
+        let expected = parse_expr(readyset_sql::Dialect::PostgreSQL, expected).unwrap();
+        constant_fold_expr(&mut expr, Dialect::DEFAULT_POSTGRESQL);
+
+        let expr = expr.display(readyset_sql::Dialect::PostgreSQL).to_string();
+        let expected = expected
+            .display(readyset_sql::Dialect::PostgreSQL)
+            .to_string();
+        assert_eq!(expr, expected, "\nExpected: {expected}\n     Got: {expr}");
+    }
+
+    /// Array constructors with all-literal elements must NOT be folded into a string literal.
+    /// Folding `ARRAY[0, 10, 20]` to `'{0,10,20}'` breaks `IN` comparisons because the
+    /// subsequent equality check compares an array against a string (REA-6335).
+    #[test]
+    fn array_literal_not_folded_to_string() {
+        pg_rewrites_to("ARRAY[0, 10, 20]", "ARRAY[0, 10, 20]");
+    }
+
+    /// When an array constructor appears in an `IN` expression, constant folding must leave the
+    /// RHS array constructors intact so the `IN` desugars to element-wise array equality.
+    #[test]
+    fn array_in_list_not_folded() {
+        pg_rewrites_to(
+            "t.x IN (ARRAY[0, 10, 20], ARRAY[1, 2, 3])",
+            "t.x IN (ARRAY[0, 10, 20], ARRAY[1, 2, 3])",
         );
     }
 

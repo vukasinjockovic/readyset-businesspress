@@ -8,6 +8,7 @@ use std::fmt::Display;
 use readyset_errors::ReadySetError;
 use readyset_sql::ast::{
     CacheInner, CacheType, CreateCacheStatement, EvictionPolicy, Relation, SelectStatement,
+    TrxCachePolicy,
 };
 use readyset_sql::DialectDisplay;
 use readyset_util::fmt::fmt_with;
@@ -102,10 +103,15 @@ impl MigrationStatus {
 pub struct CacheExpr {
     pub name: Relation,
     pub statement: SelectStatement,
-    pub always: bool,
+    pub trx_cache_policy: TrxCachePolicy,
     pub cache_type: Option<CacheType>,
     pub policy: Option<EvictionPolicy>,
     pub query_id: QueryId,
+    /// Multiplier applied to the TopK operator's buffer size when this cache lowers to a TopK
+    /// dataflow node. `None` means use the default (`buffered = k`); `Some(0)` disables buffering.
+    /// Only meaningful for deep caches that include a TopK node.
+    #[serde(default)]
+    pub topk_buffer_multiplier: Option<usize>,
 }
 
 impl From<CacheExpr> for CreateCacheStatement {
@@ -119,11 +125,14 @@ impl From<CacheExpr> for CreateCacheStatement {
                 deep: Ok(Box::new(value.statement.clone())),
                 shallow: Err("Not a shallow cache".into()),
             },
-            always: value.always,
+            trx_cache_policy: value.trx_cache_policy,
             // CacheExpr represents a migrated query, and the below fields are not relevant for an
             // already-migrated query
+            adaptive: false,
             concurrently: false,
             unparsed_create_cache_statement: None,
+            topk_buffer_multiplier: value.topk_buffer_multiplier,
+            autoparam: Default::default(),
         }
     }
 }
@@ -144,7 +153,7 @@ impl DialectDisplay for CacheExpr {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct CacheInfo {
     pub name: Relation,
-    pub always: bool,
+    pub trx_cache_policy: TrxCachePolicy,
 }
 
 /// Represents some high-level information about an expression.

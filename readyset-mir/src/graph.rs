@@ -188,11 +188,20 @@ impl MirGraph {
             }
             MirNodeInner::Distinct { group_by } => group_by.clone(),
             MirNodeInner::Project { emit } => {
-                let mut columns = vec![];
+                let mut columns: Vec<MirColumn> = vec![];
                 for expr in emit {
                     match expr {
                         ProjectExpr::Column(c) => {
-                            if !columns.contains(c) {
+                            // Dedup by exact (table, name) identity rather than
+                            // Column's alias-aware equality: two emit columns
+                            // that resolve to different parent columns (e.g.
+                            // `a.c2 AS c1` and `a.y AS c2`) must both be
+                            // demanded, even though `c1`'s alias collides by
+                            // name with `c2`'s surface.
+                            if !columns
+                                .iter()
+                                .any(|x| x.name == c.name && x.table == c.table)
+                            {
                                 columns.push(c.clone());
                             }
                         }
@@ -238,11 +247,32 @@ impl MirGraph {
                 }
                 columns
             }
-            MirNodeInner::Join { on, project } | MirNodeInner::LeftJoin { on, project } => {
+            MirNodeInner::Join { on, project } => {
                 let mut columns = project.clone();
                 for c in on.iter().flat_map(|(lc, rc)| [lc, rc]) {
                     if !columns.iter().any(|col| col == c) {
                         columns.push(c.clone())
+                    }
+                }
+                columns
+            }
+            MirNodeInner::LeftJoin {
+                on,
+                project,
+                left_local_preds,
+            } => {
+                let mut columns = project.clone();
+                for c in on.iter().flat_map(|(lc, rc)| [lc, rc]) {
+                    if !columns.iter().any(|col| col == c) {
+                        columns.push(c.clone())
+                    }
+                }
+                for pred in left_local_preds {
+                    for c in pred.referred_columns() {
+                        let mir_col = MirColumn::from(c.clone());
+                        if !columns.contains(&mir_col) {
+                            columns.push(mir_col)
+                        }
                     }
                 }
                 columns
@@ -258,11 +288,51 @@ impl MirGraph {
                 columns.extend(group_by.clone());
                 columns
             }
+            // AliasTable stamps every parent column with a table qualifier, so
+            // its output columns have different identity than its input columns.
+            // What it *references* (needs from its parent) is the parent's
+            // columns as-is, not the stamped versions. Returning the stamped
+            // versions here would cause pull_columns to see false mismatches
+            // and add duplicate columns.
+            MirNodeInner::AliasTable { .. } => {
+                let parent = self
+                    .sorted_ancestors(node)
+                    .next()
+                    .expect("AliasTable node must have a parent");
+                self.columns(parent)
+            }
+            // Union strips table qualifiers from emit columns, so, like
+            // AliasTable, we must return the parent's columns rather than
+            // the unqualified emit entries.  Otherwise demand-driven pruning
+            // sees a mismatch between the unqualified demand and the
+            // table-qualified parent columns, and incorrectly prunes them.
+            MirNodeInner::Union { emit, .. } => {
+                let ancestors: Vec<_> = self.sorted_ancestors(node).collect();
+                let mut columns = vec![];
+                for (i, e) in emit.iter().enumerate() {
+                    if let Some(&ancestor) = ancestors.get(i) {
+                        let parent_cols = self.columns(ancestor);
+                        for ec in e {
+                            for pc in &parent_cols {
+                                if pc.name == ec.name && !columns.contains(pc) {
+                                    columns.push(pc.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                columns
+            }
             _ => self.columns(node),
         }
     }
 
     /// Computes the list of columns in the output of this node.
+    ///
+    /// # Invariant
+    ///
+    /// Node types that generate output columns (Window, Paginate, etc.) MUST append them at
+    /// the end of the list. `column_id_for_column` relies on this via `rposition()`.
     pub fn columns(&self, node: NodeIndex) -> Vec<MirColumn> {
         let parent_columns = || {
             // see note [edge-ordering]
@@ -311,7 +381,7 @@ impl MirGraph {
             | MirNodeInner::LeftJoin { project, .. }
             | MirNodeInner::DependentJoin { project, .. }
             | MirNodeInner::DependentLeftJoin { project, .. } => project.clone(),
-            MirNodeInner::JoinAggregates => {
+            MirNodeInner::JoinAggregates { .. } => {
                 let cols = self
                     // see note [edge-ordering]
                     .sorted_ancestors(node)
@@ -352,6 +422,9 @@ impl MirGraph {
                 // nobody cares about that column, so just give it a throwaway name here
                 .chain(iter::once(MirColumn::named("__distinct_count")))
                 .collect(),
+            MirNodeInner::Constant { column_names, .. } => {
+                column_names.iter().map(MirColumn::named).collect()
+            }
         }
     }
 
@@ -399,10 +472,16 @@ impl MirGraph {
             },
             // otherwise, just look up in the column set
             // Compare by name if there is no table
+            // Use `rposition` because, like the Base case above, multiple columns of the same
+            // name may exist. Window and Paginate nodes pass through all parent columns and
+            // append their own output column last, so when a parent already has a column with
+            // the same name, the *last* match is the correct one. For node types that
+            // reconstruct their column list (e.g., Aggregation, Distinct), rposition is
+            // harmless since duplicates cannot occur.
             _ => match if c.table.is_none() {
-                self.columns(node).iter().position(|cc| cc.name == c.name)
+                self.columns(node).iter().rposition(|cc| cc.name == c.name)
             } else {
-                self.columns(node).iter().position(|cc| cc == c)
+                self.columns(node).iter().rposition(|cc| cc == c)
             } {
                 Some(id) => Ok(id),
                 None => err,
@@ -412,6 +491,11 @@ impl MirGraph {
 
     /// Finds the source of a child column within the node.
     /// This is currently used for locating the source of a projected column.
+    ///
+    /// `rposition` is used (rather than `position`) for the same reason as
+    /// `column_id_for_column`: Window and Paginate nodes pass through all parent columns and
+    /// append their own output column last, so when a name collision exists the *last* match
+    /// is the correct one.
     pub fn find_source_for_child_column(
         &self,
         node: NodeIndex,
@@ -424,13 +508,13 @@ impl MirGraph {
         // column struct but means its the "alias" that will exist in the parent node,
         // not the column name.
         if child.aliases.is_empty() {
-            self.columns(node).iter().position(|c| child == c)
+            self.columns(node).iter().rposition(|c| child == c)
         } else {
             let columns = self.columns(node);
             columns
                 .iter()
-                .position(|c| child.aliases.contains(c))
-                .or_else(|| columns.iter().position(|c| child == c))
+                .rposition(|c| child.aliases.contains(c))
+                .or_else(|| columns.iter().rposition(|c| child == c))
         }
     }
 
@@ -510,7 +594,137 @@ impl IndexMut<NodeIndex> for MirGraph {
 
 #[cfg(test)]
 mod tests {
+    use dataflow::ops::window::WindowOperationKind;
+    use readyset_sql::ast::ColumnSpecification;
+    use readyset_sql::ast::{self, OrderType, SqlType};
+
     use super::*;
+
+    /// Helper to create a ColumnSpecification from a name string.
+    fn cspec(name: &str) -> ColumnSpecification {
+        ColumnSpecification::new(ast::Column::from(name), SqlType::Int(None))
+    }
+
+    /// Helper to create a ColumnSpecification with an explicit table qualifier.
+    fn cspec_with_table(table: &str, name: &str) -> ColumnSpecification {
+        let col = ast::Column {
+            table: Some(table.into()),
+            name: name.into(),
+        };
+        ColumnSpecification::new(col, SqlType::Int(None))
+    }
+
+    /// Regression test for REA-6338: when a Window node passes through a column from its
+    /// parent that has the same name as the Window's own output column,
+    /// `column_id_for_column` must resolve to the *last* (Window-appended) column, not the
+    /// first (pass-through) one.
+    #[test]
+    fn column_id_for_column_resolves_shadowed_window_output() {
+        let mut graph = MirGraph::new();
+
+        // Base node with columns: [id, __rn]
+        // The __rn here simulates a pass-through from a lower-level subquery.
+        let base = graph.add_node(MirNode::new(
+            "base".into(),
+            MirNodeInner::Base {
+                column_specs: vec![cspec("id"), cspec("__rn")],
+                primary_key: None,
+                unique_keys: Default::default(),
+            },
+        ));
+
+        // Window node that appends its own __rn output column.
+        // After this node, columns are: [id, __rn (pass-through), __rn (window output)]
+        let window = graph.add_node(MirNode::new(
+            "window".into(),
+            MirNodeInner::Window {
+                group_by: vec![],
+                partition_by: vec![],
+                order_by: vec![(
+                    MirColumn::named("id"),
+                    OrderType::OrderAscending,
+                    readyset_sql::ast::NullOrder::NullsLast,
+                )],
+                output_column: MirColumn::named("__rn"),
+                function: WindowOperationKind::RowNumber,
+                args: vec![],
+            },
+        ));
+        graph.add_edge(base, window, 0);
+
+        // Verify the window node has 3 columns: id, __rn, __rn
+        let cols = graph.columns(window);
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[1].name, "__rn"); // pass-through from base
+        assert_eq!(cols[2].name, "__rn"); // window output
+
+        // column_id_for_column with table=None should resolve to the LAST __rn (index 2),
+        // not the first (index 1).
+        let col = MirColumn::named("__rn");
+        let idx = graph.column_id_for_column(window, &col).unwrap();
+        assert_eq!(
+            idx, 2,
+            "should resolve to the window's output __rn (last), not the pass-through (first)"
+        );
+    }
+
+    /// Regression test for REA-6338 (table-qualified branch): exercises the
+    /// `c.table.is_some()` path in `column_id_for_column` (`self.columns(node).iter().rposition(|cc|
+    /// cc == c)`). When a Window node passes through a table-qualified column from its parent
+    /// that has the same name as the Window's own output column,
+    /// `column_id_for_column` must resolve to the *last* (Window-appended) column.
+    #[test]
+    fn column_id_for_column_resolves_shadowed_window_output_with_table() {
+        let mut graph = MirGraph::new();
+
+        // Base node with columns: [t.id, t.__rn]
+        // The t.__rn here simulates a pass-through from a lower-level subquery.
+        let base = graph.add_node(MirNode::new(
+            "base".into(),
+            MirNodeInner::Base {
+                column_specs: vec![cspec_with_table("t", "id"), cspec_with_table("t", "__rn")],
+                primary_key: None,
+                unique_keys: Default::default(),
+            },
+        ));
+
+        // Window node that appends its own t.__rn output column.
+        // After this node, columns are: [t.id, t.__rn (pass-through), t.__rn (window output)]
+        let window = graph.add_node(MirNode::new(
+            "window".into(),
+            MirNodeInner::Window {
+                group_by: vec![],
+                partition_by: vec![],
+                order_by: vec![(
+                    MirColumn::new(Some("t"), "id"),
+                    OrderType::OrderAscending,
+                    readyset_sql::ast::NullOrder::NullsLast,
+                )],
+                output_column: MirColumn::new(Some("t"), "__rn"),
+                function: WindowOperationKind::RowNumber,
+                args: vec![],
+            },
+        ));
+        graph.add_edge(base, window, 0);
+
+        // Verify the window node has 3 columns: t.id, t.__rn, t.__rn
+        let cols = graph.columns(window);
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[1].name, "__rn"); // pass-through from base
+        assert_eq!(cols[2].name, "__rn"); // window output
+
+        // column_id_for_column with table=Some("t") should resolve to the LAST t.__rn
+        // (index 2), not the first (index 1).
+        let col = MirColumn::new(Some("t"), "__rn");
+        let idx = graph.column_id_for_column(window, &col).unwrap();
+        assert_eq!(
+            idx, 2,
+            "should resolve to the window's output t.__rn (last), \
+             not the pass-through (first)"
+        );
+    }
 
     #[test]
     fn swap_with_child_preserves_edge_weights() {

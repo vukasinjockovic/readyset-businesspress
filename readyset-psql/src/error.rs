@@ -10,7 +10,7 @@ pub enum Error {
     #[error(transparent)]
     ReadySet(#[from] ReadySetError),
 
-    #[error(transparent)]
+    #[error("{}", readyset_errors::postgres_err(.0))]
     PostgreSql(#[from] tokio_postgres::Error),
 
     #[error(transparent)]

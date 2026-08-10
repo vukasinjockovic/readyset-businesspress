@@ -1,0 +1,87 @@
+[
+  {
+    "epoch": 1,
+    "indices": [
+      {
+        "columns": [
+          0
+        ],
+        "index_type": "HashMap"
+      }
+    ],
+    "persistent_state_version": 7,
+    "replication_offset": null
+  },
+  {
+    "epoch": 42,
+    "indices": [
+      {
+        "columns": [
+          0,
+          1
+        ],
+        "index_type": "HashMap"
+      },
+      {
+        "columns": [
+          2
+        ],
+        "index_type": "BTreeMap"
+      }
+    ],
+    "persistent_state_version": 7,
+    "replication_offset": {
+      "MySql": {
+        "binlog_file_base_name": "binlog",
+        "binlog_file_suffix": 1,
+        "binlog_file_suffix_length": 6,
+        "position": 154
+      }
+    }
+  },
+  {
+    "epoch": 100,
+    "indices": [
+      {
+        "columns": [
+          0
+        ],
+        "index_type": "HashMap"
+      }
+    ],
+    "persistent_state_version": 7,
+    "replication_offset": {
+      "Postgres": {
+        "commit_lsn": 12345,
+        "lsn": 6789
+      }
+    }
+  },
+  {
+    "epoch": 200,
+    "indices": [
+      {
+        "columns": [
+          0,
+          1,
+          2
+        ],
+        "index_type": "BTreeMap"
+      }
+    ],
+    "persistent_state_version": 7,
+    "replication_offset": {
+      "Gtid": {
+        "entries": {
+          "3e11fa47-71ca-11e1-9e33-c80aa9429562": [
+            {
+              "end": 10,
+              "start": 1
+            }
+          ]
+        },
+        "pending": null
+      }
+    }
+  }
+]

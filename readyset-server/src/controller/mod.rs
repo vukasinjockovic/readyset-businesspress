@@ -6,16 +6,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{format_err, Context};
+use bytes::Bytes;
 use dataflow::node::{self, Column};
 use dataflow::prelude::ChannelCoordinator;
+use dataflow::{DomainBuilder, DomainRequest};
 use futures::future::Either;
-use hyper::http::{Method, StatusCode};
+use http::{Method, StatusCode};
 use metrics::{counter, gauge, histogram};
 use readyset_client::consensus::{
     Authority, AuthorityControl, AuthorityWorkerHeartbeatResponse, CacheDDLRequest,
     GetLeaderResult, WorkerDescriptor, WorkerId, WorkerSchedulingConfig,
 };
-use readyset_client::metrics::recorded;
+use readyset_client::internal::DomainIndex;
 use readyset_client::recipe::changelist::Change;
 use readyset_client::recipe::ChangeList;
 use readyset_client::{ControllerConnectionPool, ControllerDescriptor, TableStatus};
@@ -27,15 +29,15 @@ use readyset_telemetry_reporter::TelemetrySender;
 use readyset_util::retry_with_exponential_backoff;
 use readyset_util::select;
 use readyset_util::shutdown::ShutdownReceiver;
+use replication_offset::ReplicationOffset;
 use replicators::{ControllerMessage, ReplicatorMessage};
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use table_status::TableStatusState;
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, error, info, info_span, warn};
 use tracing_futures::Instrument;
 use url::Url;
+use vec1::Vec1;
 
 use crate::controller::events::EventsHandle;
 use crate::controller::inner::Leader;
@@ -43,8 +45,8 @@ use crate::controller::migrate::Migration;
 use crate::controller::sql::Recipe;
 use crate::controller::state::DfState;
 use crate::materialization::Materializations;
-use crate::worker::WorkerRequestKind;
-use crate::{Config, VolumeId};
+use crate::worker::WorkerRequest;
+use crate::Config;
 
 mod domain_handle;
 pub(crate) mod events;
@@ -52,7 +54,6 @@ mod inner;
 mod keys;
 pub(crate) mod migrate;
 mod mir_to_flow;
-pub(crate) mod replication;
 pub(crate) mod schema;
 pub(crate) mod sql;
 mod state;
@@ -64,35 +65,16 @@ const LEADER_STATE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// Timeout for HTTP requests made to the controller.
 const CONTROLLER_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A set of placement restrictions applied to a domain
-/// that a dataflow node is in. Each base table node can have
-/// a set of DomainPlacementRestrictions. A domain's
-/// DomainPlacementRestriction is the merged set of restrictions
-/// of all contained dataflow nodes.
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct DomainPlacementRestriction {
-    worker_volume: Option<VolumeId>,
-}
+/// Maximum time to wait for the replicator task to stop gracefully before aborting it.
+const REPLICATOR_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The key for a DomainPlacementRestriction for a dataflow node.
-/// Each dataflow node, shard pair may have a DomainPlacementRestriction.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
-pub struct NodeRestrictionKey {
-    node_name: Relation,
-    shard: usize,
-}
+/// Timeout for failover command responses from the controller event loop.
+const FAILOVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The full (metadata) state of a running ReadySet cluster.
-///
-/// This struct is the root data structure that is serialized atomically and written to the
-/// [`Authority`] upon changes to the state of the cluster. It includes:
-/// - All configuration for the cluster
-/// - The full schema of the database (both `CREATE TABLE` statements taken from the upstream
-///   database and ReadySet-specific configuration including `CREATE CACHE` statements)
-/// - The full state of the graph, including both [`MIR`][] and the dataflow graph itself
-///
-/// [`MIR`]: readyset_mir
-#[derive(Clone, Serialize, Deserialize)]
+/// The full (metadata) state of a running ReadySet cluster: the user-provided configuration
+/// plus the dataflow engine state. Held only in memory; rebuilt from individual Authority
+/// keys at leader election.
+#[derive(Clone)]
 pub(crate) struct ControllerState {
     /// The user-provided configuration for the cluster
     pub(crate) config: Config,
@@ -111,7 +93,6 @@ impl Debug for ControllerState {
                 "schema_replication_offset",
                 &self.dataflow_state.schema_replication_offset(),
             )
-            .field("node_restrictions", &self.dataflow_state.node_restrictions)
             .finish()
     }
 }
@@ -135,8 +116,11 @@ impl ControllerState {
         let mut materializations = Materializations::new();
         materializations.set_config(config.materialization_config.clone());
 
-        let cc = Arc::new(ChannelCoordinator::new());
-        assert_ne!(config.min_workers, 0);
+        // The `Arc<ChannelCoordinator>` here is a placeholder; the shared coord owned by
+        // `Controller` is injected into `state.dataflow_state.channel_coordinator` inside
+        // `handle_authority_update` before the state is handed to `Leader::new`. Constructing
+        // a fresh one is harmless because nothing reads through this field until then.
+        let channel_coordinator = Arc::new(ChannelCoordinator::new());
 
         let dialect = dialect
             .unwrap_or_else(|| {
@@ -163,15 +147,12 @@ impl ControllerState {
             g,
             source,
             0,
-            config.sharding,
             config.domain_config.clone(),
             config.persistence.clone(),
             materializations,
             recipe,
             None,
-            HashMap::new(),
-            cc,
-            config.replication_strategy,
+            channel_coordinator,
         );
 
         Self {
@@ -185,42 +166,99 @@ impl ControllerState {
 pub struct Worker {
     healthy: bool,
     uri: Url,
-    http: reqwest::Client,
     /// Configuration for how domains should be scheduled onto this worker
     domain_scheduling_config: WorkerSchedulingConfig,
-    request_timeout: Duration,
+    /// Channel into the in-process `crate::worker::Worker` task. Each variant of
+    /// [`WorkerRequest`] carries its own typed `oneshot` for the response.
+    worker_tx: Sender<WorkerRequest>,
 }
 
 impl Worker {
     pub fn new(
         instance_uri: Url,
         domain_scheduling_config: WorkerSchedulingConfig,
-        request_timeout: Duration,
+        worker_tx: Sender<WorkerRequest>,
     ) -> Self {
         Worker {
             healthy: true,
             uri: instance_uri,
-            http: reqwest::Client::new(),
             domain_scheduling_config,
-            request_timeout,
+            worker_tx,
         }
     }
 
-    pub async fn rpc<T: DeserializeOwned>(&self, req: WorkerRequestKind) -> ReadySetResult<T> {
-        common::worker::rpc(
-            &self.http,
-            self.uri.join("worker_request")?,
-            self.request_timeout,
-            req,
-        )
-        .await
+    async fn send(&self, req: WorkerRequest) -> ReadySetResult<()> {
+        self.worker_tx
+            .send(req)
+            .await
+            .map_err(|_| internal_err!("worker request channel closed"))
+    }
+
+    pub async fn run_domain(&self, builder: DomainBuilder) -> ReadySetResult<()> {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.send(WorkerRequest::RunDomain { builder, done_tx })
+            .await?;
+        done_rx
+            .await
+            .map_err(|_| internal_err!("worker dropped RunDomain done_tx"))?
+    }
+
+    pub async fn clear_domains(&self) -> ReadySetResult<()> {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.send(WorkerRequest::ClearDomains { done_tx }).await?;
+        done_rx
+            .await
+            .map_err(|_| internal_err!("worker dropped ClearDomains done_tx"))?
+    }
+
+    pub async fn kill_domains(&self, domains: Vec1<DomainIndex>) -> ReadySetResult<()> {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.send(WorkerRequest::KillDomains { domains, done_tx })
+            .await?;
+        done_rx
+            .await
+            .map_err(|_| internal_err!("worker dropped KillDomains done_tx"))?
+    }
+
+    pub async fn domain_request(
+        &self,
+        domain_index: DomainIndex,
+        request: Box<DomainRequest>,
+    ) -> ReadySetResult<Vec<u8>> {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.send(WorkerRequest::DomainRequest {
+            domain_index,
+            request,
+            done_tx,
+        })
+        .await?;
+        done_rx
+            .await
+            .map_err(|_| internal_err!("worker dropped DomainRequest done_tx"))?
+    }
+
+    pub async fn set_memory_limit(
+        &self,
+        period: Option<Duration>,
+        limit: Option<usize>,
+    ) -> ReadySetResult<()> {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.send(WorkerRequest::SetMemoryLimit {
+            period,
+            limit,
+            done_tx,
+        })
+        .await?;
+        done_rx
+            .await
+            .map_err(|_| internal_err!("worker dropped SetMemoryLimit done_tx"))?
     }
 }
 
 /// Type alias for "a worker's URI" (as reported in a `RegisterPayload`).
 type WorkerIdentifier = Url;
 
-/// Channel used to notify the controller of events.
+/// Channel for replicator → controller notifications (snapshot progress, errors, etc.).
 pub struct ControllerChannel {
     sender: UnboundedSender<ControllerMessage>,
     receiver: UnboundedReceiver<ControllerMessage>,
@@ -233,6 +271,41 @@ impl ControllerChannel {
     }
 
     fn sender(&self) -> UnboundedSender<ControllerMessage> {
+        self.sender.clone()
+    }
+}
+
+/// Admin command sent from the HTTP handler to the controller event loop.
+///
+/// Unlike [`ControllerMessage`] (replicator notifications), these are request/response
+/// commands that carry a oneshot channel for the caller to await the result.
+#[derive(Debug)]
+pub(crate) enum AdminCommand {
+    StopReplication(tokio::sync::oneshot::Sender<ReadySetResult<()>>),
+    StartReplication(tokio::sync::oneshot::Sender<ReadySetResult<()>>),
+    SetReplicationPosition {
+        position: String,
+        response: tokio::sync::oneshot::Sender<ReadySetResult<()>>,
+    },
+    ChangeCdcUrl {
+        url: String,
+        response: tokio::sync::oneshot::Sender<ReadySetResult<()>>,
+    },
+}
+
+/// Channel for adapter/HTTP → controller commands (failover, admin operations).
+pub(crate) struct AdapterControllerChannel {
+    sender: UnboundedSender<AdminCommand>,
+    receiver: UnboundedReceiver<AdminCommand>,
+}
+
+impl AdapterControllerChannel {
+    fn new() -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        Self { sender, receiver }
+    }
+
+    fn sender(&self) -> UnboundedSender<AdminCommand> {
         self.sender.clone()
     }
 }
@@ -296,7 +369,7 @@ pub struct ControllerRequest {
     /// The request's query string.
     pub query: Option<String>,
     /// The request body.
-    pub body: hyper::body::Bytes,
+    pub body: Bytes,
     /// Sender to send the response down.
     pub reply_tx: tokio::sync::oneshot::Sender<Result<Result<Vec<u8>, Vec<u8>>, StatusCode>>,
 }
@@ -377,6 +450,15 @@ pub struct Controller {
     inner: Arc<LeaderHandle>,
     /// The `Authority` structure used for leadership elections & such state.
     authority: Arc<Authority>,
+    /// Channel coordinator shared with the in-process Worker. Re-injected into every
+    /// `DfState` we hand to a freshly elected `Leader`, because `DfState.channel_coordinator`
+    /// is `#[serde(skip)]` and arrives from the Authority as a disconnected default.
+    channel_coordinator: Arc<ChannelCoordinator>,
+    /// Sender end of the worker's request channel. Cloned into every
+    /// `controller::Worker` we construct from a `WorkerDescriptor`, so the
+    /// `WorkerRequest`s flow straight to the in-process worker task without an
+    /// HTTP loopback.
+    worker_tx: Sender<WorkerRequest>,
     /// Receives external HTTP requests.
     http_rx: Receiver<ControllerRequest>,
     /// Receives requests from the controller's `Handle`.
@@ -398,14 +480,21 @@ pub struct Controller {
     parsing_preset: ParsingPreset,
     /// Whether we are in maintenance mode
     maintenance_mode: Arc<AtomicBool>,
+    /// Whether replication has been explicitly stopped
+    replication_stopped: Arc<AtomicBool>,
+    /// Serializes failover operations (stop/start replication, set position, change CDC URL)
+    /// so that only one runs at a time, preventing race conditions between them.
+    failover_mutex: Arc<tokio::sync::Mutex<()>>,
     /// Cache ddl statements to re-run after a backwards incompatible upgrade, if relevant
     cache_ddl: Option<Vec<CacheDDLRequest>>,
     /// Connection pool to whichever controller is presently leader.
     controller_http: ControllerConnectionPool,
-    /// Channel used to notify the controller of events.
+    /// Replicator → controller notifications.
     controller_channel: ControllerChannel,
-    /// Channel used to notify the replicator of events.
+    /// Controller → replicator notifications.
     replicator_channel: ReplicatorChannel,
+    /// Adapter/HTTP → controller commands.
+    adapter_controller_channel: AdapterControllerChannel,
     /// Provides the ability to report metrics to Segment
     telemetry_sender: TelemetrySender,
     /// Whether or not to consider failed writes to base tables as no-ops
@@ -429,6 +518,9 @@ impl Controller {
         controller_http: ControllerConnectionPool,
         controller_rx: Receiver<ControllerRequest>,
         handle_rx: Receiver<HandleRequest>,
+        domain_exited_rx: UnboundedReceiver<DomainIndex>,
+        channel_coordinator: Arc<ChannelCoordinator>,
+        worker_tx: Sender<WorkerRequest>,
         our_descriptor: ControllerDescriptor,
         worker_descriptor: WorkerDescriptor,
         telemetry_sender: TelemetrySender,
@@ -449,9 +541,33 @@ impl Controller {
             table_status_rx,
             shutdown_rx.clone(),
         );
+
+        // Drain worker-reported domain exits in a dedicated task. Keeping this off the main
+        // `select!` loop is what prevents the worker from blocking on a controller-loopback
+        // call when the loop is busy in `controller_channel` work like `maybe_recreate_caches`.
+        // Supervised via `background_task_failed_tx` so a panic doesn't silently lose future
+        // notifications.
+        let inner = Arc::new(LeaderHandle::new());
+        let consumer = tokio::spawn(
+            domain_exited_consumer(domain_exited_rx, Arc::clone(&inner), shutdown_rx.clone())
+                .instrument(info_span!("domain_exited_consumer")),
+        );
+        {
+            let supervisor = background_task_failed_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = consumer.await {
+                    let _ = supervisor
+                        .send(internal_err!("domain_exited_consumer task died: {e}"))
+                        .await;
+                }
+            });
+        }
+
         Self {
-            inner: Arc::new(LeaderHandle::new()),
+            inner,
             authority,
+            channel_coordinator,
+            worker_tx,
             http_rx: controller_rx,
             handle_rx,
             background_task_failed_rx,
@@ -462,10 +578,13 @@ impl Controller {
             parsing_preset,
             leader_ready: Arc::new(AtomicBool::new(false)),
             maintenance_mode: Arc::new(AtomicBool::new(false)),
+            replication_stopped: Arc::new(AtomicBool::new(false)),
+            failover_mutex: Arc::new(tokio::sync::Mutex::new(())),
             cache_ddl: None,
             controller_http,
             controller_channel: ControllerChannel::new(),
             replicator_channel: ReplicatorChannel::new(),
+            adapter_controller_channel: AdapterControllerChannel::new(),
             telemetry_sender,
             permissive_writes,
             dialect,
@@ -538,7 +657,7 @@ impl Controller {
     async fn handle_authority_update(&mut self, msg: AuthorityUpdate) -> ReadySetResult<()> {
         match msg {
             AuthorityUpdate::LeaderChange(descriptor) => {
-                gauge!(recorded::CONTROLLER_IS_LEADER).set(0f64);
+                gauge!(metric::CONTROLLER_IS_LEADER).set(0f64);
                 self.events_handle.stop();
                 self.controller_http
                     .set(descriptor.controller_uri, CONTROLLER_REQUEST_TIMEOUT)
@@ -549,7 +668,13 @@ impl Controller {
                 cache_ddl,
             }) => {
                 info!("won leader election, creating Leader");
-                gauge!(recorded::CONTROLLER_IS_LEADER).set(1f64);
+                gauge!(metric::CONTROLLER_IS_LEADER).set(1f64);
+
+                // `DfState.channel_coordinator` is `#[serde(skip)]`, so the state we got from
+                // the Authority (or from a freshly-constructed `ControllerState::new`) carries
+                // a disconnected default `Arc`. Replace it with the coord shared with the
+                // in-process Worker so `coord.get_addr` / `builder_for` resolve correctly.
+                state.dataflow_state.channel_coordinator = self.channel_coordinator.clone();
 
                 // If replication is disabled (shallow-only mode), clean up any deep
                 // state left over from a previous replication-enabled run.  Disk
@@ -562,10 +687,22 @@ impl Controller {
                         "Removing all dataflow state and persistent storage for shallow-only mode"
                     );
                     state.dataflow_state.remove_persistent_state().await;
-                    if state.dataflow_state.remove_all_tables() {
-                        self.authority
-                            .overwrite_controller_state(state.clone())
-                            .await?;
+                    state.dataflow_state.remove_all_tables();
+                    if let Err(error) = self.authority.overwrite_schema_catalog(vec![]).await {
+                        error!(%error, "Failed to clear persisted schema catalog");
+                    }
+                    if let Err(error) = self.authority.overwrite_custom_types(vec![]).await {
+                        error!(%error, "Failed to clear persisted custom types");
+                    }
+                    if let Err(error) = self
+                        .authority
+                        .overwrite_non_replicated_relations(vec![])
+                        .await
+                    {
+                        error!(%error, "Failed to clear persisted non-replicated relations");
+                    }
+                    if let Err(error) = self.authority.remove_all_cache_ddl_requests().await {
+                        error!(%error, "Failed to clear persisted cache DDL requests");
                     }
                 }
 
@@ -587,7 +724,7 @@ impl Controller {
                     background_task_failed_tx,
                     self.config.replicator_statement_logging,
                     self.config.replicator_config.clone(),
-                    self.config.worker_request_timeout,
+                    self.worker_tx.clone(),
                     self.config.background_recovery_interval,
                     self.parsing_preset,
                     self.replicator_channel.sender(),
@@ -608,6 +745,7 @@ impl Controller {
                     .await;
 
                 self.inner.replace(leader).await;
+                self.replication_stopped.store(false, Ordering::Release);
                 self.controller_http
                     .set(
                         self.our_descriptor.controller_uri.clone(),
@@ -670,6 +808,7 @@ impl Controller {
 
         let leader_ready = self.leader_ready.clone();
         let maintenance_mode = self.maintenance_mode.clone();
+        let replication_stopped = self.replication_stopped.clone();
         loop {
             // There is either...
             let running_recovery = self
@@ -715,12 +854,15 @@ impl Controller {
                     if let Some(req) = req {
                         let leader_ready = leader_ready.load(Ordering::Acquire);
                         let maintenance_mode = maintenance_mode.load(Ordering::Acquire);
+                        let replication_stopped = replication_stopped.load(Ordering::Acquire);
                         tokio::spawn(handle_controller_request(
                             req,
                             self.authority.clone(),
                             self.inner.clone(),
+                            self.adapter_controller_channel.sender(),
                             leader_ready,
                             maintenance_mode,
+                            replication_stopped,
                         ));
                     }
                     else {
@@ -825,6 +967,53 @@ impl Controller {
                     }
 
                 }
+                cmd = self.adapter_controller_channel.receiver.recv() => {
+                    if let Some(cmd) = cmd {
+                        // All failover handlers are spawned as separate tasks
+                        // so the select loop stays free to process HTTP
+                        // requests (avoids deadlock). The failover_mutex
+                        // serializes them to prevent race conditions.
+                        let inner = self.inner.clone();
+                        let stopped = self.replication_stopped.clone();
+                        let mutex = self.failover_mutex.clone();
+                        match cmd {
+                            AdminCommand::StopReplication(response_tx) => {
+                                Self::spawn_failover_handler(mutex, response_tx, async move {
+                                    Self::handle_stop_replication(inner, stopped).await
+                                });
+                            },
+                            AdminCommand::StartReplication(response_tx) => {
+                                let controller_tx = self.controller_channel.sender();
+                                let telemetry_sender = self.telemetry_sender.clone();
+                                let shutdown_rx = self.shutdown_rx.clone();
+                                Self::spawn_failover_handler(mutex, response_tx, async move {
+                                    Self::handle_start_replication(
+                                        inner,
+                                        stopped,
+                                        controller_tx,
+                                        telemetry_sender,
+                                        shutdown_rx,
+                                    )
+                                    .await
+                                });
+                            },
+                            AdminCommand::SetReplicationPosition { position, response } => {
+                                let authority = self.authority.clone();
+                                Self::spawn_failover_handler(mutex, response, async move {
+                                    Self::handle_set_replication_position(
+                                        inner, stopped, authority, position,
+                                    )
+                                    .await
+                                });
+                            },
+                            AdminCommand::ChangeCdcUrl { url, response } => {
+                                Self::spawn_failover_handler(mutex, response, async move {
+                                    Self::handle_change_cdc_url(inner, stopped, url).await
+                                });
+                            },
+                        }
+                    }
+                }
                 res = running_recovery => {
                     res?; // If recovery fails, fail the whole controller (there's not much else we
                           // can do!)
@@ -855,6 +1044,257 @@ impl Controller {
             }
         }
         Ok(())
+    }
+
+    /// Spawn a failover handler as a separate tokio task, serialized by the failover mutex.
+    fn spawn_failover_handler<F>(
+        mutex: Arc<tokio::sync::Mutex<()>>,
+        response_tx: tokio::sync::oneshot::Sender<ReadySetResult<()>>,
+        handler: F,
+    ) where
+        F: std::future::Future<Output = ReadySetResult<()>> + Send + 'static,
+    {
+        tokio::spawn(async move {
+            let _guard = mutex.lock().await;
+            let result = handler.await;
+            if response_tx.send(result).is_err() {
+                warn!("Failover response receiver dropped");
+            }
+        });
+    }
+
+    /// Handle STOP REPLICATION: signal the replicator task to stop and await its completion.
+    ///
+    /// This is a standalone associated function (not `&mut self`) so it can be spawned as a
+    /// separate tokio task from the controller event loop without blocking it.
+    ///
+    /// The write lock on LeaderHandle is held only briefly to extract the stop channel
+    /// and task handle. The actual await on the JoinHandle happens without any lock held
+    /// to avoid blocking all controller HTTP operations.
+    async fn handle_stop_replication(
+        inner: Arc<LeaderHandle>,
+        replication_stopped: Arc<AtomicBool>,
+    ) -> ReadySetResult<()> {
+        if replication_stopped.load(Ordering::Acquire) {
+            return Err(ReadySetError::Internal(
+                "replication is already stopped".into(),
+            ));
+        }
+
+        // Take the stop channel and task handle under a short write lock,
+        // then drop the lock before awaiting the handle.
+        let (stop_tx, handle) = {
+            let mut guard = inner.write().await;
+            if let Some(ref mut leader) = *guard {
+                let stop_tx = leader.replicator_stop_tx.take();
+                let handle = leader.replicator_handle.take();
+                if stop_tx.is_none() && handle.is_none() {
+                    return Err(ReadySetError::Internal(
+                        "no replicator task is running".into(),
+                    ));
+                }
+                (stop_tx, handle)
+            } else {
+                return Err(ReadySetError::NotLeader);
+            }
+        };
+
+        // Signal the replicator to stop
+        if let Some(stop_tx) = stop_tx {
+            let _ = stop_tx.send(true);
+        }
+
+        // Await the replicator task with a timeout (no lock held)
+        if let Some(handle) = handle {
+            let abort = handle.abort_handle();
+            match tokio::time::timeout(REPLICATOR_STOP_TIMEOUT, handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!(%e, "Replicator task panicked during shutdown");
+                    replication_stopped.store(true, Ordering::Release);
+                    return Err(ReadySetError::Internal(format!(
+                        "replicator panicked during shutdown: {e}"
+                    )));
+                }
+                Err(_) => {
+                    abort.abort();
+                    replication_stopped.store(true, Ordering::Release);
+                    return Err(ReadySetError::Internal(
+                        "replicator did not stop within timeout; aborted".into(),
+                    ));
+                }
+            }
+        }
+
+        replication_stopped.store(true, Ordering::Release);
+
+        // Log the position (re-acquire read lock briefly)
+        let position = {
+            let guard = inner.read().await;
+            if let Some(ref leader) = *guard {
+                leader
+                    .dataflow_state_handle
+                    .read()
+                    .await
+                    .replication_offsets()
+                    .await
+                    .ok()
+                    .and_then(|offsets| offsets.min_present_offset().ok().flatten().cloned())
+            } else {
+                None
+            }
+        };
+        match position {
+            Some(pos) => info!(%pos, "Replication stopped"),
+            None => info!("Replication stopped"),
+        }
+        Ok(())
+    }
+
+    /// Handle START REPLICATION: respawn the replicator task with current config.
+    ///
+    /// Spawned as a separate tokio task to avoid blocking the controller event loop.
+    async fn handle_start_replication(
+        inner: Arc<LeaderHandle>,
+        replication_stopped: Arc<AtomicBool>,
+        controller_tx: UnboundedSender<ControllerMessage>,
+        telemetry_sender: TelemetrySender,
+        shutdown_rx: ShutdownReceiver,
+    ) -> ReadySetResult<()> {
+        if !replication_stopped.load(Ordering::Acquire) {
+            return Err(ReadySetError::Internal("replication is not stopped".into()));
+        }
+
+        let mut guard = inner.write().await;
+        if let Some(ref mut leader) = *guard {
+            // Create a new replicator channel pair for the restarted task
+            let (replicator_tx, replicator_rx) =
+                tokio::sync::mpsc::unbounded_channel::<ReplicatorMessage>();
+            leader.replicator_tx = replicator_tx;
+
+            let started = leader
+                .start_replication_task(
+                    controller_tx,
+                    replicator_rx,
+                    telemetry_sender,
+                    shutdown_rx,
+                    false, // not server_startup: skip resnapshot, resume from current position
+                )
+                .await;
+
+            if !started {
+                return Err(ReadySetError::Internal(
+                    "replication could not be started; check server configuration".into(),
+                ));
+            }
+
+            replication_stopped.store(false, Ordering::Release);
+            info!("Replication started");
+            Ok(())
+        } else {
+            Err(ReadySetError::NotLeader)
+        }
+    }
+
+    /// Handle SET REPLICATION POSITION: update replication offsets for all tables.
+    ///
+    /// Spawned as a separate tokio task because it makes RPC calls (via ReadySetHandle)
+    /// that route back through the controller's HTTP handler. Running this inline in the
+    /// select loop would deadlock since the loop couldn't process those RPCs.
+    async fn handle_set_replication_position(
+        inner: Arc<LeaderHandle>,
+        replication_stopped: Arc<AtomicBool>,
+        authority: Arc<Authority>,
+        position: String,
+    ) -> ReadySetResult<()> {
+        if !replication_stopped.load(Ordering::Acquire) {
+            return Err(ReadySetError::Internal(
+                "replication must be stopped before setting position".into(),
+            ));
+        }
+
+        let (tables, offset) = {
+            let guard = inner.read().await;
+            if let Some(ref leader) = *guard {
+                let ds = leader.dataflow_state_handle.read().await;
+                let offset: ReplicationOffset = position.parse()?;
+
+                let replication_offsets = ds.replication_offsets().await?;
+
+                // Block cross-dialect position changes (e.g. MySQL -> PostgreSQL)
+                // but allow switching between MySQL offset types (file+pos <-> GTID).
+                if let Some(current) = replication_offsets.max_offset()? {
+                    if current.dialect() != offset.dialect() {
+                        return Err(ReadySetError::Internal(format!(
+                            "cannot change replication position from {} to {}",
+                            current.dialect(),
+                            offset.dialect(),
+                        )));
+                    }
+                }
+
+                let tables: Vec<Relation> = replication_offsets.tables.keys().cloned().collect();
+                (tables, offset)
+            } else {
+                return Err(ReadySetError::NotLeader);
+            }
+        };
+
+        // RPCs go through HTTP back to the controller, which is why this
+        // handler must run in a spawned task (not inline in the select loop).
+        let mut noria = readyset_client::ReadySetHandle::new(authority).await;
+        for table in &tables {
+            let mut table_handle = noria.table(table.clone()).await?;
+            table_handle.set_replication_offset(offset.clone()).await?;
+        }
+
+        noria.set_schema_replication_offset(Some(&offset)).await?;
+
+        info!(%position, "Replication position updated");
+        Ok(())
+    }
+
+    /// Handle CHANGE CDC: update the CDC URL in the replicator config.
+    ///
+    /// Spawned as a separate tokio task to avoid blocking the controller event loop
+    /// while waiting on the LeaderHandle write lock.
+    async fn handle_change_cdc_url(
+        inner: Arc<LeaderHandle>,
+        replication_stopped: Arc<AtomicBool>,
+        url: String,
+    ) -> ReadySetResult<()> {
+        if !replication_stopped.load(Ordering::Acquire) {
+            return Err(ReadySetError::Internal(
+                "replication must be stopped before changing CDC URL".into(),
+            ));
+        }
+
+        // Validate the URL parses correctly.
+        // Avoid including the parse error in the message as it may contain credentials.
+        let parsed: database_utils::DatabaseURL = url
+            .parse()
+            .map_err(|_| ReadySetError::Internal("invalid CDC URL".into()))?;
+
+        // Validate dialect matches and update config under a single write lock
+        // to avoid a TOCTOU race between validation and mutation.
+        let mut guard = inner.write().await;
+        if let Some(ref mut leader) = *guard {
+            let ds = leader.dataflow_state_handle.read().await;
+            let expected_dialect: readyset_sql::Dialect = ds.recipe.dialect().into();
+            if parsed.dialect() != expected_dialect {
+                return Err(ReadySetError::Internal(format!(
+                    "CDC URL dialect mismatch: expected {expected_dialect:?}, got {:?}",
+                    parsed.dialect()
+                )));
+            }
+            drop(ds);
+
+            leader.replicator_config.cdc_db_url = Some(url.into());
+            info!("CDC URL changed");
+            Ok(())
+        } else {
+            Err(ReadySetError::NotLeader)
+        }
     }
 
     async fn maybe_recreate_caches(&mut self) -> ReadySetResult<()> {
@@ -1063,6 +1503,54 @@ impl Controller {
     }
 }
 
+/// Drains worker-reported domain-exit notifications and forwards each one to
+/// [`Leader::handle_failed_domain`] (which distinguishes intentional teardown from
+/// unexpected death by consulting its own state).
+///
+/// Runs in its own task so it is never starved by long-running work in the controller's main
+/// `select!` loop (notably `maybe_recreate_caches`, which performs multiple migrations
+/// back-to-back). [`Leader::handle_failed_domain`] internally `tokio::spawn`s its body and
+/// returns near-instantly, so each iteration is O(1) work plus the spawn.
+///
+/// `LeaderHandle::read()` is held across `handle_failed_domain(...).await` for the duration
+/// of that synchronous prefix. The codebase's leader-election write (`LeaderHandle::replace`)
+/// blocks if a reader is active; readers here drop their guard within one iteration so
+/// writer starvation is bounded by per-iteration cost.
+///
+/// Exits cleanly on shutdown, or when all senders are dropped (process tear-down).
+async fn domain_exited_consumer(
+    mut rx: UnboundedReceiver<DomainIndex>,
+    leader: Arc<LeaderHandle>,
+    mut shutdown_rx: ShutdownReceiver,
+) {
+    loop {
+        select! {
+            _ = shutdown_rx.recv() => {
+                debug!("domain_exited_consumer shutting down");
+                return;
+            }
+            msg = rx.recv() => {
+                let Some(addr) = msg else {
+                    debug!("domain_exited_consumer exiting: all senders dropped");
+                    return;
+                };
+                let guard = leader.read().await;
+                let Some(leader) = guard.as_ref() else {
+                    warn!(%addr, "Dropping domain-exit notification: no leader");
+                    continue;
+                };
+                // `handle_failed_domain` spawns its body and returns near-instantly. The
+                // `Err` arm is currently unreachable (the synchronous prefix can't fail)
+                // but is kept defensive — errors from the spawned body flow through
+                // `background_task_failed` independently.
+                if let Err(error) = leader.handle_failed_domain(addr).await {
+                    error!(%error, %addr, "Failed to dispatch domain-exit handler");
+                }
+            }
+        }
+    }
+}
+
 /// Manages this authority's leader election state and sends update
 /// along `event_tx` when the state changes.
 struct AuthorityLeaderElectionState {
@@ -1106,6 +1594,53 @@ impl AuthorityLeaderElectionState {
         self.is_leader
     }
 
+    /// Replays the persisted schema catalog into a freshly-created `ControllerState` so the
+    /// recipe has tables and views by the time cache regeneration runs at `SnapshotDone`.
+    /// Without this, a controller-state wipe leaves the recipe empty and cache compilation
+    /// fails unless an upstream resnapshot redelivers the schema.
+    ///
+    /// Returns an error if the catalog cannot be read, parsed, or applied. The caller should
+    /// react by forcing a fresh upstream resnapshot.
+    async fn replay_persisted_schema_catalog(
+        authority: &Arc<Authority>,
+        state: &mut ControllerState,
+    ) -> ReadySetResult<()> {
+        let custom_types = authority.custom_types().await?;
+        let non_replicated = authority.non_replicated_relations().await?;
+        let ddl_entries = authority.schema_catalog_entries().await?;
+        if custom_types.is_empty() && non_replicated.is_empty() && ddl_entries.is_empty() {
+            return Ok(());
+        }
+
+        let dialect = state.dataflow_state.recipe.dialect();
+        let mut changes: Vec<Change> = Vec::new();
+
+        // Custom types first; table DDL may reference them.
+        for entry in custom_types {
+            changes.push(Change::CreateType {
+                name: entry.name,
+                ty: entry.ty,
+            });
+        }
+        for relation in non_replicated {
+            changes.push(Change::AddNonReplicatedRelation(relation));
+        }
+        if !ddl_entries.is_empty() {
+            let stmts: Vec<String> = ddl_entries.into_iter().map(|e| e.unparsed_stmt).collect();
+            let ddl = ChangeList::from_strings(stmts, dialect)?;
+            changes.extend(ddl.changes);
+        }
+
+        let n_changes = changes.len();
+        let changelist = ChangeList::from_changes(changes, dialect);
+        state
+            .dataflow_state
+            .extend_recipe(changelist.into(), false, None)
+            .await?;
+        info!(n_changes, "Replayed persisted schema catalog");
+        Ok(())
+    }
+
     async fn update_leader_state(&mut self) -> ReadySetResult<()> {
         let mut should_attempt_leader_election = false;
         match self.authority.try_get_leader().await? {
@@ -1136,96 +1671,33 @@ impl AuthorityLeaderElectionState {
                 return Ok(());
             }
 
-            // We are the new leader, attempt to update the leader state with our state.
-            let update_res = self
+            // Build a fresh ControllerState from authority-persisted inputs. The previously
+            // persisted ControllerState is intentionally not consulted: the inputs needed at
+            // startup are config (from CLI), schema replication offset, schema catalog
+            // (tables, views, custom types, non-replicated markers), and cache DDL. The
+            // dataflow graph is regenerated from these on every leader election.
+            let schema_replication_offset = self
                 .authority
-                .update_controller_state(
-                    |state: Option<ControllerState>| -> Result<ControllerState, Option<ReadySetError>> {
-                        match state {
-                            None => {
-                                Ok(ControllerState::new(self.config.clone(), self.permissive_writes, self.dialect))
-                            },
-                            Some(mut state) => {
-                                // Validate that immutable config fields have not changed.
-                                // These fields cannot be changed on restart with existing state.
-                                if state.config.sharding != self.config.sharding {
-                                    return Err(Some(ReadySetError::Internal(format!(
-                                        "Cannot change sharding on restart with existing state. \
-                                         Existing: {:?}, New: {:?}.",
-                                        state.config.sharding, self.config.sharding
-                                    ))));
-                                }
-                                if state.config.mir_config != self.config.mir_config {
-                                    return Err(Some(ReadySetError::Internal(format!(
-                                        "Cannot change MIR config on restart with existing state. \
-                                         Existing: {:?}, New: {:?}.",
-                                        state.config.mir_config, self.config.mir_config
-                                    ))));
-                                }
-
-                                // check that running config is compatible with the new
-                                // configuration.
-                                if state.config != self.config {
-                                    warn!(
-                                    authority_config = ?state.config,
-                                    our_config = ?self.config,
-                                    "Config in authority different than our config, changing to our config"
-                                );
-                                }
-                                state.dataflow_state.domain_config = self.config.domain_config.clone();
-                                state.dataflow_state.replication_strategy = self.config.replication_strategy;
-                                state.dataflow_state.materializations.set_config(self.config.materialization_config.clone());
-                                state.dataflow_state.persistence = self.config.persistence.clone();
-                                state.config = self.config.clone();
-                                Ok(state)
-                            }
-                        }
-                    },
-                    |state: &ControllerState| {
-                        state.dataflow_state.schema_replication_offset().clone()
-                    },
-                    |state: &mut ControllerState| {
-                        state.dataflow_state.touch_up();
-                    }
-                )
-                .await;
-
-            let (state, cache_ddl) = match update_res {
-                Ok(Ok(state)) => (state, None),
-                Ok(Err(Some(e))) => return Err(e),
-                Ok(Err(None)) => return Ok(()),
-                Err(error) if error.caused_by_serialization_failed() => {
-                    warn!(
-                        %error,
-                        "Error deserializing controller state, wiping state and starting fresh \
-                         (NOTE: Caches will be re-created once snapshotting finishes)"
-                    );
-                    // If we are unsuccessful loading the schema replication offset from the
-                    // authority, we leave it as None which will mean performing a resnapshot. We
-                    // can still recover the caches.
-                    let schema_replication_offset = self
-                        .authority
-                        .schema_replication_offset()
-                        .await
-                        .unwrap_or_default();
-                    let mut state = ControllerState::new(
-                        self.config.clone(),
-                        self.permissive_writes,
-                        self.dialect,
-                    );
-                    state
-                        .dataflow_state
-                        .set_schema_replication_offset(schema_replication_offset);
-                    let cache_ddl = match self.authority.cache_ddl_requests().await? {
-                        res if res.is_empty() => None,
-                        res => Some(res),
-                    };
-                    self.authority
-                        .overwrite_controller_state(state.clone())
-                        .await?;
-                    (state, cache_ddl)
-                }
-                Err(e) => return Err(e),
+                .schema_replication_offset()
+                .await
+                .unwrap_or_default();
+            let mut state =
+                ControllerState::new(self.config.clone(), self.permissive_writes, self.dialect);
+            state
+                .dataflow_state
+                .set_schema_replication_offset(schema_replication_offset);
+            if let Err(error) =
+                Self::replay_persisted_schema_catalog(&self.authority, &mut state).await
+            {
+                warn!(
+                    %error,
+                    "Schema catalog replay failed; forcing upstream resnapshot"
+                );
+                state.dataflow_state.set_schema_replication_offset(None);
+            }
+            let cache_ddl = match self.authority.cache_ddl_requests().await? {
+                res if res.is_empty() => None,
+                res => Some(res),
             };
 
             // Notify our worker that we have won the leader election.
@@ -1295,8 +1767,8 @@ impl AuthorityWorkerState {
 
         let failed_workers: Vec<_> = self
             .active_workers
-            .iter()
-            .filter_map(|(w, _)| {
+            .keys()
+            .filter_map(|w| {
                 if !workers.contains(w) {
                     Some(w.clone())
                 } else {
@@ -1447,12 +1919,102 @@ pub(crate) async fn authority_runner(
     Ok(())
 }
 
+/// Handle failover-related requests that must be processed WITHOUT holding the Leader read lock.
+///
+/// These requests send a [`AdminCommand`] via the command channel and await the result.
+/// The controller event loop handlers need a write lock on Leader to manage the replicator task,
+/// so we must not hold any read lock while waiting for the response.
+///
+/// Returns `Some(result)` if the request was handled, `None` if it's not a failover request.
+async fn handle_failover_request(
+    method: &Method,
+    path: &str,
+    body: &Bytes,
+    command_tx: &UnboundedSender<AdminCommand>,
+) -> Option<ReadySetResult<Vec<u8>>> {
+    let await_response = |rx: tokio::sync::oneshot::Receiver<ReadySetResult<()>>| async move {
+        let result = tokio::time::timeout(FAILOVER_RESPONSE_TIMEOUT, rx)
+            .await
+            .map_err(|_| ReadySetError::Internal("failover command timed out".into()))?
+            .map_err(|_| ReadySetError::Internal("controller dropped".into()))?;
+        result?;
+        Ok(bincode::serialize(&())?)
+    };
+
+    match (method, path) {
+        (&Method::POST, "/stop_replication") => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if command_tx.send(AdminCommand::StopReplication(tx)).is_err() {
+                return Some(Err(ReadySetError::Internal(
+                    "controller channel closed".into(),
+                )));
+            }
+            Some(await_response(rx).await)
+        }
+        (&Method::POST, "/start_replication") => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if command_tx.send(AdminCommand::StartReplication(tx)).is_err() {
+                return Some(Err(ReadySetError::Internal(
+                    "controller channel closed".into(),
+                )));
+            }
+            Some(await_response(rx).await)
+        }
+        (&Method::POST, "/set_replication_position") => {
+            let position: String = match bincode::deserialize(body) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Some(Err(ReadySetError::Internal(format!(
+                        "deserialize error: {e}"
+                    ))))
+                }
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if command_tx
+                .send(AdminCommand::SetReplicationPosition {
+                    position,
+                    response: tx,
+                })
+                .is_err()
+            {
+                return Some(Err(ReadySetError::Internal(
+                    "controller channel closed".into(),
+                )));
+            }
+            Some(await_response(rx).await)
+        }
+        (&Method::POST, "/change_cdc_url") => {
+            let url: String = match bincode::deserialize(body) {
+                Ok(u) => u,
+                Err(e) => {
+                    return Some(Err(ReadySetError::Internal(format!(
+                        "deserialize error: {e}"
+                    ))))
+                }
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if command_tx
+                .send(AdminCommand::ChangeCdcUrl { url, response: tx })
+                .is_err()
+            {
+                return Some(Err(ReadySetError::Internal(
+                    "controller channel closed".into(),
+                )));
+            }
+            Some(await_response(rx).await)
+        }
+        _ => None,
+    }
+}
+
 async fn handle_controller_request(
     req: ControllerRequest,
     authority: Arc<Authority>,
     leader_handle: Arc<LeaderHandle>,
+    command_tx: UnboundedSender<AdminCommand>,
     leader_ready: bool,
     maintenance_mode: bool,
+    replication_stopped: bool,
 ) {
     let ControllerRequest {
         method,
@@ -1464,8 +2026,15 @@ async fn handle_controller_request(
 
     let request_start = Instant::now();
     let ret: Result<Result<Vec<u8>, Vec<u8>>, StatusCode> = {
-        let guard = leader_handle.read().await;
-        let resp = {
+        // Failover commands must be handled WITHOUT holding the Leader read lock,
+        // because the controller event loop handlers need a write lock on Leader.
+        // Holding the read lock here while awaiting the oneshot would deadlock.
+        let resp = if let Some(result) =
+            handle_failover_request(&method, &path, &body, &command_tx).await
+        {
+            Ok(result)
+        } else {
+            let guard = leader_handle.read().await;
             if let Some(ref ci) = *guard {
                 Ok(ci
                     .external_request(
@@ -1476,6 +2045,7 @@ async fn handle_controller_request(
                         &authority,
                         leader_ready,
                         maintenance_mode,
+                        replication_stopped,
                     )
                     .await)
             } else {
@@ -1494,13 +2064,13 @@ async fn handle_controller_request(
     };
 
     counter!(
-        recorded::CONTROLLER_RPC_OVERALL_TIME,
+        metric::CONTROLLER_RPC_OVERALL_TIME,
         "path" => path.clone()
     )
     .increment(request_start.elapsed().as_micros() as u64);
 
     histogram!(
-        recorded::CONTROLLER_RPC_REQUEST_TIME,
+        metric::CONTROLLER_RPC_REQUEST_TIME,
         "path" => path.clone()
     )
     .record(request_start.elapsed().as_micros() as f64);
@@ -1512,7 +2082,10 @@ async fn handle_controller_request(
 
 #[cfg(test)]
 mod tests {
-    use assert_matches::assert_matches;
+    use std::assert_matches;
+    use std::collections::HashSet;
+
+    use petgraph::visit::IntoNodeReferences;
 
     use dataflow::DomainIndex;
     use readyset_client::debug::info::KeyCount;
@@ -1532,19 +2105,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn remove_query() {
         let (mut noria, shutdown_tx) = start_simple("remove_query").await;
-        noria
-            .extend_recipe(
-                ChangeList::from_strings(
-                    vec![
-                        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);",
-                        "CREATE CACHE test_query FROM SELECT * FROM users;",
-                    ],
-                    DataDialect::DEFAULT_MYSQL,
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec![
+                            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);",
+                            "CREATE CACHE test_query FROM SELECT * FROM users;",
+                        ],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
+                .await
+                .is_ok()
+        }
 
         let queries = noria.views().await.unwrap();
         assert!(queries.contains_key(&"test_query".into()));
@@ -1560,20 +2135,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn remove_all_queries() {
         let (mut noria, shutdown_tx) = start_simple("remove_all_queries").await;
-        noria
-            .extend_recipe(
-                ChangeList::from_strings(
-                    vec![
-                        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);",
-                        "CREATE CACHE q1 FROM SELECT id FROM users;",
-                        "CREATE CACHE q2 FROM SELECT name FROM users where id = ?;",
-                    ],
-                    DataDialect::DEFAULT_MYSQL,
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec![
+                            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);",
+                            "CREATE CACHE q1 FROM SELECT id FROM users;",
+                            "CREATE CACHE q2 FROM SELECT name FROM users where id = ?;",
+                        ],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
+                .await
+                .is_ok()
+        }
 
         let queries = noria.views().await.unwrap();
         assert!(queries.contains_key(&"q1".into()));
@@ -1599,20 +2176,22 @@ mod tests {
             .set_schema_replication_offset(Some(&offset))
             .await
             .unwrap();
-        noria
-            .extend_recipe(
-                ChangeList::from_strings(
-                    vec![
-                        "CREATE TABLE t1 (id int);",
-                        "CREATE TABLE t2 (id int);",
-                        "CREATE TABLE t3 (id int);",
-                    ],
-                    DataDialect::DEFAULT_MYSQL,
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec![
+                            "CREATE TABLE t1 (id int);",
+                            "CREATE TABLE t2 (id int);",
+                            "CREATE TABLE t3 (id int);",
+                        ],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
+                .await
+                .is_ok()
+        }
 
         let mut t1 = noria.table("t1").await.unwrap();
         let mut t2 = noria.table("t2").await.unwrap();
@@ -1657,19 +2236,21 @@ mod tests {
     async fn key_count_rpc() {
         let (mut noria, shutdown_tx) = start_simple("all_tables").await;
 
-        noria
-            .extend_recipe(
-                ChangeList::from_strings(
-                    vec![
-                        "CREATE TABLE key_count_test (id INT PRIMARY KEY, stuff TEXT);",
-                        "CREATE CACHE q1 FROM SELECT * FROM key_count_test;",
-                    ],
-                    DataDialect::DEFAULT_MYSQL,
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec![
+                            "CREATE TABLE key_count_test (id INT PRIMARY KEY, stuff TEXT);",
+                            "CREATE CACHE q1 FROM SELECT * FROM key_count_test;",
+                        ],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
+                .await
+                .is_ok()
+        }
 
         let mut table = noria.table("key_count_test").await.unwrap();
         // The table only contains the local index, so we use `tables()` to get the global index
@@ -1725,20 +2306,22 @@ mod tests {
             .unwrap();
         assert_eq!(res1, vec![None, None]);
 
-        noria
-            .extend_recipe(
-                ChangeList::from_strings(
-                    vec![
-                        "CREATE TABLE t1 (x int);",
-                        "CREATE CACHE FROM SELECT * FROM t1;",
-                    ],
-                    DataDialect::DEFAULT_MYSQL,
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec![
+                            "CREATE TABLE t1 (x int);",
+                            "CREATE CACHE FROM SELECT * FROM t1;",
+                        ],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap()
+                    .with_schema_search_path(schema_search_path.clone()),
                 )
-                .unwrap()
-                .with_schema_search_path(schema_search_path.clone()),
-            )
-            .await
-            .unwrap();
+                .await
+                .is_ok()
+        }
 
         let res2 = noria
             .views_info(
@@ -1781,16 +2364,18 @@ mod tests {
         assert!(matches!(&res3[..], &[Some(_)]));
 
         // A change in schema_search_path that *does* change the semantics
-        noria
-            .extend_recipe(
-                ChangeList::from_strings(
-                    vec!["CREATE TABLE s2.t1 (x int)"],
-                    DataDialect::DEFAULT_MYSQL,
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec!["CREATE TABLE s2.t1 (x int)"],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
+                .await
+                .is_ok()
+        }
 
         let query1_equivalent = parse_select(Dialect::MySQL, "SELECT x FROM t1").unwrap();
         let res3 = noria
@@ -1811,28 +2396,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn non_replicated_relations() {
         let (mut noria, shutdown_tx) = start_simple("non_replicated_tables").await;
-        noria
-            .extend_recipe(ChangeList::from_changes(
-                vec![
-                    Change::AddNonReplicatedRelation(NonReplicatedRelation {
-                        name: Relation {
-                            schema: Some("s1".into()),
-                            name: "t".into(),
-                        },
-                        reason: NotReplicatedReason::Default,
-                    }),
-                    Change::AddNonReplicatedRelation(NonReplicatedRelation {
-                        name: Relation {
-                            schema: Some("s2".into()),
-                            name: "t".into(),
-                        },
-                        reason: NotReplicatedReason::Default,
-                    }),
-                ],
-                DataDialect::DEFAULT_MYSQL,
-            ))
-            .await
-            .unwrap();
+        eventually! {
+            noria
+                .extend_recipe(ChangeList::from_changes(
+                    vec![
+                        Change::AddNonReplicatedRelation(NonReplicatedRelation {
+                            name: Relation {
+                                schema: Some("s1".into()),
+                                name: "t".into(),
+                            },
+                            reason: NotReplicatedReason::Default,
+                        }),
+                        Change::AddNonReplicatedRelation(NonReplicatedRelation {
+                            name: Relation {
+                                schema: Some("s2".into()),
+                                name: "t".into(),
+                            },
+                            reason: NotReplicatedReason::Default,
+                        }),
+                    ],
+                    DataDialect::DEFAULT_MYSQL,
+                ))
+                .await
+                .is_ok()
+        }
 
         let rels = noria.non_replicated_relations().await.unwrap();
 
@@ -1862,37 +2449,39 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn table_statuses() {
         let (mut noria, shutdown_tx) = start_simple("table_status").await;
-        noria
-            .extend_recipe(ChangeList::from_changes(
-                vec![
-                    Change::AddNonReplicatedRelation(NonReplicatedRelation {
-                        name: Relation {
-                            schema: Some("s1".into()),
-                            name: "t".into(),
+        eventually! {
+            noria
+                .extend_recipe(ChangeList::from_changes(
+                    vec![
+                        Change::AddNonReplicatedRelation(NonReplicatedRelation {
+                            name: Relation {
+                                schema: Some("s1".into()),
+                                name: "t".into(),
+                            },
+                            reason: NotReplicatedReason::Configuration,
+                        }),
+                        Change::CreateTable {
+                            statement: parse_create_table(
+                                Dialect::MySQL,
+                                "CREATE TABLE s2.snapshotting_t (x int);",
+                            )
+                            .unwrap(),
+                            pg_meta: None,
                         },
-                        reason: NotReplicatedReason::Configuration,
-                    }),
-                    Change::CreateTable {
-                        statement: parse_create_table(
-                            Dialect::MySQL,
-                            "CREATE TABLE s2.snapshotting_t (x int);",
-                        )
-                        .unwrap(),
-                        pg_meta: None,
-                    },
-                    Change::CreateTable {
-                        statement: parse_create_table(
-                            Dialect::MySQL,
-                            "CREATE TABLE s2.snapshotted_t (x int);",
-                        )
-                        .unwrap(),
-                        pg_meta: None,
-                    },
-                ],
-                DataDialect::DEFAULT_MYSQL,
-            ))
-            .await
-            .unwrap();
+                        Change::CreateTable {
+                            statement: parse_create_table(
+                                Dialect::MySQL,
+                                "CREATE TABLE s2.snapshotted_t (x int);",
+                            )
+                            .unwrap(),
+                            pg_meta: None,
+                        },
+                    ],
+                    DataDialect::DEFAULT_MYSQL,
+                ))
+                .await
+                .is_ok()
+        }
 
         noria
             .table(Relation {
@@ -1967,17 +2556,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn domains() {
         let (mut noria, shutdown_tx) = start_simple("domains").await;
-        noria
-            .extend_recipe(ChangeList::from_change(
-                Change::CreateTable {
-                    statement: parse_create_table(Dialect::MySQL, "CREATE TABLE t1 (x int);")
-                        .unwrap(),
-                    pg_meta: None,
-                },
-                DataDialect::DEFAULT_MYSQL,
-            ))
-            .await
-            .unwrap();
+        eventually! {
+            noria
+                .extend_recipe(ChangeList::from_change(
+                    Change::CreateTable {
+                        statement: parse_create_table(Dialect::MySQL, "CREATE TABLE t1 (x int);")
+                            .unwrap(),
+                        pg_meta: None,
+                    },
+                    DataDialect::DEFAULT_MYSQL,
+                ))
+                .await
+                .is_ok()
+        }
 
         let res = noria.domains().await.unwrap();
         assert_eq!(res.len(), 1);
@@ -1989,23 +2580,385 @@ mod tests {
         shutdown_tx.shutdown().await;
     }
 
+    async fn apply_sql(noria: &mut crate::Handle, sqls: Vec<&str>) {
+        noria
+            .extend_recipe(ChangeList::from_strings(sqls, DataDialect::DEFAULT_MYSQL).unwrap())
+            .await
+            .unwrap();
+    }
+
+    async fn domain_set(noria: &mut crate::Handle) -> HashSet<DomainIndex> {
+        noria.domains().await.unwrap().keys().copied().collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_cache_reclaims_reader_domain() {
+        let (mut noria, shutdown_tx) = start_simple("drop_cache_reclaims_reader_domain").await;
+        eventually! {
+            apply_sql(&mut noria, vec!["CREATE TABLE t (id INT PRIMARY KEY, x INT);"]).await;
+            true
+        }
+        let baseline = domain_set(&mut noria).await;
+        assert_eq!(baseline.len(), 1, "table-only baseline = 1 domain");
+
+        apply_sql(
+            &mut noria,
+            vec!["CREATE CACHE q FROM SELECT * FROM t WHERE id = ?;"],
+        )
+        .await;
+        let with_cache = domain_set(&mut noria).await;
+        assert_eq!(
+            with_cache.len(),
+            baseline.len() + 1,
+            "expected exactly one new domain for the cache's reader \
+             (baseline={baseline:?}, with_cache={with_cache:?})",
+        );
+        assert!(baseline.is_subset(&with_cache));
+
+        noria.remove_query(&"q".into()).await.unwrap();
+
+        let after = domain_set(&mut noria).await;
+        assert_eq!(
+            after, baseline,
+            "expected exact baseline domain set restored after dropping the cache \
+             (baseline={baseline:?}, after={after:?})",
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_cache_reclaims_join_domains() {
+        let (mut noria, shutdown_tx) = start_simple("drop_cache_reclaims_join_domains").await;
+        eventually! {
+            apply_sql(&mut noria, vec![
+                "CREATE TABLE a (id INT PRIMARY KEY, b_id INT);",
+                "CREATE TABLE b (id INT PRIMARY KEY, val INT);",
+            ]).await;
+            true
+        }
+        let baseline = domain_set(&mut noria).await;
+        assert_eq!(baseline.len(), 2, "two-table baseline = 2 domains");
+
+        apply_sql(
+            &mut noria,
+            vec![
+                "CREATE CACHE qj FROM \
+                 SELECT a.id, b.val FROM a JOIN b ON a.b_id = b.id WHERE a.id = ?;",
+            ],
+        )
+        .await;
+        let with_cache = domain_set(&mut noria).await;
+        // A JOIN cache adds at least one new domain (the reader).
+        assert!(
+            with_cache.len() > baseline.len(),
+            "expected JOIN cache to add at least 1 domain \
+             (baseline={baseline:?}, with_cache={with_cache:?})",
+        );
+        assert!(baseline.is_subset(&with_cache));
+
+        noria.remove_query(&"qj".into()).await.unwrap();
+
+        let after = domain_set(&mut noria).await;
+        assert_eq!(
+            after, baseline,
+            "expected exact baseline domain set restored after dropping the JOIN cache \
+             (baseline={baseline:?}, after={after:?})",
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_create_drop_cache_does_not_leak_domains() {
+        let (mut noria, shutdown_tx) =
+            start_simple("repeated_create_drop_cache_does_not_leak_domains").await;
+        eventually! {
+            apply_sql(&mut noria, vec!["CREATE TABLE t (id INT PRIMARY KEY, x INT);"]).await;
+            true
+        }
+        let baseline = domain_set(&mut noria).await;
+
+        for _ in 0..5 {
+            apply_sql(
+                &mut noria,
+                vec!["CREATE CACHE q FROM SELECT * FROM t WHERE id = ?;"],
+            )
+            .await;
+            noria.remove_query(&"q".into()).await.unwrap();
+        }
+
+        let after = domain_set(&mut noria).await;
+        assert_eq!(
+            after, baseline,
+            "expected exact baseline domain set restored across 5 create+drop cycles \
+             (baseline={baseline:?}, after={after:?})",
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_table_reclaims_base_domain() {
+        let (mut noria, shutdown_tx) = start_simple("drop_table_reclaims_base_domain").await;
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec![
+                            "CREATE TABLE keep (id INT PRIMARY KEY);",
+                            "CREATE TABLE gone (id INT PRIMARY KEY);",
+                        ],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .is_ok()
+        }
+        let before: HashSet<DomainIndex> = noria.domains().await.unwrap().keys().copied().collect();
+        assert_eq!(before.len(), 2);
+
+        noria
+            .extend_recipe(
+                ChangeList::from_strings(vec!["DROP TABLE gone;"], DataDialect::DEFAULT_MYSQL)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let after: HashSet<DomainIndex> = noria.domains().await.unwrap().keys().copied().collect();
+        assert_eq!(
+            after.len(),
+            1,
+            "expected the dropped table's base domain to be reclaimed \
+             (before={before:?}, after={after:?})"
+        );
+        // The remaining domain must be a subset of the original — the surviving table's
+        // domain identity is preserved, no fresh domain was conjured.
+        assert!(
+            after.is_subset(&before),
+            "expected the surviving table's DomainIndex to be one of the originals \
+             (before={before:?}, after={after:?})"
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
+    /// Drop a CACHE backed by a VALUES clause and verify that:
+    ///   - the Constant node's domain IS reclaimed (Constants are per-query inline data with no
+    ///     replication cost; they should be reaped alongside their owning query, the same way
+    ///     Readers are — only Bases anchor reachability beyond their consumers, since reclaiming
+    ///     a Base would force a full re-replication of its table from upstream); and
+    ///   - no orphan non-dropped graph node is left behind pointing at the reclaimed domain.
+    ///
+    /// This test would fail if the seed set were widened to include Constants (e.g. `is_source()`
+    /// instead of `is_base()`), which would keep the Constant's domain alive forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_cache_with_values_reclaims_constant_domain() {
+        let (mut noria, shutdown_tx) =
+            start_simple("drop_cache_with_values_reclaims_constant_domain").await;
+        eventually! {
+            apply_sql(&mut noria, vec!["CREATE TABLE t (id INT PRIMARY KEY);"]).await;
+            true
+        }
+        let baseline = domain_set(&mut noria).await;
+        assert_eq!(baseline.len(), 1, "table-only baseline = 1 domain");
+
+        // VALUES is supported only when JOINed (standalone VALUES is rejected).
+        apply_sql(
+            &mut noria,
+            vec![
+                "CREATE CACHE qv FROM \
+                 SELECT t.id FROM t \
+                 JOIN (VALUES (1), (2), (3)) AS v(x) ON t.id = v.x \
+                 WHERE t.id = ?;",
+            ],
+        )
+        .await;
+        let with_cache = domain_set(&mut noria).await;
+        // Post-REA-6613, the only new domain is the Reader's: the Constant co-locates with
+        // the Join (which itself inherits the Base's domain). Pre-change this delta was 2
+        // (the Constant got its own dedicated domain). Tightening this assertion is what
+        // ground-truth-tests REA-6613 end-to-end.
+        assert_eq!(
+            with_cache.len() - baseline.len(),
+            1,
+            "VALUES JOIN should add exactly one domain (the Reader); the Constant must \
+             co-locate with the Join, not get its own \
+             (baseline={baseline:?}, with_cache={with_cache:?})",
+        );
+
+        noria.remove_query(&"qv".into()).await.unwrap();
+
+        // 1) The Constant's domain must be reclaimed alongside the Reader's, returning the
+        //    domain set to baseline. If Constants ever get added to the seed set in
+        //    `find_orphaned_domains`, this assertion will catch it.
+        let after = domain_set(&mut noria).await;
+        assert_eq!(
+            after, baseline,
+            "expected exact baseline domain set restored after dropping the VALUES cache \
+             (baseline={baseline:?}, after={after:?})",
+        );
+
+        // 2) No node may remain in the graph un-flagged while pointing at a reclaimed domain.
+        //    `process_removal` only walks downstream from MIR seeds, so the Constant and the
+        //    Ingress feeding it are not flagged dropped by the drop path; the reclaim must.
+        let orphans = noria
+            .migrate(|m| {
+                let ds = &m.dataflow_state;
+                ds.ingredients
+                    .node_references()
+                    .filter_map(|(ni, n)| {
+                        if n.is_dropped() || n.is_graph_root() || !n.has_domain() {
+                            return None;
+                        }
+                        let di = n.domain();
+                        if ds.domains.contains_key(&di) {
+                            None
+                        } else {
+                            Some((ni, n.description(), di))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        assert!(
+            orphans.is_empty(),
+            "expected no orphan non-dropped nodes pointing at reclaimed domains, got {orphans:?}",
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
+    /// `Materializations.paths`, `Materializations.redundant_partial`, and
+    /// `domain_node_index_pairs` are all keyed by `NodeIndex` / `DomainIndex` and grow
+    /// monotonically as caches are added. They MUST be cleaned by the reclaim path or we'd
+    /// substitute one leak for another.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_cache_does_not_leak_internal_maps() {
+        let (mut noria, shutdown_tx) = start_simple("drop_cache_does_not_leak_internal_maps").await;
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec!["CREATE TABLE t (id INT PRIMARY KEY, x INT);"],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .is_ok()
+        }
+
+        async fn snapshot(noria: &mut crate::Handle) -> (usize, usize, usize, usize) {
+            noria
+                .migrate(|m| {
+                    let ds = &m.dataflow_state;
+                    (
+                        ds.materializations.paths.len(),
+                        ds.materializations.redundant_partial.len(),
+                        ds.domain_node_index_pairs.len(),
+                        ds.domain_nodes.len(),
+                    )
+                })
+                .await
+        }
+
+        let baseline = snapshot(&mut noria).await;
+
+        for _ in 0..5 {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec!["CREATE CACHE q FROM SELECT * FROM t WHERE id = ?;"],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            noria.remove_query(&"q".into()).await.unwrap();
+        }
+
+        let after = snapshot(&mut noria).await;
+        // (paths, redundant_partial, domain_node_index_pairs, domain_nodes)
+        assert_eq!(
+            after, baseline,
+            "expected internal maps to be stable across create+drop cycles \
+             (baseline={baseline:?}, after={after:?})",
+        );
+        shutdown_tx.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drop_all_caches_preserves_base_table_domain() {
+        let (mut noria, shutdown_tx) =
+            start_simple("drop_all_caches_preserves_base_table_domain").await;
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec!["CREATE TABLE t (id INT PRIMARY KEY, x INT);"],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .is_ok()
+        }
+        // Capture the base table's domain identity from the table-only state, so that we can
+        // assert the *exact same* DomainIndex is still present after dropping all caches.
+        // Replication writes into this domain; reclaiming it would break ongoing ingest.
+        let base_domains: HashSet<DomainIndex> =
+            noria.domains().await.unwrap().keys().copied().collect();
+        assert_eq!(base_domains.len(), 1);
+
+        noria
+            .extend_recipe(
+                ChangeList::from_strings(
+                    vec![
+                        "CREATE CACHE q1 FROM SELECT * FROM t WHERE id = ?;",
+                        "CREATE CACHE q2 FROM SELECT x FROM t WHERE id = ?;",
+                    ],
+                    DataDialect::DEFAULT_MYSQL,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        noria.remove_all_queries().await.unwrap();
+
+        let after: HashSet<DomainIndex> = noria.domains().await.unwrap().keys().copied().collect();
+        assert_eq!(
+            after, base_domains,
+            "expected the base table's domain to be preserved across DROP ALL CACHES \
+             (before={base_domains:?}, after={after:?})"
+        );
+
+        shutdown_tx.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn materialization_info() {
         let (mut noria, shutdown_tx) = start_simple("materialization_info").await;
-        noria
-            .extend_recipe(ChangeList::from_change(
-                Change::CreateTable {
-                    statement: parse_create_table(
-                        Dialect::MySQL,
-                        "CREATE TABLE t1 (x int primary key);",
-                    )
-                    .unwrap(),
-                    pg_meta: None,
-                },
-                DataDialect::DEFAULT_MYSQL,
-            ))
-            .await
-            .unwrap();
+        eventually! {
+            noria
+                .extend_recipe(ChangeList::from_change(
+                    Change::CreateTable {
+                        statement: parse_create_table(
+                            Dialect::MySQL,
+                            "CREATE TABLE t1 (x int primary key);",
+                        )
+                        .unwrap(),
+                        pg_meta: None,
+                    },
+                    DataDialect::DEFAULT_MYSQL,
+                ))
+                .await
+                .is_ok()
+        }
 
         let res = noria.materialization_info().await.unwrap();
         assert_eq!(res.len(), 1);
@@ -2017,14 +2970,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn min_persisted_replication_offset() {
-        let (mut noria, shutdown_tx) = start_simple("min_persisted_replication_offset").await;
+    async fn materialization_info_for_cache_filters_to_cache_subgraph() {
+        let (mut noria, shutdown_tx) =
+            start_simple("materialization_info_for_cache_filters_to_cache_subgraph").await;
+
+        // Two caches on the same table — the filtered call should return only the
+        // nodes that belong to the requested cache, not those of the other cache.
         noria
             .extend_recipe(
                 ChangeList::from_strings(
                     vec![
-                        "CREATE TABLE persisted_offset_test1 (id INT PRIMARY KEY, stuff TEXT)",
-                        "CREATE TABLE persisted_offset_test2 (id INT PRIMARY KEY, stuff TEXT)",
+                        "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);",
+                        "CREATE CACHE cache_a FROM SELECT id FROM users WHERE id = ?;",
+                        "CREATE CACHE cache_b FROM SELECT name FROM users WHERE name = ?;",
                     ],
                     DataDialect::DEFAULT_MYSQL,
                 )
@@ -2032,6 +2990,63 @@ mod tests {
             )
             .await
             .unwrap();
+
+        let all = noria.materialization_info().await.unwrap();
+        let for_a = noria
+            .materialization_info_for_cache("cache_a".into())
+            .await
+            .unwrap();
+        let for_b = noria
+            .materialization_info_for_cache("cache_b".into())
+            .await
+            .unwrap();
+
+        // Each per-cache result must be a strict subset of all materializations.
+        assert!(!for_a.is_empty());
+        assert!(!for_b.is_empty());
+        assert!(for_a.len() <= all.len());
+        assert!(for_b.len() <= all.len());
+
+        let all_indices: std::collections::HashSet<_> =
+            all.iter().map(|mi| mi.node_index).collect();
+        let a_indices: std::collections::HashSet<_> =
+            for_a.iter().map(|mi| mi.node_index).collect();
+        let b_indices: std::collections::HashSet<_> =
+            for_b.iter().map(|mi| mi.node_index).collect();
+
+        // All nodes in the per-cache results must appear in the global list.
+        assert!(a_indices.is_subset(&all_indices));
+        assert!(b_indices.is_subset(&all_indices));
+
+        // The reader nodes for each cache must appear in their respective results.
+        assert!(for_a.iter().any(|mi| mi.node_name == "cache_a".into()));
+        assert!(for_b.iter().any(|mi| mi.node_name == "cache_b".into()));
+
+        // Each cache's reader must not appear in the other cache's result.
+        assert!(!for_a.iter().any(|mi| mi.node_name == "cache_b".into()));
+        assert!(!for_b.iter().any(|mi| mi.node_name == "cache_a".into()));
+
+        shutdown_tx.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn min_persisted_replication_offset() {
+        let (mut noria, shutdown_tx) = start_simple("min_persisted_replication_offset").await;
+        eventually! {
+            noria
+                .extend_recipe(
+                    ChangeList::from_strings(
+                        vec![
+                            "CREATE TABLE persisted_offset_test1 (id INT PRIMARY KEY, stuff TEXT)",
+                            "CREATE TABLE persisted_offset_test2 (id INT PRIMARY KEY, stuff TEXT)",
+                        ],
+                        DataDialect::DEFAULT_MYSQL,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .is_ok()
+        }
 
         let min_persisted_offset = noria.min_persisted_replication_offset().await.unwrap();
 

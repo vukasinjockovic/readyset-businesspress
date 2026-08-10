@@ -3,12 +3,11 @@ use std::fmt::{self, Display};
 
 use dataflow_state::MaterializedNodeState;
 use itertools::Itertools;
-use readyset_client::{self, KeyComparison, PacketData, PacketTrace};
+use readyset_client::{self, KeyComparison, PacketData, PacketTrace, ReplayKeys};
 use readyset_data::DfType;
 use readyset_sql::ast::Relation;
 use serde::{Deserialize, Serialize};
 use strum::{EnumCount, EnumDiscriminants, EnumIter, IntoStaticStr};
-use url::Url;
 use vec1::Vec1;
 
 use crate::node::Column;
@@ -105,21 +104,6 @@ impl Display for PrettyReplayPath<'_> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub enum SourceSelection {
-    /// Query only the shard of the source that matches the key.
-    KeyShard {
-        key_i_to_shard: usize,
-        nshards: usize,
-    },
-    /// Query the same shard of the source as the destination.
-    SameShard,
-    /// Query all shards of the source.
-    ///
-    /// Value is the number of shards.
-    AllShards(usize),
-}
-
 /// Representation for how to trigger replays for a partial replay path that touches a particular
 /// domain
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -127,9 +111,8 @@ pub enum TriggerEndpoint {
     None,
     /// This domain is the start of the replay path
     Start(Index),
-    /// This domain is the end of the replay path, with the indicated source domain and how to
-    /// query that domain's shards
-    End(SourceSelection, DomainIndex),
+    /// This domain is the end of the replay path, with the indicated source domain
+    End(DomainIndex),
     /// The replay path is contained entirely within this domain
     Local(Index),
 }
@@ -139,7 +122,7 @@ impl fmt::Display for TriggerEndpoint {
         match self {
             TriggerEndpoint::None => write!(f, "None"),
             TriggerEndpoint::Start(idx) => write!(f, "Start({})", idx),
-            TriggerEndpoint::End(source, domain) => write!(f, "End({:?}, {:?})", source, domain),
+            TriggerEndpoint::End(domain) => write!(f, "End({:?})", domain),
             TriggerEndpoint::Local(idx) => write!(f, "Local({})", idx),
         }
     }
@@ -170,8 +153,6 @@ pub enum PrepareStateKind {
         node_index: petgraph::graph::NodeIndex,
         /// The number of columns within the reader node
         num_columns: usize,
-        /// The number of ways this reader node is sharded
-        num_shards: usize,
         /// The index that the reader is keyed on
         index: Index,
         /// The domain index of the domain this reader should ask to trigger replays to this reader
@@ -192,58 +173,26 @@ pub enum PrepareStateKind {
 pub enum ReplayPieceContext {
     /// Context for a partial replay
     Partial {
-        /// The set of keys that are being replayed
-        for_keys: HashSet<KeyComparison>,
-        /// The index of the shard that originally requested the replay.
-        requesting_shard: usize,
-        /// The index of the replica that originally requested the replay.
-        ///
-        /// Only this replica will receive any replay piece packets.
-        requesting_replica: usize,
-        /// Is this replay coming from a single shard in the source domain?
-        unishard: bool,
+        /// The set of keys that are being replayed.
+        for_keys: ReplayKeys,
     },
-    /// Context for a full replay
+    /// A batch of records in a full replay.
     Full {
         /// Is this the last batch of records for this full replay?
         last: bool,
-        /// Optionally forward to only these replicas when we encounter a [`Fanout`] sender
-        ///
-        /// [`Fanout`]: SenderReplication::Fanout
-        replicas: Option<Vec<usize>>,
     },
+    /// Empty barrier emitted before the replay data to flip the target domain to `Replaying`, so
+    /// writes processed after the snapshot buffer instead of being dropped at the not-ready guard
+    /// (REA-6688). A distinct variant so it survives the short-circuit that drops empty `Full`
+    /// pieces and is never mistaken for data. Never terminal; a `Full { last: true }` ends the
+    /// replay.
+    FullStart,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceChannelIdentifier {
     pub token: u64,
     pub tag: u32,
-}
-
-/// Description for how a sender node (an [`Egress`] or a [`Sharder`]) should replicate the
-/// messages that it sends
-///
-/// Currently, we're limited to either going from n replicas to n replicas, or going from 1 replica
-/// to n replicas. If in the future that limitation is lifted, this type will have to change to
-/// accommodate the different ways we can do n-to-m replication
-///
-/// [`Egress`]: crate::node::special::Egress
-/// [`Sharder`]: crate::node::special::Sharder
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SenderReplication {
-    /// Send all messages to the same replica index as the current domain.
-    ///
-    /// This is the case both when going from an unreplicated domain to an unreplicated domain, and
-    /// when going from a replicated domain to a domain with the same number of replicas
-    Same,
-
-    /// Fan-out from an unreplicated domain to `num_replicas` replicas.
-    ///
-    /// For most messages, this just consists of duplicating the message from 0 to `num_replicas`
-    /// replicas. The one exception is replay pieces, which we only want to send to the replica
-    /// that requested the replay originally (since some other replica might have requested the
-    /// same key, and we don't want to replay the same key twice to the same replica)
-    Fanout { num_replicas: usize },
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, EnumDiscriminants, Debug)]
@@ -331,8 +280,6 @@ pub enum DomainRequest {
         ingress_node: (NodeIndex, LocalNodeIndex),
         target_domain: DomainIndex,
         target_shard: usize,
-        /// Description for how messages should be replicated when sending to the target domain
-        replication: SenderReplication,
     },
 
     /// Tell an egress node about a new tag that will pass through it, and the ingress node in the
@@ -353,31 +300,36 @@ pub enum DomainRequest {
         target_node: NodeIndex,
     },
 
-    /// Tell a Sharder node about its corresponding ingress node in the next domain, and how it
-    /// should shard messages when sending to shards of that domain.
-    ///
-    /// Note that this *must* be done *before* the sharder starts being used!
-    AddSharderTx {
-        /// The local index of the sharder node to update
-        sharder_node: LocalNodeIndex,
-        /// The local index of the ingress node in the target domain
-        ingress_node: LocalNodeIndex,
-        /// The index of the target domain
-        target_domain: DomainIndex,
-        /// The number of shards to send to in the target domain
-        num_shards: usize,
-        /// Description for how messages should be replicated when sending to the target domain
-        replication: SenderReplication,
-    },
-
     /// Set up a fresh, empty state for a node, indexed by a particular column.
     ///
     /// This is done in preparation of a subsequent state replay.
+    /// This variant uses the original blocking implementation - the domain blocks
+    /// until index building is complete.
     PrepareState {
         /// The node to set up state for
         node: LocalNodeIndex,
         /// What kind of state should we set up?
         state: PrepareStateKind,
+    },
+
+    /// Set up state for a node using non-blocking online index building.
+    ///
+    /// This variant uses snapshot-based scanning with WAL catch-up, allowing
+    /// writes to continue during index building. The migration controller
+    /// must poll `PrepareStateStatus` to wait for completion.
+    PrepareStateNonBlocking {
+        /// The node to set up state for
+        node: LocalNodeIndex,
+        /// What kind of state should we set up?
+        state: PrepareStateKind,
+    },
+
+    /// Check if a node's state preparation (e.g., index building) is complete.
+    ///
+    /// Used to poll nodes that are preparing indices asynchronously during migrations.
+    /// Returns the current `IndexBuildStatus` (`Succeeded`, `InProgress`, or `Failed`).
+    PrepareStateStatus {
+        node: LocalNodeIndex,
     },
 
     /// Inform domain about a new replay path.
@@ -386,17 +338,8 @@ pub enum DomainRequest {
         source: Option<LocalNodeIndex>,
         source_index: Option<Index>,
         path: Vec1<ReplayPathSegment>,
-        partial_unicast_sharder: Option<NodeIndex>,
         notify_done: bool,
         trigger: TriggerEndpoint,
-
-        /// True if the domain at the source of the replay path is unreplicated, but this domain is
-        /// replicated.
-        ///
-        /// This is used to select the replica index to send replay requests to - if this is
-        /// `true`, all replay requests will go to replica index `0`, but if it's `false`
-        /// all replay requests will go to the same replica as the requesting domain
-        replica_fanout: bool,
     },
 
     /// Instruct domain to replay the state of a particular node along an existing replay path,
@@ -404,13 +347,10 @@ pub enum DomainRequest {
     StartReplay {
         tag: Tag,
         from: LocalNodeIndex,
-        /// Optionally replay to only these replicas
-        replicas: Option<Vec<usize>>,
         /// Index of the domain that will eventually receive the replay.
         ///
-        /// Not used by the domain itself, but used when sending the message to set the list of
-        /// replicas above, if we've just recovered some replicas due to a worker joining the
-        /// cluster
+        /// Not used by the domain itself, but used when checking whether the target domain has
+        /// been placed before dispatching this message.
         targeting_domain: DomainIndex,
     },
 
@@ -513,9 +453,6 @@ pub mod packets {
     pub struct RequestPartialReplay {
         pub tag: Tag,
         pub keys: Vec<KeyComparison>,
-        pub unishard: bool,
-        pub requesting_shard: usize,
-        pub requesting_replica: usize,
         /// The cache name associated with the replay. Only used for metric labels.
         pub cache_name: Relation,
     }
@@ -533,10 +470,9 @@ pub mod packets {
     pub struct Evict {
         /// The eviction request
         pub req: Eviction,
-        /// If a URL is provided, flush downstream connections using provided barrier credits.
-        pub done: Option<Url>,
-        pub barrier: u128,
-        pub credits: u128,
+        /// If `Some`, the receiving domain must either propagate this credit further
+        /// downstream or return it to the worker's `BarrierManager`.
+        pub barrier: Option<BarrierCredit>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,10 +480,9 @@ pub mod packets {
         pub node: LocalNodeIndex,
         pub cols: Vec<usize>,
         pub keys: Vec<KeyComparison>,
-        /// If a URL is provided, evict keys within the specified barrier.
-        pub done: Option<Url>,
-        pub barrier: u128,
-        pub credits: u128,
+        /// If `Some`, the receiving domain must either propagate this credit further
+        /// downstream or return it to the worker's `BarrierManager`.
+        pub barrier: Option<BarrierCredit>,
     }
 
     impl RequestEvictionFromReader {
@@ -560,9 +495,7 @@ pub mod packets {
                 node,
                 cols,
                 keys,
-                done: Default::default(),
-                barrier: Default::default(),
-                credits: Default::default(),
+                barrier: None,
             }
         }
     }
@@ -571,10 +504,9 @@ pub mod packets {
     pub struct RequestEviction {
         pub tag: Tag,
         pub keys: Vec<KeyComparison>,
-        /// If a URL is provided, evict keys within the specified barrier.
-        pub done: Option<Url>,
-        pub barrier: u128,
-        pub credits: u128,
+        /// If `Some`, the receiving domain must either propagate this credit further
+        /// downstream or return it to the worker's `BarrierManager`.
+        pub barrier: Option<BarrierCredit>,
     }
 
     impl RequestEviction {
@@ -582,9 +514,7 @@ pub mod packets {
             Self {
                 tag,
                 keys,
-                done: Default::default(),
-                barrier: Default::default(),
-                credits: Default::default(),
+                barrier: None,
             }
         }
     }
@@ -762,13 +692,6 @@ impl Packet {
             _ => unreachable!(),
         };
         std::mem::take(inner)
-    }
-
-    pub(crate) fn replay_piece_context(&self) -> Option<&ReplayPieceContext> {
-        match self {
-            Packet::ReplayPiece(x) => Some(&x.context),
-            _ => None,
-        }
     }
 }
 

@@ -19,6 +19,8 @@ pub enum SqlQuery {
     CreateCache(CreateCacheStatement),
     DropCache(DropCacheStatement),
     DropAllCaches(DropAllCachesStatement),
+    FlushAllShallowCaches(FlushAllShallowCachesStatement),
+    FlushCache(FlushCacheStatement),
     DropAllProxiedQueries(DropAllProxiedQueriesStatement),
     AlterTable(AlterTableStatement),
     AlterReadySet(AlterReadysetStatement),
@@ -37,6 +39,10 @@ pub enum SqlQuery {
     Use(UseStatement),
     Show(ShowStatement),
     Explain(ExplainStatement),
+    // Postgres-only and not round-trippable through both dialects, so excluded from proptest
+    // generation; mirrors the other `#[weight(0)]` variants here.
+    #[weight(0)]
+    Discard(DiscardStatement),
     // Unfortunately, weight(0) is a special case that removes this option from the generated
     // `prop_oneof!`, but actually having a weight of 0 is not supported. If that worked, we could
     // generate this only for PostgreSQL like so:
@@ -54,6 +60,12 @@ pub enum SqlQuery {
     CreateRls(CreateRlsStatement),
     #[weight(0)]
     DropRls(DropRlsStatement),
+    #[weight(0)]
+    CreateMcpToken(CreateMcpTokenStatement),
+    #[weight(0)]
+    DropMcpToken(DropMcpTokenStatement),
+    #[weight(0)]
+    AlterMcpToken(AlterMcpTokenStatement),
 }
 
 impl DialectDisplay for SqlQuery {
@@ -67,6 +79,8 @@ impl DialectDisplay for SqlQuery {
             Self::CreateCache(create) => write!(f, "{}", create.display(dialect)),
             Self::DropCache(drop) => write!(f, "{}", drop.display(dialect)),
             Self::DropAllCaches(drop) => write!(f, "{drop}"),
+            Self::FlushAllShallowCaches(flush) => write!(f, "{flush}"),
+            Self::FlushCache(flush) => write!(f, "{}", flush.display(dialect)),
             Self::Delete(delete) => write!(f, "{}", delete.display(dialect)),
             Self::DropTable(drop) => write!(f, "{}", drop.display(dialect)),
             Self::DropView(drop) => write!(f, "{}", drop.display(dialect)),
@@ -82,6 +96,7 @@ impl DialectDisplay for SqlQuery {
             Self::Use(use_db) => write!(f, "{use_db}"),
             Self::Show(show) => write!(f, "{}", show.display(dialect)),
             Self::Explain(explain) => write!(f, "{}", explain.display(dialect)),
+            Self::Discard(discard) => write!(f, "{discard}"),
             Self::Comment(c) => write!(f, "{}", c.display(dialect)),
             Self::DropAllProxiedQueries(drop) => write!(f, "{}", drop.display(dialect)),
             Self::Deallocate(dealloc) => write!(f, "{}", dealloc.display(dialect)),
@@ -89,6 +104,9 @@ impl DialectDisplay for SqlQuery {
             Self::CreateDatabase(create) => write!(f, "{}", create.display(dialect)),
             Self::CreateRls(create_rls) => write!(f, "{}", create_rls.display(dialect)),
             Self::DropRls(drop_rls) => write!(f, "{}", drop_rls.display(dialect)),
+            Self::CreateMcpToken(create) => write!(f, "{}", create.display(dialect)),
+            Self::DropMcpToken(drop) => write!(f, "{}", drop.display(dialect)),
+            Self::AlterMcpToken(a) => write!(f, "{}", a.display(dialect)),
         })
     }
 }
@@ -233,6 +251,40 @@ impl TryFromDialect<sqlparser::ast::Statement> for SqlQuery {
             RenameTable(rename) => Ok(Self::RenameTable(RenameTableStatement {
                 ops: rename.try_into_dialect(dialect)?,
             })),
+            Discard { object_type } => Ok(Self::Discard(DiscardStatement {
+                object_type: object_type.try_into()?,
+            })),
+            // `RESET ALL` resets all run-time parameters; PG documents it as a
+            // strict subset of `DISCARD ALL`. Readyset observes it only to reset
+            // mirrored session state and proxies the original text upstream
+            // verbatim, so model it as the session reset it triggers.
+            Reset(sqlparser::ast::ResetStatement {
+                reset: sqlparser::ast::Reset::ALL,
+            }) => Ok(Self::Discard(DiscardStatement {
+                object_type: DiscardObject::All,
+            })),
+            // `RESET <name>` is `SET <name> TO DEFAULT` in Postgres; model it as
+            // such so the session mirror resets the parameter (the role or a
+            // policy-keyed GUC) through the same path as an explicit
+            // `SET ... = DEFAULT`. The dotted parameter name is rejoined so a
+            // namespaced GUC like `request.jwt.claims` keys against the same
+            // name the `set_config` path stores.
+            Reset(sqlparser::ast::ResetStatement {
+                reset: sqlparser::ast::Reset::ConfigurationParameter(name),
+            }) => {
+                let name = name
+                    .0
+                    .iter()
+                    .filter_map(|part| part.as_ident().map(|ident| ident.value.as_str()))
+                    .join(".");
+                Ok(Self::Set(SetStatement::PostgresParameter(
+                    SetPostgresParameter {
+                        scope: Some(PostgresParameterScope::Session),
+                        name: name.into(),
+                        value: SetPostgresParameterValue::Default,
+                    },
+                )))
+            }
             _ => not_yet_implemented!("other query: {value:?}"),
         }
     }
@@ -281,6 +333,8 @@ impl SqlQuery {
             Self::CreateCache(_) => "CREATE CACHE",
             Self::DropCache(_) => "DROP CACHE",
             Self::DropAllCaches(_) => "DROP ALL CACHES",
+            Self::FlushAllShallowCaches(_) => "FLUSH ALL SHALLOW CACHES",
+            Self::FlushCache(_) => "FLUSH CACHE",
             Self::DropAllProxiedQueries(_) => "DROP ALL PROXIED QUERIES",
             Self::Delete(_) => "DELETE",
             Self::DropTable(_) => "DROP TABLE",
@@ -297,17 +351,79 @@ impl SqlQuery {
             Self::Use(_) => "USE",
             Self::Show(_) => "SHOW",
             Self::Explain(_) => "EXPLAIN",
+            Self::Discard(_) => "DISCARD",
             Self::Comment(_) => "COMMENT",
             Self::Deallocate(_) => "DEALLOCATE",
             Self::Truncate(_) => "TRUNCATE",
             Self::CreateRls(_) => "CREATE RLS",
             Self::DropRls(_) => "DROP RLS",
+            Self::CreateMcpToken(_) => "CREATE MCP TOKEN",
+            Self::DropMcpToken(_) => "DROP MCP TOKEN",
+            Self::AlterMcpToken(_) => "ALTER MCP TOKEN",
         }
     }
 
     /// Returns whether the provided SqlQuery is a SELECT or not.
     pub fn is_select(&self) -> bool {
         matches!(self, Self::Select(_))
+    }
+
+    /// Returns true if this query is a write statement, used by the adapter to flip the
+    /// per-transaction `had_write` flag that gates [`TrxCachePolicy::UntilWrite`] caches.
+    ///
+    /// "Write" is interpreted broadly: every variant that changes user-visible state of the
+    /// upstream database (DML, DDL, cache lifecycle, RLS, and runtime configuration
+    /// statements) counts. Read-only and transaction-control variants return `false`,
+    /// as do Readyset-internal management statements that do not mutate upstream user
+    /// data (e.g. MCP token DDL).
+    ///
+    /// Several writes never reach an `SqlQuery` variant because the parser rejects them
+    /// upstream of this code (e.g. `SELECT ... FOR UPDATE`, `LOAD DATA`, stored-procedure
+    /// `CALL`, CTE-embedded INSERT). Routing-layer callers must compensate by conservatively
+    /// flipping `had_write` on parse failure inside a transaction; see the design doc.
+    pub fn is_write(&self) -> bool {
+        match self {
+            // DML.
+            Self::Insert(_) | Self::Update(_) | Self::Delete(_) | Self::Truncate(_) => true,
+            // DDL on relations.
+            Self::CreateTable(_)
+            | Self::AlterTable(_)
+            | Self::DropTable(_)
+            | Self::RenameTable(_)
+            | Self::CreateView(_)
+            | Self::DropView(_)
+            | Self::CreateIndex(_)
+            | Self::CreateDatabase(_) => true,
+            // Cache lifecycle.
+            Self::CreateCache(_)
+            | Self::DropCache(_)
+            | Self::DropAllCaches(_)
+            | Self::FlushCache(_)
+            | Self::FlushAllShallowCaches(_) => true,
+            // RLS DDL.
+            Self::CreateRls(_) | Self::DropRls(_) => true,
+            // Runtime control.
+            Self::AlterReadySet(_) => true,
+            // Reads, transaction control, session-only commands, and Readyset bookkeeping
+            // (including MCP token management, which mutates Readyset state but not the
+            // upstream user data that drives cache routing).
+            Self::Select(_)
+            | Self::CompoundSelect(_)
+            | Self::Set(_)
+            | Self::Show(_)
+            | Self::Explain(_)
+            | Self::Discard(_)
+            | Self::Comment(_)
+            | Self::Use(_)
+            | Self::Deallocate(_)
+            | Self::StartTransaction(_)
+            | Self::Commit(_)
+            | Self::Rollback(_)
+            | Self::DropAllProxiedQueries(_)
+            | Self::CreateMcpToken(_)
+            | Self::DropMcpToken(_)
+            | Self::AlterMcpToken(_) => false,
+        }
     }
 
     /// Returns the query as a select statement, if it is a select statement.
@@ -325,6 +441,8 @@ impl SqlQuery {
             | SqlQuery::CreateCache(_)
             | SqlQuery::DropCache(_)
             | SqlQuery::DropAllCaches(_)
+            | SqlQuery::FlushAllShallowCaches(_)
+            | SqlQuery::FlushCache(_)
             | SqlQuery::AlterReadySet(_)
             | SqlQuery::DropAllProxiedQueries(_) => true,
             SqlQuery::Show(show_stmt) => match show_stmt {
@@ -341,9 +459,17 @@ impl SqlQuery {
                 | ShowStatement::Connections
                 | ShowStatement::Rls(_)
                 | ShowStatement::ReplayPaths
-                | ShowStatement::ShallowCacheEntries { .. } => true,
+                | ShowStatement::ShallowCacheEntries { .. }
+                | ShowStatement::ShallowCacheAllowlist(_)
+                | ShowStatement::McpTokens => true,
+                // Handled by the MySQL query handler via the
+                // requires_fallback + return_default_response path.
+                ShowStatement::ReadySetRsaPublicKey => false,
             },
             SqlQuery::CreateRls(_) | SqlQuery::DropRls(_) => true,
+            SqlQuery::CreateMcpToken(_)
+            | SqlQuery::DropMcpToken(_)
+            | SqlQuery::AlterMcpToken(_) => true,
             SqlQuery::CreateDatabase(_)
             | SqlQuery::CreateTable(_)
             | SqlQuery::CreateView(_)
@@ -364,6 +490,7 @@ impl SqlQuery {
             | SqlQuery::RenameTable(_)
             | SqlQuery::Use(_)
             | SqlQuery::Truncate(_)
+            | SqlQuery::Discard(_)
             | SqlQuery::Comment(_) => false,
         }
     }

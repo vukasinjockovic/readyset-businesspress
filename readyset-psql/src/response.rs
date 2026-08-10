@@ -8,8 +8,8 @@ use readyset_adapter::backend::{
 };
 use readyset_adapter::upstream_database::LazyUpstream;
 use readyset_adapter_types::ParsedCommand;
-use readyset_client::ColumnSchema;
-use readyset_client::results::{ResultIterator, Results};
+use readyset_client::post_processing::{ResultIterator, Results};
+use readyset_client::schema::ColumnSchema;
 use readyset_data::DfType;
 use readyset_shallow::QueryMetadata;
 use readyset_sql::ast::{self, SqlIdentifier};
@@ -94,7 +94,7 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
                 let select_schema = SelectSchema(schema);
                 let resultset = Resultset::from_readyset(rows, &select_schema)?;
                 Ok(Select {
-                    schema: select_schema.try_into()?,
+                    schema: Arc::new(select_schema.try_into()?),
                     resultset,
                 })
             }
@@ -105,7 +105,7 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
             Noria(NoriaResult::Meta(vars)) => {
                 let columns = vars.iter().map(|v| v.name.clone()).collect::<Vec<_>>();
 
-                let select_schema = SelectSchema(readyset_adapter::backend::SelectSchema {
+                let select_schema = SelectSchema(readyset_client::schema::SelectSchema {
                     schema: Cow::Owned(
                         vars.iter()
                             .map(|v| ColumnSchema {
@@ -129,12 +129,12 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
                     &select_schema,
                 )?;
                 Ok(Select {
-                    schema: select_schema.try_into()?,
+                    schema: Arc::new(select_schema.try_into()?),
                     resultset,
                 })
             }
             Noria(NoriaResult::MetaVariables(vars)) => {
-                let select_schema = SelectSchema(readyset_adapter::backend::SelectSchema {
+                let select_schema = SelectSchema(readyset_client::schema::SelectSchema {
                     schema: Cow::Owned(vec![
                         ColumnSchema {
                             column: ast::Column {
@@ -165,14 +165,14 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
                     &select_schema,
                 )?;
                 Ok(Select {
-                    schema: select_schema.try_into()?,
+                    schema: Arc::new(select_schema.try_into()?),
                     resultset,
                 })
             }
             Noria(NoriaResult::MetaWithHeader(vars)) => {
                 let (col1_header, col2_header): (SqlIdentifier, SqlIdentifier) =
                     (vars[0].name.clone(), vars[0].value.clone().into());
-                let select_schema = SelectSchema(readyset_adapter::backend::SelectSchema {
+                let select_schema = SelectSchema(readyset_client::schema::SelectSchema {
                     schema: Cow::Owned(vec![
                         ColumnSchema {
                             column: ast::Column {
@@ -203,7 +203,7 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
                     &select_schema,
                 )?;
                 Ok(Select {
-                    schema: select_schema.try_into()?,
+                    schema: Arc::new(select_schema.try_into()?),
                     resultset,
                 })
             }
@@ -215,10 +215,10 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
                 if let Some(first) = result.values.first() {
                     match first {
                         CacheEntry::DfValue(_) => Ok(Select {
-                            schema: metadata.schema.clone(),
+                            schema: Arc::clone(&metadata.schema),
                             resultset: Resultset::from_shallow_dfvalue(
                                 Arc::clone(&result.values),
-                                metadata.types.clone(),
+                                Arc::clone(&metadata.types),
                             ),
                         }),
                         CacheEntry::Simple(_) => {
@@ -236,7 +236,7 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
                     }
                 } else {
                     Ok(Select {
-                        schema: metadata.schema.clone(),
+                        schema: Arc::clone(&metadata.schema),
                         resultset: Resultset::empty(),
                     })
                 }
@@ -248,7 +248,7 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
                     drop(cache.filled());
                 }
                 Ok(Select {
-                    schema: Vec::new(),
+                    schema: Default::default(),
                     resultset: Resultset::empty(),
                 })
             }
@@ -259,7 +259,7 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
                     .map(|c| c.type_().clone())
                     .collect();
                 Ok(ps::QueryResponse::Select {
-                    schema: vec![], // Schema isn't necessary for upstream execute results
+                    schema: Default::default(), // Schema isn't necessary for upstream execute results
                     resultset: Resultset::from_stream(stream, first_row, field_types, cache),
                 })
             }
@@ -271,7 +271,7 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
                     .collect();
                 let client_formats = meta.map(|m| m.to_vec());
                 Ok(ps::QueryResponse::Select {
-                    schema: vec![], // Schema isn't necessary for upstream execute results
+                    schema: Default::default(), // Schema isn't necessary for upstream execute results
                     resultset: Resultset::from_row_stream(
                         stream, first_row, field_types, cache, client_formats
                     ),
@@ -294,6 +294,13 @@ impl<'a> TryFrom<QueryResponse<'a>> for ps::QueryResponse<Resultset> {
             UpstreamBufferedInMemory(..) => Err(ps::Error::InternalError(
                 "Mismatched QueryResult for UpstreamBufferedInMemory response type: Expected SimpleQuery".to_string(),
             )),
+            ReadysetSchema(result) => {
+                let schema = Arc::new(readyset_schema::psql::extract_columns(&result));
+                Ok(Select {
+                    schema,
+                    resultset: Resultset::from_readyset_schema(result),
+                })
+            }
             Parser(p) => match p {
                 ParsedCommand::Deallocate(name) => Ok(ps::QueryResponse::Deallocate(name)),
             },

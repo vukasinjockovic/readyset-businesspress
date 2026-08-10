@@ -369,7 +369,9 @@ impl From<CreateTableStatement> for TableSpec {
                     .get_mut(&ColumnName::from(field.column.name.as_str()))
                     .unwrap();
 
-                let generator = d.spec.generator_for_col(field.sql_type.clone());
+                let generator = d
+                    .spec
+                    .generator_for_col(field.sql_type.clone(), &mut rand::rng());
                 col_spec.gen_spec.lock().generator = if d.unique {
                     generator.into_unique()
                 } else {
@@ -397,6 +399,7 @@ impl From<TableSpec> for CreateTableStatement {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     })
                     .collect(),
                 keys: spec.primary_key.map(|cn| {
@@ -542,7 +545,7 @@ impl TableSpec {
             .unwrap()
             .gen_spec
             .lock()
-            .generator = spec.generator_for_col(col_spec.sql_type.clone());
+            .generator = spec.generator_for_col(col_spec.sql_type.clone(), &mut rand::rng());
     }
 
     /// Overrides the existing `gen_spec` for a set of columns..
@@ -581,12 +584,12 @@ impl TableSpec {
                         }
                         _ if random => random_value_of_type(col_type, &mut rand::rng()),
                         ColumnGenerator::Constant(c) => c.gen(),
-                        ColumnGenerator::Uniform(u) => u.gen(),
-                        ColumnGenerator::Random(r) => r.gen(),
-                        ColumnGenerator::RandomString(r) => r.gen(),
-                        ColumnGenerator::RandomChars(r) => r.gen(),
-                        ColumnGenerator::Zipfian(z) => z.gen(),
-                        ColumnGenerator::NonRepeating(r) => r.gen(),
+                        ColumnGenerator::Uniform(u) => u.gen(&mut rand::rng()),
+                        ColumnGenerator::Random(r) => r.gen(&mut rand::rng()),
+                        ColumnGenerator::RandomString(r) => r.gen(&mut rand::rng()),
+                        ColumnGenerator::RandomChars(r) => r.gen(&mut rand::rng()),
+                        ColumnGenerator::Zipfian(z) => z.gen(&mut rand::rng()),
+                        ColumnGenerator::NonRepeating(r) => r.gen(&mut rand::rng()),
                     };
 
                     (col_name.clone(), value)
@@ -848,6 +851,7 @@ impl<'a> QueryState<'a> {
                 query.tables.push(TableExpr {
                     inner: TableExprInner::Table(table.name.clone().into()),
                     alias: None,
+                    column_aliases: vec![],
                 });
                 table
             }
@@ -1016,7 +1020,7 @@ impl<'a> QueryState<'a> {
                     let sql_type = &self.gen.tables[table_name].columns[column_name].sql_type;
                     match index {
                         Some(idx) => unique_value_of_type(sql_type, *idx),
-                        None => generator.lock().gen(),
+                        None => generator.lock().gen(&mut rand::rng()),
                     }
                 },
             )
@@ -1209,6 +1213,30 @@ impl AggregateType {
             | AggregateType::Max { .. }
             | AggregateType::Min { .. } => false,
         }
+    }
+
+    /// Returns true if this aggregate accumulates all input row values into a single,
+    /// potentially unbounded result (e.g. `array_agg`, `group_concat`, `string_agg`).
+    /// These are dangerous in fuzz-generated queries without WHERE clauses because they can
+    /// cause OOM on large tables (REA-6279).
+    pub fn is_unbounded_accumulator(&self) -> bool {
+        matches!(
+            self,
+            AggregateType::ArrayAgg { .. }
+                | AggregateType::GroupConcat { .. }
+                | AggregateType::StringAgg { .. }
+        )
+    }
+
+    /// Returns true if this aggregate is NOT supported as a post-lookup aggregate.
+    /// Post-lookup aggregation is required when queries use `IN (?, ?)` parameters
+    /// (collapsed to `= ?`) or range parameters (BTreeMap index).
+    /// Mirrors the unsupported!() checks in `post_lookup_aggregates()` (grouped.rs).
+    ///
+    /// AVG (non-DISTINCT) is supported: the adapter decomposes it into
+    /// SUM + COUNT + MIN for post-lookup recomputation.
+    pub fn unsupported_as_post_lookup(&self) -> bool {
+        matches!(self, AggregateType::JsonObjectAgg { .. }) || self.is_distinct()
     }
 
     /// Check if this aggregate function is supported by the given SQL dialect
@@ -1504,6 +1532,7 @@ impl BuiltinFunction {
                 ParseDialect::MySQL => "json_object",
                 ParseDialect::PostgreSQL => "json_build_object",
             },
+            JsonBuildArray => "json_build_array",
             SpatialAsText => "st_astext",
             SpatialAsEWKT => "st_asewkt",
             Bucket => "bucket",
@@ -1551,6 +1580,7 @@ impl BuiltinFunction {
                 Lower => true,
                 Upper => true,
                 Hex => false,
+                JsonBuildArray => false,
                 SpatialAsText => true,
                 SpatialAsEWKT => false,
                 Bucket => false,
@@ -1599,6 +1629,7 @@ impl BuiltinFunction {
                 Lower => true,
                 Upper => true,
                 Hex => false,
+                JsonBuildArray => false,
                 SpatialAsText => true,
                 SpatialAsEWKT => true,
                 Bucket => false,
@@ -2002,6 +2033,17 @@ fn parameter_column_in_query(state: &mut QueryState<'_>, query: &mut SelectState
     parameter_column_in_query_filtered(state, query, |_, _, _| true)
 }
 
+/// Returns true if `sql_type` has well-defined ordering semantics in `dialect`.
+///
+/// PostgreSQL's `json` type has no comparison operators, so a query that sorts
+/// or partitions on a `json` column errors at runtime. `jsonb` is unaffected.
+/// MySQL defines an ordering on its `JSON` type, so this filter is a no-op
+/// there. Used when picking columns for ORDER BY, window PARTITION BY, and
+/// window ORDER BY.
+fn is_orderable_in_dialect(sql_type: &SqlType, dialect: ParseDialect) -> bool {
+    !(dialect == ParseDialect::PostgreSQL && *sql_type == SqlType::Json)
+}
+
 impl QueryOperation {
     /// Returns true if this query operation is supported inside of subqueries. If this function
     /// returns false, `add_to_query` will not be called on this query operation when adding it to a
@@ -2360,10 +2402,7 @@ impl QueryOperation {
 
                         let mut arguments = Vec::new();
                         add_builtin!(@args_to_expr, table, arguments, $($arg)*);
-                        let expr = Expr::Call(FunctionExpr::Call {
-                            name: fn_name.into(),
-                            arguments: Some(arguments),
-                        });
+                        let expr = Expr::Call(FunctionExpr::from_name_and_args(fn_name, arguments));
                         let alias = state.fresh_alias();
                         query.fields.push(FieldDefinitionExpr::Expr {
                             alias: Some(alias.clone()),
@@ -2433,12 +2472,14 @@ impl QueryOperation {
                     Lower => add_builtin!(SqlType::Text),
                     Upper => add_builtin!(SqlType::Text),
                     Hex => add_builtin!(SqlType::Text),
+                    JsonBuildArray => add_builtin!(SqlType::Text),
                     SpatialAsText => add_builtin!(SqlType::Text),
                     SpatialAsEWKT => add_builtin!(SqlType::Text),
                     Bucket => add_builtin!(SqlType::TimestampTz),
                 }
             }
             QueryOperation::TopK { order_type, limit } => {
+                let dialect = state.gen.dialect;
                 let table = state.some_table_in_query_mut(query);
 
                 if query.tables.is_empty() {
@@ -2447,7 +2488,10 @@ impl QueryOperation {
                         .push(TableExpr::from(Relation::from(table.name.clone())));
                 }
 
-                let column_name = table.some_column_name();
+                let column_name = table.some_column_name_filtered(
+                    || SqlType::Int(None),
+                    |_, spec| is_orderable_in_dialect(&spec.sql_type, dialect),
+                );
                 let column = Column {
                     table: Some(table.name.clone().into()),
                     ..column_name.into()
@@ -2477,6 +2521,7 @@ impl QueryOperation {
                 limit,
                 page_number,
             } => {
+                let dialect = state.gen.dialect;
                 let table = state.some_table_in_query_mut(query);
 
                 if query.tables.is_empty() {
@@ -2485,7 +2530,10 @@ impl QueryOperation {
                         .push(TableExpr::from(Relation::from(table.name.clone())));
                 }
 
-                let column_name = table.some_column_name();
+                let column_name = table.some_column_name_filtered(
+                    || SqlType::Int(None),
+                    |_, spec| is_orderable_in_dialect(&spec.sql_type, dialect),
+                );
                 let column = Column {
                     table: Some(table.name.clone().into()),
                     ..column_name.into()
@@ -2535,6 +2583,7 @@ impl QueryOperation {
                     return;
                 }
 
+                let dialect = state.gen.dialect;
                 let table = state.some_table_in_query_mut(query);
                 let table_name = table.name.clone();
 
@@ -2585,17 +2634,23 @@ impl QueryOperation {
                 let mut make_column = || {
                     Expr::Column(Column {
                         table: Some(table_name.clone().into()),
-                        name: table.some_column_name().into(),
+                        name: table
+                            .some_column_name_filtered(
+                                || SqlType::Int(None),
+                                |_, spec| is_orderable_in_dialect(&spec.sql_type, dialect),
+                            )
+                            .into(),
                     })
                 };
 
-                let partition_by = match config.over_clause {
+                let mut partition_by: Vec<Expr> = match config.over_clause {
                     OverClauseKind::PartitionOnly(count)
                     | OverClauseKind::PartitionAndOrder(count, _) => {
                         iter::repeat_with(&mut make_column).take(count).collect()
                     }
                     _ => vec![],
                 };
+                partition_by.dedup();
 
                 let make_ordering = || {
                     (
@@ -2605,13 +2660,14 @@ impl QueryOperation {
                     )
                 };
 
-                let order_by = match config.over_clause {
+                let mut order_by: Vec<(Expr, OrderType, NullOrder)> = match config.over_clause {
                     OverClauseKind::OrderOnly(count)
                     | OverClauseKind::PartitionAndOrder(_, count) => {
                         iter::repeat_with(make_ordering).take(count).collect()
                     }
                     _ => vec![],
                 };
+                order_by.dedup();
 
                 query.fields.push(FieldDefinitionExpr::Expr {
                     alias: Some(state.fresh_alias()),
@@ -2885,6 +2941,11 @@ fn prune_query_operations(ops: &mut Vec<QueryOperation>) {
     let mut distinct_found = false;
     let mut in_parameter_found = false;
 
+    // Don't generate aggregates unsupported as post-lookup (JsonObjectAgg, DISTINCT
+    // aggregates) in the same query as a WHERE IN clause, since post-lookup aggregation for
+    // these is not supported (REA-6024)
+    let mut post_lookup_unsupported_agg_found = false;
+
     // Don't generate an OR filter in the same query as a parameter of any kind, since
     // we don't support those queries (ENG-2976)
     let mut parameter_found = false;
@@ -2901,9 +2962,28 @@ fn prune_query_operations(ops: &mut Vec<QueryOperation>) {
     // (REA-5805)
     let mut topk_found = false;
 
+    // Don't generate unbounded accumulator aggregates (array_agg, group_concat, string_agg)
+    // without a WHERE parameter to limit the input rows. Without a filter these aggregates scan
+    // the entire table and accumulate all values into a single result, which can OOM on large
+    // tables (REA-6279).
+    let has_parameter = ops.iter().any(|op| {
+        matches!(
+            op,
+            QueryOperation::SingleParameter
+                | QueryOperation::MultipleParameters
+                | QueryOperation::InParameter { .. }
+                | QueryOperation::RangeParameter
+                | QueryOperation::MultipleRangeParameters
+        )
+    });
+
     ops.retain(|op| match op {
         QueryOperation::ColumnAggregate(agg) if agg.is_distinct() => {
-            if in_parameter_found || window_function_found || topk_found {
+            if in_parameter_found
+                || window_function_found
+                || topk_found
+                || (agg.is_unbounded_accumulator() && !has_parameter)
+            {
                 false
             } else {
                 distinct_found = true;
@@ -2920,7 +3000,12 @@ fn prune_query_operations(ops: &mut Vec<QueryOperation>) {
             }
         }
         QueryOperation::InParameter { .. } => {
-            if distinct_found || or_filter_found || window_function_found || in_parameter_found {
+            if distinct_found
+                || or_filter_found
+                || window_function_found
+                || in_parameter_found
+                || post_lookup_unsupported_agg_found
+            {
                 false
             } else {
                 in_parameter_found = true;
@@ -2956,10 +3041,17 @@ fn prune_query_operations(ops: &mut Vec<QueryOperation>) {
                 true
             }
         }
-        QueryOperation::ColumnAggregate(_) => {
-            if window_function_found || topk_found {
+        QueryOperation::ColumnAggregate(agg) => {
+            if window_function_found
+                || topk_found
+                || (agg.is_unbounded_accumulator() && !has_parameter)
+                || (agg.unsupported_as_post_lookup() && in_parameter_found)
+            {
                 false
             } else {
+                if agg.unsupported_as_post_lookup() {
+                    post_lookup_unsupported_agg_found = true;
+                }
                 aggregate_found = true;
                 true
             }
@@ -3116,6 +3208,7 @@ impl Subquery {
                 JoinRightSide::Table(TableExpr {
                     inner: TableExprInner::Subquery(Box::new(subquery)),
                     alias: Some(subquery_name.clone()),
+                    column_aliases: vec![],
                 }),
                 operator,
             ),
@@ -3640,6 +3733,59 @@ mod tests {
         query
             .detect_problematic_self_joins()
             .expect("subquery join should not produce a problematic self-join");
+    }
+
+    #[test]
+    fn prunes_unbounded_accumulators_without_parameter() {
+        // Without any parameter (WHERE filter), unbounded accumulators should be pruned
+        // to avoid OOM on large tables (REA-6279)
+        let mut ops = vec![
+            QueryOperation::ColumnAggregate(AggregateType::ArrayAgg { distinct: false }),
+            QueryOperation::ColumnAggregate(AggregateType::Count {
+                column_type: SqlType::Int(None),
+                distinct: false,
+            }),
+        ];
+        prune_query_operations(&mut ops);
+        // array_agg should be pruned, count should remain
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0],
+            QueryOperation::ColumnAggregate(AggregateType::Count { .. })
+        ));
+    }
+
+    #[test]
+    fn keeps_unbounded_accumulators_with_parameter() {
+        // With a parameter (WHERE filter), unbounded accumulators are safe
+        let mut ops = vec![
+            QueryOperation::SingleParameter,
+            QueryOperation::ColumnAggregate(AggregateType::ArrayAgg { distinct: false }),
+        ];
+        prune_query_operations(&mut ops);
+        assert_eq!(ops.len(), 2);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            QueryOperation::ColumnAggregate(AggregateType::ArrayAgg { .. })
+        )));
+    }
+
+    #[test]
+    fn prunes_distinct_unbounded_accumulators_without_parameter() {
+        let mut ops = vec![
+            QueryOperation::ColumnAggregate(AggregateType::GroupConcat { distinct: true }),
+            QueryOperation::ColumnAggregate(AggregateType::Sum {
+                column_type: SqlType::Int(None),
+                distinct: true,
+            }),
+        ];
+        prune_query_operations(&mut ops);
+        // group_concat(distinct) should be pruned, sum(distinct) should remain
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(
+            &ops[0],
+            QueryOperation::ColumnAggregate(AggregateType::Sum { .. })
+        ));
     }
 
     #[test]

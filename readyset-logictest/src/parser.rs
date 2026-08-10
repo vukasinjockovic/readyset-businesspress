@@ -25,6 +25,7 @@ use nom::IResult;
 use nom_locate::LocatedSpan;
 use nom_sql::to_nom_result;
 use readyset_data::TimestampTz;
+use readyset_decimal::Decimal;
 
 use crate::ast::*;
 
@@ -124,6 +125,7 @@ fn column_type(i: &[u8]) -> IResult<&[u8], Type> {
         map(tag("I"), |_| Type::Integer),
         map(tag("UI"), |_| Type::UnsignedInteger),
         map(tag("R"), |_| Type::Real),
+        map(tag("F"), |_| Type::Numeric),
         map(tag("D"), |_| Type::Date),
         map(tag("M"), |_| Type::Time),
         map(tag("Z"), |_| Type::TimestampTz),
@@ -177,12 +179,11 @@ fn hash_results(i: &[u8]) -> IResult<&[u8], QueryResults> {
 }
 
 fn float(i: &[u8]) -> IResult<&[u8], Value> {
-    let (i, v) = map_parser(
-        recognize(tuple((opt(tag("-")), digit1, tag("."), digit1))),
-        nom::number::complete::double,
-    )(i)?;
-
-    Ok((i, Value::from(v)))
+    let (i, slice) = recognize(tuple((opt(tag("-")), digit1, tag("."), digit1)))(i)?;
+    let err = || nom::Err::Error(nom::error::Error::new(slice, nom::error::ErrorKind::Verify));
+    let s = std::str::from_utf8(slice).map_err(|_| err())?;
+    let dec = Decimal::from_str(s).map_err(|_| err())?;
+    Ok((i, Value::Numeric(dec)))
 }
 
 fn integer(i: &[u8]) -> IResult<&[u8], i64> {
@@ -332,12 +333,30 @@ fn query(i: &[u8]) -> IResult<&[u8], Query> {
     let (i, _) = tag("query")(i)?;
     let (i, column_types) = opt(preceded(space0, column_types))(i)?;
     let (i, sort_mode) = opt(preceded(space0, sort_mode))(i)?;
-    let (i, label) = opt(preceded(
+    // Parse optional "error" or "error: <pattern>" before the label.
+    let (i, expected_error) = opt(preceded(
         space0,
-        map_opt(not_line_ending, |s: &[u8]| {
-            String::from_utf8(s.into()).ok().filter(|s| !s.is_empty())
-        }),
+        preceded(
+            tag("error"),
+            map(
+                opt(preceded(tag(":"), preceded(space0, not_line_ending))),
+                |pat| {
+                    pat.map(|s| String::from_utf8_lossy(s).trim().to_string())
+                        .unwrap_or_default()
+                },
+            ),
+        ),
     ))(i)?;
+    let (i, label) = if expected_error.is_some() {
+        (i, None)
+    } else {
+        opt(preceded(
+            space0,
+            map_opt(not_line_ending, |s: &[u8]| {
+                String::from_utf8(s.into()).ok().filter(|s| !s.is_empty())
+            }),
+        ))(i)?
+    };
     let (i, _) = line_ending(i)?;
     let (i, query) = map(many_till(anychar, end_of_query), |(s, _)| {
         s.into_iter().collect::<String>()
@@ -373,6 +392,7 @@ fn query(i: &[u8]) -> IResult<&[u8], Query> {
             query,
             results,
             params,
+            expected_error,
         },
     ))
 }
@@ -426,7 +446,9 @@ pub fn records(i: &[u8]) -> IResult<&[u8], Vec<Record>> {
     ))(i)
 }
 
-pub fn read_records<R>(mut input: R) -> anyhow::Result<Vec<Record>>
+/// Read and parse records from the input, returning each record paired with its 1-based line number
+/// in the input.
+pub fn read_records<R>(mut input: R) -> anyhow::Result<Vec<(usize, Record)>>
 where
     R: io::Read,
 {
@@ -435,7 +457,8 @@ where
     input
         .read_to_end(&mut bytes)
         .with_context(|| "Failed to read input file")?;
-    let (remaining, records) = records(bytes.as_slice()).map_err(|e| match e {
+
+    let map_nom_err = |e: nom::Err<nom::error::Error<&[u8]>>| match e {
         nom::Err::Incomplete(_) => anyhow!("Parse error: Incomplete"),
         nom::Err::Error(nom::error::Error { input, code })
         | nom::Err::Failure(nom::error::Error { input, code }) => {
@@ -446,15 +469,27 @@ where
                 code
             )
         }
-    })?;
+    };
 
-    if !remaining.is_empty() {
-        bail!(
-            "Parse error, at {}: expected end of file",
-            &String::from_utf8_lossy(remaining)[..32]
-        );
+    let all_bytes = bytes.as_slice();
+    let mut remaining = ignore(all_bytes).map(|(r, _)| r).unwrap_or(all_bytes);
+    let mut result = Vec::new();
+
+    while !remaining.is_empty() {
+        // Compute 1-based line number from byte offset before parsing each record
+        let offset = all_bytes.len() - remaining.len();
+        let line = all_bytes[..offset].iter().filter(|&&b| b == b'\n').count() + 1;
+
+        let (r, rec) = complete(record)(remaining).map_err(&map_nom_err)?;
+        result.push((line, rec));
+        remaining = ignore(r).map(|(r, _)| r).unwrap_or(r);
     }
-    Ok(records)
+
+    if result.is_empty() {
+        bail!("Parse error: no records found");
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -906,7 +941,7 @@ SELECT * FROM t2
     #[test]
     fn float_trailing_zeros() {
         let input = b"0.7500";
-        let expected = Value::from(0.75_f64);
+        let expected = Value::Numeric(Decimal::from_str("0.7500").unwrap());
         assert_eq!(complete(float)(input).unwrap().1, expected);
     }
 
@@ -931,6 +966,69 @@ b'00000000000000000'
                 ..Default::default()
             })]
         )
+    }
+
+    #[test]
+    fn parse_query_error() {
+        let input = b"query I nosort error
+SELECT a FROM t1
+----
+1
+2
+3
+";
+        let result = complete(query)(input);
+        let q = result.unwrap().1;
+        assert_eq!(q.expected_error, Some(String::new()));
+        assert_eq!(q.column_types, Some(vec![Type::Integer]));
+        assert_eq!(q.sort_mode, Some(SortMode::NoSort));
+    }
+
+    #[test]
+    fn parse_query_error_with_pattern() {
+        let input = b"query I nosort error: unsupported.*
+SELECT a FROM t1
+----
+1
+";
+        let result = complete(query)(input);
+        let q = result.unwrap().1;
+        assert_eq!(q.expected_error, Some("unsupported.*".to_string()));
+    }
+
+    #[test]
+    fn parse_query_without_error_has_none() {
+        let input = b"query I nosort
+SELECT a FROM t1
+----
+1
+";
+        let result = complete(query)(input);
+        assert_eq!(result.unwrap().1.expected_error, None);
+    }
+
+    #[test]
+    fn parse_query_error_in_records() {
+        let input = b"statement ok
+CREATE TABLE t1(a INT)
+
+query I nosort error
+SELECT a FROM t1
+----
+99
+
+statement ok
+DROP TABLE t1";
+        let result = complete(records)(input);
+        let recs = result.unwrap().1;
+        assert_eq!(recs.len(), 3);
+        match &recs[1] {
+            Record::Query(q) => {
+                assert_eq!(q.expected_error, Some(String::new()));
+                assert_eq!(q.query, "SELECT a FROM t1");
+            }
+            other => panic!("Expected Query, got {other:?}"),
+        }
     }
 
     #[test]
@@ -969,5 +1067,31 @@ select x - 1 from t1
                 ..Default::default()
             })]
         )
+    }
+
+    #[test]
+    fn column_type_tag_f_parses_as_numeric() {
+        let (_, types) = super::column_types(b"F").unwrap();
+        assert_eq!(types, vec![Type::Numeric]);
+    }
+
+    #[test]
+    fn float_rule_preserves_scale() {
+        for s in [
+            "-123.4500",
+            "-691179223.7500",
+            "0.0000",
+            "-0.0001",
+            "12345.000000001",
+        ] {
+            let mut input = s.as_bytes().to_vec();
+            input.push(b'\n');
+            let (_, v) = super::value(&input).unwrap();
+            assert_eq!(
+                v,
+                Value::Numeric(Decimal::from_str(s).unwrap()),
+                "parsing {s:?}",
+            );
+        }
     }
 }

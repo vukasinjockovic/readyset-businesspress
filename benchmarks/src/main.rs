@@ -8,8 +8,8 @@ use benchmarks::utils::readyset_ready;
 use benchmarks::QUANTILES;
 use clap::builder::ArgPredicate;
 use clap::{Parser, ValueHint};
+use readyset_metrics::{PrometheusBuilder, PrometheusHandle};
 use readyset_server::Handle;
-use readyset_server::{PrometheusBuilder, PrometheusHandle};
 use readyset_util::shutdown::ShutdownSender;
 use tracing::warn;
 
@@ -271,7 +271,7 @@ impl BenchmarkRunner {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut benchmark_cmd_runner = BenchmarkRunner::parse();
-    println!("Benchmark cli options: {:?}", &benchmark_cmd_runner);
+    println!("Benchmark cli options: {benchmark_cmd_runner:?}");
     let _ = benchmark_cmd_runner
         .tracing
         .init("benchmarks", "benchmark-deployment")?;

@@ -19,14 +19,14 @@ use std::time::Duration;
 
 use failpoint_macros::set_failpoint;
 use futures_util::StreamExt;
-use hyper::client::HttpConnector;
-use hyper::{Body, Client, Method, Request, StatusCode};
+use metrics::counter;
 use readyset_errors::{internal, internal_err, ReadySetResult};
+use reqwest::{Client, StatusCode};
 use schema_catalog::SchemaCatalogUpdate;
 use serde::{Deserialize, Serialize};
 use strum::IntoStaticStr;
 use tokio::sync::broadcast;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use url::Url;
 
 use crate::consensus::{Authority, AuthorityControl};
@@ -79,12 +79,18 @@ enum LeaderUrlSource {
     /// A URL that might change (updated by checking the authority)
     Dynamic {
         authority: Arc<Authority>,
+        /// Cached leader URL. Lock ordering: this lock must be acquired without holding
+        /// any other lock.
         leader_url: Arc<parking_lot::RwLock<Option<Url>>>,
     },
 }
 
 impl LeaderUrlSource {
-    /// Get the current leader URL
+    /// Get the current leader URL.
+    ///
+    /// The cached URL is shared with the RPC path in `Controller::call()` via
+    /// `Arc<RwLock>`, so concurrent reads/writes are possible. Within the events
+    /// client, `url()` and `clear()` are called sequentially from the `run` loop.
     async fn url(&self) -> Option<Url> {
         match self {
             LeaderUrlSource::Fixed(url) => Some(url.clone()),
@@ -107,6 +113,17 @@ impl LeaderUrlSource {
                         None
                     }
                 }
+            }
+        }
+    }
+
+    /// Clear the cached leader URL, forcing a fresh lookup on the next call to `url()`.
+    /// No-op for fixed URLs.
+    fn clear(&self) {
+        if let LeaderUrlSource::Dynamic { leader_url, .. } = self {
+            let mut guard = leader_url.write();
+            if let Some(old_url) = guard.take() {
+                tracing::info!(%old_url, "Cleared cached leader URL");
             }
         }
     }
@@ -245,10 +262,25 @@ const DEFAULT_SSE_BUFFER_LIMIT: usize = 50 * 1024 * 1024;
 /// Environment variable to override the SSE buffer limit
 const SSE_BUFFER_LIMIT_ENV: &str = "READYSET_SSE_BUFFER_LIMIT";
 
+/// Capacity of the broadcast channel for controller events.
+///
+/// Used on both the client side ([`ControllerEventsClient`]) and the server side
+/// (`readyset_server::controller::events::EventsHandle`) to keep them in sync and
+/// minimize lag under DDL stress.
+pub const BROADCAST_CHANNEL_CAPACITY: usize = 256;
+
+/// Timeout for the initial HTTP response headers when connecting to the SSE endpoint.
+const SSE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for receiving the next chunk from the SSE body stream. If no data (including
+/// heartbeats, which are sent every 5 seconds by default) arrives within this window, the
+/// connection is considered stalled and will be reconnected.
+const SSE_BODY_CHUNK_TIMEOUT: Duration = Duration::from_secs(90);
+
 impl ControllerEventsClient {
     /// Create a new `ControllerEventsClient`.
     fn new(leader_url: LeaderUrlSource) -> Self {
-        let (events_tx, _events_rx) = broadcast::channel(10);
+        let (events_tx, _events_rx) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
         let buffer_limit = std::env::var(SSE_BUFFER_LIMIT_ENV)
             .ok()
             .and_then(|v| v.parse().ok())
@@ -302,11 +334,11 @@ impl ControllerEventsClient {
         buffer_limit: usize,
     ) {
         // Configure the HTTP client with reasonable timeouts
-        let mut http_connector = HttpConnector::new();
-        http_connector.set_connect_timeout(Some(Duration::from_secs(5)));
         let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
             .http2_keep_alive_timeout(Duration::from_secs(20))
-            .build(http_connector);
+            .build()
+            .expect("failed to build reqwest client");
 
         loop {
             let Some(url) = leader_url.url().await else {
@@ -341,20 +373,31 @@ impl ControllerEventsClient {
                 sleep(Duration::from_millis(delay_ms)).await;
             }
 
-            match Self::connect_and_stream(&events_url, &client, &events_tx, buffer_limit).await {
+            match Self::connect_and_stream(
+                &events_url,
+                &client,
+                &events_tx,
+                &leader_url,
+                buffer_limit,
+                SSE_RESPONSE_TIMEOUT,
+                SSE_BODY_CHUNK_TIMEOUT,
+            )
+            .await
+            {
                 Ok(should_reconnect) => {
                     if !should_reconnect {
                         tracing::debug!("Event stream closed permanently");
                         break;
                     }
-                    metrics::counter!(crate::metrics::recorded::CONTROLLER_EVENTS_DISCONNECTED)
-                        .increment(1);
+                    counter!(metric::CONTROLLER_EVENTS_DISCONNECTED).increment(1);
                     tracing::info!("Event stream closed, attempting to reconnect");
                 }
                 Err(e) => {
-                    metrics::counter!(crate::metrics::recorded::CONTROLLER_EVENTS_DISCONNECTED)
-                        .increment(1);
-                    tracing::info!("Error connecting to event stream: {}, retrying", e);
+                    // Clear the cached leader URL on connection failure so we re-resolve
+                    // the leader on the next iteration instead of retrying a stale URL.
+                    leader_url.clear();
+                    counter!(metric::CONTROLLER_EVENTS_DISCONNECTED).increment(1);
+                    tracing::info!("Event stream error: {}, retrying", e);
                 }
             }
 
@@ -373,46 +416,57 @@ impl ControllerEventsClient {
     /// Connects to the SSE endpoint and processes events.
     /// Returns Ok(true) if we should attempt to reconnect, Ok(false) if we should terminate.
     async fn connect_and_stream(
-        url: &Url,
-        client: &Client<HttpConnector>,
+        events_url: &Url,
+        client: &Client,
         events_tx: &broadcast::Sender<ControllerEvent>,
+        leader_url: &LeaderUrlSource,
         buffer_limit: usize,
+        response_timeout: Duration,
+        body_chunk_timeout: Duration,
     ) -> ReadySetResult<bool> {
-        tracing::debug!(%url, "Connecting to SSE endpoint");
+        tracing::debug!(url = %events_url, "Connecting to SSE endpoint");
 
-        let req = Request::builder()
-            .uri(url.as_str())
-            .method(Method::GET)
+        let send = client
+            .get(events_url.as_str())
             .header("Accept", "text/event-stream")
             .header("Cache-Control", "no-cache")
-            .body(Body::empty())
-            .map_err(|e| internal_err!("Failed to build request: {e}"))?;
-
-        let mut res = client
-            .request(req)
+            .send();
+        let res = timeout(response_timeout, send)
             .await
+            .map_err(|_| {
+                internal_err!(
+                    "HTTP request to {events_url} timed out waiting for response headers ({}s)",
+                    response_timeout.as_secs()
+                )
+            })?
             .map_err(|e| internal_err!("Failed to send request: {e}"))?;
 
         if res.status() != StatusCode::OK {
             let status = res.status();
-            let body = hyper::body::to_bytes(res.body_mut())
-                .await
-                .unwrap_or_default();
+            let body = res.bytes().await.unwrap_or_default();
             internal!(
                 "Error response from server: {status} - {body}",
                 body = String::from_utf8_lossy(&body)
             );
         }
 
-        metrics::counter!(crate::metrics::recorded::CONTROLLER_EVENTS_CONNECTED).increment(1);
+        counter!(metric::CONTROLLER_EVENTS_CONNECTED).increment(1);
         tracing::debug!("Connected to SSE endpoint");
 
         // Process the event stream
         let mut processor = SseStreamProcessor::new(buffer_limit);
 
-        let mut body_stream = res.into_body();
+        let mut body_stream = res.bytes_stream();
 
-        while let Some(chunk_result) = body_stream.next().await {
+        while let Some(chunk_result) = timeout(body_chunk_timeout, body_stream.next())
+            .await
+            .map_err(|_| {
+                internal_err!(
+                    "SSE body stream to {events_url} timed out: no data received within {}s",
+                    body_chunk_timeout.as_secs()
+                )
+            })?
+        {
             set_failpoint!(
                 readyset_util::failpoints::CONTROLLER_EVENTS_SSE_DISCONNECT,
                 |_| Err(internal_err!("failpoint: SSE stream disconnect"))
@@ -423,9 +477,20 @@ impl ControllerEventsClient {
             for (event_type, data) in events {
                 match Self::parse_controller_event(&event_type, &data) {
                     Ok(event) => {
+                        let force_reconnect = if matches!(event, ControllerEvent::LeaderLost) {
+                            leader_url.clear();
+                            true
+                        } else {
+                            false
+                        };
                         if events_tx.send(event).is_err() {
                             // All receivers have been dropped, we can stop
                             return Ok(false);
+                        }
+                        if force_reconnect {
+                            // Force reconnect to discover the new leader rather than
+                            // continuing to read from the old leader's stream.
+                            return Ok(true);
                         }
                     }
                     Err(e) => {
@@ -461,6 +526,15 @@ impl ControllerEventsClient {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::net::SocketAddr;
+
+    use axum::body::{Body, Bytes};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use axum::Router;
+    use futures_util::stream;
+
     use super::*;
 
     /// Validates that the background task exits when all receivers are dropped,
@@ -515,5 +589,264 @@ mod tests {
         assert_eq!(events.len(), 1, "expected 1 event, got {:?}", events);
         assert_eq!(events[0].0, "Real");
         assert_eq!(events[0].1, "\"real\"");
+    }
+
+    /// Helper: build an HTTP client matching what `run()` creates.
+    fn build_test_client() -> Client {
+        Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .http2_keep_alive_timeout(Duration::from_secs(20))
+            .build()
+            .expect("failed to build reqwest client")
+    }
+
+    /// Whether the test SSE stream closes after the first event or stalls open indefinitely.
+    #[derive(Clone, Copy)]
+    enum StreamClose {
+        /// Send the event and then close the stream (response body ends).
+        AfterFirst,
+        /// Send the event and then keep the body open without sending anything else, so the
+        /// client's body-chunk timeout is what eventually breaks the connection.
+        Stall,
+    }
+
+    /// Spawn an axum server on a random local port that responds to `GET /events/stream` with the
+    /// given pre-formatted SSE bytes. Returns the server's bound address.
+    async fn spawn_sse_test_server(event: &'static str, close: StreamClose) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let handler = move || async move {
+            let item = Ok::<Bytes, Infallible>(Bytes::from_static(event.as_bytes()));
+            let body = match close {
+                StreamClose::AfterFirst => Body::from_stream(stream::iter(vec![item])),
+                StreamClose::Stall => Body::from_stream(
+                    stream::iter(vec![item]).chain(stream::pending::<Result<Bytes, Infallible>>()),
+                ),
+            };
+            ([("Content-Type", "text/event-stream")], body).into_response()
+        };
+
+        let app = Router::new().route("/events/stream", get(handler));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        addr
+    }
+
+    /// response_timeout fires when the server accepts TCP but never sends headers.
+    ///
+    /// Uses real (not paused) time with a short timeout so we don't have to fight
+    /// `start_paused = true` auto-advancing past the TCP connect deadline before
+    /// the real hyper I/O completes.
+    #[tokio::test]
+    async fn test_response_timeout_on_silent_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // Accept the connection but never write anything back.
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept");
+            // Hold socket open long enough for the response timeout to fire.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let url = Url::parse(&format!("http://{addr}/events/stream")).expect("url");
+        let base_url = Url::parse(&format!("http://{addr}")).expect("base url");
+        let (events_tx, _rx) = broadcast::channel(16);
+        let client = build_test_client();
+        let leader_url = LeaderUrlSource::Fixed(base_url.clone());
+
+        let result = ControllerEventsClient::connect_and_stream(
+            &url,
+            &client,
+            &events_tx,
+            &leader_url,
+            DEFAULT_SSE_BUFFER_LIMIT,
+            Duration::from_millis(200),
+            SSE_BODY_CHUNK_TIMEOUT,
+        )
+        .await;
+
+        let err = result.expect_err("expected timeout error").to_string();
+        assert!(
+            err.contains("timed out waiting for response headers"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// body_chunk_timeout fires when the server sends headers + one chunk then stalls.
+    ///
+    /// Uses real (not paused) time with a short timeout so we don't have to fight
+    /// `start_paused = true` auto-advancing past the TCP connect deadline before
+    /// the real I/O completes.
+    #[tokio::test]
+    async fn test_body_chunk_timeout_on_stalled_stream() {
+        let addr = spawn_sse_test_server(
+            "event: Heartbeat\ndata: \"Heartbeat\"\n\n",
+            StreamClose::Stall,
+        )
+        .await;
+        let url = Url::parse(&format!("http://{addr}/events/stream")).expect("url");
+        let base_url = Url::parse(&format!("http://{addr}")).expect("base url");
+        let (events_tx, _rx) = broadcast::channel(16);
+        let client = build_test_client();
+        let leader_url = LeaderUrlSource::Fixed(base_url.clone());
+
+        let result = ControllerEventsClient::connect_and_stream(
+            &url,
+            &client,
+            &events_tx,
+            &leader_url,
+            DEFAULT_SSE_BUFFER_LIMIT,
+            SSE_RESPONSE_TIMEOUT,
+            Duration::from_millis(200),
+        )
+        .await;
+
+        let err = result.expect_err("expected timeout error").to_string();
+        assert!(err.contains("SSE body stream"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_clear_fixed_is_noop() {
+        let url = Url::parse("http://example.com").expect("url");
+        let source = LeaderUrlSource::Fixed(url);
+        // Should not panic or change anything
+        source.clear();
+    }
+
+    #[test]
+    fn test_clear_dynamic_clears_url() {
+        let url = Url::parse("http://leader1.example.com").expect("url");
+        let leader_url = Arc::new(parking_lot::RwLock::new(Some(url)));
+        let authority = Arc::new(Authority::from(crate::consensus::LocalAuthority::new()));
+        let source = LeaderUrlSource::Dynamic {
+            authority,
+            leader_url: leader_url.clone(),
+        };
+
+        source.clear();
+        assert!(leader_url.read().is_none(), "URL should be cleared");
+    }
+
+    /// Verifies that a LeaderLost SSE event clears the cached URL and triggers reconnect.
+    #[tokio::test]
+    async fn test_leader_lost_clears_url_and_reconnects() {
+        let addr = spawn_sse_test_server(
+            "event: LeaderLost\ndata: \"LeaderLost\"\n\n",
+            StreamClose::AfterFirst,
+        )
+        .await;
+
+        let base_url = Url::parse(&format!("http://{addr}")).expect("base url");
+        let url = Url::parse(&format!("http://{addr}/events/stream")).expect("url");
+        let (events_tx, mut rx) = broadcast::channel(16);
+        let client = build_test_client();
+
+        let cached_url = Arc::new(parking_lot::RwLock::new(Some(base_url.clone())));
+        let authority = Arc::new(Authority::from(crate::consensus::LocalAuthority::new()));
+        let leader_url = LeaderUrlSource::Dynamic {
+            authority,
+            leader_url: cached_url.clone(),
+        };
+
+        let result = ControllerEventsClient::connect_and_stream(
+            &url,
+            &client,
+            &events_tx,
+            &leader_url,
+            DEFAULT_SSE_BUFFER_LIMIT,
+            SSE_RESPONSE_TIMEOUT,
+            SSE_BODY_CHUNK_TIMEOUT,
+        )
+        .await;
+
+        // Should return Ok(true) to trigger reconnect
+        assert!(result.expect("should succeed"));
+
+        // The cached URL should have been cleared
+        assert!(
+            cached_url.read().is_none(),
+            "cached URL should be cleared after LeaderLost"
+        );
+
+        // The LeaderLost event should have been forwarded to subscribers
+        let event = rx.try_recv().expect("should receive LeaderLost event");
+        assert!(matches!(event, ControllerEvent::LeaderLost));
+    }
+
+    /// Verifies that LeaderLost returns Ok(false) when all receivers are dropped.
+    #[tokio::test]
+    async fn test_leader_lost_stops_when_no_receivers() {
+        let addr = spawn_sse_test_server(
+            "event: LeaderLost\ndata: \"LeaderLost\"\n\n",
+            StreamClose::AfterFirst,
+        )
+        .await;
+
+        let base_url = Url::parse(&format!("http://{addr}")).expect("base url");
+        let url = Url::parse(&format!("http://{addr}/events/stream")).expect("url");
+        let (events_tx, _rx) = broadcast::channel(16);
+        let client = build_test_client();
+        let leader_url = LeaderUrlSource::Fixed(base_url.clone());
+
+        // Drop all receivers so send() fails
+        drop(_rx);
+
+        let result = ControllerEventsClient::connect_and_stream(
+            &url,
+            &client,
+            &events_tx,
+            &leader_url,
+            DEFAULT_SSE_BUFFER_LIMIT,
+            SSE_RESPONSE_TIMEOUT,
+            SSE_BODY_CHUNK_TIMEOUT,
+        )
+        .await;
+
+        // Should return Ok(false) to terminate rather than reconnect
+        assert!(
+            !result.expect("should succeed"),
+            "should terminate when no receivers"
+        );
+    }
+
+    /// Connection error with a Dynamic URL source clears the cached URL so the next
+    /// iteration re-resolves via the authority instead of retrying the stale address.
+    /// This exercises the full `run()` loop: connect fails → clear → URL is None.
+    #[tokio::test]
+    async fn test_connection_error_clears_dynamic_url() {
+        // Point at a port where nothing is listening so the connection fails.
+        let stale_url = Url::parse("http://127.0.0.1:1").expect("url");
+
+        let cached_url = Arc::new(parking_lot::RwLock::new(Some(stale_url.clone())));
+        let authority = Arc::new(Authority::from(crate::consensus::LocalAuthority::new()));
+        let client = ControllerEventsClient::new(LeaderUrlSource::Dynamic {
+            authority,
+            leader_url: cached_url.clone(),
+        });
+
+        let rx = client.subscribe_and_start();
+
+        // Wait for the connection attempt to fail and clear the cached URL.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if cached_url.read().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("cached URL should be cleared after connection failure");
+
+        // Clean up: drop the receiver so the background task exits.
+        drop(rx);
     }
 }

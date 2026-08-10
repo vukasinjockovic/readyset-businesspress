@@ -25,7 +25,7 @@ fn commutes_with(conditions: &Expr, inner: &MirNodeInner) -> bool {
         MirNodeInner::Filter { .. }
         | MirNodeInner::Identity
         | MirNodeInner::Join { .. }
-        | MirNodeInner::JoinAggregates
+        | MirNodeInner::JoinAggregates { .. }
         | MirNodeInner::DependentJoin { .. }
         | MirNodeInner::ViewKey { .. }
         | MirNodeInner::Project { .. }
@@ -34,6 +34,7 @@ fn commutes_with(conditions: &Expr, inner: &MirNodeInner) -> bool {
         | MirNodeInner::Leaf { .. } => true,
 
         MirNodeInner::Base { .. }
+        | MirNodeInner::Constant { .. }
         | MirNodeInner::LeftJoin { .. }
         | MirNodeInner::DependentLeftJoin { .. } => false,
     }
@@ -249,6 +250,7 @@ mod tests {
                     generated: None,
                     constraints: vec![],
                     comment: None,
+                    invisible: false,
                 }],
                 primary_key: Some([Column::from("a")].into()),
                 unique_keys: Default::default(),
@@ -266,6 +268,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                     ColumnSpecification {
                         column: ast::Column::from("t2.b"),
@@ -273,6 +276,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                 ],
                 primary_key: Some([Column::new(Some("t2"), "a")].into()),
@@ -354,6 +358,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                     ColumnSpecification {
                         column: ast::Column::from("t1.b"),
@@ -361,6 +366,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                 ],
                 primary_key: Some([Column::from("a")].into()),

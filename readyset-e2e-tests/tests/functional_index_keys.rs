@@ -17,12 +17,13 @@ use readyset_client_test_helpers::{TestBuilder, sleep};
 use readyset_sql::ast::{Relation, SqlIdentifier};
 use readyset_sql_parsing::ParsingPreset;
 use readyset_util::eventually;
-use test_utils::tags;
+use test_utils::{tags, upstream};
 
 /// Test that a table with no primary key but a unique key consisting only of functional
 /// expressions is marked as non-replicated.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn functional_uk_only_rejects_table() {
     readyset_tracing::init_test_logging();
     let db_name = "functional_uk_only_test";
@@ -45,7 +46,7 @@ async fn functional_uk_only_rejects_table() {
 
     let (_rs_opts, mut handle, shutdown_tx) = TestBuilder::default()
         .recreate_database(false)
-        .replicate_db(db_name.to_string())
+        .replicate_db(db_name)
         .parsing_preset(ParsingPreset::OnlySqlparser)
         .build::<MySQLAdapter>()
         .await;
@@ -86,7 +87,8 @@ async fn functional_uk_only_rejects_table() {
 /// Test that a table with no PK, first UK is functional-only, but second UK is usable
 /// IS replicated (uses the second unique key for snapshotting).
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn no_pk_functional_first_uk_usable_second_uk_succeeds() {
     readyset_tracing::init_test_logging();
     let db_name = "no_pk_fallback_uk_test";
@@ -116,7 +118,7 @@ async fn no_pk_functional_first_uk_usable_second_uk_succeeds() {
 
     let (rs_opts, mut handle, shutdown_tx) = TestBuilder::default()
         .recreate_database(false)
-        .replicate_db(db_name.to_string())
+        .replicate_db(db_name)
         .parsing_preset(ParsingPreset::OnlySqlparser)
         .build::<MySQLAdapter>()
         .await;
@@ -169,7 +171,8 @@ async fn no_pk_functional_first_uk_usable_second_uk_succeeds() {
 /// snapshotted. The functional index columns should be skipped for regular KEY indexes,
 /// allowing the table to be processed successfully.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_functional_index_snapshot() {
     readyset_tracing::init_test_logging();
     let db_name = "func_index_snapshot_test";
@@ -204,7 +207,7 @@ async fn test_functional_index_snapshot() {
     // Setup ReadySet connection after table creation (triggers snapshot)
     let (rs_opts, _rs_handle, tx) = TestBuilder::default()
         .recreate_database(false)
-        .replicate_db(db_name.to_string())
+        .replicate_db(db_name)
         .parsing_preset(ParsingPreset::OnlySqlparser)
         .build::<MySQLAdapter>()
         .await;
@@ -240,7 +243,8 @@ async fn test_functional_index_snapshot() {
 /// Tests that tables with functional index columns can be created during streaming replication.
 /// The CREATE TABLE statement comes through the binlog and should be parsed successfully.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_functional_index_replication() {
     readyset_tracing::init_test_logging();
     let db_name = "func_index_repl_test";
@@ -252,7 +256,7 @@ async fn test_functional_index_replication() {
     // Setup ReadySet connection BEFORE table creation (so CREATE TABLE comes via replication)
     let (rs_opts, _rs_handle, tx) = TestBuilder::default()
         .recreate_database(false)
-        .replicate_db(db_name.to_string())
+        .replicate_db(db_name)
         .parsing_preset(ParsingPreset::OnlySqlparser)
         .build::<MySQLAdapter>()
         .await;
@@ -314,7 +318,8 @@ async fn test_functional_index_replication() {
 /// during snapshotting. The functional columns should be filtered out, keeping only
 /// the regular column references.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_mixed_functional_index_snapshot() {
     readyset_tracing::init_test_logging();
     let db_name = "mixed_index_snapshot_test";
@@ -350,7 +355,7 @@ async fn test_mixed_functional_index_snapshot() {
     // Setup ReadySet connection after table creation (triggers snapshot)
     let (rs_opts, _rs_handle, tx) = TestBuilder::default()
         .recreate_database(false)
-        .replicate_db(db_name.to_string())
+        .replicate_db(db_name)
         .parsing_preset(ParsingPreset::OnlySqlparser)
         .build::<MySQLAdapter>()
         .await;
@@ -385,7 +390,8 @@ async fn test_mixed_functional_index_snapshot() {
 /// Tests that tables with mixed functional and regular index columns work correctly
 /// during streaming replication. The CREATE TABLE comes through the binlog.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_mixed_functional_index_replication() {
     readyset_tracing::init_test_logging();
     let db_name = "mixed_index_repl_test";
@@ -397,7 +403,7 @@ async fn test_mixed_functional_index_replication() {
     // Setup ReadySet connection BEFORE table creation (so CREATE TABLE comes via replication)
     let (rs_opts, _rs_handle, tx) = TestBuilder::default()
         .recreate_database(false)
-        .replicate_db(db_name.to_string())
+        .replicate_db(db_name)
         .parsing_preset(ParsingPreset::OnlySqlparser)
         .build::<MySQLAdapter>()
         .await;
@@ -458,7 +464,8 @@ async fn test_mixed_functional_index_replication() {
 /// and regular index columns. This verifies that row identity is correctly tracked using
 /// the primary key even when the table has functional index expressions.
 #[tokio::test(flavor = "multi_thread")]
-#[tags(serial, mysql8_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn test_mixed_functional_index_update_delete() {
     readyset_tracing::init_test_logging();
     let db_name = "mixed_index_update_delete_test";
@@ -494,7 +501,7 @@ async fn test_mixed_functional_index_update_delete() {
     // Setup ReadySet after data is inserted (triggers snapshot)
     let (rs_opts, _rs_handle, tx) = TestBuilder::default()
         .recreate_database(false)
-        .replicate_db(db_name.to_string())
+        .replicate_db(db_name)
         .parsing_preset(ParsingPreset::OnlySqlparser)
         .build::<MySQLAdapter>()
         .await;

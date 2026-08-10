@@ -30,7 +30,7 @@ postgres = { workspace = true }
 postgres-protocol = { workspace = true }
 postgres-types = { workspace = true, features = [
     "with-chrono-0_4",
-    "with-cidr-0_2",
+    "with-cidr-0_3",
 ] }
 rand = { workspace = true }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
@@ -43,9 +43,9 @@ tokio-native-tls = { workspace = true }
 tokio-postgres = { workspace = true, features = [
     "with-chrono-0_4",
     "with-eui48-1",
-    "with-uuid-0_8",
+    "with-uuid-1",
     "with-serde_json-1",
-    "with-bit-vec-0_6",
+    "with-bit-vec-0_9",
 ] }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing = { workspace = true }
@@ -65,6 +65,8 @@ database-utils = { path = "../database-utils" }
 readyset-tracing = { path = "../readyset-tracing" }
 postgres-native-tls = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
+proptest = { workspace = true }
+test-strategy = { workspace = true }
 test-utils = { path = "../test-utils" }
 
 [[bench]]

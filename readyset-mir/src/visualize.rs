@@ -254,7 +254,7 @@ impl GraphViz for MirNodeInner {
                 let jc = on.iter().map(|(l, r)| format!("{l}:{r}")).join(", ");
                 write!(f, "⋈  | on: {jc}")
             }
-            MirNodeInner::JoinAggregates => write!(f, "AGG ⋈"),
+            MirNodeInner::JoinAggregates { .. } => write!(f, "AGG ⋈"),
             MirNodeInner::Leaf {
                 ref keys,
                 index_type,
@@ -402,6 +402,18 @@ impl GraphViz for MirNodeInner {
                         .join(", "),
                     function.display(),
                     args.iter().join(", ")
+                )
+            }
+            MirNodeInner::Constant {
+                ref rows,
+                ref column_names,
+                ..
+            } => {
+                write!(
+                    f,
+                    "C | {} | {} rows",
+                    column_names.iter().join(", "),
+                    rows.len()
                 )
             }
         }

@@ -10,9 +10,9 @@ use database_utils::{
     UpstreamConfig,
 };
 use itertools::Itertools as _;
-use mysql_srv::MySqlIntermediary;
+use mysql_srv::{AuthCache, AuthKeys, AuthPlugin, MySqlIntermediary};
 use readyset_adapter::{
-    backend::{noria_connector::ReadBehavior, MigrationMode, NoriaConnector},
+    backend::{MigrationMode, NoriaConnector},
     query_status_cache::QueryStatusCache,
     shallow_refresh_pool::ShallowRefreshPool,
     upstream_database::LazyUpstream,
@@ -129,7 +129,6 @@ async fn setup_adapter(
             auto_increments,
             view_name_cache.new_local(),
             view_cache.new_local(),
-            ReadBehavior::Blocking,
             match database_type {
                 DatabaseType::MySQL => readyset_data::Dialect::DEFAULT_MYSQL,
                 DatabaseType::PostgreSQL => readyset_data::Dialect::DEFAULT_POSTGRESQL,
@@ -160,6 +159,7 @@ async fn setup_adapter(
                             UpstreamConfig::from_url(url),
                             None,
                             None,
+                            false,
                         )
                         .await
                         .unwrap(),
@@ -176,8 +176,9 @@ async fn setup_adapter(
                     Default::default(),
                     authority.clone(),
                     Vec::new(),
+                    std::path::Path::new("/"),
                 );
-                let shallow = Arc::new(CacheManager::new(None));
+                let shallow = Arc::new(CacheManager::new(None, None));
                 let shallow_refresh_pool =
                     if let Some(config) = replication_url.as_ref().map(UpstreamConfig::from_url) {
                         Some(ShallowRefreshPool::<LazyUpstream<$upstream>>::new(
@@ -202,6 +203,8 @@ async fn setup_adapter(
                         status_reporter,
                         adapter_start_time,
                         shallow,
+                        // RLS coordinator: the in-process logictest harness runs RLS-disabled.
+                        None,
                         shallow_refresh_pool,
                     )
                     .await
@@ -209,18 +212,23 @@ async fn setup_adapter(
         }
 
         match database_type {
-            DatabaseType::MySQL => MySqlIntermediary::run_on_tcp(
-                readyset_mysql::Backend {
-                    noria: make_backend!(MySqlUpstream, MySqlQueryHandler, Dialect::MySQL,),
-                    enable_statement_logging: false,
-                },
-                s,
-                false,
-                None,
-                TlsMode::Optional,
-            )
-            .await
-            .unwrap(),
+            DatabaseType::MySQL => {
+                let _ = AuthKeys::initialize(None);
+                MySqlIntermediary::run_on_tcp(
+                    readyset_mysql::Backend {
+                        noria: make_backend!(MySqlUpstream, MySqlQueryHandler, Dialect::MySQL,),
+                        enable_statement_logging: false,
+                    },
+                    s,
+                    false,
+                    None,
+                    TlsMode::Optional,
+                    AuthCache::new(),
+                    AuthPlugin::default(),
+                )
+                .await
+                .unwrap()
+            }
             DatabaseType::PostgreSQL => {
                 psql_srv::run_backend(
                     readyset_psql::Backend::new(make_backend!(

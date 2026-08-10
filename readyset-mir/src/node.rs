@@ -144,6 +144,7 @@ mod tests {
                             generated: None,
                             constraints: vec![],
                             comment: None,
+                            invisible: false,
                         },
                         ColumnSpecification {
                             column: "base.b".into(),
@@ -151,6 +152,7 @@ mod tests {
                             generated: None,
                             constraints: vec![],
                             comment: None,
+                            invisible: false,
                         },
                     ],
                     primary_key: None,
@@ -170,6 +172,7 @@ mod tests {
                             generated: None,
                             constraints: vec![],
                             comment: None,
+                            invisible: false,
                         },
                         ColumnSpecification {
                             column: "base2.b".into(),
@@ -177,6 +180,7 @@ mod tests {
                             generated: None,
                             constraints: vec![],
                             comment: None,
+                            invisible: false,
                         },
                     ],
                     primary_key: None,
@@ -224,6 +228,7 @@ mod tests {
                         distinct: false.into(),
                         order_by: None,
                     },
+                    skip_finalization: false,
                 },
                 vec![Column::new(Some("base"), "b"), Column::named("agg")],
             );
@@ -383,6 +388,7 @@ mod tests {
                 returned_cols: None,
                 default_row: None,
                 aggregates: None,
+                distinct: false,
             })
         }
 
@@ -396,6 +402,8 @@ mod tests {
                 )],
                 group_by: vec![Column::new(Some("base"), "b")],
                 limit: 3,
+                topk_buffer_multiplier: None,
+                query_name: "topk".into(),
             })
         }
 
@@ -447,7 +455,9 @@ mod tests {
 
             let ja = graph.add_node(MirNode::new(
                 "join_aggregates".into(),
-                MirNodeInner::JoinAggregates,
+                MirNodeInner::JoinAggregates {
+                    group_by: vec![Column::new(Some("base"), "b")],
+                },
             ));
             graph.add_edge(count, ja, 0);
             graph.add_edge(sum, ja, 1);
@@ -488,7 +498,9 @@ mod tests {
 
             let join_aggs = graph.add_node(MirNode::new(
                 "join_aggs".into(),
-                MirNodeInner::JoinAggregates,
+                MirNodeInner::JoinAggregates {
+                    group_by: vec![Column::named("a"), Column::named("b")],
+                },
             ));
             graph.add_edge(agg1, join_aggs, 0);
             graph.add_edge(agg2, join_aggs, 1);

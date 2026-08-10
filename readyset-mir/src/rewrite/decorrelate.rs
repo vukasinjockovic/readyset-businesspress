@@ -291,9 +291,14 @@ pub(crate) fn eliminate_dependent_joins(query: &mut MirQuery<'_>) -> ReadySetRes
                     on: on.clone(),
                     project: project.clone(),
                 },
-                MirNodeInner::DependentLeftJoin { on, project } => MirNodeInner::LeftJoin {
+                MirNodeInner::DependentLeftJoin {
+                    on,
+                    project,
+                    left_local_preds,
+                } => MirNodeInner::LeftJoin {
                     on: on.clone(),
                     project: project.clone(),
+                    left_local_preds: left_local_preds.clone(),
                 },
                 _ => unreachable!("Already checked is_dependent_join above"),
             };
@@ -366,6 +371,7 @@ mod tests {
                     generated: None,
                     constraints: vec![],
                     comment: None,
+                    invisible: false,
                 }],
                 primary_key: Some([Column::new(Some("t2"), "a")].into()),
                 unique_keys: Default::default(),
@@ -457,6 +463,7 @@ mod tests {
                     generated: None,
                     constraints: vec![],
                     comment: None,
+                    invisible: false,
                 }],
                 primary_key: Some([Column::from("a")].into()),
                 unique_keys: Default::default(),
@@ -569,6 +576,7 @@ mod tests {
                     generated: None,
                     constraints: vec![],
                     comment: None,
+                    invisible: false,
                 }],
                 primary_key: Some([Column::new(Some("t2"), "a")].into()),
                 unique_keys: Default::default(),
@@ -680,6 +688,7 @@ mod tests {
                     generated: None,
                     constraints: vec![],
                     comment: None,
+                    invisible: false,
                 }],
                 primary_key: Some([Column::from("a")].into()),
                 unique_keys: Default::default(),
@@ -718,6 +727,7 @@ mod tests {
                     Column::named("__count_grp"),
                     Column::named("__exists_count"),
                 ],
+                left_local_preds: vec![],
             },
         ));
         graph[exists_join].add_owner(query_name.clone());
@@ -799,6 +809,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                     ColumnSpecification {
                         column: ast::Column::from("t2.b"),
@@ -806,6 +817,7 @@ mod tests {
                         generated: None,
                         constraints: vec![],
                         comment: None,
+                        invisible: false,
                     },
                 ],
                 primary_key: Some([Column::new(Some("t2"), "a")].into()),
@@ -933,6 +945,7 @@ mod tests {
                     generated: None,
                     constraints: vec![],
                     comment: None,
+                    invisible: false,
                 }],
                 primary_key: Some([Column::from("a")].into()),
                 unique_keys: Default::default(),

@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use dataflow::payload::packets::*;
 use dataflow::payload::{MaterializedState, SourceChannelIdentifier};
-use dataflow::prelude::Upcall;
-use dataflow::{Domain, DomainReceiver, DomainRequest, DualTcpStream, Outboxes, Packet};
+use dataflow::{
+    BaseWriteStream, Domain, DomainReceiver, DomainRequest, Outboxes, Packet, ReplayReceiver,
+};
 use futures_util::sink::{Sink, SinkExt};
 use futures_util::stream::StreamExt;
 use futures_util::FutureExt;
-use readyset_client::internal::ReplicaAddress;
+use readyset_client::internal::DomainIndex;
 use readyset_client::{
     KeyComparison, PacketData, PacketPayload, Tagged, CONNECTION_FROM_BASE, CONNECTION_MAGIC_NUMBER,
 };
@@ -19,16 +20,15 @@ use readyset_errors::{ReadySetError, ReadySetResult};
 use readyset_util::logging::{rate_limit, TCP_CONNECTION_LOG_RECEIVED_FROM_UNKNOWN_SOURCE};
 use readyset_util::time_scope;
 use strawpoll::Strawpoll;
-use tokio::io::{AsyncReadExt, BufReader, BufStream, BufWriter};
+use tokio::io::{AsyncReadExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::IntervalStream;
 use tracing::{debug, error, info, info_span, trace, warn, Instrument, Span};
 
-use super::{ChannelCoordinator, WorkerRequestKind};
+use super::{BarrierManager, ChannelCoordinator};
 
-type Outputs =
-    HashMap<ReplicaAddress, Box<dyn Sink<Packet, Error = bincode::Error> + Send + Unpin>>;
+type Outputs = HashMap<DomainIndex, Box<dyn Sink<Packet, Error = bincode::Error> + Send + Unpin>>;
 
 const SLOW_LOOP_THRESHOLD: Duration = Duration::from_secs(1);
 
@@ -54,6 +54,16 @@ fn next_token() -> u64 {
     NEXT_TOKEN.fetch_add(1, atomic::Ordering::Relaxed)
 }
 
+/// Whether a *failed* domain request should bring the whole domain down -- propagated as an error
+/// out of the replica loop, which exits the domain so the controller rebuilds it -- rather than
+/// only being reported back to the controller. `StartReplay` qualifies: a replay that fails to
+/// start can leave a detached chunker thread we can't cancel (REA-6688), and only tearing the
+/// domain down also tears that down, preventing a half-finished replay from completing behind the
+/// controller's back. Every other request reports its error and the domain keeps running.
+fn domain_request_is_fatal_on_error(req: &DomainRequest) -> bool {
+    matches!(req, DomainRequest::StartReplay { .. })
+}
+
 /// A domain request wrapped together with the sender to which to send the processing result
 pub struct WrappedDomainRequest {
     pub req: DomainRequest,
@@ -71,7 +81,9 @@ pub struct Replica {
     /// NOTE: if `aggressively_update_state_sizes` updates will happen every packet
     refresh_sizes: IntervalStream,
 
-    /// Incoming TCP connections, usually from other Domains
+    /// Incoming TCP connections from base-table writers (the replicator and any
+    /// external base writers). Inter-domain traffic stays in-process via
+    /// `ChannelCoordinator`.
     incoming: Strawpoll<TcpListener>,
 
     /// A receiver for locally sent messages
@@ -82,11 +94,16 @@ pub struct Replica {
 
     init_state_reqs: mpsc::Receiver<MaterializedState>,
 
+    /// Bounded channel for receiving chunked replay packets from the replay thread.
+    /// Provides backpressure so the replay thread doesn't outrun the domain.
+    replay_rx: ReplayReceiver,
+
     /// Stores pending outgoing messages
     out: Outboxes,
 
-    /// Client for upcalls to worker
-    client: reqwest::Client,
+    /// Worker's barrier accounting. Barrier credits the domain accumulates in `out` are
+    /// drained into this directly each select-loop iteration.
+    barriers: Arc<BarrierManager>,
 }
 
 impl Replica {
@@ -96,7 +113,9 @@ impl Replica {
         locals: DomainReceiver,
         requests: mpsc::Receiver<WrappedDomainRequest>,
         init_state_reqs: mpsc::Receiver<MaterializedState>,
+        replay_rx: ReplayReceiver,
         cc: Arc<ChannelCoordinator>,
+        barriers: Arc<BarrierManager>,
     ) -> Self {
         Replica {
             coord: cc,
@@ -107,7 +126,8 @@ impl Replica {
             refresh_sizes: IntervalStream::new(tokio::time::interval(Duration::from_millis(500))),
             requests,
             init_state_reqs,
-            client: reqwest::Client::new(),
+            replay_rx,
+            barriers,
         }
     }
 }
@@ -144,11 +164,14 @@ impl Replica {
         )
     }
 
-    /// Read the first 4 bytes of a connection to determine if it has the correct magic number,
-    /// and then read the next byte to determine if it is from a base node. If it is, convert it to
-    /// a DualTcpStream, returning a unique token for the connection together with the upgraded
+    /// Read the first 4 bytes of a connection to determine if it has the correct magic
+    /// number, and then read the next byte to confirm it is a base-table connection
+    /// (the only kind that should arrive at this listener now that inter-domain TCP is
+    /// gone). Upgrade to a `BaseWriteStream` and return a unique token plus the upgraded
     /// connection.
-    async fn handle_new_connection(mut stream: TcpStream) -> ReadySetResult<(u64, DualTcpStream)> {
+    async fn handle_new_connection(
+        mut stream: TcpStream,
+    ) -> ReadySetResult<(u64, BaseWriteStream)> {
         let mut magic: [u8; 4] = [0; 4];
         stream.read_exact(&mut magic).await?;
         if magic != CONNECTION_MAGIC_NUMBER {
@@ -171,31 +194,28 @@ impl Replica {
 
         let mut tag: u8 = 0;
         stream.read_exact(std::slice::from_mut(&mut tag)).await?;
-        let is_base = tag == CONNECTION_FROM_BASE;
+        if tag != CONNECTION_FROM_BASE {
+            return Err(ReadySetError::TcpSendError(format!(
+                "Replica received non-base connection (tag={tag}); only base-table \
+                 writers should connect here in single-worker mode"
+            )));
+        }
 
-        debug!(base = is_base, "established new connection");
+        debug!("established new base-table connection");
 
         let token = next_token();
         let _ = stream.set_nodelay(true);
 
-        let tcp = if is_base {
-            DualTcpStream::upgrade(BufStream::new(stream), move |Tagged { v, tag }| {
-                let input: PacketData = v;
-                // Peek at its type.
-                match input.data {
-                    PacketPayload::Input(_) => Packet::Input(Input {
-                        inner: input,
-                        src: SourceChannelIdentifier { token, tag },
-                    }),
-                }
-            })
-        } else {
-            BufStream::from(BufReader::with_capacity(
-                2 * 1024 * 1024,
-                BufWriter::with_capacity(4 * 1024, stream),
-            ))
-            .into()
-        };
+        let tcp = BaseWriteStream::upgrade(BufStream::new(stream), move |Tagged { v, tag }| {
+            let input: PacketData = v;
+            // Peek at its type.
+            match input.data {
+                PacketPayload::Input(_) => Packet::Input(Input {
+                    inner: input,
+                    src: SourceChannelIdentifier { token, tag },
+                }),
+            }
+        });
 
         Ok((token, tcp))
     }
@@ -203,7 +223,7 @@ impl Replica {
     /// Receive packets from local and remote connections
     async fn receive_packets(
         locals: &mut DomainReceiver,
-        connections: &mut tokio_stream::StreamMap<u64, DualTcpStream>,
+        connections: &mut tokio_stream::StreamMap<u64, BaseWriteStream>,
     ) -> ReadySetResult<Option<VecDeque<Packet>>> {
         const MAX_PACKETS_PER_CALL: usize = 64;
 
@@ -254,7 +274,7 @@ impl Replica {
     /// their destination, therefore it can't be dropped before completion without risking some
     /// packets being lost
     async fn send_packets(
-        to_send: Vec<(ReplicaAddress, VecDeque<Packet>)>,
+        to_send: Vec<(DomainIndex, VecDeque<Packet>)>,
         connections: &tokio::sync::Mutex<Outputs>,
         coord: &ChannelCoordinator,
         failed: &Mutex<HashSet<SocketAddr>>,
@@ -262,20 +282,20 @@ impl Replica {
         let mut lock = connections.lock().await;
 
         let connections = &mut *lock;
-        for (replica_address, mut messages) in to_send {
+        for (domain, mut messages) in to_send {
             if messages.is_empty() {
                 continue;
             }
 
-            let tx = match connections.entry(replica_address) {
+            let tx = match connections.entry(domain) {
                 Occupied(entry) => {
-                    trace!(%replica_address, "Reusing existing domain connection");
+                    trace!(%domain, "Reusing existing domain connection");
                     entry.into_mut()
                 }
                 Vacant(entry) => {
-                    let Some(addr) = coord.get_addr(&replica_address) else {
+                    let Some(addr) = coord.get_addr(&domain) else {
                         trace!(
-                            target = %replica_address,
+                            target = %domain,
                             num_messages = messages.len(),
                             "Missing channel for domain, dropping messages"
                         );
@@ -284,15 +304,15 @@ impl Replica {
 
                     if failed.lock().await.contains(&addr) {
                         warn!(
-                            target = %replica_address,
+                            target = %domain,
                             num_messages = messages.len(),
                             "Skipping packets to domain as it may have failed"
                         );
                         continue;
                     }
 
-                    debug!(%replica_address, %addr, "Establishing connection to domain");
-                    entry.insert(coord.builder_for(&replica_address)?.build_async()?)
+                    debug!(%domain, %addr, "Establishing connection to domain");
+                    entry.insert(coord.connect_to(&domain)?)
                 }
             };
 
@@ -320,11 +340,11 @@ impl Replica {
             }
 
             if send_err {
-                connections.remove(&replica_address);
-                if let Some(addr) = coord.get_addr(&replica_address) {
+                connections.remove(&domain);
+                if let Some(addr) = coord.get_addr(&domain) {
                     failed.lock().await.insert(addr);
                 } else {
-                    warn!(target = ?replica_address, "Failure on sending packet to domain")
+                    warn!(target = ?domain, "Failure on sending packet to domain")
                 }
             }
         }
@@ -333,24 +353,24 @@ impl Replica {
 
     async fn handle_address_change(
         outputs: &Mutex<Outputs>,
-        replica_addr: Result<ReplicaAddress, broadcast::error::RecvError>,
+        recv: Result<DomainIndex, broadcast::error::RecvError>,
     ) {
-        match replica_addr {
-            Ok(replica_addr) => {
-                // We've received a notification that the socket address for a replica
+        match recv {
+            Ok(domain) => {
+                // We've received a notification that the socket address for a domain
                 // has changed - remove its cached connection from `outputs` so that
                 // when we try to send to it later we re-lookup the addr and reconnect
-                if outputs.lock().await.remove(&replica_addr).is_some() {
-                    info!(%replica_addr, "Removed connection for replica");
+                if outputs.lock().await.remove(&domain).is_some() {
+                    info!(%domain, "Removed connection for domain");
                 }
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 // If we've lagged behind, that means we've missed some changes to
-                // replica addresses, so we need to consider all connections invalid
+                // domain addresses, so we need to consider all connections invalid
                 warn!(
                     %skipped,
                     "Coordinator change broadcast receiver lagged behind; reconnecting \
-                    to all replicas"
+                    to all domains"
                 );
                 outputs.lock().await.clear();
             }
@@ -367,14 +387,18 @@ impl Replica {
     ) -> Option<ReadySetResult<()>> {
         match req {
             Some(req) => {
-                if req
-                    .done_tx
-                    .send(domain.domain_request(req.req, out))
-                    .is_err()
-                {
+                let fatal_on_error = domain_request_is_fatal_on_error(&req.req);
+                let res = domain.domain_request(req.req, out);
+                // Report the error to the controller as usual, then, for a fatal request, propagate
+                // it to end the replica loop and bring the domain down.
+                let fatal = res.as_ref().err().filter(|_| fatal_on_error).cloned();
+                if req.done_tx.send(res).is_err() {
                     warn!("domain request sender hung up");
                 }
-                Some(Ok(()))
+                match fatal {
+                    Some(error) => Some(Err(error)),
+                    None => Some(Ok(())),
+                }
             }
             None => {
                 warn!("domain request stream ended");
@@ -400,7 +424,7 @@ impl Replica {
 
     async fn handle_one_packet(
         packets: &mut VecDeque<Packet>,
-        established: &mut tokio_stream::StreamMap<u64, DualTcpStream>,
+        established: &mut tokio_stream::StreamMap<u64, BaseWriteStream>,
         domain: &mut Domain,
         out: &mut Outboxes,
         mut packet: Packet,
@@ -452,7 +476,7 @@ impl Replica {
 
     async fn handle_packets(
         packets: Option<VecDeque<Packet>>,
-        established: &mut tokio_stream::StreamMap<u64, DualTcpStream>,
+        established: &mut tokio_stream::StreamMap<u64, BaseWriteStream>,
         domain: &mut Domain,
         out: &mut Outboxes,
     ) -> Option<ReadySetResult<()>> {
@@ -503,11 +527,6 @@ impl Replica {
         // future when it is empty.
         let mut send_packets = futures::stream::FuturesUnordered::new();
 
-        // Similar to `send_packets`, we push our outbox of `Upcall`s in here and let the `select!`
-        // loop poll it; however, we don't maintain the invariant of only one future being in here
-        // at a time, and instead simply append to it as needed.
-        let mut pending_rpc_requests = futures::stream::FuturesUnordered::new();
-
         let Replica {
             domain,
             coord,
@@ -517,7 +536,8 @@ impl Replica {
             requests,
             out,
             init_state_reqs,
-            client,
+            replay_rx,
+            barriers,
         } = &mut self;
 
         loop {
@@ -532,7 +552,7 @@ impl Replica {
                     accepted.push(Self::handle_new_connection(conn));
                 },
 
-                // Accepted but still converting to DualTcpStream
+                // Accepted but still converting to BaseWriteStream
                 Some(established_conn) = accepted.next() => {
                     let (token, tcp) = match established_conn {
                         Err(_) => continue, // errors on unestablished connections don't matter
@@ -541,9 +561,9 @@ impl Replica {
                     established.insert(token, tcp);
                 },
 
-                // Changes to the addresses of individual domain replicas
-                replica_addr = channel_changes.recv() => {
-                    Self::handle_address_change(&outputs, replica_addr).await;
+                // Changes to the addresses of individual domains
+                recv = channel_changes.recv() => {
+                    Self::handle_address_change(&outputs, recv).await;
                 }
 
                 // Domain requests
@@ -566,11 +586,24 @@ impl Replica {
                     Self::handle_packets(packets?, &mut established, domain, out).await
                 ),
 
+                // Receive chunked replay packets from the bounded replay channel
+                Some(packet) = replay_rx.recv() => {
+                    let mut replay_packets = VecDeque::with_capacity(1);
+                    replay_packets.push_back(packet);
+                    call!(
+                        "handle_packets",
+                        Some(replay_packets.len()),
+                        Self::handle_packets(
+                            Some(replay_packets),
+                            &mut established,
+                            domain,
+                            out,
+                        ).await
+                    )
+                },
+
                 // Poll the send packets future and reissue if outstanding packets are present
                 Some(res) = send_packets.next() => res?,
-
-                // Poll the pending RPC upcalls
-                Some(res) = pending_rpc_requests.next() => res?,
 
                 // Update domain sizes when `refresh_sizes` expires
                 Some(_) = refresh_sizes.next() => domain.update_state_sizes(),
@@ -585,16 +618,10 @@ impl Replica {
                 send_packets.push(Self::send_packets(to_send, &outputs, coord, &failed));
             }
 
-            // Send rpcs
-            if out.have_rpcs() {
-                for (url, req) in out.take_rpcs() {
-                    const RPC_TIMEOUT: Duration = Duration::from_secs(5);
-                    let req = match req {
-                        Upcall::BarrierCredit { id, credits } => {
-                            WorkerRequestKind::BarrierCredit { id, credits }
-                        }
-                    };
-                    pending_rpc_requests.push(common::worker::rpc(client, url, RPC_TIMEOUT, req))
+            // Return any accumulated barrier credits to the worker's BarrierManager in-process.
+            if out.have_barrier_credits() {
+                for credit in out.take_barrier_credits() {
+                    barriers.add(credit).await;
                 }
             }
         }
@@ -603,5 +630,29 @@ impl Replica {
     pub async fn run(self) -> ReadySetResult<()> {
         let span = self.span();
         self.run_inner().instrument(span).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::Tag;
+    use readyset_client::internal::LocalNodeIndex;
+
+    use super::*;
+
+    #[test]
+    fn only_start_replay_failure_brings_down_the_domain() {
+        let start_replay = DomainRequest::StartReplay {
+            tag: Tag::new(0),
+            from: LocalNodeIndex::make(0),
+            targeting_domain: DomainIndex::new(0),
+        };
+        assert!(domain_request_is_fatal_on_error(&start_replay));
+
+        // A failed QueryReplayDone is reported to the controller; the domain keeps running.
+        let other = DomainRequest::QueryReplayDone {
+            node: LocalNodeIndex::make(0),
+        };
+        assert!(!domain_request_is_fatal_on_error(&other));
     }
 }

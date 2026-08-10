@@ -5,7 +5,6 @@ use std::time::Instant;
 use dataflow_state::PointKey;
 use derive_more::From;
 use metrics::{counter, histogram};
-use readyset_client::metrics::recorded;
 use readyset_client::KeyComparison;
 use readyset_errors::ReadySetResult;
 use serde::{Deserialize, Serialize};
@@ -150,6 +149,10 @@ impl Ingredient for NodeOperator {
         impl_ingredient_fn_mut!(self, on_connected, graph)
     }
 
+    fn post_deserialize(&mut self) {
+        impl_ingredient_fn_mut!(self, post_deserialize,)
+    }
+
     fn replace_sibling(&mut self, from_idx: NodeIndex, to_idx: NodeIndex) {
         impl_ingredient_fn_mut!(self, replace_sibling, from_idx, to_idx)
     }
@@ -180,11 +183,11 @@ impl Ingredient for NodeOperator {
         );
 
         let elapsed = start.elapsed().as_micros();
-        histogram!(recorded::NODE_ON_INPUT_DURATION,
+        histogram!(metric::NODE_ON_INPUT_DURATION,
             "ntype" => self.to_string()
         )
         .record(elapsed as f64);
-        counter!(recorded::NODE_ON_INPUT_INVOCATIONS, "ntype" => self.to_string()).increment(1);
+        counter!(metric::NODE_ON_INPUT_INVOCATIONS, "ntype" => self.to_string()).increment(1);
 
         result
     }
@@ -211,11 +214,11 @@ impl Ingredient for NodeOperator {
         );
 
         let elapsed = start.elapsed().as_micros();
-        histogram!(recorded::NODE_ON_INPUT_RAW_DURATION,
+        histogram!(metric::NODE_ON_INPUT_RAW_DURATION,
             "ntype" => self.to_string()
         )
         .record(elapsed as f64);
-        counter!(recorded::NODE_ON_INPUT_RAW_INVOCATIONS, "ntype" => self.to_string()).increment(1);
+        counter!(metric::NODE_ON_INPUT_RAW_INVOCATIONS, "ntype" => self.to_string()).increment(1);
 
         result
     }
@@ -226,7 +229,7 @@ impl Ingredient for NodeOperator {
         tag: Tag,
         keys: &[KeyComparison],
         auxiliary_node_states: &mut AuxiliaryNodeStateMap,
-    ) {
+    ) -> usize {
         impl_ingredient_fn_mut!(self, on_eviction, from, tag, keys, auxiliary_node_states)
     }
 
@@ -408,7 +411,7 @@ pub mod test {
             // we're now committing to testing this op
             // add all nodes to the same domain
             for node in self.graph.node_weights_mut() {
-                if node.is_source() {
+                if node.is_graph_root() {
                     continue;
                 }
                 node.add_to(0.into());
@@ -508,7 +511,7 @@ pub mod test {
                 return res;
             }
 
-            if let RawProcessingResult::Regular(ref mut res) = &mut res {
+            if let RawProcessingResult::Regular(res) = &mut res {
                 node::materialize(
                     &mut res.results,
                     None,

@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
+use clap::Parser;
 use database_utils::TlsMode;
-use mysql_srv::MySqlIntermediary;
+use mysql_srv::{AuthCache, AuthPlugin, MySqlIntermediary};
+use readyset_adapter::backend::UsersSync;
 use readyset_adapter::upstream_database::LazyUpstream;
 use readyset_mysql::{MySqlQueryHandler, MySqlUpstream};
 use tokio::net::TcpStream;
@@ -10,6 +13,31 @@ use tokio_native_tls::TlsAcceptor;
 use tracing::{debug, error};
 
 use crate::ConnectionHandler;
+
+/// Wires the [`AuthCache`] up to [`UsersSync`] so it stays in sync with runtime mutations of the
+/// adapter's allowed-users map.
+#[derive(Debug)]
+struct AuthCacheSync(Arc<AuthCache>);
+
+impl UsersSync for AuthCacheSync {
+    fn refresh(&self, users: &HashMap<String, String>) {
+        self.0.set_all(users);
+    }
+}
+
+/// MySQL-specific CLI options.
+#[derive(Clone, Debug, Parser)]
+pub struct MySqlOptions {
+    /// Authentication method for MySQL client connections
+    ///
+    /// [possible values: mysql_native_password, caching_sha2_password]
+    #[arg(
+        long,
+        env = "MYSQL_AUTHENTICATION_METHOD",
+        default_value_t = AuthPlugin::default(),
+    )]
+    pub mysql_authentication_method: AuthPlugin,
+}
 
 #[derive(Clone)]
 pub struct MySqlHandler {
@@ -19,6 +47,10 @@ pub struct MySqlHandler {
     pub tls_acceptor: Option<Arc<TlsAcceptor>>,
     /// Indicates which type of client connections are allowed
     pub tls_mode: TlsMode,
+    /// Shared cache for caching_sha2_password fast-auth lookups.
+    pub auth_cache: Arc<AuthCache>,
+    /// The authentication plugin to advertise to clients.
+    pub mysql_authentication_method: AuthPlugin,
 }
 
 impl ConnectionHandler for MySqlHandler {
@@ -39,6 +71,8 @@ impl ConnectionHandler for MySqlHandler {
             self.enable_statement_logging,
             self.tls_acceptor.clone(),
             self.tls_mode,
+            self.auth_cache.clone(),
+            self.mysql_authentication_method,
         )
         .await
         {
@@ -60,5 +94,13 @@ impl ConnectionHandler for MySqlHandler {
         {
             error!(%error, "Could not send immediate error packet")
         }
+    }
+
+    fn warm_up(&mut self, users: &HashMap<String, String>) {
+        self.auth_cache.populate(users);
+    }
+
+    fn users_sync(&self) -> Option<Arc<dyn UsersSync>> {
+        Some(Arc::new(AuthCacheSync(Arc::clone(&self.auth_cache))))
     }
 }

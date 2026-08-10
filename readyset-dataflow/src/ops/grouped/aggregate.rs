@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 
 use readyset_data::dialect::SqlEngine;
-use readyset_data::{DfType, Dialect};
-use readyset_errors::{invariant, ReadySetResult};
+use readyset_data::{AverageAccumulator, AvgScaleMode, DfType, Dialect};
+use readyset_errors::{ReadySetResult, invariant};
 pub use readyset_sql::ast::{BinaryOperator, Literal, SqlType};
+use readyset_util::SizeOf;
 use serde::{Deserialize, Serialize};
 
 use crate::node::AuxiliaryNodeState;
 use crate::ops::grouped::{GroupedOperation, GroupedOperator};
 use crate::prelude::*;
 
-use super::{hash_grouped_records, GroupHash};
+use super::{GroupHash, hash_grouped_records};
 
 /// Supported aggregation operators.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,14 +48,37 @@ impl Aggregation {
 
                 match dialect.engine() {
                     SqlEngine::MySQL => {
-                        if over_col_ty.is_any_float() {
+                        if over_col_ty.is_any_float() || over_col_ty.is_any_text() {
+                            // MySQL returns DOUBLE for SUM over float and text columns
                             DfType::Double
+                        } else if let Some(dec_prec) = over_col_ty.mysql_decimal_precision() {
+                            // MySQL SUM on integers: DECIMAL(prec + 22, 0), capped at 65
+                            DfType::Numeric {
+                                prec: (dec_prec + 22).min(65),
+                                scale: 0,
+                            }
+                        } else if let DfType::Numeric { prec, scale } = over_col_ty {
+                            // MySQL SUM on DECIMAL: DECIMAL(min(prec+22, 65), scale)
+                            DfType::Numeric {
+                                prec: (*prec + 22).min(65),
+                                scale: *scale,
+                            }
                         } else {
                             DfType::DEFAULT_NUMERIC
                         }
                     }
                     SqlEngine::PostgreSQL => {
-                        if over_col_ty.is_any_bigint() || over_col_ty.is_numeric() {
+                        if over_col_ty.is_any_bigint() {
+                            // SUM(bigint) → numeric (scale 0)
+                            DfType::DEFAULT_NUMERIC
+                        } else if let DfType::Numeric { prec, scale } = over_col_ty {
+                            // SUM(numeric(p,s)) → numeric preserving scale
+                            DfType::Numeric {
+                                prec: *prec,
+                                scale: *scale,
+                            }
+                        } else if over_col_ty.is_numeric() {
+                            // SUM(numeric) without explicit precision
                             DfType::DEFAULT_NUMERIC
                         } else if over_col_ty.is_any_int() {
                             DfType::BigInt
@@ -70,12 +94,22 @@ impl Aggregation {
             }
             Aggregation::Avg => {
                 antithesis_sdk::assert_reachable!("Aggregation::Avg");
-                if over_col_ty.is_any_float() {
-                    DfType::Double
-                } else {
-                    DfType::DEFAULT_NUMERIC
+                match dialect.engine() {
+                    SqlEngine::MySQL => DfType::mysql_avg_output_type(over_col_ty),
+                    SqlEngine::PostgreSQL => {
+                        if over_col_ty.is_any_float() {
+                            DfType::Double
+                        } else {
+                            DfType::DEFAULT_NUMERIC
+                        }
+                    }
                 }
             }
+        };
+
+        let avg_scale_mode = match &self {
+            Aggregation::Avg => AvgScaleMode::for_avg(*dialect, &out_ty)?,
+            _ => AvgScaleMode::Fixed(0),
         };
 
         Ok(GroupedOperator::new(
@@ -86,6 +120,7 @@ impl Aggregation {
                 group: group_by.into(),
                 over_else: None,
                 out_ty,
+                avg_scale_mode,
             },
         ))
     }
@@ -111,6 +146,9 @@ pub struct Aggregator {
     over_else: Option<Literal>,
     // Output type of this column
     out_ty: DfType,
+    /// How to compute the display scale for AVG results.
+    #[serde(default = "default_scale_mode")]
+    avg_scale_mode: AvgScaleMode,
 }
 
 /// Diff type for numerical aggregations.
@@ -124,35 +162,25 @@ pub struct NumericalDiff {
     group_hash: GroupHash,
 }
 
-/// For storing (Count, Sum) in additional state for Average.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AverageDataPair {
-    count: DfValue,
-    sum: DfValue,
-}
-
-impl AverageDataPair {
-    fn apply_diff(&mut self, d: NumericalDiff) -> ReadySetResult<DfValue> {
-        if d.positive {
-            self.sum = (&self.sum + &d.value)?;
-            self.count = (&self.count + &DfValue::Int(1))?;
-        } else {
-            self.sum = (&self.sum - &d.value)?;
-            self.count = (&self.count - &DfValue::Int(1))?;
-        }
-
-        if self.count > DfValue::Int(0) {
-            &self.sum / &self.count
-        } else {
-            Ok(DfValue::Double(0.0))
-        }
-    }
+fn default_scale_mode() -> AvgScaleMode {
+    // Serde default for state predating the `scale_mode` field.
+    AvgScaleMode::Fixed(0)
 }
 
 #[derive(Debug, Default)]
 /// Auxiliary State for an Aggregator node, which is owned by a Domain
 pub struct AggregatorState {
-    count_sum_map: HashMap<GroupHash, AverageDataPair>,
+    count_sum_map: HashMap<GroupHash, AverageAccumulator>,
+}
+
+impl SizeOf for AggregatorState {
+    fn deep_size_of(&self) -> usize {
+        self.count_sum_map.deep_size_of()
+    }
+
+    fn size_is_empty(&self) -> bool {
+        self.count_sum_map.is_empty()
+    }
 }
 
 impl Aggregator {
@@ -162,7 +190,7 @@ impl Aggregator {
             DfType::Double => Ok(DfValue::Double(Default::default())),
             DfType::Float => Ok(DfValue::Float(Default::default())),
             DfType::Numeric { .. } => Ok(DfValue::Numeric(Default::default())),
-            DfType::Text { .. } => Ok(DfValue::from("" /* TODO(aspen): Use collation here */)),
+            DfType::Text(c) => Ok(DfValue::from_str_and_collation("", *c)),
             e => unsupported!("Unsupported output type for aggregation: {}", e),
         }
     }
@@ -186,8 +214,19 @@ impl GroupedOperation for Aggregator {
 
     fn to_diff(&self, r: &[DfValue], pos: bool) -> ReadySetResult<Self::Diff> {
         let group_hash = hash_grouped_records(r, self.group_by());
+        let value = r[self.over].clone();
+        let value = match self.op {
+            Aggregation::Sum | Aggregation::Avg => {
+                // MySQL implicitly coerces text to numeric for SUM/AVG,
+                // treating non-numeric strings as 0.
+                value
+                    .coerce_to(&self.out_ty, &DfType::Unknown)
+                    .unwrap_or_else(|_| self.new_data().unwrap_or(DfValue::Int(0)))
+            }
+            Aggregation::Count => value,
+        };
         Ok(NumericalDiff {
-            value: r[self.over].clone(),
+            value,
             positive: pos,
             group_hash,
         })
@@ -208,7 +247,19 @@ impl GroupedOperation for Aggregator {
         };
 
         let apply_sum = |curr: DfValue, diff: Self::Diff| -> ReadySetResult<DfValue> {
-            if diff.positive {
+            if curr.is_none() {
+                if diff.positive {
+                    // First non-NULL positive value initializes the sum.
+                    Ok(diff.value)
+                } else {
+                    // A negative record when sum is NULL should not occur
+                    // in normal operation, but can arise during state
+                    // recovery / replay.  Start from the typed zero and
+                    // subtract.
+                    let zero = self.new_data()?;
+                    &zero - &diff.value
+                }
+            } else if diff.positive {
                 &curr + &diff.value
             } else {
                 &curr - &diff.value
@@ -216,21 +267,21 @@ impl GroupedOperation for Aggregator {
         };
 
         let count_sum_map = match auxiliary_node_state {
-            Some(AuxiliaryNodeState::Aggregation(ref mut aggregator_state)) => {
+            Some(AuxiliaryNodeState::Aggregation(aggregator_state)) => {
                 &mut aggregator_state.count_sum_map
             }
             Some(_) => internal!("Incorrect auxiliary state for Aggregation node"),
             None => internal!("Missing auxiliary state for Aggregation node"),
         };
 
+        let scale_mode = self.avg_scale_mode;
+        let out_ty = &self.out_ty;
         let mut apply_avg = |_curr, diff: Self::Diff| -> ReadySetResult<DfValue> {
-            count_sum_map
+            let acc = count_sum_map
                 .entry(diff.group_hash)
-                .or_insert(AverageDataPair {
-                    sum: DfValue::Double(0.0),
-                    count: DfValue::Int(0),
-                })
-                .apply_diff(diff)
+                .or_insert_with(|| AverageAccumulator::for_out_ty(out_ty, scale_mode));
+            acc.delta(&diff.value, diff.positive)?;
+            acc.result()
         };
 
         let apply_diff =
@@ -246,9 +297,12 @@ impl GroupedOperation for Aggregator {
                 }
             };
 
-        diffs
-            .fold(Ok(current.cloned().unwrap_or(self.new_data()?)), apply_diff)
-            .map(Some)
+        let initial = match (current, &self.op) {
+            (Some(val), _) => val.clone(),
+            (None, Aggregation::Sum | Aggregation::Avg) => DfValue::None,
+            (None, _) => self.new_data()?,
+        };
+        diffs.fold(Ok(initial), apply_diff).map(Some)
     }
 
     fn description(&self) -> String {
@@ -276,16 +330,13 @@ impl GroupedOperation for Aggregator {
 
     fn empty_value(&self) -> Option<DfValue> {
         match self.op {
-            Aggregation::Count => Some(0.into()),
-            _ => None,
+            Aggregation::Count => Some(DfValue::Int(0)),
+            Aggregation::Sum | Aggregation::Avg => Some(DfValue::None),
         }
     }
 
     fn emit_empty(&self) -> bool {
-        match self.op {
-            Aggregation::Count => self.group_by().is_empty(),
-            _ => false,
-        }
+        self.group_by().is_empty()
     }
 
     fn can_lose_state(&self) -> bool {
@@ -299,8 +350,12 @@ impl GroupedOperation for Aggregator {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
+    use readyset_decimal::Decimal;
+
     use super::*;
-    use crate::{ops, LookupIndex};
+    use crate::{LookupIndex, ops};
 
     fn setup(aggregation: Aggregation, mat: bool) -> ops::test::MockGraph {
         let mut g = ops::test::MockGraph::new();
@@ -1133,6 +1188,192 @@ mod tests {
         );
     }
 
+    /// Helper to set up an aggregation over a text column (MySQL).
+    fn setup_text_column(aggregation: Aggregation, mat: bool) -> ops::test::MockGraph {
+        let mut g = ops::test::MockGraph::new();
+        let s = g.add_base("source", &["x", "y"]);
+        g.set_op(
+            "identity",
+            &["x", "ys"],
+            aggregation
+                .over(
+                    s.as_global(),
+                    1,
+                    &[0],
+                    &DfType::DEFAULT_TEXT,
+                    &Dialect::DEFAULT_MYSQL,
+                )
+                .expect("failed to create aggregation over text column"),
+            mat,
+        );
+        g
+    }
+
+    /// SUM over a text column should coerce text values to numeric (MySQL behavior).
+    /// Non-numeric strings are treated as 0. MySQL returns DOUBLE for SUM(text).
+    #[test]
+    fn sum_over_text_column() {
+        let mut c = setup_text_column(Aggregation::Sum, true);
+
+        // Add a numeric string "5"
+        let u: Record = vec![1.into(), DfValue::from("5")].into();
+        let rs = c.narrow_one(u, true);
+        assert_eq!(rs.len(), 1);
+        match rs.into_iter().next().expect("expected one record") {
+            Record::Positive(r) => {
+                assert_eq!(r[0], 1.into());
+                // "5" coerced to Double 5.0
+                assert_eq!(r[1], DfValue::Double(5.0));
+            }
+            other => panic!("expected Positive, got {other:?}"),
+        }
+
+        // Add a non-numeric string "hello" — should be treated as 0
+        let u: Record = vec![1.into(), DfValue::from("hello")].into();
+        let rs = c.narrow_one(u, true);
+        assert_eq!(rs.len(), 2);
+        let mut rs = rs.into_iter();
+        // Negative of previous value
+        match rs.next().expect("expected record") {
+            Record::Negative(r) => {
+                assert_eq!(r[0], 1.into());
+                assert_eq!(r[1], DfValue::Double(5.0));
+            }
+            other => panic!("expected Negative, got {other:?}"),
+        }
+        // Positive with same value (0 was added)
+        match rs.next().expect("expected record") {
+            Record::Positive(r) => {
+                assert_eq!(r[0], 1.into());
+                assert_eq!(r[1], DfValue::Double(5.0));
+            }
+            other => panic!("expected Positive, got {other:?}"),
+        }
+
+        // Add another numeric string "3"
+        let u: Record = vec![1.into(), DfValue::from("3")].into();
+        let rs = c.narrow_one(u, true);
+        assert_eq!(rs.len(), 2);
+        let mut rs = rs.into_iter();
+        match rs.next().expect("expected record") {
+            Record::Negative(r) => {
+                assert_eq!(r[0], 1.into());
+                assert_eq!(r[1], DfValue::Double(5.0));
+            }
+            other => panic!("expected Negative, got {other:?}"),
+        }
+        match rs.next().expect("expected record") {
+            Record::Positive(r) => {
+                assert_eq!(r[0], 1.into());
+                // 5.0 + 0.0 + 3.0 = 8.0
+                assert_eq!(r[1], DfValue::Double(8.0));
+            }
+            other => panic!("expected Positive, got {other:?}"),
+        }
+    }
+
+    /// Helper to set up an aggregation over an integer column (MySQL).
+    fn setup_int_column(aggregation: Aggregation, mat: bool) -> ops::test::MockGraph {
+        let mut g = ops::test::MockGraph::new();
+        let s = g.add_base("source", &["x", "y"]);
+        g.set_op(
+            "identity",
+            &["x", "ys"],
+            aggregation
+                .over(
+                    s.as_global(),
+                    1,
+                    &[0],
+                    &DfType::Int,
+                    &Dialect::DEFAULT_MYSQL,
+                )
+                .expect("failed to create aggregation over int column"),
+            mat,
+        );
+        g
+    }
+
+    /// AVG over an integer column in MySQL should produce Numeric(14,4) values,
+    /// matching MySQL's DECIMAL(14,4) output for AVG on integer inputs.
+    #[test]
+    fn avg_of_integers_mysql_decimal_precision() {
+        let mut c = setup_int_column(Aggregation::Avg, true);
+
+        // Add Group=1, Value=1
+        let u: Record = vec![1.into(), 1.into()].into();
+        let rs = c.narrow_one(u, true);
+        assert_eq!(rs.len(), 1);
+        match rs.into_iter().next().unwrap() {
+            Record::Positive(r) => {
+                assert_eq!(r[0], 1.into());
+                // Verify it's actually a Numeric, not a Double
+                assert!(
+                    matches!(r[1], DfValue::Numeric(_)),
+                    "AVG result should be DfValue::Numeric, got {:?}",
+                    r[1]
+                );
+                // MySQL AVG(int) should return DECIMAL with 4 decimal places
+                assert_eq!(
+                    r[1].to_string(),
+                    "1.0000",
+                    "AVG(1) should be 1.0000, got {:?}",
+                    r[1]
+                );
+            }
+            other => panic!("expected Positive, got {other:?}"),
+        }
+
+        // Add Group=1, Value=3 — average should be 2.0000
+        let u: Record = vec![1.into(), 3.into()].into();
+        let rs = c.narrow_one(u, true);
+        assert_eq!(rs.len(), 2);
+        let mut rs = rs.into_iter();
+        // Skip the Negative record
+        rs.next().unwrap();
+        match rs.next().unwrap() {
+            Record::Positive(r) => {
+                assert_eq!(r[0], 1.into());
+                assert_eq!(
+                    r[1].to_string(),
+                    "2.0000",
+                    "AVG(1,3) should be 2.0000, got {:?}",
+                    r[1]
+                );
+            }
+            other => panic!("expected Positive, got {other:?}"),
+        }
+    }
+
+    /// AVG that produces a repeating decimal should be rounded to 4 decimal places
+    /// (MySQL DECIMAL(14,4) for integer inputs).
+    #[test]
+    fn avg_of_integers_mysql_rounds_repeating_decimal() {
+        let mut c = setup_int_column(Aggregation::Avg, true);
+
+        // Insert 7 values into group 1 that sum to 249440
+        // 249440 / 7 = 35634.285714... which should round to scale 4
+        let values: Vec<i32> = vec![35000, 35100, 35200, 35300, 35400, 35500, 37940];
+        let mut last_rs = Records::default();
+        for v in values {
+            let u: Record = vec![1.into(), v.into()].into();
+            last_rs = c.narrow_one(u, true);
+        }
+
+        let positive = Vec::from(last_rs)
+            .into_iter()
+            .find_map(|r| match r {
+                Record::Positive(r) => Some(r),
+                _ => None,
+            })
+            .expect("expected Positive record");
+
+        let expected = Decimal::from(249440_i64)
+            .checked_div(&Decimal::from(7_i64))
+            .unwrap()
+            .round_dp(4);
+        assert_eq!(positive[1], DfValue::from(expected));
+    }
+
     #[test]
     fn it_determines_postgres_sum_output_type() {
         let grouped = Aggregation::Sum
@@ -1156,5 +1397,511 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(grouped.output_col_type(), DfType::Numeric { .. }));
+    }
+
+    fn setup_no_group_by(aggregation: Aggregation, mat: bool) -> ops::test::MockGraph {
+        let mut g = ops::test::MockGraph::new();
+        let s = g.add_base("source", &["x"]);
+        g.set_op(
+            "identity",
+            &["xs"],
+            aggregation
+                .over(
+                    s.as_global(),
+                    0,
+                    &[], // no group by
+                    &DfType::BigInt,
+                    &Dialect::DEFAULT_MYSQL,
+                )
+                .unwrap(),
+            mat,
+        );
+        g
+    }
+
+    #[test]
+    fn count_no_group_by_empty_input() {
+        let mut c = setup_no_group_by(Aggregation::Count, true);
+        // Empty input should still produce count=0
+        let rs = c.narrow_one(Records::default(), true);
+        assert_eq!(
+            rs,
+            vec![Record::Positive(vec![DfValue::Int(0), DfValue::Int(0)])].into()
+        );
+        // Idempotency: second empty input should produce nothing
+        let rs2 = c.narrow_one(Records::default(), true);
+        assert!(rs2.is_empty());
+    }
+
+    #[test]
+    fn sum_no_group_by_empty_input() {
+        let mut c = setup_no_group_by(Aggregation::Sum, true);
+        // Empty input should produce sum=NULL
+        let rs = c.narrow_one(Records::default(), true);
+        assert_eq!(
+            rs,
+            vec![Record::Positive(vec![DfValue::None, DfValue::Int(0)])].into()
+        );
+    }
+
+    #[test]
+    fn sum_no_group_by_empty_then_real_data() {
+        let mut c = setup_no_group_by(Aggregation::Sum, true);
+        // Empty input → default [NULL, 0]
+        let rs = c.narrow_one(Records::default(), true);
+        assert_eq!(rs.len(), 1);
+
+        // Real data arrives: rows with value 5 and 3
+        let u: Records = vec![
+            Record::Positive(vec![5.into()]),
+            Record::Positive(vec![3.into()]),
+        ]
+        .into();
+        let rs2 = c.narrow_one(u, true);
+        // Should revoke [NULL, 0] and emit [8, 2] — NOT [NULL, 2]
+        assert!(
+            rs2.iter()
+                .any(|r| r.is_positive() && r[0] == DfValue::from(8i64))
+        );
+    }
+
+    #[test]
+    fn sum_no_group_by_data_then_delete_all() {
+        let mut c = setup_no_group_by(Aggregation::Sum, true);
+        // Insert rows: 5 + 3 = 8
+        let u: Records = vec![
+            Record::Positive(vec![5.into()]),
+            Record::Positive(vec![3.into()]),
+        ]
+        .into();
+        let rs = c.narrow_one(u, true);
+        assert!(
+            rs.iter()
+                .any(|r| r.is_positive() && r[0] == DfValue::from(8i64))
+        );
+
+        // Delete all rows
+        let d: Records = vec![
+            Record::Negative(vec![5.into()]),
+            Record::Negative(vec![3.into()]),
+        ]
+        .into();
+        let rs2 = c.narrow_one(d, true);
+        // Should emit [NULL, 0] — NOT [0, 0]
+        // SQL: SUM on empty input returns NULL, not 0
+        assert!(rs2.iter().any(|r| r.is_positive() && r[0] == DfValue::None));
+    }
+
+    fn setup_pg(aggregation: Aggregation, over_col_ty: &DfType, mat: bool) -> ops::test::MockGraph {
+        let mut g = ops::test::MockGraph::new();
+        let s = g.add_base("source", &["x", "y"]);
+        g.set_op(
+            "identity",
+            &["x", "ys"],
+            aggregation
+                .over(
+                    s.as_global(),
+                    1,
+                    &[0],
+                    over_col_ty,
+                    &Dialect::DEFAULT_POSTGRESQL,
+                )
+                .unwrap(),
+            mat,
+        );
+        g
+    }
+
+    /// Postgres AVG(INT) should return NUMERIC with display scale ~16 for small values.
+    #[test]
+    fn avg_postgres_int_scale() {
+        let mut c = setup_pg(Aggregation::Avg, &DfType::Int, true);
+
+        // Insert group=1, value=5
+        let u: Record = vec![1.into(), DfValue::Int(5)].into();
+        c.narrow_one(u, true);
+
+        // Insert group=1, value=3 → AVG = 4.0
+        let u: Record = vec![1.into(), DfValue::Int(3)].into();
+        let rs = c.narrow_one(u, true);
+        let Record::Positive(r) = rs.into_iter().find(|r| r.is_positive()).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(r[0], 1.into());
+        // sum=8 (weight 0), count=2 (weight 0), rscale = 16 - 0*4 = 16
+        assert_matches!(&r[1], DfValue::Numeric(dec) if dec.scale() == Some(16));
+    }
+
+    /// Postgres AVG scale decreases with larger magnitude results.
+    /// AVG(50000, 30000) = 40000 → scale 12 (not 16) because result has more integer digits.
+    #[test]
+    fn avg_postgres_large_values_scale() {
+        let mut c = setup_pg(Aggregation::Avg, &DfType::Int, true);
+        let u: Record = vec![1.into(), DfValue::Int(50000)].into();
+        c.narrow_one(u, true);
+        let u: Record = vec![1.into(), DfValue::Int(30000)].into();
+        let rs = c.narrow_one(u, true);
+        let Record::Positive(r) = rs.into_iter().find(|r| r.is_positive()).unwrap() else {
+            unreachable!()
+        };
+        // 40000 has weight=1 in base-10000, so scale = 16 - 1*4 = 12
+        assert_matches!(&r[1], DfValue::Numeric(dec) if dec.scale() == Some(12));
+    }
+
+    /// Postgres AVG on small NUMERIC fractions (< 1) should not panic and
+    /// should produce correct display scale. Regression test for u32
+    /// underflow in the old `postgres_select_div_scale`.
+    #[test]
+    fn avg_postgres_fractional_numeric_scale() {
+        let mut c = setup_pg(
+            Aggregation::Avg,
+            &DfType::Numeric { prec: 10, scale: 2 },
+            true,
+        );
+
+        // Insert group=1, value=0.01
+        let v1 = DfValue::from(readyset_decimal::Decimal::new(1, 2));
+        let u: Record = vec![1.into(), v1].into();
+        c.narrow_one(u, true);
+
+        // Insert group=1, value=0.02 → AVG = 0.015
+        let v2 = DfValue::from(readyset_decimal::Decimal::new(2, 2));
+        let u: Record = vec![1.into(), v2].into();
+        let rs = c.narrow_one(u, true);
+        let Record::Positive(r) = rs.into_iter().find(|r| r.is_positive()).unwrap() else {
+            unreachable!()
+        };
+        // sum=0.03 (weight -1, first 300), count=2 (weight 0, first 2)
+        // qweight = -1 - 0 = -1 (no decrement since 300 > 2)
+        // rscale = 16 - (-1)*4 = 20
+        assert_matches!(&r[1], DfValue::Numeric(dec) if dec.scale() == Some(20));
+    }
+
+    /// MySQL AVG output type varies by integer subtype.
+    #[test]
+    fn avg_mysql_per_type_precision() {
+        fn check(ty: &DfType, expected_prec: u16) {
+            let mut g = ops::test::MockGraph::new();
+            let s = g.add_base("source", &["x", "y"]);
+            let agg = Aggregation::Avg
+                .over(s.as_global(), 1, &[0], ty, &Dialect::DEFAULT_MYSQL)
+                .unwrap();
+            assert_eq!(
+                agg.output_col_type(),
+                DfType::Numeric {
+                    prec: expected_prec,
+                    scale: 4
+                },
+                "MySQL AVG({:?}) should be DECIMAL({},4)",
+                ty,
+                expected_prec
+            );
+        }
+
+        check(&DfType::TinyInt, 7);
+        check(&DfType::UnsignedTinyInt, 7);
+        check(&DfType::SmallInt, 9);
+        check(&DfType::UnsignedSmallInt, 9);
+        check(&DfType::MediumInt, 11);
+        check(&DfType::UnsignedMediumInt, 12);
+        check(&DfType::Int, 14);
+        check(&DfType::UnsignedInt, 14);
+        check(&DfType::BigInt, 23);
+        check(&DfType::UnsignedBigInt, 24);
+    }
+
+    // ---- Regression tests for aggregate precision/scale bugs ----
+
+    /// Helper for setting up MySQL aggregation tests with specific column types.
+    fn setup_mysql(
+        aggregation: Aggregation,
+        over_col_ty: &DfType,
+        mat: bool,
+    ) -> ops::test::MockGraph {
+        let mut g = ops::test::MockGraph::new();
+        let s = g.add_base("source", &["x", "y"]);
+        g.set_op(
+            "identity",
+            &["x", "ys"],
+            aggregation
+                .over(s.as_global(), 1, &[0], over_col_ty, &Dialect::DEFAULT_MYSQL)
+                .unwrap(),
+            mat,
+        );
+        g
+    }
+
+    /// REA-6199: Postgres AVG on INT should return Numeric with dynamic scale
+    /// (~16 significant digits for small values), not scale 0.
+    ///
+    /// Bug: Postgres AVG used DEFAULT_NUMERIC (scale=0) for all non-float types,
+    /// causing results like `33437` instead of `33437.314617500000`.
+    #[test]
+    fn regression_rea_6199_postgres_avg_int_scale() {
+        let mut c = setup_pg(Aggregation::Avg, &DfType::Int, true);
+
+        // Insert group=1, value=5
+        let u: Record = vec![1.into(), DfValue::Int(5)].into();
+        c.narrow_one(u, true);
+
+        // Insert group=1, value=3 → AVG = 4.0
+        let u: Record = vec![1.into(), DfValue::Int(3)].into();
+        let rs = c.narrow_one(u, true);
+        let Record::Positive(r) = rs.into_iter().find(|r| r.is_positive()).unwrap() else {
+            unreachable!()
+        };
+        // sum=8 (weight 0), count=2 (weight 0), rscale = 16 - 0*4 = 16
+        assert_matches!(&r[1], DfValue::Numeric(dec) if dec.scale() == Some(16));
+    }
+
+    /// REA-6199: Postgres AVG on NUMERIC(10,6) should return result with appropriate
+    /// display scale, not 0 or excessive digits.
+    #[test]
+    fn regression_rea_6199_postgres_avg_numeric_scale() {
+        let mut c = setup_pg(
+            Aggregation::Avg,
+            &DfType::Numeric { prec: 10, scale: 6 },
+            true,
+        );
+
+        // Insert group=1, value=33437.314617
+        let v1 = DfValue::from(readyset_decimal::Decimal::new(33437314617, 6));
+        let u: Record = vec![1.into(), v1].into();
+        c.narrow_one(u, true);
+
+        // Insert group=1, value=33437.314618 → AVG ≈ 33437.3146175
+        let v2 = DfValue::from(readyset_decimal::Decimal::new(33437314618, 6));
+        let u: Record = vec![1.into(), v2].into();
+        let rs = c.narrow_one(u, true);
+        let Record::Positive(r) = rs.into_iter().find(|r| r.is_positive()).unwrap() else {
+            unreachable!()
+        };
+        // Decimal::select_div_scale for sum≈66874.6 (weight 1, first 6),
+        // count=2 (weight 0, first 2) yields rscale = 16 - 1*4 = 12.
+        assert_matches!(&r[1], DfValue::Numeric(dec) if dec.scale() == Some(12));
+    }
+
+    /// REA-6118: MySQL AVG on INT should return DECIMAL with scale 4, not Double.
+    ///
+    /// Bug: MySQL AVG(INT) returned a Double-like value (e.g., 35634.28571428572)
+    /// instead of DECIMAL(14,4) (e.g., 35634.2857).
+    #[test]
+    fn regression_rea_6118_mysql_avg_int_returns_decimal_not_double() {
+        let mut c = setup_mysql(Aggregation::Avg, &DfType::Int, true);
+
+        // Insert values that produce a non-integer average, mimicking the
+        // Antithesis scenario from REA-6118
+        let u: Record = vec![1.into(), DfValue::Int(71268)].into();
+        c.narrow_one(u, true);
+        let u: Record = vec![1.into(), DfValue::Int(1)].into();
+        let rs = c.narrow_one(u, true);
+        let Record::Positive(r) = rs.into_iter().find(|r| r.is_positive()).unwrap() else {
+            unreachable!()
+        };
+        assert_matches!(&r[1], DfValue::Numeric(dec) if dec.scale() == Some(4));
+    }
+
+    /// REA-5423: MySQL AVG on DECIMAL(7,2) should return DECIMAL with scale 6
+    /// (input_scale 2 + div_precision_increment 4 = 6).
+    ///
+    /// Bug: AVG on DECIMAL returned too many digits (like 3.1617615204639344
+    /// instead of 3.161762), suggesting wrong scale or Double output.
+    #[test]
+    fn regression_rea_5423_mysql_avg_decimal_scale() {
+        let mut c = setup_mysql(
+            Aggregation::Avg,
+            &DfType::Numeric { prec: 7, scale: 2 },
+            true,
+        );
+
+        // Insert group=1, value=3.16
+        let v1 = DfValue::from(readyset_decimal::Decimal::new(316, 2));
+        let u: Record = vec![1.into(), v1].into();
+        c.narrow_one(u, true);
+
+        // Insert group=1, value=3.17 → AVG = 3.165
+        let v2 = DfValue::from(readyset_decimal::Decimal::new(317, 2));
+        let u: Record = vec![1.into(), v2].into();
+        let rs = c.narrow_one(u, true);
+        let Record::Positive(r) = rs.into_iter().find(|r| r.is_positive()).unwrap() else {
+            unreachable!()
+        };
+        assert_matches!(&r[1], DfValue::Numeric(dec) if dec.scale() == Some(6));
+    }
+
+    /// REA-5423: MySQL SUM on DECIMAL(10,2) should preserve scale 2, not use
+    /// DEFAULT_NUMERIC (scale 0).
+    #[test]
+    fn regression_rea_5423_mysql_sum_decimal_preserves_scale() {
+        let sum_op = Aggregation::Sum
+            .over(
+                0.into(),
+                1,
+                &[0],
+                &DfType::Numeric { prec: 10, scale: 2 },
+                &Dialect::DEFAULT_MYSQL,
+            )
+            .unwrap();
+
+        assert_eq!(
+            sum_op.output_col_type(),
+            DfType::Numeric { prec: 32, scale: 2 },
+        );
+    }
+
+    /// REA-6199: Postgres SUM on NUMERIC(10,2) should preserve scale 2, not use
+    /// DEFAULT_NUMERIC (scale 0).
+    #[test]
+    fn regression_rea_6199_postgres_sum_numeric_preserves_scale() {
+        let sum_op = Aggregation::Sum
+            .over(
+                0.into(),
+                1,
+                &[0],
+                &DfType::Numeric { prec: 10, scale: 2 },
+                &Dialect::DEFAULT_POSTGRESQL,
+            )
+            .unwrap();
+
+        assert_eq!(
+            sum_op.output_col_type(),
+            DfType::Numeric { prec: 10, scale: 2 },
+        );
+    }
+
+    /// REA-6118: MySQL AVG on INT should produce output type DECIMAL(14,4),
+    /// matching MySQL's convention for AVG on regular INT.
+    #[test]
+    fn regression_rea_6118_mysql_avg_int_output_type() {
+        let avg_op = Aggregation::Avg
+            .over(0.into(), 1, &[0], &DfType::Int, &Dialect::DEFAULT_MYSQL)
+            .unwrap();
+
+        assert_eq!(
+            avg_op.output_col_type(),
+            DfType::Numeric { prec: 14, scale: 4 },
+        );
+    }
+
+    /// REA-6118: MySQL AVG on BIGINT should produce DECIMAL(23,4), not DECIMAL(14,4).
+    #[test]
+    fn regression_rea_6118_mysql_avg_bigint_output_type() {
+        let avg_op = Aggregation::Avg
+            .over(0.into(), 1, &[0], &DfType::BigInt, &Dialect::DEFAULT_MYSQL)
+            .unwrap();
+
+        assert_eq!(
+            avg_op.output_col_type(),
+            DfType::Numeric { prec: 23, scale: 4 },
+        );
+    }
+
+    /// Helper: assert that a single NULL input to the given aggregation
+    /// produces a NULL output (not zero).
+    fn assert_all_null_returns_null(agg: Aggregation) {
+        let mut c = setup(agg, true);
+
+        let u: Record = vec![1.into(), DfValue::None].into();
+        let rs = c.narrow_one(u, true);
+        assert_eq!(rs.len(), 1);
+
+        match rs.into_iter().next().unwrap() {
+            Record::Positive(r) => {
+                assert_eq!(r[0], 1.into());
+                assert_eq!(r[1], DfValue::None);
+            }
+            other => panic!("expected Record::Positive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sum_all_null_returns_null() {
+        assert_all_null_returns_null(Aggregation::Sum);
+    }
+
+    #[test]
+    fn avg_all_null_returns_null() {
+        assert_all_null_returns_null(Aggregation::Avg);
+    }
+
+    /// Helper: assert that a NULL followed by non-NULL values produces the
+    /// expected aggregate (only non-NULL values contribute).
+    fn assert_mix_null_nonnull(agg: Aggregation, values: &[f64], expected: DfValue) {
+        let mut c = setup(agg, true);
+
+        // Add Group=1, Value=NULL
+        let u: Record = vec![1.into(), DfValue::None].into();
+        c.narrow_one(u, true);
+
+        // Add non-NULL values; keep the last result set
+        let mut last_rs = Records::default();
+        for &v in values {
+            let u: Record = vec![1.into(), DfValue::Double(v)].into();
+            last_rs = c.narrow_one(u, true);
+        }
+        let positive = last_rs.into_iter().find(|r| r.is_positive()).unwrap();
+        match positive {
+            Record::Positive(r) => {
+                assert_eq!(r[0], 1.into());
+                assert_eq!(r[1], expected);
+            }
+            other => panic!("expected Record::Positive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sum_mix_null_nonnull() {
+        assert_mix_null_nonnull(Aggregation::Sum, &[5.0], DfValue::Double(5.0));
+    }
+
+    #[test]
+    fn avg_mix_null_nonnull() {
+        // AVG of 4.0, 6.0 = 5.0 (NULL excluded)
+        assert_mix_null_nonnull(Aggregation::Avg, &[4.0, 6.0], DfValue::Double(5.0));
+    }
+
+    /// SUM with multiple NULLs should still return NULL.
+    #[test]
+    fn sum_multiple_nulls_returns_null() {
+        let mut c = setup(Aggregation::Sum, true);
+
+        let u: Record = vec![1.into(), DfValue::None].into();
+        c.narrow_one(u, true);
+        let u: Record = vec![1.into(), DfValue::None].into();
+        let rs = c.narrow_one(u, true);
+
+        // Should still be NULL — adding more NULL rows doesn't make it 0
+        let positive = rs.into_iter().find(|r| r.is_positive()).unwrap();
+        match positive {
+            Record::Positive(r) => {
+                assert_eq!(r[0], 1.into());
+                assert_eq!(r[1], DfValue::None);
+            }
+            other => panic!("expected Record::Positive, got {other:?}"),
+        }
+    }
+
+    /// SUM negative from NULL state (defensive path for replay/recovery).
+    /// When a group has no prior state and a negative diff arrives, the sum
+    /// should start from zero and subtract.
+    #[test]
+    fn sum_negative_from_null_state() {
+        let mut c = setup(Aggregation::Sum, true);
+
+        // Insert value=5 for group 1, then remove it.
+        let u: Record = vec![1.into(), DfValue::Double(5.0)].into();
+        c.narrow_one(u, true);
+        let u = (vec![1.into(), DfValue::Double(5.0)], false);
+        let rs = c.narrow_one_row(u, true);
+
+        // After removing the only row, group should report NULL (via
+        // empty_value), not 0.
+        let positive = rs.into_iter().find(|r| r.is_positive());
+        // When the group drops to 0 rows and emit_empty is false, no
+        // positive record is emitted — the group simply disappears.
+        assert!(
+            positive.is_none(),
+            "group with 0 rows should not emit a positive record"
+        );
     }
 }

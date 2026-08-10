@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::convert::TryInto;
 use std::mem;
+use std::sync::Arc;
 
 use dataflow_state::PointKey;
 use itertools::Itertools;
@@ -337,7 +338,7 @@ impl Ingredient for Paginate {
 
         Ok(vec![ColumnMiss {
             node: *self.our_index.unwrap(),
-            column_indices: self.group_by.clone(),
+            column_indices: Arc::from(self.group_by.as_slice()),
             missed_keys: miss.missed_keys.mapped(|k| {
                 k.map_endpoints(|mut r| {
                     r.remove(page_number_column)
@@ -440,7 +441,7 @@ mod tests {
             .node_mut()
             .handle_upquery(ColumnMiss {
                 node: *g.node_index(),
-                column_indices: vec![1, 2],
+                column_indices: Arc::from([1, 2]),
                 missed_keys: vec1![vec1![DfValue::from("a"), DfValue::from(1)].into()],
             })
             .unwrap();
@@ -450,7 +451,7 @@ mod tests {
             *res.first().unwrap(),
             ColumnMiss {
                 node: *g.node_index(),
-                column_indices: vec![1],
+                column_indices: Arc::from([1]),
                 missed_keys: vec1![vec1![DfValue::from("a")].into()]
             }
         );

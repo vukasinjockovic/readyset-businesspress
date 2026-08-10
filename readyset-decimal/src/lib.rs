@@ -16,6 +16,8 @@ use strum::{EnumDiscriminants, FromRepr, IntoStaticStr, VariantNames};
 mod mysql;
 mod postgres;
 
+pub use postgres::PgWeightInfo;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReadysetDecimalError {
     #[error("Invalid decimal format: {0}")]
@@ -26,6 +28,8 @@ pub enum ReadysetDecimalError {
         to_ty: &'static str,
         value: String,
     },
+    #[error("Division scale requires finite, non-zero inputs")]
+    InvalidDivisionScale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, EnumDiscriminants)]

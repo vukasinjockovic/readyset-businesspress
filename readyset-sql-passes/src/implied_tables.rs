@@ -1,22 +1,26 @@
 use std::collections::{HashMap, HashSet};
+use std::iter;
 use std::mem;
 
-use itertools::Itertools;
-use readyset_errors::{ReadySetError, ReadySetResult, internal, invalid_query_err};
-use readyset_sql::Dialect;
-use readyset_sql::analysis::visit_mut::{
-    VisitorMut, walk_group_by_clause, walk_order_clause, walk_select_statement,
-};
+use itertools::{Either, Itertools};
+use readyset_errors::{ReadySetError, ReadySetResult, internal, invalid_query};
+use readyset_sql::analysis::visit_mut::{VisitorMut, walk_function_expr, walk_select_statement};
 use readyset_sql::ast::{
-    Column, FieldDefinitionExpr, GroupByClause, OrderClause, Relation, SelectStatement,
-    SqlIdentifier, SqlQuery, TableExprInner,
+    Column, Expr, FieldDefinitionExpr, FieldReference, FunctionExpr, GroupByClause, JoinConstraint,
+    JoinRightSide, OrderClause, Relation, SelectStatement, SqlIdentifier, SqlQuery, TableExprInner,
 };
+use readyset_sql::{Dialect, DialectDisplay};
 use tracing::warn;
 
-use crate::{RewriteDialectContext, outermost_table_exprs, util};
+use crate::rewrite_utils::get_from_item_reference_name;
+use crate::{RewriteDialectContext, get_local_from_items_iter, outermost_table_exprs, util};
 
 pub trait ImpliedTablesContext: RewriteDialectContext {
     /// An exhaustive list of all view and table schemas in the database.
+    /// Production impls must include both compiled views/base tables and
+    /// uncompiled views: column resolution needs the full schema universe
+    /// or unqualified columns of uncompiled views go unresolved and trip
+    /// `validate_pipeline_invariants`'s internal error.
     // TODO(mvzink): Find a better way to do this
     fn all_schemas(&self) -> impl IntoIterator<Item = (Relation, Vec<SqlIdentifier>)>;
 }
@@ -37,12 +41,15 @@ pub trait ImpliedTableExpansion: Sized {
 #[derive(Debug)]
 struct ExpandImpliedTablesVisitor<I: ImpliedTablesContext> {
     context: I,
-    /// Map from aliases for subqueries that are in scope, to a list of that subquery's projected
-    /// fields
-    subquery_schemas: HashMap<SqlIdentifier, Vec<SqlIdentifier>>,
-    /// All the tables which are currently in scope for the query, represented as a map from the
-    /// name of the table to its alias (or name, if unaliased)
-    tables: HashMap<Relation, Relation>,
+    /// Stack of subquery-schema scopes (parallel to `tables`). Each scope maps
+    /// subquery aliases to their projected column lists.
+    subquery_schemas: Vec<HashMap<SqlIdentifier, Vec<SqlIdentifier>>>,
+    /// Stack of table scopes, where each scope is a map from table name to its alias
+    /// (or name, if unaliased). The last element is the innermost (current) scope.
+    /// Scope hierarchy is maintained for proper SQL precedence resolution: unqualified
+    /// names are resolved innermost-first, and correlated references to outer scopes
+    /// are found by walking outward.
+    tables: Vec<HashMap<Relation, Relation>>,
     /// The set of aliases for projected fields that are currently in-scope
     aliases: HashSet<SqlIdentifier>,
     // Are we currently in a position in the query that can reference aliases in the projected
@@ -53,21 +60,51 @@ struct ExpandImpliedTablesVisitor<I: ImpliedTablesContext> {
 }
 
 impl<I: ImpliedTablesContext> ExpandImpliedTablesVisitor<I> {
+    /// Resolve an unqualified column name to its table. Searches scopes from
+    /// innermost to outermost, returning the first match. This correctly handles
+    /// both local column resolution and correlated references to outer scopes
+    /// (the outermost match for a non-local column is the correlated table).
     fn find_table(&self, column_name: &str) -> Option<Relation> {
+        for (scope_tables, scope_sq) in self
+            .tables
+            .iter()
+            .rev()
+            .zip(self.subquery_schemas.iter().rev())
+        {
+            if let Some(t) = self.find_table_in_scope(scope_tables, scope_sq, column_name) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    fn find_table_in_scope(
+        &self,
+        tables: &HashMap<Relation, Relation>,
+        subquery_schemas: &HashMap<SqlIdentifier, Vec<SqlIdentifier>>,
+        column_name: &str,
+    ) -> Option<Relation> {
         let mut matches = self
             .context
             .all_schemas()
             .into_iter()
             .chain(
-                self.subquery_schemas
+                subquery_schemas
                     .iter()
                     .map(|(n, fs)| (Relation::from(n.clone()), fs.clone())),
             )
-            .filter_map(|(t, ws)| self.tables.get(&t).cloned().map(|t| (t, ws)))
+            .filter_map(|(t, ws)| tables.get(&t).cloned().map(|t| (t, ws)))
             .filter_map(|(t, ws)| {
                 let num_matching = ws.iter().filter(|c| **c == column_name).count();
-                assert!(num_matching <= 1);
-                if num_matching == 1 { Some(t) } else { None }
+                // Qualify the column with its table as long as at least one
+                // projected name matches.  When there are duplicates
+                // (num_matching > 1), qualifying still lets the downstream
+                // semantic validator (`validate_no_duplicate_derived_table_columns`)
+                // detect and report the ambiguity with a proper user-facing error.
+                // Leaving the column unqualified would instead trigger the
+                // pipeline-invariants check ("Unresolved column"), which is an
+                // internal error that skips the semantic validator entirely.
+                if num_matching > 0 { Some(t) } else { None }
             })
             .collect::<Vec<_>>();
 
@@ -79,12 +116,8 @@ impl<I: ImpliedTablesContext> ExpandImpliedTablesVisitor<I> {
             );
             Some(matches.pop().unwrap())
         } else if matches.is_empty() {
-            // This might be an alias for a computed column, which has no
-            // implied table. So, we allow it to pass and our code should
-            // crash in the future if this is not the case.
             None
         } else {
-            // exactly one match
             Some(matches.pop().unwrap())
         }
     }
@@ -97,25 +130,44 @@ impl<'ast, S: ImpliedTablesContext> VisitorMut<'ast> for ExpandImpliedTablesVisi
         &mut self,
         select_statement: &'ast mut SelectStatement,
     ) -> Result<(), Self::Error> {
-        let orig_tables = mem::replace(
-            &mut self.tables,
-            outermost_table_exprs(select_statement)
-                .filter_map(|tbl| {
-                    Some((
-                        match &tbl.inner {
-                            TableExprInner::Table(t) => t.clone(),
-                            TableExprInner::Subquery(_) => tbl.alias.clone()?.into(),
-                        },
-                        tbl.alias
-                            .clone()
-                            .map(Relation::from)
-                            .or_else(|| tbl.inner.as_table().cloned())?,
-                    ))
-                })
-                .collect(),
-        );
-        let orig_subquery_schemas = mem::replace(
-            &mut self.subquery_schemas,
+        // Reject duplicate effective aliases in FROM — they cause silent wrong
+        // column qualification via HashMap key collisions in `tables`.
+        {
+            let mut seen = HashSet::new();
+            for te in get_local_from_items_iter!(select_statement) {
+                let name = get_from_item_reference_name(te)?;
+                if !seen.insert(name.clone()) {
+                    invalid_query!("Not unique table/alias: {}", name.display(self.dialect));
+                }
+            }
+        }
+
+        // Visit CTEs with the current scope stack BEFORE pushing local scope.
+        // CTEs are logically defined before the SELECT's FROM clause, so their
+        // bodies should see parent scopes but NOT the current SELECT's tables.
+        for cte in &mut select_statement.ctes {
+            self.visit_common_table_expr(cte)?;
+        }
+
+        // Collect local tables for this SELECT statement and push a new scope.
+        let local_tables: HashMap<Relation, Relation> = outermost_table_exprs(select_statement)
+            .filter_map(|tbl| {
+                Some((
+                    match &tbl.inner {
+                        TableExprInner::Table(t) => t.clone(),
+                        TableExprInner::Subquery(_) => tbl.alias.clone()?.into(),
+                        TableExprInner::Values { .. } => tbl.alias.clone()?.into(),
+                    },
+                    tbl.alias
+                        .clone()
+                        .map(Relation::from)
+                        .or_else(|| tbl.inner.as_table().cloned())?,
+                ))
+            })
+            .collect();
+        self.tables.push(local_tables);
+
+        let local_subquery_schemas: HashMap<SqlIdentifier, Vec<SqlIdentifier>> =
             util::subquery_schemas(
                 &mut select_statement.tables,
                 &mut select_statement.ctes,
@@ -124,8 +176,9 @@ impl<'ast, S: ImpliedTablesContext> VisitorMut<'ast> for ExpandImpliedTablesVisi
             )?
             .into_iter()
             .map(|(k, v)| (k.into(), v.into_iter().cloned().collect()))
-            .collect(),
-        );
+            .collect();
+        self.subquery_schemas.push(local_subquery_schemas);
+
         let orig_aliases = mem::replace(
             &mut self.aliases,
             select_statement
@@ -139,18 +192,43 @@ impl<'ast, S: ImpliedTablesContext> VisitorMut<'ast> for ExpandImpliedTablesVisi
                 })
                 .collect(),
         );
-        walk_select_statement(self, select_statement)?;
 
-        self.tables = orig_tables;
-        self.subquery_schemas = orig_subquery_schemas;
+        // Temporarily remove CTEs so walk_select_statement won't visit them again
+        // (we already visited them above with the correct parent scope).
+        let ctes = mem::take(&mut select_statement.ctes);
+        walk_select_statement(self, select_statement)?;
+        select_statement.ctes = ctes;
+
+        // Pop the scope level we pushed.
+        self.tables.pop();
+        self.subquery_schemas.pop();
         self.aliases = orig_aliases;
 
         Ok(())
     }
 
-    fn visit_order_clause(&mut self, order: &'ast mut OrderClause) -> Result<(), Self::Error> {
+    fn visit_having_clause(&mut self, expr: &'ast mut Expr) -> Result<(), Self::Error> {
+        // If the parser accepted a bare alias reference in HAVING, respect it.
+        // MySQL allows this natively; PostgreSQL is stricter, but the parser
+        // enforces that — by the time we see the AST, any bare alias that
+        // survived parsing is intentional.
         self.can_reference_aliases = true;
-        walk_order_clause(self, order)?;
+        self.visit_expr(expr)?;
+        self.can_reference_aliases = false;
+        Ok(())
+    }
+
+    fn visit_order_clause(&mut self, order: &'ast mut OrderClause) -> Result<(), Self::Error> {
+        // Only top-level bare columns may be SELECT-alias references.
+        // Columns nested inside expressions (e.g., SUM(col)) must be qualified
+        // as table columns, even when the column name matches a SELECT alias.
+        for ord_by in order.order_by.iter_mut() {
+            self.can_reference_aliases = matches!(
+                &ord_by.field,
+                FieldReference::Expr(Expr::Column(Column { table: None, .. }))
+            );
+            self.visit_field_reference(&mut ord_by.field)?;
+        }
         self.can_reference_aliases = false;
         Ok(())
     }
@@ -159,10 +237,48 @@ impl<'ast, S: ImpliedTablesContext> VisitorMut<'ast> for ExpandImpliedTablesVisi
         &mut self,
         group_by: &'ast mut GroupByClause,
     ) -> Result<(), Self::Error> {
-        self.can_reference_aliases = true;
-        walk_group_by_clause(self, group_by)?;
+        // Same logic as ORDER BY: only top-level bare columns may reference aliases.
+        for field in group_by.fields.iter_mut() {
+            self.can_reference_aliases = matches!(
+                field,
+                FieldReference::Expr(Expr::Column(Column { table: None, .. }))
+            );
+            self.visit_field_reference(field)?;
+        }
         self.can_reference_aliases = false;
         Ok(())
+    }
+
+    fn visit_function_expr(
+        &mut self,
+        function_expr: &'ast mut FunctionExpr,
+    ) -> Result<(), Self::Error> {
+        // Inside a function call (e.g., SUM(col)), column references are always
+        // table columns, never SELECT aliases.  Temporarily disable alias
+        // recognition so that columns inside aggregates get properly qualified.
+        let saved = self.can_reference_aliases;
+        self.can_reference_aliases = false;
+        walk_function_expr(self, function_expr)?;
+        self.can_reference_aliases = saved;
+        Ok(())
+    }
+
+    fn visit_join_constraint(
+        &mut self,
+        join_constraint: &'ast mut JoinConstraint,
+    ) -> Result<(), Self::Error> {
+        match join_constraint {
+            // ON expressions contain normal column references that need qualification.
+            JoinConstraint::On(expr) => self.visit_expr(expr),
+            // USING columns are bare column *names* (not references) that identify
+            // a column present on both sides of the join.  They must NOT be qualified
+            // here — `expand_join_on_using` (which runs next) reads only `.name` and
+            // builds fresh, correctly-qualified ON predicates.  Qualifying them would
+            // trigger a spurious "Ambiguous column" warning in `find_table` (the name
+            // exists on both sides by design) and attach an arbitrary table.
+            JoinConstraint::Using(_) => Ok(()),
+            JoinConstraint::Empty => Ok(()),
+        }
     }
 
     fn visit_column(&mut self, column: &'ast mut Column) -> Result<(), Self::Error> {
@@ -175,22 +291,25 @@ impl<'ast, S: ImpliedTablesContext> VisitorMut<'ast> for ExpandImpliedTablesVisi
                 return Ok(());
             }
 
-            let matches = self
-                .tables
-                .iter()
-                .filter(|(t, _alias)| t.name == table.name)
-                .map(|(_t, alias)| alias)
-                .collect::<Vec<_>>();
+            // Search scopes from innermost to outermost for the table reference.
+            // First match wins (local scope shadows outer scopes).
+            for scope in self.tables.iter().rev() {
+                let matches: Vec<_> = scope
+                    .iter()
+                    .filter(|(t, _alias)| t.name == table.name)
+                    .map(|(_t, alias)| alias)
+                    .collect();
 
-            if matches.len() > 1 {
-                return Err(invalid_query_err!(
-                    "Table reference {} is ambiguous",
-                    table.display_unquoted()
-                ));
-            }
-
-            if let Some(t) = matches.first() {
-                table.schema.clone_from(&t.schema);
+                if matches.len() > 1 {
+                    invalid_query!(
+                        "Table reference {} is ambiguous",
+                        table.display(self.dialect)
+                    );
+                } else if let Some(resolved) = matches.first() {
+                    table.schema.clone_from(&resolved.schema);
+                    return Ok(());
+                }
+                // Not found at this scope level, continue to outer scope.
             }
         } else {
             column.table = self.find_table(&column.name);
@@ -207,8 +326,8 @@ fn rewrite_select<S: ImpliedTablesContext>(
     let dialect = context.dialect().into();
     let mut visitor = ExpandImpliedTablesVisitor {
         context,
-        subquery_schemas: Default::default(),
-        tables: Default::default(),
+        subquery_schemas: Vec::new(),
+        tables: Vec::new(),
         aliases: Default::default(),
         can_reference_aliases: false,
         dialect,
@@ -680,6 +799,456 @@ mod tests {
             "\n left: {}\nright: {}",
             q.display(Dialect::PostgreSQL),
             expected.display(Dialect::PostgreSQL)
+        );
+    }
+
+    /// MySQL: Outer ORDER BY SUM(test_dec) must qualify test_dec inside the
+    /// aggregate to the derived-table column (t.test_dec), not skip it as a
+    /// SELECT alias.  Inner HAVING uses a bare alias reference (test_dec > ...)
+    /// which MySQL allows — it should stay unqualified.
+    #[test]
+    fn order_by_agg_over_aliased_column_having_alias_ref() {
+        let schema: HashMap<Relation, Vec<SqlIdentifier>> = [(
+            Relation {
+                schema: Some("qa".into()),
+                name: "datatypes".into(),
+            },
+            vec!["rownum".into(), "test_dec".into()],
+        )]
+        .into();
+
+        let mut q = parse_query_with_config(
+            ParsingPreset::OnlySqlparser,
+            Dialect::MySQL,
+            r#"SELECT rownum, test_dec
+               FROM (SELECT rownum, SUM(test_dec) AS test_dec
+                     FROM qa.datatypes
+                     GROUP BY rownum
+                     HAVING test_dec > 100000.00 AND rownum > 2) t
+               ORDER BY SUM(test_dec)"#,
+        )
+        .unwrap();
+
+        // Inner: rownum and test_dec inside SUM() qualify to qa.datatypes.
+        //        HAVING bare test_dec stays unqualified — MySQL allows
+        //        SELECT-alias references in HAVING.
+        //        rownum in HAVING is NOT a SELECT alias (no explicit AS),
+        //        so it qualifies to qa.datatypes.rownum.
+        // Outer: rownum and test_dec in SELECT qualify to t.
+        //        ORDER BY SUM(test_dec): test_dec inside SUM qualifies to t
+        //        (the only FROM source in scope).
+        let expected = parse_query_with_config(
+            ParsingPreset::OnlySqlparser,
+            Dialect::MySQL,
+            r#"SELECT `t`.`rownum`, `t`.`test_dec`
+               FROM (SELECT `qa`.`datatypes`.`rownum`,
+                            SUM(`qa`.`datatypes`.`test_dec`) AS `test_dec`
+                     FROM `qa`.`datatypes`
+                     GROUP BY `qa`.`datatypes`.`rownum`
+                     HAVING `test_dec` > 100000.00
+                        AND `qa`.`datatypes`.`rownum` > 2) `t`
+               ORDER BY SUM(`t`.`test_dec`)"#,
+        )
+        .unwrap();
+
+        q.expand_implied_tables(TestImpliedTablesContext {
+            schema,
+            dialect: Dialect::MySQL,
+        })
+        .unwrap();
+        assert_eq!(
+            q,
+            expected,
+            "\n left: {}\nright: {}",
+            q.display(Dialect::MySQL),
+            expected.display(Dialect::MySQL)
+        );
+    }
+
+    /// Same as above but inner HAVING uses the full aggregate expression
+    /// SUM(test_dec) instead of the alias.  test_dec inside SUM is a table
+    /// column reference (not an alias) — it must be qualified.
+    #[test]
+    fn order_by_agg_over_aliased_column_having_agg_expr() {
+        let schema: HashMap<Relation, Vec<SqlIdentifier>> = [(
+            Relation {
+                schema: Some("qa".into()),
+                name: "datatypes".into(),
+            },
+            vec!["rownum".into(), "test_dec".into()],
+        )]
+        .into();
+
+        let mut q = parse_query_with_config(
+            ParsingPreset::OnlySqlparser,
+            Dialect::PostgreSQL,
+            r#"SELECT rownum, test_dec
+               FROM (SELECT rownum, SUM(test_dec) AS test_dec
+                     FROM qa.datatypes
+                     GROUP BY rownum
+                     HAVING SUM(test_dec) > 100000.00 AND rownum > 2) t
+               ORDER BY SUM(test_dec)"#,
+        )
+        .unwrap();
+
+        // Inner HAVING SUM(test_dec): test_dec inside the aggregate is a
+        // table column reference → qualifies to qa.datatypes.test_dec.
+        // rownum in HAVING is NOT a SELECT alias → also qualifies.
+        let expected = parse_query_with_config(
+            ParsingPreset::OnlySqlparser,
+            Dialect::PostgreSQL,
+            r#"SELECT "t"."rownum", "t"."test_dec"
+               FROM (SELECT "qa"."datatypes"."rownum",
+                            SUM("qa"."datatypes"."test_dec") AS "test_dec"
+                     FROM "qa"."datatypes"
+                     GROUP BY "qa"."datatypes"."rownum"
+                     HAVING SUM("qa"."datatypes"."test_dec") > 100000.00
+                        AND "qa"."datatypes"."rownum" > 2) "t"
+               ORDER BY SUM("t"."test_dec")"#,
+        )
+        .unwrap();
+
+        q.expand_implied_tables(TestImpliedTablesContext {
+            schema,
+            dialect: Dialect::PostgreSQL,
+        })
+        .unwrap();
+        assert_eq!(
+            q,
+            expected,
+            "\n left: {}\nright: {}",
+            q.display(Dialect::PostgreSQL),
+            expected.display(Dialect::PostgreSQL)
+        );
+    }
+
+    #[test]
+    fn unqualified_correlated_column() {
+        let schema: HashMap<Relation, Vec<SqlIdentifier>> = [
+            (
+                Relation {
+                    schema: Some("qa".into()),
+                    name: "spj".into(),
+                },
+                vec!["sn".into(), "qty".into()],
+            ),
+            (
+                Relation {
+                    schema: Some("qa".into()),
+                    name: "s".into(),
+                },
+                vec!["sn".into(), "status".into()],
+            ),
+        ]
+        .into();
+
+        let mut q = parse_query_with_config(
+            ParsingPreset::OnlySqlparser,
+            Dialect::PostgreSQL,
+            r#"SELECT spj.sn, Tab3.sn, spj.qty FROM qa.spj,
+            LATERAL (SELECT status, sn FROM qa.s WHERE status = qty) AS Tab3
+            ORDER BY spj.sn, spj.qty;"#,
+        )
+        .unwrap();
+
+        let expected = parse_query_with_config(
+            ParsingPreset::OnlySqlparser,
+            Dialect::PostgreSQL,
+            r#"SELECT qa.spj.sn, Tab3.sn, qa.spj.qty FROM qa.spj,
+            LATERAL (SELECT qa.s.status, qa.s.sn FROM qa.s WHERE qa.s.status = qa.spj.qty) AS Tab3
+            ORDER BY qa.spj.sn, qa.spj.qty;"#,
+        )
+        .unwrap();
+
+        q.expand_implied_tables(TestImpliedTablesContext {
+            schema,
+            dialect: Dialect::PostgreSQL,
+        })
+        .unwrap();
+        assert_eq!(
+            q,
+            expected,
+            "\n left: {}\nright: {}",
+            q.display(Dialect::PostgreSQL),
+            expected.display(Dialect::PostgreSQL)
+        );
+    }
+
+    #[test]
+    fn correlated_subquery_column_qualification() {
+        // Correlated columns in non-LATERAL subqueries are properly qualified
+        // with the outer query's table name.
+        let mut q = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM users WHERE id IN (
+                SELECT user_id FROM posts WHERE author = name
+            )",
+        )
+        .unwrap();
+        let expected = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM users WHERE users.id IN (
+                SELECT posts.user_id FROM posts WHERE posts.author = users.name
+            )",
+        )
+        .unwrap();
+        let schema = [
+            (
+                Relation::from("users"),
+                vec!["id".into(), "name".into(), "email".into()],
+            ),
+            (
+                Relation::from("posts"),
+                vec!["id".into(), "user_id".into(), "author".into()],
+            ),
+        ]
+        .into();
+
+        q.expand_implied_tables(TestImpliedTablesContext {
+            schema,
+            dialect: Dialect::MySQL,
+        })
+        .unwrap();
+        assert_eq!(
+            q,
+            expected,
+            "\n left: {}\nright: {}",
+            q.display(Dialect::MySQL),
+            expected.display(Dialect::MySQL)
+        );
+    }
+
+    #[test]
+    fn correlated_subquery_nested_deep() {
+        // Deeply nested: innermost correlates with the outermost (skipping t2).
+        let mut q = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM t1 WHERE id IN (
+                SELECT t1_id FROM t2 WHERE value IN (
+                    SELECT val FROM t3 WHERE ref_col = name
+                )
+            )",
+        )
+        .unwrap();
+        let expected = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM t1 WHERE t1.id IN (
+                SELECT t2.t1_id FROM t2 WHERE t2.value IN (
+                    SELECT t3.val FROM t3 WHERE t3.ref_col = t1.name
+                )
+            )",
+        )
+        .unwrap();
+        let schema = [
+            (Relation::from("t1"), vec!["id".into(), "name".into()]),
+            (Relation::from("t2"), vec!["t1_id".into(), "value".into()]),
+            (Relation::from("t3"), vec!["val".into(), "ref_col".into()]),
+        ]
+        .into();
+
+        q.expand_implied_tables(TestImpliedTablesContext {
+            schema,
+            dialect: Dialect::MySQL,
+        })
+        .unwrap();
+        assert_eq!(
+            q,
+            expected,
+            "\n left: {}\nright: {}",
+            q.display(Dialect::MySQL),
+            expected.display(Dialect::MySQL)
+        );
+    }
+
+    #[test]
+    fn scope_local_shadows_outer() {
+        // Local table with same name shadows outer. Both `id` references
+        // resolve to the inner `t1`, not the outer.
+        let mut q = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM t1 WHERE EXISTS (
+                SELECT * FROM t1 WHERE t1.id = id
+            )",
+        )
+        .unwrap();
+        let expected = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM t1 WHERE EXISTS (
+                SELECT * FROM t1 WHERE t1.id = t1.id
+            )",
+        )
+        .unwrap();
+        let schema = [(Relation::from("t1"), vec!["id".into(), "name".into()])].into();
+
+        q.expand_implied_tables(TestImpliedTablesContext {
+            schema,
+            dialect: Dialect::MySQL,
+        })
+        .unwrap();
+        assert_eq!(
+            q,
+            expected,
+            "\n left: {}\nright: {}",
+            q.display(Dialect::MySQL),
+            expected.display(Dialect::MySQL)
+        );
+    }
+
+    #[test]
+    fn scope_precedence_local_wins_all_levels() {
+        // 5 levels deep: all tables have 'id' and 'val' columns.
+        // At each level, unqualified columns resolve to the LOCAL scope.
+        let mut q = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM t1 WHERE id IN (
+                SELECT * FROM t2 WHERE id IN (
+                    SELECT * FROM t3 WHERE id IN (
+                        SELECT * FROM t4 WHERE id IN (
+                            SELECT * FROM t5 WHERE val = id
+                        )
+                    )
+                )
+            )",
+        )
+        .unwrap();
+        let expected = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM t1 WHERE t1.id IN (
+                SELECT * FROM t2 WHERE t2.id IN (
+                    SELECT * FROM t3 WHERE t3.id IN (
+                        SELECT * FROM t4 WHERE t4.id IN (
+                            SELECT * FROM t5 WHERE t5.val = t5.id
+                        )
+                    )
+                )
+            )",
+        )
+        .unwrap();
+        let schema = [
+            (Relation::from("t1"), vec!["id".into(), "val".into()]),
+            (Relation::from("t2"), vec!["id".into(), "val".into()]),
+            (Relation::from("t3"), vec!["id".into(), "val".into()]),
+            (Relation::from("t4"), vec!["id".into(), "val".into()]),
+            (Relation::from("t5"), vec!["id".into(), "val".into()]),
+        ]
+        .into();
+
+        q.expand_implied_tables(TestImpliedTablesContext {
+            schema,
+            dialect: Dialect::MySQL,
+        })
+        .unwrap();
+        assert_eq!(
+            q,
+            expected,
+            "\n left: {}\nright: {}",
+            q.display(Dialect::MySQL),
+            expected.display(Dialect::MySQL)
+        );
+    }
+
+    #[test]
+    fn scope_precedence_skip_intermediate_levels() {
+        // Correlation can skip intermediate levels:
+        // - t1 has: id, a, b, c  |  t2 has: id, b  |  t3 has: id, c  |  t4 has: id
+        // In t4: 'a' correlates from t1 (skips t2, t3), 'b' from t2 (skips t3), 'c' from t3.
+        let mut q = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM t1 WHERE id IN (
+                SELECT * FROM t2 WHERE id IN (
+                    SELECT * FROM t3 WHERE id IN (
+                        SELECT * FROM t4 WHERE a = b AND b = c
+                    )
+                )
+            )",
+        )
+        .unwrap();
+        let expected = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM t1 WHERE t1.id IN (
+                SELECT * FROM t2 WHERE t2.id IN (
+                    SELECT * FROM t3 WHERE t3.id IN (
+                        SELECT * FROM t4 WHERE t1.a = t2.b AND t2.b = t3.c
+                    )
+                )
+            )",
+        )
+        .unwrap();
+        let schema = [
+            (
+                Relation::from("t1"),
+                vec!["id".into(), "a".into(), "b".into(), "c".into()],
+            ),
+            (Relation::from("t2"), vec!["id".into(), "b".into()]),
+            (Relation::from("t3"), vec!["id".into(), "c".into()]),
+            (Relation::from("t4"), vec!["id".into()]),
+        ]
+        .into();
+
+        q.expand_implied_tables(TestImpliedTablesContext {
+            schema,
+            dialect: Dialect::MySQL,
+        })
+        .unwrap();
+        assert_eq!(
+            q,
+            expected,
+            "\n left: {}\nright: {}",
+            q.display(Dialect::MySQL),
+            expected.display(Dialect::MySQL)
+        );
+    }
+
+    #[test]
+    fn scope_precedence_mixed_local_and_correlation() {
+        // 4 levels with mixed scenarios:
+        // t1: id, name, x  |  t2: id, y  |  t3: id, z  |  t4: id
+        // At t4: 'id' is local, 'x' correlates from t1, 'name' correlates from t1,
+        //        'z' correlates from t3.
+        let mut q = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM t1 WHERE id IN (
+                SELECT * FROM t2 WHERE id IN (
+                    SELECT * FROM t3 WHERE id IN (
+                        SELECT * FROM t4 WHERE id = x AND name = z
+                    )
+                )
+            )",
+        )
+        .unwrap();
+        let expected = parse_query(
+            Dialect::MySQL,
+            "SELECT * FROM t1 WHERE t1.id IN (
+                SELECT * FROM t2 WHERE t2.id IN (
+                    SELECT * FROM t3 WHERE t3.id IN (
+                        SELECT * FROM t4 WHERE t4.id = t1.x AND t1.name = t3.z
+                    )
+                )
+            )",
+        )
+        .unwrap();
+        let schema = [
+            (
+                Relation::from("t1"),
+                vec!["id".into(), "name".into(), "x".into()],
+            ),
+            (Relation::from("t2"), vec!["id".into(), "y".into()]),
+            (Relation::from("t3"), vec!["id".into(), "z".into()]),
+            (Relation::from("t4"), vec!["id".into()]),
+        ]
+        .into();
+
+        q.expand_implied_tables(TestImpliedTablesContext {
+            schema,
+            dialect: Dialect::MySQL,
+        })
+        .unwrap();
+        assert_eq!(
+            q,
+            expected,
+            "\n left: {}\nright: {}",
+            q.display(Dialect::MySQL),
+            expected.display(Dialect::MySQL)
         );
     }
 }

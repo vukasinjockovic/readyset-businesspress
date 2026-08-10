@@ -54,6 +54,18 @@ pub(crate) enum SnapshotType {
 }
 
 impl SnapshotType {
+    /// Positions of the columns that identify a row, for reporting which row failed to convert.
+    /// Empty for [`SnapshotType::FullTableScan`], where callers report every column instead.
+    ///
+    /// These are positions in the snapshot's select list, which is built from the same
+    /// `CreateTableBody::fields` ordering that the indices were resolved against.
+    pub(crate) fn identifier_columns(&self) -> &[usize] {
+        match self {
+            SnapshotType::KeyBased { column_indices, .. } => column_indices,
+            SnapshotType::FullTableScan => &[],
+        }
+    }
+
     pub fn new(table: &readyset_client::Table) -> ReadySetResult<Self> {
         let cts = match table.schema() {
             Some(cts) => cts,
@@ -125,6 +137,7 @@ impl SnapshotType {
         &self,
         table_name: &Relation,
         snapshot_query_comment: Option<String>,
+        columns: Option<&[SqlIdentifier]>,
     ) -> (String, String, String, String) {
         let force_index = match self {
             SnapshotType::KeyBased { name, .. } => {
@@ -161,6 +174,17 @@ impl SnapshotType {
             .map(|s| format!(" /*{s} */"))
             .unwrap_or_default();
 
+        // Use explicit column list instead of `*` to include invisible columns
+        // (MySQL excludes them from SELECT *). Fall back to `*` if no schema.
+        let select_list = columns
+            .map(|cols| {
+                cols.iter()
+                    .map(|c| readyset_sql::Dialect::MySQL.quote_identifier(c).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "*".to_string());
+
         let (initial_query, bound_based_query) = match self {
             SnapshotType::KeyBased { ref keys, .. } => {
                 let keys = keys
@@ -185,14 +209,14 @@ impl SnapshotType {
                 let next_bound = format!("({next_bound})");
 
                 let initial_query = format!(
-                    "SELECT{snapshot_query_comment} * FROM {} {} ORDER BY {} LIMIT {}",
+                    "SELECT{snapshot_query_comment} {select_list} FROM {} {} ORDER BY {} LIMIT {}",
                     table_name.display(readyset_sql::Dialect::MySQL),
                     force_index,
                     order_by,
                     MYSQL_BATCH_SIZE
                 );
                 let bound_based_query = format!(
-                    "SELECT{snapshot_query_comment} * FROM {} {} WHERE {} ORDER BY {} LIMIT {}",
+                    "SELECT{snapshot_query_comment} {select_list} FROM {} {} WHERE {} ORDER BY {} LIMIT {}",
                     table_name.display(readyset_sql::Dialect::MySQL),
                     force_index,
                     next_bound,
@@ -203,7 +227,7 @@ impl SnapshotType {
             }
             SnapshotType::FullTableScan => {
                 let initial_query = format!(
-                    "SELECT{snapshot_query_comment} * FROM {}",
+                    "SELECT{snapshot_query_comment} {select_list} FROM {}",
                     table_name.display(readyset_sql::Dialect::MySQL)
                 );
                 (initial_query.clone(), initial_query)
@@ -266,6 +290,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn identifier_columns_are_the_key_positions() {
+        let snapshot_type = SnapshotType::KeyBased {
+            name: Some(SqlIdentifier::from("PRIMARY")),
+            keys: vec![Column::from(SqlIdentifier::from("b"))],
+            column_indices: vec![2, 0],
+        };
+        assert_eq!(snapshot_type.identifier_columns(), &[2, 0]);
+    }
+
+    #[test]
+    fn identifier_columns_empty_for_full_table_scan() {
+        assert!(SnapshotType::FullTableScan.identifier_columns().is_empty());
+    }
+
+    #[test]
     fn snapshot_query_no_comment() {
         let snapshot_type = SnapshotType::KeyBased {
             name: Some(SqlIdentifier::from("PRIMARY")),
@@ -277,7 +316,7 @@ mod tests {
             name: SqlIdentifier::from("test"),
         };
         let (count_query, initial_query, bound_based_query, collation_query) =
-            snapshot_type.get_queries(&table_name, None);
+            snapshot_type.get_queries(&table_name, None, None);
         assert_eq!(count_query, "SELECT TABLE_ROWS FROM information_schema.tables WHERE TABLE_NAME = 'test' AND TABLE_SCHEMA = 'test'");
         assert_eq!(
             initial_query,
@@ -288,7 +327,7 @@ mod tests {
 
         let snapshot_type = SnapshotType::FullTableScan;
         let (_count_query, initial_query, bound_based_query, _collation_query) =
-            snapshot_type.get_queries(&table_name, None);
+            snapshot_type.get_queries(&table_name, None, None);
         assert_eq!(bound_based_query, initial_query);
         assert_eq!(initial_query, "SELECT * FROM `test`.`test`");
     }
@@ -306,17 +345,47 @@ mod tests {
         };
 
         let (_count_query, initial_query, bound_based_query, _collation_query) =
-            snapshot_type.get_queries(&table_name, Some("+ PT_KILL_BYPASS".to_string()));
+            snapshot_type.get_queries(&table_name, Some("+ PT_KILL_BYPASS".to_string()), None);
         assert_eq!(initial_query, "SELECT /*+ PT_KILL_BYPASS */ * FROM `test`.`test` FORCE INDEX (`PRIMARY`) ORDER BY `id` ASC LIMIT 100000");
         assert_eq!(bound_based_query, "SELECT /*+ PT_KILL_BYPASS */ * FROM `test`.`test` FORCE INDEX (`PRIMARY`) WHERE ((`id` > ?)) ORDER BY `id` ASC LIMIT 100000");
 
         let snapshot_type = SnapshotType::FullTableScan;
         let (_count_query, initial_query, bound_based_query, _collation_query) =
-            snapshot_type.get_queries(&table_name, Some("+ PT_KILL_BYPASS".to_string()));
+            snapshot_type.get_queries(&table_name, Some("+ PT_KILL_BYPASS".to_string()), None);
         assert_eq!(
             initial_query,
             "SELECT /*+ PT_KILL_BYPASS */ * FROM `test`.`test`"
         );
         assert_eq!(bound_based_query, initial_query);
+    }
+
+    #[test]
+    fn snapshot_query_with_explicit_columns() {
+        let columns = vec![SqlIdentifier::from("a"), SqlIdentifier::from("b")];
+
+        let snapshot_type = SnapshotType::KeyBased {
+            name: Some(SqlIdentifier::from("PRIMARY")),
+            keys: vec![Column::from(SqlIdentifier::from("a"))],
+            column_indices: vec![0],
+        };
+        let table_name = Relation {
+            schema: Some(SqlIdentifier::from("db")),
+            name: SqlIdentifier::from("foo"),
+        };
+        let (_count_query, initial_query, bound_based_query, _collation_query) =
+            snapshot_type.get_queries(&table_name, None, Some(&columns));
+        assert_eq!(
+            initial_query,
+            "SELECT `a`, `b` FROM `db`.`foo` FORCE INDEX (`PRIMARY`) ORDER BY `a` ASC LIMIT 100000"
+        );
+        assert_eq!(
+            bound_based_query,
+            "SELECT `a`, `b` FROM `db`.`foo` FORCE INDEX (`PRIMARY`) WHERE ((`a` > ?)) ORDER BY `a` ASC LIMIT 100000"
+        );
+
+        let snapshot_type = SnapshotType::FullTableScan;
+        let (_count_query, initial_query, _bound_based_query, _collation_query) =
+            snapshot_type.get_queries(&table_name, None, Some(&columns));
+        assert_eq!(initial_query, "SELECT `a`, `b` FROM `db`.`foo`");
     }
 }

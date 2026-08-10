@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fmt::{self, Display};
 
 use fallible_iterator::FallibleIterator;
@@ -23,6 +24,9 @@ use crate::{DfType, DfValue, DfValueKind};
 /// 3. Are always homogeneously typed
 ///
 /// This struct supports the first two features, but does not enforce the third.
+//
+// NOTE: PartialEq/Hash are derived, but Ord/PartialOrd are manually implemented
+// with PostgreSQL NULL-high semantics. Consistency is verified by ord_laws! proptests.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Array {
     /// The lower bounds for each of the dimensions
@@ -116,6 +120,69 @@ impl Array {
             .map(|contents| ArrayView { contents })
     }
 
+    /// Construct a multidimensional array by stacking a list of sub-arrays as a new outer
+    /// dimension. All sub-arrays must have the same shape and lower bounds. This is used by
+    /// `array_agg()` when aggregating array-typed columns — PostgreSQL produces a
+    /// (N+1)-dimensional array from N-dimensional elements.
+    ///
+    /// Accepts `Arc<Array>` references to avoid unnecessary deep clones when the caller
+    /// already holds Arc-wrapped arrays.
+    ///
+    /// If `sub_arrays` is empty, returns an empty 1D array. If any sub-array has a different
+    /// shape or lower bounds than the first, returns an error.
+    pub fn from_sub_arrays(sub_arrays: &[std::sync::Arc<Array>]) -> ReadySetResult<Self> {
+        if sub_arrays.is_empty() {
+            return Ok(Self::from(vec![]));
+        }
+
+        let expected_shape = sub_arrays[0].contents.shape();
+        let expected_bounds = &sub_arrays[0].lower_bounds;
+        let elements_per_sub: usize = expected_shape.iter().product();
+        let mut all_values = Vec::with_capacity(sub_arrays.len() * elements_per_sub);
+        for arr in sub_arrays {
+            if arr.contents.shape() != expected_shape {
+                return Err(invalid_query_err!(
+                    "Multidimensional arrays must have sub-arrays with matching dimensions"
+                ));
+            }
+            if arr.lower_bounds != *expected_bounds {
+                return Err(invalid_query_err!(
+                    "Multidimensional arrays must have sub-arrays with matching lower bounds"
+                ));
+            }
+            all_values.extend(arr.contents.iter().cloned());
+        }
+
+        let mut new_shape: SmallVec<[usize; 4]> = smallvec![sub_arrays.len()];
+        new_shape.extend_from_slice(expected_shape);
+        let mut lower_bounds: SmallVec<[i32; 2]> = smallvec![1]; // outer dim starts at 1
+        lower_bounds.extend_from_slice(expected_bounds);
+
+        Ok(Self {
+            lower_bounds,
+            contents: ArrayD::from_shape_vec(IxDyn(&new_shape), all_values).map_err(|e| {
+                invalid_query_err!("Failed to construct multidimensional array: {e}")
+            })?,
+        })
+    }
+
+    /// Split a multidimensional array into sub-arrays along the outermost dimension.
+    /// Each element of the returned Vec is an owned `Array` representing one slice of the
+    /// outer dimension. This is the inverse of [`from_sub_arrays`].
+    ///
+    /// For a 1D array, returns each scalar element wrapped in `DfValue` directly (via the
+    /// caller — this method is only intended for ndim > 1).
+    pub fn into_sub_arrays(self) -> Vec<Array> {
+        let inner_bounds: SmallVec<[i32; 2]> = self.lower_bounds[1..].into();
+        self.contents
+            .outer_iter()
+            .map(|view| Array {
+                lower_bounds: inner_bounds.clone(),
+                contents: view.to_owned(),
+            })
+            .collect()
+    }
+
     /// Returns `true` if the array does not contain a mix of inferred types.
     pub fn is_homogeneous(&self) -> bool {
         let mut iter = self.values();
@@ -161,15 +228,68 @@ impl Array {
     /// - Duplicates don't matter: `ARRAY[1,1] @> ARRAY[1]` is true
     /// - Empty array is contained by everything
     /// - Multi-dimensional arrays are flattened to element sets for comparison
-    /// - NULL contains NULL (element-level equality)
+    /// - NULL needles always fail: PostgreSQL's `=` yields NULL for `NULL = x`,
+    ///   so a NULL element in `other` can never be "found" in `self`
+    ///
+    /// NOTE: For large arrays, uses `HashSet` for O(n+m) lookup. This relies on
+    /// arrays being homogeneously typed (as in PostgreSQL). `DfValue`'s `Hash` and
+    /// `PartialEq` are not fully consistent across type variants (e.g.,
+    /// `Int(1) == UnsignedInt(1)` but they hash differently), so mixed-type arrays
+    /// could produce incorrect results via hash-bucket misses. For small arrays,
+    /// falls back to O(n*m) linear scan to avoid HashSet allocation overhead.
     pub fn contains(&self, other: &Array) -> bool {
         if other.is_empty() {
             return true;
         }
+        if self.is_empty() {
+            return false;
+        }
+        // A NULL needle can never be "found" (PG's = yields NULL for NULL = anything),
+        // so !needle.is_none() short-circuits to false for NULL elements in `other`.
+        let n = self.contents.len();
+        let m = other.contents.len();
+        if n * m <= 64 {
+            // For small arrays, linear scan avoids HashSet allocation overhead.
+            return other
+                .contents
+                .iter()
+                .all(|needle| !needle.is_none() && self.contents.iter().any(|e| e == needle));
+        }
+        let haystack: HashSet<&DfValue> = self.contents.iter().collect();
         other
             .contents
             .iter()
-            .all(|needle| self.contents.iter().any(|e| e == needle))
+            .all(|needle| !needle.is_none() && haystack.contains(needle))
+    }
+
+    /// PostgreSQL array overlap (`&&`): returns `true` if `self` and `other` share at least one
+    /// common element.
+    ///
+    /// Semantics follow PostgreSQL:
+    /// - Set-based comparison: element order is irrelevant
+    /// - Multi-dimensional arrays are flattened to element sets
+    /// - Empty arrays never overlap with anything
+    /// - NULL elements are skipped (PostgreSQL's `=` yields NULL for `NULL = NULL`)
+    ///
+    /// NOTE: Uses `HashSet` for O(n+m) lookup. This relies on arrays being
+    /// homogeneously typed (as in PostgreSQL). `DfValue`'s `Hash` and `PartialEq`
+    /// are not fully consistent across type variants, so mixed-type arrays could
+    /// produce incorrect results via hash-bucket misses.
+    pub fn overlaps(&self, other: &Array) -> bool {
+        if self.is_empty() || other.is_empty() {
+            return false;
+        }
+        // Build HashSet from the smaller array for efficiency.
+        let (build_from, probe_with) = if self.contents.len() <= other.contents.len() {
+            (&self.contents, &other.contents)
+        } else {
+            (&other.contents, &self.contents)
+        };
+        let haystack: HashSet<&DfValue> = build_from.iter().filter(|v| !v.is_none()).collect();
+        probe_with
+            .iter()
+            .filter(|v| !v.is_none())
+            .any(|e| haystack.contains(e))
     }
 
     /// PostgreSQL array concatenation (`||`): produces a new 1-D array by appending elements.
@@ -196,12 +316,45 @@ impl Array {
     }
 }
 
+/// Lexicographically compare two element iterators with PostgreSQL NULL semantics:
+/// NULL is considered greater than any non-NULL value. If one iterator is a prefix
+/// of the other, the shorter one is less.
+///
+/// This differs from `DfValue::cmp`, where `None` (variant 0) sorts below all
+/// other variants. We cannot change `DfValue::Ord` globally because range query
+/// sentinels (`DfValue::MIN`) depend on `None` being the minimum value.
+fn cmp_elements_nulls_high<'a>(
+    mut a: impl Iterator<Item = &'a DfValue>,
+    mut b: impl Iterator<Item = &'a DfValue>,
+) -> Ordering {
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                // Match on DfValue variants directly: DfValue::None represents SQL NULL
+                let ord = match (x, y) {
+                    (DfValue::None, DfValue::None) => Ordering::Equal,
+                    (DfValue::None, _) => Ordering::Greater,
+                    (_, DfValue::None) => Ordering::Less,
+                    _ => x.cmp(y),
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+    }
+}
+
 impl Ord for Array {
     fn cmp(&self, other: &Self) -> Ordering {
         // PostgreSQL array comparison semantics:
         // 1. Compare elements in row-major order (element-by-element lexicographic).
-        //    Iterator::cmp handles the prefix case: shorter is less when one array
-        //    is a prefix of the other.
+        //    NULL is greater than any non-NULL value (handled by
+        //    cmp_elements_nulls_high). Shorter is less when one array is a prefix
+        //    of the other.
         // 2. If contents are equal, compare number of dimensions as tiebreaker.
         // 3. If ndim also equal, compare dimension sizes lexicographically.
         // 4. Lower bounds as final tiebreaker for Ord/PartialEq consistency.
@@ -209,9 +362,7 @@ impl Ord for Array {
         // From the PostgreSQL docs: "If the contents of two arrays are equal but
         // the dimensionality is different, the first difference in the
         // dimensionality information determines the sort order."
-        self.contents
-            .iter()
-            .cmp(other.contents.iter())
+        cmp_elements_nulls_high(self.contents.iter(), other.contents.iter())
             .then_with(|| self.contents.ndim().cmp(&other.contents.ndim()))
             .then_with(|| self.contents.shape().cmp(other.contents.shape()))
             .then_with(|| self.lower_bounds.cmp(&other.lower_bounds))
@@ -660,11 +811,36 @@ mod tests {
         })
     }
 
+    /// Strategy that generates 1-D arrays with a mix of NULL and Int elements.
+    /// This exercises the NULL-aware comparison logic in `cmp_elements_nulls_high`.
+    fn nullable_int_array() -> impl Strategy<Value = Array> {
+        use proptest::collection::vec;
+        use proptest::prelude::*;
+
+        vec(
+            prop_oneof![Just(DfValue::None), any::<i64>().prop_map(DfValue::from),],
+            1..=5,
+        )
+        .prop_map(Array::from)
+    }
+
     ord_laws!(
         // see [note: mixed-type-comparisons]
         #[strategy(non_numeric_array())]
         Array
     );
+
+    // Also verify Ord laws hold for arrays containing NULLs, since Array::cmp
+    // uses custom NULL ordering (cmp_elements_nulls_high) that differs from
+    // DfValue::Ord.
+    mod ord_with_nulls {
+        use super::*;
+
+        ord_laws!(
+            #[strategy(nullable_int_array())]
+            Array
+        );
+    }
 
     #[test]
     fn from_vec() {
@@ -959,6 +1135,26 @@ mod tests {
         assert_eq!(a == b, a.cmp(&b) == Ordering::Equal);
     }
 
+    // Proptest: Ord and PartialEq must agree for nullable arrays
+    #[tags(no_retry)]
+    #[proptest]
+    fn eq_consistent_with_cmp_nullable(
+        #[strategy(nullable_int_array())] a: Array,
+        #[strategy(nullable_int_array())] b: Array,
+    ) {
+        assert_eq!(a == b, a.cmp(&b) == Ordering::Equal);
+    }
+
+    // Proptest: NULL element is always greater than any non-NULL Int element
+    #[tags(no_retry)]
+    #[proptest]
+    fn null_element_greater_than_int(v: i64) {
+        let null_arr = Array::from(vec![DfValue::None]);
+        let int_arr = Array::from(vec![DfValue::from(v)]);
+        assert_eq!(null_arr.cmp(&int_arr), Ordering::Greater);
+        assert_eq!(int_arr.cmp(&null_arr), Ordering::Less);
+    }
+
     // --- 1-D comparison tests ---
 
     #[test]
@@ -1205,21 +1401,39 @@ mod tests {
     }
 
     // --- NULL element tests ---
-    // NOTE: PostgreSQL treats NULL as greater than any non-NULL value in array
-    // element comparison. DfValue::Ord compares mismatched variants by
-    // discriminant order, where None (variant 0) < Int (variant 1). This means
-    // ReadySet's NULL ordering in arrays does NOT match PostgreSQL. Fixing this
-    // requires changes to DfValue::Ord, which is out of scope for this change.
-    // These tests document the current (incorrect) behavior.
+    // PostgreSQL treats NULL as greater than any non-NULL value in array element
+    // comparison. Array::cmp uses cmp_elements_nulls_high to match this behavior.
 
     #[test]
-    fn cmp_1d_null_element_ordering() {
-        // PostgreSQL: ARRAY[1, NULL] > ARRAY[1, 999] (NULL > non-NULL)
-        // ReadySet: DfValue::None < DfValue::Int, so this is reversed.
+    fn cmp_1d_null_greater_than_int() {
+        // PostgreSQL: ARRAY[1, NULL] > ARRAY[1, 999]
         let a = Array::from(vec![DfValue::from(1), DfValue::None]);
         let b = Array::from(vec![DfValue::from(1), DfValue::from(999)]);
-        // Document current behavior (opposite of PostgreSQL):
+        assert_eq!(a.cmp(&b), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_1d_int_less_than_null() {
+        // PostgreSQL: ARRAY[1, 999] < ARRAY[1, NULL]
+        let a = Array::from(vec![DfValue::from(1), DfValue::from(999)]);
+        let b = Array::from(vec![DfValue::from(1), DfValue::None]);
         assert_eq!(a.cmp(&b), Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_1d_null_only_greater_than_any_value() {
+        // PostgreSQL: ARRAY[NULL::int] > ARRAY[1]
+        let a = Array::from(vec![DfValue::None]);
+        let b = Array::from(vec![DfValue::from(1)]);
+        assert_eq!(a.cmp(&b), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_1d_null_greater_than_text() {
+        // NULL > any text value
+        let a = Array::from(vec![DfValue::from("abc"), DfValue::None]);
+        let b = Array::from(vec![DfValue::from("abc"), DfValue::from("zzz")]);
+        assert_eq!(a.cmp(&b), Ordering::Greater);
     }
 
     #[test]
@@ -1232,9 +1446,102 @@ mod tests {
 
     #[test]
     fn cmp_1d_all_nulls_different_lengths() {
+        // Shorter all-null array is less than longer all-null array
         let a = Array::from(vec![DfValue::None]);
         let b = Array::from(vec![DfValue::None, DfValue::None]);
         assert_eq!(a.cmp(&b), Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_1d_null_first_element() {
+        // PostgreSQL: ARRAY[NULL, 1] > ARRAY[999, 1] (NULL > 999 in first position)
+        let a = Array::from(vec![DfValue::None, DfValue::from(1)]);
+        let b = Array::from(vec![DfValue::from(999), DfValue::from(1)]);
+        assert_eq!(a.cmp(&b), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_1d_null_vs_negative() {
+        // NULL > negative numbers too
+        let a = Array::from(vec![DfValue::None]);
+        let b = Array::from(vec![DfValue::from(-999)]);
+        assert_eq!(a.cmp(&b), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_1d_null_vs_zero() {
+        let a = Array::from(vec![DfValue::None]);
+        let b = Array::from(vec![DfValue::from(0)]);
+        assert_eq!(a.cmp(&b), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_1d_multiple_nulls_equal() {
+        let a = Array::from(vec![DfValue::None, DfValue::None]);
+        let b = Array::from(vec![DfValue::None, DfValue::None]);
+        assert_eq!(a.cmp(&b), Ordering::Equal);
+    }
+
+    #[test]
+    fn cmp_1d_null_then_value_vs_null_then_null() {
+        // ARRAY[NULL, 1] < ARRAY[NULL, NULL] (first elements equal, then 1 < NULL)
+        let a = Array::from(vec![DfValue::None, DfValue::from(1)]);
+        let b = Array::from(vec![DfValue::None, DfValue::None]);
+        assert_eq!(a.cmp(&b), Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_1d_mixed_null_positions() {
+        // ARRAY[1, NULL, 3] vs ARRAY[1, 2, 3]: second element NULL > 2
+        let a = Array::from(vec![DfValue::from(1), DfValue::None, DfValue::from(3)]);
+        let b = Array::from(vec![DfValue::from(1), DfValue::from(2), DfValue::from(3)]);
+        assert_eq!(a.cmp(&b), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_2d_null_element() {
+        // NULL ordering applies in multi-dimensional arrays too
+        let a = Array::from(
+            ArrayD::from_shape_vec(
+                IxDyn(&[2, 2]),
+                vec![
+                    DfValue::from(1),
+                    DfValue::None,
+                    DfValue::from(3),
+                    DfValue::from(4),
+                ],
+            )
+            .unwrap(),
+        );
+        let b = Array::from(
+            ArrayD::from_shape_vec(
+                IxDyn(&[2, 2]),
+                vec![
+                    DfValue::from(1),
+                    DfValue::from(999),
+                    DfValue::from(3),
+                    DfValue::from(4),
+                ],
+            )
+            .unwrap(),
+        );
+        assert_eq!(a.cmp(&b), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_1d_null_shorter_vs_non_null_longer() {
+        // ARRAY[NULL] vs ARRAY[1, 2]: first element NULL > 1, so Greater
+        let a = Array::from(vec![DfValue::None]);
+        let b = Array::from(vec![DfValue::from(1), DfValue::from(2)]);
+        assert_eq!(a.cmp(&b), Ordering::Greater);
+    }
+
+    #[test]
+    fn cmp_1d_equal_prefix_then_null_vs_shorter() {
+        // ARRAY[1, NULL] vs ARRAY[1]: equal prefix, then longer wins
+        let a = Array::from(vec![DfValue::from(1), DfValue::None]);
+        let b = Array::from(vec![DfValue::from(1)]);
+        assert_eq!(a.cmp(&b), Ordering::Greater);
     }
 
     // ---------------------------------------------------------------
@@ -1286,9 +1593,11 @@ mod tests {
 
     #[test]
     fn contains_null_elements() {
+        // PostgreSQL: ARRAY[NULL, 1] @> ARRAY[NULL] => false
+        // NULL = NULL yields NULL (falsy), so NULLs are skipped in containment.
         let a = Array::from(vec![DfValue::None, DfValue::from(1)]);
         let b = Array::from(vec![DfValue::None]);
-        assert!(a.contains(&b));
+        assert!(!a.contains(&b));
     }
 
     #[test]
@@ -1308,6 +1617,161 @@ mod tests {
         );
         let b = Array::from(vec![DfValue::from(2), DfValue::from(4)]);
         assert!(a.contains(&b));
+    }
+
+    // Proptest: contains() must agree with naive O(n*m) linear scan.
+    // Uses non_numeric_array() which generates independent random DfValueKinds
+    // per array — covers both same-type (meaningful) and cross-type (vacuous) pairs.
+    #[tags(no_retry)]
+    #[proptest]
+    fn contains_matches_linear_scan(
+        #[strategy(non_numeric_array())] a: Array,
+        #[strategy(non_numeric_array())] b: Array,
+    ) {
+        let expected = b
+            .contents
+            .iter()
+            .all(|needle| !needle.is_none() && a.contents.iter().any(|e| e == needle));
+        assert_eq!(a.contains(&b), expected);
+    }
+
+    // Targeted test: same-type arrays with overlapping values exercise the
+    // HashSet lookup path (unlike the cross-type proptest pairs which are vacuous).
+    #[test]
+    fn contains_same_type_overlap() {
+        let a = Array::from(vec![
+            DfValue::from("apple"),
+            DfValue::from("banana"),
+            DfValue::from("cherry"),
+            DfValue::from("date"),
+            DfValue::from("elderberry"),
+            DfValue::from("fig"),
+            DfValue::from("grape"),
+            DfValue::from("honeydew"),
+            DfValue::from("kiwi"),
+        ]);
+        // Subset — should be contained
+        let b = Array::from(vec![DfValue::from("banana"), DfValue::from("fig")]);
+        assert!(a.contains(&b));
+        // Non-subset — should not be contained
+        let c = Array::from(vec![DfValue::from("banana"), DfValue::from("mango")]);
+        assert!(!a.contains(&c));
+    }
+
+    // Proptest: overlaps() must agree with naive O(n*m) linear scan.
+    #[tags(no_retry)]
+    #[proptest]
+    fn overlaps_matches_linear_scan(
+        #[strategy(non_numeric_array())] a: Array,
+        #[strategy(non_numeric_array())] b: Array,
+    ) {
+        let expected = a
+            .contents
+            .iter()
+            .any(|e| !e.is_none() && b.contents.iter().any(|f| !f.is_none() && e == f));
+        assert_eq!(a.overlaps(&b), expected);
+    }
+
+    // ---------------------------------------------------------------
+    // Overlap tests (&&)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn overlaps_basic() {
+        let a = Array::from(vec![DfValue::from(1), DfValue::from(2), DfValue::from(3)]);
+        let b = Array::from(vec![DfValue::from(3), DfValue::from(4)]);
+        assert!(a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_no_common() {
+        let a = Array::from(vec![DfValue::from(1), DfValue::from(2)]);
+        let b = Array::from(vec![DfValue::from(3), DfValue::from(4)]);
+        assert!(!a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_empty_left() {
+        let a = Array::from(vec![]);
+        let b = Array::from(vec![DfValue::from(1)]);
+        assert!(!a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_empty_right() {
+        let a = Array::from(vec![DfValue::from(1)]);
+        let b = Array::from(vec![]);
+        assert!(!a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_both_empty() {
+        let a = Array::from(vec![]);
+        let b = Array::from(vec![]);
+        assert!(!a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_duplicates() {
+        let a = Array::from(vec![DfValue::from(1), DfValue::from(1)]);
+        let b = Array::from(vec![DfValue::from(1), DfValue::from(2)]);
+        assert!(a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_null_only() {
+        // PostgreSQL: ARRAY[NULL::int] && ARRAY[NULL::int] => false
+        // NULL = NULL yields NULL (falsy), so NULLs never match in overlap.
+        let a = Array::from(vec![DfValue::None]);
+        let b = Array::from(vec![DfValue::None]);
+        assert!(!a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_null_with_shared_non_null() {
+        // NULLs are skipped; overlap is found via shared non-NULL element.
+        let a = Array::from(vec![DfValue::None, DfValue::from(1)]);
+        let b = Array::from(vec![DfValue::None, DfValue::from(1)]);
+        assert!(a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_null_no_shared_non_null() {
+        // NULLs are skipped; no shared non-NULL elements => false.
+        let a = Array::from(vec![DfValue::None, DfValue::from(1)]);
+        let b = Array::from(vec![DfValue::None, DfValue::from(2)]);
+        assert!(!a.overlaps(&b));
+    }
+
+    #[test]
+    fn overlaps_symmetric() {
+        let a = Array::from(vec![DfValue::from(1), DfValue::from(2), DfValue::from(3)]);
+        let b = Array::from(vec![DfValue::from(3), DfValue::from(4)]);
+        assert_eq!(a.overlaps(&b), b.overlaps(&a));
+
+        let c = Array::from(vec![DfValue::from(5)]);
+        assert_eq!(a.overlaps(&c), c.overlaps(&a));
+
+        let d = Array::from(vec![]);
+        assert_eq!(a.overlaps(&d), d.overlaps(&a));
+    }
+
+    #[test]
+    fn overlaps_multidimensional() {
+        let a = Array::from(
+            ArrayD::from_shape_vec(
+                IxDyn(&[2, 2]),
+                vec![
+                    DfValue::from(1),
+                    DfValue::from(2),
+                    DfValue::from(3),
+                    DfValue::from(4),
+                ],
+            )
+            .unwrap(),
+        );
+        let b = Array::from(vec![DfValue::from(4), DfValue::from(5)]);
+        assert!(a.overlaps(&b));
     }
 
     // ---------------------------------------------------------------
@@ -1343,5 +1807,104 @@ mod tests {
         let a = Array::from(vec![]);
         let b = Array::from(vec![]);
         assert_eq!(a.concat(&b), Array::from(vec![]));
+    }
+
+    // ---------------------------------------------------------------
+    // from_sub_arrays / into_sub_arrays tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn from_sub_arrays_builds_2d() {
+        let a = Array::from(vec![DfValue::from(1), DfValue::from(2)]);
+        let b = Array::from(vec![DfValue::from(3), DfValue::from(4)]);
+        let result =
+            Array::from_sub_arrays(&[std::sync::Arc::new(a), std::sync::Arc::new(b)]).unwrap();
+        assert_eq!(result.num_dimensions(), 2);
+        assert_eq!(result.to_string(), "{{1,2},{3,4}}");
+    }
+
+    #[test]
+    fn from_sub_arrays_empty_returns_empty_1d() {
+        let result = Array::from_sub_arrays(&[]).unwrap();
+        assert_eq!(result.num_dimensions(), 1);
+        assert_eq!(result.total_len(), 0);
+    }
+
+    #[test]
+    fn from_sub_arrays_mismatched_shapes_errors() {
+        let a = Array::from(vec![DfValue::from(1), DfValue::from(2)]);
+        let b = Array::from(vec![DfValue::from(3)]);
+        let result = Array::from_sub_arrays(&[std::sync::Arc::new(a), std::sync::Arc::new(b)]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_sub_arrays_mismatched_lower_bounds_errors() {
+        let a = Array {
+            lower_bounds: smallvec![1],
+            contents: ArrayD::from_shape_vec(IxDyn(&[2]), vec![DfValue::from(1), DfValue::from(2)])
+                .unwrap(),
+        };
+        let b = Array {
+            lower_bounds: smallvec![0],
+            contents: ArrayD::from_shape_vec(IxDyn(&[2]), vec![DfValue::from(3), DfValue::from(4)])
+                .unwrap(),
+        };
+        let result = Array::from_sub_arrays(&[std::sync::Arc::new(a), std::sync::Arc::new(b)]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn into_sub_arrays_roundtrip_2d() {
+        let a = Array::from(vec![DfValue::from(1), DfValue::from(2)]);
+        let b = Array::from(vec![DfValue::from(3), DfValue::from(4)]);
+        let stacked = Array::from_sub_arrays(&[
+            std::sync::Arc::new(a.clone()),
+            std::sync::Arc::new(b.clone()),
+        ])
+        .unwrap();
+        let split = stacked.into_sub_arrays();
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0], a);
+        assert_eq!(split[1], b);
+    }
+
+    #[test]
+    fn into_sub_arrays_roundtrip_3d() {
+        // Build 2D sub-arrays, stack into 3D, then split back
+        let sub1 = Array::from(
+            ArrayD::from_shape_vec(
+                IxDyn(&[2, 2]),
+                vec![
+                    DfValue::from(1),
+                    DfValue::from(2),
+                    DfValue::from(3),
+                    DfValue::from(4),
+                ],
+            )
+            .unwrap(),
+        );
+        let sub2 = Array::from(
+            ArrayD::from_shape_vec(
+                IxDyn(&[2, 2]),
+                vec![
+                    DfValue::from(5),
+                    DfValue::from(6),
+                    DfValue::from(7),
+                    DfValue::from(8),
+                ],
+            )
+            .unwrap(),
+        );
+        let stacked = Array::from_sub_arrays(&[
+            std::sync::Arc::new(sub1.clone()),
+            std::sync::Arc::new(sub2.clone()),
+        ])
+        .unwrap();
+        assert_eq!(stacked.num_dimensions(), 3);
+        let split = stacked.into_sub_arrays();
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0], sub1);
+        assert_eq!(split[1], sub2);
     }
 }

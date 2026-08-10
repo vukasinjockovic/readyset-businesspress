@@ -1,0 +1,30 @@
+[package]
+name = "readyset-schema"
+version = "0.0.1"
+publish = false
+authors = ["Readyset Technology, Inc. <info@readyset.io>"]
+edition = "2024"
+
+[dependencies]
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+linkme = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+mysql_async = { workspace = true }
+mysql_common = { workspace = true }
+tokio-postgres = { workspace = true }
+
+metric = { path = "../metric" }
+mysql-srv = { path = "../mysql-srv" }
+psql-srv = { path = "../psql-srv" }
+readyset-client = { path = "../readyset-client" }
+readyset-data = { path = "../readyset-data" }
+readyset-errors = { path = "../readyset-errors" }
+readyset-metrics = { path = "../readyset-metrics" }
+readyset-shallow = { path = "../readyset-shallow" }
+readyset-sql = { path = "../readyset-sql" }
+readyset-util = { path = "../readyset-util" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

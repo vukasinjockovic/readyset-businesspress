@@ -15,7 +15,6 @@ categories = ["database", "database-implementations"]
 default = []
 generate_mysql_tests = ["default"]
 profiling = ["timekeeper/default"]
-bench = ["dataflow/bench"]
 failure_injection = [
     "fail/failpoints",
     "dataflow/failure_injection",
@@ -33,15 +32,18 @@ redact_sensitive = ["readyset-util/redact_sensitive"]
 anyhow = { workspace = true }
 antithesis_sdk = { workspace = true }
 async-bincode = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
 base64 = { workspace = true }
 bimap = { workspace = true, features = ["serde"] }
 bincode = { workspace = true }
+bytes = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 enum-kinds = { workspace = true }
 fail = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
-hyper = { workspace = true, features = ["stream", "server", "http1"] }
+http = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 lazy_static = { workspace = true }
@@ -55,6 +57,7 @@ quanta = { workspace = true }
 querystring = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
+rmp-serde = { workspace = true }
 serde = { workspace = true, features = ["rc", "derive"] }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
@@ -67,7 +70,6 @@ timekeeper = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-retry = { workspace = true }
 tokio-stream = { workspace = true }
-tokio-tower = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tracing = { workspace = true, features = ["release_max_level_debug"] }
 tracing-futures = { workspace = true }
@@ -75,7 +77,6 @@ url = { workspace = true, features = ["serde"] }
 vec1 = { workspace = true }
 
 # local deps
-array2 = { path = "../array2" }
 catalog-tables = { path = "../catalog-tables" }
 common = { path = "../readyset-common", package = "readyset-common" }
 database-utils = { path = "../database-utils" }
@@ -84,12 +85,16 @@ dataflow-expression = { path = "../dataflow-expression" }
 dataflow-state = { path = "../dataflow-state" }
 failpoint-macros = { path = "../failpoint-macros" }
 health-reporter = { path = "../health-reporter" }
+metric = { path = "../metric" }
 mir = { path = "../readyset-mir", package = "readyset-mir" }
 readyset-alloc = { path = "../readyset-alloc" }
 readyset-alloc-metrics = { path = "../readyset-alloc-metrics" }
 readyset-client = { path = "../readyset-client" }
 readyset-data = { path = "../readyset-data" }
 readyset-errors = { path = "../readyset-errors" }
+readyset-metrics = { path = "../readyset-metrics" }
+readyset-multiplex = { path = "../readyset-multiplex" }
+readyset-post-lookup = { path = "../readyset-post-lookup" }
 readyset-sql = { path = "../readyset-sql" }
 readyset-sql-parsing = { path = "../readyset-sql-parsing" }
 readyset-sql-passes = { path = "../readyset-sql-passes" }
@@ -103,12 +108,9 @@ schema-catalog = { path = "../schema-catalog" }
 
 [dev-dependencies]
 assert_approx_eq = { workspace = true }
-assert_matches = { workspace = true }
 chrono = { workspace = true }
 criterion = { workspace = true }
-dataflow = { path = "../readyset-dataflow", package = "readyset-dataflow", features = [
-    "bench",
-] }
+dataflow = { path = "../readyset-dataflow", package = "readyset-dataflow" }
 diff = { workspace = true }
 include_dir = { workspace = true }
 mysql_async = { workspace = true }
@@ -118,10 +120,6 @@ tempfile = { workspace = true }
 test-strategy = { workspace = true }
 test-utils = { path = "../test-utils" }
 triomphe = { workspace = true }
-
-[[bench]]
-name = "dataflow"
-harness = false
 
 [lints]
 workspace = true

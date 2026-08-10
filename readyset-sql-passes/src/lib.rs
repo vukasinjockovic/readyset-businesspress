@@ -3,30 +3,42 @@ pub mod alias_removal;
 pub mod anonymize;
 mod array_constructor;
 mod create_table_columns;
+mod derived_tables_rewrite;
 mod detect_bucket_functions;
 mod detect_problematic_self_joins;
+pub mod detect_schema_references;
 pub mod detect_unsupported_placeholders;
 mod disallow_row;
 mod drop_redundant_join;
+mod expand_join_on_using;
 pub mod expr;
+mod hoist_parametrizable_filters;
 mod implied_tables;
 mod infer_nullability;
 mod inline_leading_derived_table;
 mod inline_literals;
+pub(crate) mod inline_subquery;
 mod key_def_coalescing;
 mod lateral_join;
+mod normalize_right_join;
+mod normalize_subquery_positions;
 mod normalize_topk_with_aggregate;
 mod order_limit_removal;
+pub mod query_optimization_rewrite;
 mod remove_numeric_field_references;
 mod resolve_schemas;
 mod rewrite_between;
+mod rewrite_joins;
 mod rewrite_utils;
+pub mod shallow;
 mod star_expansion;
 mod strip_literals;
 mod tests;
 mod unnest_subqueries;
 mod unnest_subqueries_3vl;
 mod util;
+pub(crate) mod validate_pipeline_invariants;
+pub(crate) mod validate_query_semantics;
 mod validate_window_functions;
 
 use std::cell::RefMut;
@@ -50,23 +62,22 @@ pub use crate::create_table_columns::CreateTableColumns;
 pub use crate::detect_bucket_functions::DetectBucketFunctions;
 pub use crate::detect_problematic_self_joins::DetectProblematicSelfJoins;
 pub use crate::detect_unsupported_placeholders::DetectUnsupportedPlaceholders;
-use crate::drop_redundant_join::DropRedundantSelfJoin;
-pub use crate::expr::ScalarOptimizeExpressions;
+pub use crate::expr::{ScalarOptimizeExpressions, const_eval_to_dfvalue, eval_constant_expr};
 pub use crate::implied_tables::ImpliedTableExpansion;
 pub use crate::implied_tables::ImpliedTablesContext;
-use crate::inline_leading_derived_table::InlineLeadingDerivedTable;
 pub use crate::inline_literals::InlineLiterals;
 pub use crate::key_def_coalescing::KeyDefinitionCoalescing;
+pub use crate::normalize_right_join::NormalizeRightJoin;
 pub use crate::normalize_topk_with_aggregate::NormalizeTopKWithAggregate;
 pub use crate::order_limit_removal::OrderLimitRemoval;
 pub use crate::remove_numeric_field_references::RemoveNumericFieldReferences;
 pub use crate::resolve_schemas::ResolveSchemas;
 pub use crate::resolve_schemas::ResolveSchemasContext;
 pub use crate::rewrite_between::RewriteBetween;
+pub use crate::rewrite_utils::is_aggregated_expr;
 pub use crate::star_expansion::StarExpansion;
 pub use crate::star_expansion::StarExpansionContext;
 pub use crate::strip_literals::{SelectStatementSkeleton, StripLiterals};
-use crate::unnest_subqueries::UnnestSubqueries;
 pub use crate::util::{
     LogicalOp, is_correlated, is_logical_op, is_predicate, map_aggregates, outermost_table_exprs,
 };
@@ -103,20 +114,59 @@ impl RewriteDialectContext for readyset_sql::Dialect {
     }
 }
 
+/// Context providing access to the base schemas of tables known to the migration.
+pub trait BaseSchemasContext {
+    /// Iterator over names of *tables* in the database and the body of the `CREATE TABLE`
+    /// statement that was used to create each table. Each table returned here should also exist in
+    /// [`RewriteContext::view_schemas`].
+    fn base_schemas(&self) -> Box<dyn Iterator<Item = (&Relation, &CreateTableBody)> + '_>;
+
+    /// Fetch the `CREATE TABLE` definition for a specific relation, if it exists.
+    fn base_schema(&self, relation: &Relation) -> Option<&CreateTableBody>;
+}
+
+impl<C: BaseSchemasContext> BaseSchemasContext for &C {
+    fn base_schemas(&self) -> Box<dyn Iterator<Item = (&Relation, &CreateTableBody)> + '_> {
+        (*self).base_schemas()
+    }
+
+    fn base_schema(&self, relation: &Relation) -> Option<&CreateTableBody> {
+        (*self).base_schema(relation)
+    }
+}
+
+/// Empty schema context for tests that don't need real schema lookups.  Any
+/// pass that calls `base_schema()` against this gets `None` -- callers that
+/// depend on schema-driven type inference (e.g.
+/// `array_constructor::derive_array_element_sql_type`) fall back to their
+/// no-info path.
+#[cfg(test)]
+pub(crate) struct EmptyBaseSchemas;
+
+#[cfg(test)]
+impl BaseSchemasContext for EmptyBaseSchemas {
+    fn base_schemas(&self) -> Box<dyn Iterator<Item = (&Relation, &CreateTableBody)> + '_> {
+        Box::new(std::iter::empty())
+    }
+
+    fn base_schema(&self, _: &Relation) -> Option<&CreateTableBody> {
+        None
+    }
+}
+
 /// Context provided to all server-side query rewriting passes, i.e. those performed at migration
 /// time, not those performed in the adapter on the hot path. For those passes, see
 /// [`crate::adapter_rewrites`].
 pub trait RewriteContext:
-    ResolveSchemasContext + StarExpansionContext + ImpliedTablesContext + RewriteDialectContext
+    ResolveSchemasContext
+    + StarExpansionContext
+    + ImpliedTablesContext
+    + RewriteDialectContext
+    + BaseSchemasContext
 {
     /// Map from names of views and tables in the database, to (ordered) lists of the column names
     /// in those views
     fn view_schemas(&self) -> &HashMap<Relation, Vec<SqlIdentifier>>;
-
-    /// Map from names of *tables* in the database, to the body of the `CREATE TABLE` statement
-    /// that was used to create that table. Each key in this map should also exist in
-    /// [`view_schemas`].
-    fn base_schemas(&self) -> &HashMap<&Relation, &CreateTableBody>;
 
     /// List of views that are known to exist but have not yet been compiled (so we can't know
     /// their fields yet)
@@ -142,10 +192,6 @@ pub trait RewriteContext:
 impl<C: RewriteContext> RewriteContext for &C {
     fn view_schemas(&self) -> &HashMap<Relation, Vec<SqlIdentifier>> {
         (*self).view_schemas()
-    }
-
-    fn base_schemas(&self) -> &HashMap<&Relation, &CreateTableBody> {
-        (*self).base_schemas()
     }
 
     fn uncompiled_views(&self) -> &[&Relation] {
@@ -192,7 +238,7 @@ impl Rewrite for SelectStatement {
 
         self.rewrite_between();
         trace!(parent: &span, pass="rewrite_between", query = %self.display(sql_dialect));
-        self.disallow_row()?;
+        self.disallow_row(sql_dialect)?;
         trace!(parent: &span, pass="disallow_row", query = %self.display(sql_dialect));
         self.validate_window_functions()?;
         trace!(parent: &span, pass="validate_window_functions", query = %self.display(sql_dialect));
@@ -204,22 +250,12 @@ impl Rewrite for SelectStatement {
         trace!(parent: &span, pass="expand_stars", query = %self.display(sql_dialect));
         self.expand_implied_tables(&context)?;
         trace!(parent: &span, pass="expand_implied_tables", query = %self.display(sql_dialect));
-        self.rewrite_array_constructors()?;
-        trace!(parent: &span, pass="rewrite_array_constructors", query = %self.display(sql_dialect));
-        self.drop_redundant_join(&context)?;
-        trace!(parent: &span, pass="drop_redundant_join", query = %self.display(sql_dialect));
-        self.inline_leading_derived_table()?;
-        trace!(parent: &span, pass="inline_leading_derived_table", query = %self.display(sql_dialect));
-        self.unnest_subqueries(&context)?;
-        trace!(parent: &span, pass="unnest_subqueries", query = %self.display(sql_dialect));
+        self.remove_numeric_field_references()?;
+        trace!(parent: &span, pass="remove_numeric_field_references", query = %self.display(sql_dialect));
         self.normalize_topk_with_aggregate(&context)?;
         trace!(parent: &span, pass="normalize_topk_with_aggregate", query = %self.display(sql_dialect));
         self.detect_problematic_self_joins()?;
         trace!(parent: &span, pass="detect_problematic_self_joins", query = %self.display(sql_dialect));
-        self.remove_numeric_field_references()?;
-        trace!(parent: &span, pass="remove_numeric_field_references", query = %self.display(sql_dialect));
-        self.order_limit_removal(context.base_schemas())?;
-        trace!(parent: &span, pass="order_limit_removal", query = %self.display(sql_dialect));
         self.rewrite_table_aliases(query_name, context.table_alias_rewrites())?;
         trace!(parent: &span, pass="rewrite_table_aliases", query = %self.display(sql_dialect));
 

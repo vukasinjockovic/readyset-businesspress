@@ -1,13 +1,13 @@
+use crate::LookupIndex;
 use crate::ops::utils::Order;
 use crate::prelude::*;
-use crate::LookupIndex;
 
 use dataflow_state::PointKey;
 use enum_kinds::EnumKind;
 use itertools::{Either, Itertools};
 use readyset_client::internal;
-use readyset_data::DfType;
-use readyset_errors::{unsupported, ReadySetResult};
+use readyset_data::{AverageAccumulator, AvgScaleMode, DfType, Dialect};
+use readyset_errors::{ReadySetResult, unsupported};
 use readyset_sql::ast::FunctionExpr;
 use readyset_sql::ast::{NullOrder, OrderType};
 use readyset_util::Indices;
@@ -121,24 +121,53 @@ impl WindowOperation {
             | DfType::UnsignedInt
             | DfType::UnsignedBigInt => DfValue::Int(0),
             DfType::Float => DfValue::Float(0.0),
-            // Not sure why DfType::Numeric rounds up results of type DfValue::Numeric
-            // so we'll just use DfValue::Double instead
-            DfType::Double | DfType::Numeric { .. } => DfValue::Double(0.0),
+            DfType::Double => DfValue::Double(0.0),
+            DfType::Numeric { .. } => DfValue::Numeric(Default::default()),
             t => unsupported!("Unsupported type {t:?} for window function {self:?}"),
         })
     }
 
-    fn coerce_to_output_type(value: &DfValue, output_col_type: &DfType) -> ReadySetResult<DfValue> {
+    fn coerce_to_output_type<'a>(
+        value: &'a DfValue,
+        output_col_type: &DfType,
+    ) -> ReadySetResult<Cow<'a, DfValue>> {
         if value.is_none() {
-            return Ok(DfValue::None);
+            return Ok(Cow::Owned(DfValue::None));
         }
 
         let inferred_type = value.infer_dataflow_type();
         if &inferred_type == output_col_type {
-            Ok(value.clone())
+            Ok(Cow::Borrowed(value))
         } else {
-            value.coerce_to(output_col_type, &inferred_type)
+            value
+                .coerce_to(output_col_type, &inferred_type)
+                .map(Cow::Owned)
         }
+    }
+
+    /// Apply AVG to one chunk of `rows`: accumulate non-null values at
+    /// `arg` into `acc`, then write the result to `col_index` of every
+    /// row. `acc` is `&mut` so cumulative windows can carry totals
+    /// across chunks; non-cumulative callers pass a fresh accumulator.
+    fn apply_avg_chunk(
+        rows: &mut [Cow<'_, [DfValue]>],
+        arg: usize,
+        col_index: usize,
+        output_col_type: &DfType,
+        acc: &mut AverageAccumulator,
+    ) -> ReadySetResult<()> {
+        for row in rows.iter() {
+            let arg_value = row.get(arg).unwrap();
+            if !arg_value.is_none() {
+                let coerced = Self::coerce_to_output_type(arg_value, output_col_type)?;
+                acc.delta(&coerced, true)?;
+            }
+        }
+        let avg = acc.result()?;
+        for row in rows.iter_mut() {
+            *row.to_mut().get_mut(col_index).unwrap() = avg.clone();
+        }
+        Ok(())
     }
 
     /// Optimized implementation of cumulative window functions.
@@ -157,6 +186,7 @@ impl WindowOperation {
         output_col_type: &DfType,
         order_by: &[usize],
         offset: usize,
+        avg_scale_mode: AvgScaleMode,
     ) -> ReadySetResult<()> {
         if partition.is_empty() {
             return Ok(());
@@ -202,6 +232,7 @@ impl WindowOperation {
                                 Ok(acc)
                             } else {
                                 Self::coerce_to_output_type(arg_value, output_col_type)
+                                    .map(Cow::into_owned)
                             }
                         } else if arg_value.is_none() {
                             &acc + &default_value
@@ -282,8 +313,7 @@ impl WindowOperation {
             }
 
             WindowOperation::Avg(arg) => {
-                let mut running_sum = DfValue::None;
-                let mut running_count = DfValue::Int(0);
+                let mut acc = AverageAccumulator::for_out_ty(output_col_type, avg_scale_mode);
 
                 // chunk the partition by the order cols, starting from offset
                 // rows that have the same order cols will be treated as a new partition
@@ -296,36 +326,11 @@ impl WindowOperation {
                 });
 
                 for partition in partitions {
-                    for row in partition.iter() {
-                        let arg_value = row.get(*arg).unwrap();
-
-                        if !arg_value.is_none() {
-                            running_sum = if running_sum.is_none() {
-                                // use the default (float) to make
-                                // sure the division also returns a float
-                                &default_value + arg_value
-                            } else {
-                                &running_sum + arg_value
-                            }?;
-
-                            running_count = (&running_count + &1.into())?;
-                        }
-                    }
-
-                    for row in partition.iter_mut() {
-                        let old_avg = row.to_mut().get_mut(col_index).unwrap();
-
-                        if running_sum.is_none() || running_count.as_int().unwrap() == 0 {
-                            *old_avg = DfValue::None;
-                        } else {
-                            *old_avg = (&running_sum / &running_count)?;
-                        }
-                    }
+                    Self::apply_avg_chunk(partition, *arg, col_index, output_col_type, &mut acc)?;
                 }
 
                 Ok(())
             }
-
             WindowOperation::RowNumber => {
                 for (i, row) in partition[offset..].iter_mut().enumerate() {
                     let row_num = (offset + i + 1) as i64;
@@ -488,6 +493,7 @@ impl WindowOperation {
         diffs: Vec<(Cow<'a, [DfValue]>, bool)>,
         col_index: usize,
         output_col_type: &DfType,
+        avg_scale_mode: AvgScaleMode,
     ) -> ReadySetResult<()> {
         let default_value = self.default_value(output_col_type)?;
 
@@ -547,36 +553,10 @@ impl WindowOperation {
             WindowOperation::Avg(arg) => {
                 apply_diffs_to_partition(partition, diffs, col_index)?;
 
-                let mut sum = DfValue::None;
-                let mut count = DfValue::Int(0);
-
-                // can't use the diffs to find the new avg, since we don't
-                // have a sum or count. We have to do two passes over the partitions
-                for row in partition.iter() {
-                    let arg_value = row.get(*arg).unwrap();
-
-                    if !arg_value.is_none() {
-                        sum = if sum.is_none() {
-                            // use the default (float) to make
-                            // sure the division also returns a float
-                            &default_value + arg_value
-                        } else {
-                            &sum + arg_value
-                        }?;
-
-                        count = (&count + &1.into())?;
-                    }
-                }
-
-                for r in partition.iter_mut() {
-                    let old_avg = r.to_mut().get_mut(col_index).unwrap();
-
-                    if sum.is_none() || count.as_int().unwrap() == 0 {
-                        *old_avg = DfValue::None
-                    } else {
-                        *old_avg = (&sum / &count)?
-                    };
-                }
+                // Can't use the diffs to find the new avg, since we don't have a
+                // sum or count. Two passes over the partition.
+                let mut acc = AverageAccumulator::for_out_ty(output_col_type, avg_scale_mode);
+                Self::apply_avg_chunk(partition, *arg, col_index, output_col_type, &mut acc)?;
 
                 Ok(())
             }
@@ -595,6 +575,7 @@ impl WindowOperation {
                             Ok(acc)
                         } else {
                             Self::coerce_to_output_type(arg_value, output_col_type)
+                                .map(Cow::into_owned)
                         }
                     } else if arg_value.is_none() {
                         &acc + &default_value
@@ -615,15 +596,11 @@ impl WindowOperation {
                 Ok(())
             }
             WindowOperation::RowNumber => {
-                let mut count = 1;
-
                 apply_diffs_to_partition(partition, diffs, col_index)?;
 
-                for r in partition.iter_mut() {
+                for (count, r) in (1..).zip(partition.iter_mut()) {
                     let old_count = r.to_mut().get_mut(col_index).unwrap();
                     *old_count = DfValue::Int(count);
-
-                    count += 1;
                 }
 
                 Ok(())
@@ -735,9 +712,17 @@ pub struct Window {
     output_col_index: usize,
     // saves us time recomputing it every time
     output_col_type: DfType,
+    #[serde(default = "default_avg_scale_mode")]
+    avg_scale_mode: AvgScaleMode,
+}
+
+fn default_avg_scale_mode() -> AvgScaleMode {
+    // Serde default for `Window` state predating `avg_scale_mode`.
+    AvgScaleMode::Fixed(0)
 }
 
 impl Window {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         src: NodeIndex,
         group_by: Vec<usize>,
@@ -746,7 +731,12 @@ impl Window {
         function: WindowOperation,
         output_col_index: usize,
         output_col_type: DfType,
+        dialect: Dialect,
     ) -> ReadySetResult<Window> {
+        let avg_scale_mode = match &function {
+            WindowOperation::Avg(_) => AvgScaleMode::for_avg(dialect, &output_col_type)?,
+            _ => AvgScaleMode::Fixed(0),
+        };
         Ok(Window {
             src: src.into(),
             our_index: None,
@@ -760,6 +750,7 @@ impl Window {
             function,
             output_col_index,
             output_col_type,
+            avg_scale_mode,
         })
     }
 }
@@ -996,6 +987,7 @@ impl Window {
                 &self.output_col_type,
                 &self.order_by.columns(),
                 changes_offset,
+                self.avg_scale_mode,
             )?;
 
             out.extend(
@@ -1013,6 +1005,7 @@ impl Window {
                 partition_changes,
                 self.output_col_index,
                 &self.output_col_type,
+                self.avg_scale_mode,
             )?;
 
             out.extend(partition.iter().map(|r| Record::Positive((**r).to_vec())));
@@ -1232,6 +1225,7 @@ mod tests {
                 WindowOperation::RowNumber,
                 4,
                 DfType::Int,
+                Dialect::DEFAULT_MYSQL,
             )
             .unwrap(),
             true,
@@ -1257,6 +1251,7 @@ mod tests {
                 WindowOperation::CountStar,
                 3,
                 DfType::Int,
+                Dialect::DEFAULT_MYSQL,
             )
             .unwrap(),
             true,
@@ -1372,6 +1367,7 @@ mod tests {
             WindowOperation::RowNumber,
             2,
             DfType::Int,
+            Dialect::DEFAULT_MYSQL,
         )
         .unwrap();
 
@@ -1389,6 +1385,7 @@ mod tests {
             WindowOperation::RowNumber,
             2,
             DfType::Int,
+            Dialect::DEFAULT_MYSQL,
         )
         .unwrap();
 
@@ -1406,6 +1403,7 @@ mod tests {
             WindowOperation::RowNumber,
             2,
             DfType::Int,
+            Dialect::DEFAULT_MYSQL,
         )
         .unwrap();
 
@@ -1423,6 +1421,7 @@ mod tests {
             WindowOperation::RowNumber,
             5,
             DfType::Int,
+            Dialect::DEFAULT_MYSQL,
         )
         .unwrap();
 

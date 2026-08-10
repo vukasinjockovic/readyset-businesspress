@@ -10,11 +10,10 @@ use readyset_sql::analysis::visit::{self, Visitor};
 use readyset_sql::ast::{
     CacheType, CreateTableBody, CreateTableStatement, CreateViewStatement, EvictionPolicy,
     ItemPlaceholder, Literal, Relation, SelectSpecification, SelectStatement, SqlType,
+    TrxCachePolicy,
 };
 use readyset_sql_passes::SelectStatementSkeleton;
 use readyset_util::redacted::Sensitive;
-use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
 use tracing::debug;
 use vec1::Vec1;
 
@@ -22,7 +21,7 @@ use super::ExprId;
 
 /// A single SQL expression stored in a Recipe.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RecipeExpr {
     /// Expression that represents a `CREATE TABLE` statement.
     Table {
@@ -39,10 +38,15 @@ pub(crate) enum RecipeExpr {
     Cache {
         name: Relation,
         statement: SelectStatement,
-        always: bool,
+        trx_cache_policy: TrxCachePolicy,
         cache_type: Option<CacheType>,
         policy: Option<EvictionPolicy>,
         query_id: QueryId,
+        /// Multiplier applied to the TopK operator's buffer size for this cache. `None` means
+        /// the default buffer (`buffered = k`); `Some(n)` means `buffered = k * n`. Only
+        /// meaningful for queries that lower to a TopK dataflow node. Set via the
+        /// `WITH (TOPK_BUFFER_MULTIPLIER = n)` option on `CREATE CACHE`.
+        topk_buffer_multiplier: Option<usize>,
     },
 }
 
@@ -148,7 +152,7 @@ type LiteralPair<'a, 'b> = (&'a Literal, &'b Literal);
 /// This struct maps values in a query AST to values in a corresponding dataflow migration. We
 /// cannot directly relate an AST and dataflow migration - however, we can use this mapping to adapt
 /// the mapping given by [`Reader::placeholder_map`].
-#[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub struct MatchedCache {
     /// The name of the matching cached query.
     name: Relation,
@@ -219,7 +223,7 @@ impl MatchedCache {
 }
 
 /// A struct to maintain queries by their AST structure, without regard for literal values.
-#[derive(Clone, Default, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub(super) struct ExprSkeletons {
     /// Map from the query with all literals removed (the "skeleton") to the name of the view and
     /// the set of literals that belong to that view.
@@ -321,11 +325,9 @@ impl ExprSkeletons {
 }
 
 /// The set of all [`RecipeExpr`]s installed in a ReadySet server cluster.
-#[serde_as]
-#[derive(Clone, Default, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub(super) struct ExprRegistry {
     /// A map from [`ExprId`] to the [`RecipeExpr`] associated with it.
-    #[serde_as(as = "Vec<(_, _)>")]
     expressions: HashMap<ExprId, RecipeExpr>,
 
     /// A map from a hash of a stripped SelectStatement to all sets of stripped literals for each
@@ -463,9 +465,13 @@ impl ExprRegistry {
             .get(&expression.into())
             .map(|exp| match exp {
                 RecipeExpr::View { name, .. } => ExprInfo::View(name.clone()),
-                RecipeExpr::Cache { name, always, .. } => ExprInfo::Cache(CacheInfo {
+                RecipeExpr::Cache {
+                    name,
+                    trx_cache_policy,
+                    ..
+                } => ExprInfo::Cache(CacheInfo {
                     name: name.clone(),
-                    always: *always,
+                    trx_cache_policy: *trx_cache_policy,
                 }),
                 RecipeExpr::Table { name, .. } => ExprInfo::Table(name.clone()),
             })
@@ -738,11 +744,12 @@ mod tests {
 
         RecipeExpr::Cache {
             name: name.into(),
-            always: false,
+            trx_cache_policy: TrxCachePolicy::Never,
             cache_type: Some(CacheType::Deep),
             policy: None,
             query_id: QueryId::from_select(&statement, &[]),
             statement,
+            topk_buffer_multiplier: None,
         }
     }
 
@@ -1163,9 +1170,10 @@ mod tests {
                     name: "foo".into(),
                     query_id: QueryId::from_select(&statement, &[]),
                     statement: statement.clone(),
-                    always: false,
+                    trx_cache_policy: TrxCachePolicy::Never,
                     cache_type: Some(CacheType::Deep),
                     policy: None,
+                    topk_buffer_multiplier: None,
                 })
                 .unwrap());
 

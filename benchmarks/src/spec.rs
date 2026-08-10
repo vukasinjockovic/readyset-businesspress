@@ -103,7 +103,7 @@ use std::time::Duration;
 
 use database_utils::{DatabaseConnection, DatabaseStatement, QueryableConnection};
 use rand::distr::Uniform;
-use rand::Rng;
+use rand::RngExt;
 use rand_distr::weighted::WeightedAliasIndex;
 use rand_distr::{Distribution, Zipf};
 use readyset_data::{DfType, DfValue};
@@ -350,8 +350,11 @@ impl WorkloadSpec {
                         shallow: Err("Not used".into()),
                     },
                     unparsed_create_cache_statement: None,
-                    always: false,
+                    trx_cache_policy: TrxCachePolicy::Never,
                     concurrently: false,
+                    adaptive: false,
+                    topk_buffer_multiplier: None,
+                    autoparam: Default::default(),
                 };
 
                 let _ = conn

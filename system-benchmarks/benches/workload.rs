@@ -28,11 +28,11 @@ use database_utils::tls::ServerCertVerification;
 use database_utils::{
     DatabaseConnection, DatabaseStatement, DatabaseType, DatabaseURL, QueryableConnection, TlsMode,
 };
+use mysql_srv::{AuthCache, AuthKeys, AuthPlugin};
 use prometheus_parse::Scrape;
 use readyset::mysql::MySqlHandler;
 use readyset::psql::PsqlHandler;
 use readyset::{init_adapter_runtime, init_adapter_tracing, NoriaAdapter, Options};
-use readyset_client::metrics::recorded;
 use readyset_data::DfValue;
 use readyset_psql::AuthenticationMethod;
 use readyset_server::FrontierStrategy;
@@ -458,8 +458,8 @@ fn get_cache_hit_ratio() -> anyhow::Result<f64> {
     let lines: Vec<_> = metrics.lines().map(|l| Ok(l.to_string())).collect();
     let parsed = Scrape::parse(lines.into_iter())?;
 
-    let hit = get_metric_value!(parsed, recorded::SERVER_VIEW_QUERY_HIT);
-    let miss = get_metric_value!(parsed, recorded::SERVER_VIEW_QUERY_MISS);
+    let hit = get_metric_value!(parsed, metric::SERVER_VIEW_QUERY_HIT);
+    let miss = get_metric_value!(parsed, metric::SERVER_VIEW_QUERY_MISS);
 
     Ok(hit / (hit + miss))
 }
@@ -716,17 +716,21 @@ fn start_adapter(args: SystemBenchArgs) -> anyhow::Result<()> {
     let rt = init_adapter_runtime()?;
     let _tracing_guard = init_adapter_tracing(&rt, &options)?;
 
+    let _ = AuthKeys::initialize(None);
+
     match database_type {
         DatabaseType::MySQL => NoriaAdapter {
             description: "Readyset benchmark adapter",
-            default_address: SocketAddr::new(
+            default_addresses: vec![SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 BENCHMARK_PORT,
-            ),
+            )],
             connection_handler: MySqlHandler {
                 enable_statement_logging: false,
                 tls_acceptor: None,
                 tls_mode: TlsMode::Optional,
+                auth_cache: AuthCache::new(),
+                mysql_authentication_method: AuthPlugin::default(),
             },
             database_type: DatabaseType::MySQL,
             parse_dialect: readyset_sql::Dialect::MySQL,
@@ -735,10 +739,10 @@ fn start_adapter(args: SystemBenchArgs) -> anyhow::Result<()> {
         .run(rt, options),
         DatabaseType::PostgreSQL => NoriaAdapter {
             description: "Readyset benchmark adapter",
-            default_address: SocketAddr::new(
+            default_addresses: vec![SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                 BENCHMARK_PORT,
-            ),
+            )],
             connection_handler: PsqlHandler {
                 authentication_method: AuthenticationMethod::Cleartext,
                 tls_acceptor: None,

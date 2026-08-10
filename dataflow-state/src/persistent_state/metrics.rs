@@ -3,11 +3,9 @@ use std::time::Duration;
 
 use metrics::{gauge, Gauge};
 use rocksdb::perf::get_memory_usage_stats;
-use rocksdb::ColumnFamily;
-use rocksdb::DB;
+use rocksdb::{AsColumnFamilyRef, DB};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
-use crate::persistent_state::recorded;
 use crate::persistent_state::PersistentStateHandle;
 use crate::persistent_state::DEFAULT_CF;
 
@@ -80,25 +78,23 @@ struct MetricsCollector {
 
 impl MetricsReporter {
     pub(crate) fn start(name: String, state_handle: PersistentStateHandle) -> MetricsReporterStop {
-        let mem_table_total = gauge!(recorded::MEM_TABLE_TOTAL, "rocksdb" => name.clone());
-        let mem_table_unflushed = gauge!(recorded::MEM_TABLE_UNFLUSHED, "rocksdb" => name.clone());
-        let readers_total = gauge!(recorded::READERS_TOTAL, "rocksdb" => name.clone());
+        let mem_table_total = gauge!(metric::MEM_TABLE_TOTAL, "rocksdb" => name.clone());
+        let mem_table_unflushed = gauge!(metric::MEM_TABLE_UNFLUSHED, "rocksdb" => name.clone());
+        let readers_total = gauge!(metric::READERS_TOTAL, "rocksdb" => name.clone());
         let index_filters_total =
-            gauge!(recorded::BLOCK_INDEXES_FILTERS_TOTAL, "rocksdb" => name.clone());
-        let compaction_pending = gauge!(recorded::COMPACTION_PENDING, "rocksdb" => name.clone());
+            gauge!(metric::BLOCK_INDEXES_FILTERS_TOTAL, "rocksdb" => name.clone());
+        let compaction_pending = gauge!(metric::COMPACTION_PENDING, "rocksdb" => name.clone());
         let estimate_pending_compaction_bytes =
-            gauge!(recorded::ESTIMATE_PENDING_COMPACTION_BYTES, "rocksdb" => name.clone());
+            gauge!(metric::ESTIMATE_PENDING_COMPACTION_BYTES, "rocksdb" => name.clone());
         let num_running_compactions =
-            gauge!(recorded::NUM_RUNNING_COMPACTIONS, "rocksdb" => name.clone());
-        let num_running_flushes = gauge!(recorded::NUM_RUNNING_FLUSHES, "rocksdb" => name.clone());
-        let total_sst_files_size =
-            gauge!(recorded::TOTAL_SST_FILES_SIZE, "rocksdb" => name.clone());
-        let live_sst_files_size = gauge!(recorded::LIVE_SST_FILES_SIZE, "rocksdb" => name.clone());
-        let block_cache_capacity =
-            gauge!(recorded::BLOCK_CACHE_CAPACITY, "rocksdb" => name.clone());
-        let block_cache_usage = gauge!(recorded::BLOCK_CACHE_USAGE, "rocksdb" => name.clone());
+            gauge!(metric::NUM_RUNNING_COMPACTIONS, "rocksdb" => name.clone());
+        let num_running_flushes = gauge!(metric::NUM_RUNNING_FLUSHES, "rocksdb" => name.clone());
+        let total_sst_files_size = gauge!(metric::TOTAL_SST_FILES_SIZE, "rocksdb" => name.clone());
+        let live_sst_files_size = gauge!(metric::LIVE_SST_FILES_SIZE, "rocksdb" => name.clone());
+        let block_cache_capacity = gauge!(metric::BLOCK_CACHE_CAPACITY, "rocksdb" => name.clone());
+        let block_cache_usage = gauge!(metric::BLOCK_CACHE_USAGE, "rocksdb" => name.clone());
         let block_cache_pinned_usage =
-            gauge!(recorded::BLOCK_CACHE_PINNED_USAGE, "rocksdb" => name.clone());
+            gauge!(metric::BLOCK_CACHE_PINNED_USAGE, "rocksdb" => name.clone());
 
         let (tx, rx) = sync_channel(1);
 
@@ -133,11 +129,10 @@ impl MetricsReporter {
     }
 
     fn memory_stats(&self) {
-        let inner = self.state_handle.inner_fair();
-        let db = inner.db;
+        let db = self.state_handle.db();
         // We don't have references to the caches, so we can't report their memory usage from
         // the `get_memory_usage_stats()` function.
-        if let Ok(stats) = get_memory_usage_stats(Some(&[&db]), None) {
+        if let Ok(stats) = get_memory_usage_stats(Some(&[db]), None) {
             self.mem_table_total.set(stats.mem_table_total as f64);
             self.mem_table_unflushed
                 .set(stats.mem_table_unflushed as f64);
@@ -151,11 +146,21 @@ impl MetricsReporter {
         // we need to iterate over each column family as, if we don't do this, we will only get
         // the value for the default column family. This is not obvious from the docs.
         if let Some(cf) = db.cf_handle(DEFAULT_CF) {
-            self.capture_metrics(&db, cf, &mut collector);
+            self.capture_metrics(db, &cf, &mut collector);
         }
-        for index in &inner.shared_state.indices {
-            if let Some(cf) = db.cf_handle(&index.column_family) {
-                self.capture_metrics(&db, cf, &mut collector);
+
+        // Clone CF names under lock, then drop before slow property queries
+        let cf_names: Vec<String> = self
+            .state_handle
+            .shared_state()
+            .indices
+            .iter()
+            .map(|idx| idx.column_family.clone())
+            .collect();
+
+        for cf_name in &cf_names {
+            if let Some(cf) = db.cf_handle(cf_name) {
+                self.capture_metrics(db, &cf, &mut collector);
             }
         }
         self.block_indexes_filters_total
@@ -180,7 +185,12 @@ impl MetricsReporter {
             .set(collector.block_cache_pinned_usage as f64);
     }
 
-    fn capture_metrics(&self, db: &DB, cf: &ColumnFamily, collector: &mut MetricsCollector) {
+    fn capture_metrics(
+        &self,
+        db: &DB,
+        cf: &impl AsColumnFamilyRef,
+        collector: &mut MetricsCollector,
+    ) {
         // macro to add the value of a property to a target variable.
         macro_rules! add_property_value {
             ($cf:expr, $property:expr, $target:expr) => {
@@ -192,60 +202,56 @@ impl MetricsReporter {
 
         // readers-related metrics
         add_property_value!(
-            &cf,
+            cf,
             "rocksdb.estimate-table-readers-mem",
             collector.block_indexes_filters_count
         );
 
         // compaction-related metrics
         add_property_value!(
-            &cf,
+            cf,
             "rocksdb.compaction-pending",
             collector.compaction_pending
         );
         add_property_value!(
-            &cf,
+            cf,
             "rocksdb.estimate-pending-compaction-bytes",
             collector.estimate_pending_compaction_bytes
         );
         add_property_value!(
-            &cf,
+            cf,
             "rocksdb.num-running-compactions",
             collector.num_running_compactions
         );
 
         // flush-related metrics
         add_property_value!(
-            &cf,
+            cf,
             "rocksdb.num-running-flushes",
             collector.num_running_flushes
         );
 
         // sst-file-related metrics
         add_property_value!(
-            &cf,
+            cf,
             "rocksdb.total-sst-files-size",
             collector.total_sst_files_size
         );
         add_property_value!(
-            &cf,
+            cf,
             "rocksdb.live-sst-files-size",
             collector.live_sst_files_size
         );
 
         // block-cache-related metrics
         add_property_value!(
-            &cf,
+            cf,
             "rocksdb.block-cache-capacity",
             collector.block_cache_capacity
         );
+        add_property_value!(cf, "rocksdb.block-cache-usage", collector.block_cache_usage);
         add_property_value!(
-            &cf,
-            "rocksdb.block-cache-usage",
-            collector.block_cache_usage
-        );
-        add_property_value!(
-            &cf,
+            cf,
             "rocksdb.block-cache-pinned-usage",
             collector.block_cache_pinned_usage
         );

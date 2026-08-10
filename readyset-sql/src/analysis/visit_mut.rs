@@ -445,6 +445,20 @@ pub trait VisitorMut<'ast>: Sized {
         Ok(())
     }
 
+    fn visit_flush_all_shallow_caches_statement(
+        &mut self,
+        _flush_all_shallow_caches_statement: &'ast mut FlushAllShallowCachesStatement,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn visit_flush_cache_statement(
+        &mut self,
+        _flush_cache_statement: &'ast mut FlushCacheStatement,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     fn visit_drop_view_statement(
         &mut self,
         drop_view_statement: &'ast mut DropViewStatement,
@@ -630,16 +644,106 @@ pub fn walk_function_expr<'ast, V: VisitorMut<'ast>>(
         FunctionExpr::CountStar
         | FunctionExpr::RowNumber
         | FunctionExpr::Rank
-        | FunctionExpr::DenseRank => Ok(()),
-        FunctionExpr::Call {
-            arguments: None, ..
-        } => Ok(()),
-        FunctionExpr::Call {
-            arguments: Some(arguments),
-            ..
-        } => {
-            for arg in arguments {
-                visitor.visit_expr(arg)?;
+        | FunctionExpr::DenseRank
+        | FunctionExpr::CurrentDate
+        | FunctionExpr::CurrentTimestamp(_)
+        | FunctionExpr::CurrentTime
+        | FunctionExpr::LocalTimestamp
+        | FunctionExpr::LocalTime
+        | FunctionExpr::CurrentUser
+        | FunctionExpr::SessionUser
+        | FunctionExpr::CurrentCatalog
+        | FunctionExpr::SqlUser => Ok(()),
+        FunctionExpr::DayOfWeek(expr)
+        | FunctionExpr::Month(expr)
+        | FunctionExpr::Length(expr)
+        | FunctionExpr::OctetLength(expr)
+        | FunctionExpr::CharLength(expr)
+        | FunctionExpr::Ascii(expr)
+        | FunctionExpr::Hex(expr)
+        | FunctionExpr::JsonDepth(expr)
+        | FunctionExpr::JsonValid(expr)
+        | FunctionExpr::JsonQuote(expr)
+        | FunctionExpr::JsonTypeof(expr)
+        | FunctionExpr::JsonArrayLength(expr)
+        | FunctionExpr::JsonStripNulls(expr)
+        | FunctionExpr::JsonbStripNulls(expr)
+        | FunctionExpr::JsonbPretty(expr)
+        | FunctionExpr::StAsText(expr)
+        | FunctionExpr::StAsWkt(expr)
+        | FunctionExpr::StAsEwkt(expr) => visitor.visit_expr(expr.as_mut()),
+        FunctionExpr::Timediff(a, b)
+        | FunctionExpr::Addtime(a, b)
+        | FunctionExpr::DateFormat(a, b)
+        | FunctionExpr::DateTrunc(a, b)
+        | FunctionExpr::IfNull(a, b)
+        | FunctionExpr::JsonOverlaps(a, b) => {
+            visitor.visit_expr(a.as_mut())?;
+            visitor.visit_expr(b.as_mut())
+        }
+        FunctionExpr::ConvertTz(a, b, c) | FunctionExpr::SplitPart(a, b, c) => {
+            visitor.visit_expr(a.as_mut())?;
+            visitor.visit_expr(b.as_mut())?;
+            visitor.visit_expr(c.as_mut())
+        }
+        FunctionExpr::Round(expr, prec) => {
+            visitor.visit_expr(expr.as_mut())?;
+            if let Some(p) = prec {
+                visitor.visit_expr(p.as_mut())?;
+            }
+            Ok(())
+        }
+        FunctionExpr::ArrayToString(a, b, c) => {
+            visitor.visit_expr(a.as_mut())?;
+            visitor.visit_expr(b.as_mut())?;
+            if let Some(c) = c {
+                visitor.visit_expr(c.as_mut())?;
+            }
+            Ok(())
+        }
+        FunctionExpr::JsonbInsert(a, b, c, d) | FunctionExpr::JsonbSet(a, b, c, d) => {
+            visitor.visit_expr(a.as_mut())?;
+            visitor.visit_expr(b.as_mut())?;
+            visitor.visit_expr(c.as_mut())?;
+            if let Some(d) = d {
+                visitor.visit_expr(d.as_mut())?;
+            }
+            Ok(())
+        }
+        FunctionExpr::JsonbSetLax(a, b, c, d, e) => {
+            visitor.visit_expr(a.as_mut())?;
+            visitor.visit_expr(b.as_mut())?;
+            visitor.visit_expr(c.as_mut())?;
+            if let Some(d) = d {
+                visitor.visit_expr(d.as_mut())?;
+            }
+            if let Some(e) = e {
+                visitor.visit_expr(e.as_mut())?;
+            }
+            Ok(())
+        }
+        FunctionExpr::JsonExtractPathText(json, keys)
+        | FunctionExpr::JsonExtractPath(json, keys)
+        | FunctionExpr::JsonbExtractPath(json, keys) => {
+            visitor.visit_expr(json.as_mut())?;
+            for k in keys {
+                visitor.visit_expr(k)?;
+            }
+            Ok(())
+        }
+        FunctionExpr::Coalesce(exprs)
+        | FunctionExpr::Greatest(exprs)
+        | FunctionExpr::Least(exprs)
+        | FunctionExpr::Concat(exprs)
+        | FunctionExpr::ConcatWs(exprs)
+        | FunctionExpr::JsonObject(exprs)
+        | FunctionExpr::JsonbObject(exprs)
+        | FunctionExpr::JsonBuildObject(exprs)
+        | FunctionExpr::JsonbBuildObject(exprs)
+        | FunctionExpr::JsonBuildArray(exprs)
+        | FunctionExpr::JsonbBuildArray(exprs) => {
+            for e in exprs {
+                visitor.visit_expr(e)?;
             }
             Ok(())
         }
@@ -858,9 +962,19 @@ pub fn walk_table_expr<'ast, V: VisitorMut<'ast>>(
     match &mut table_expr.inner {
         TableExprInner::Table(table) => visitor.visit_table(table)?,
         TableExprInner::Subquery(sq) => visitor.visit_select_statement(sq)?,
+        TableExprInner::Values { rows } => {
+            for row in rows {
+                for expr in row {
+                    visitor.visit_expr(expr)?;
+                }
+            }
+        }
     }
     if let Some(ref mut alias) = table_expr.alias {
         visitor.visit_sql_identifier(alias)?;
+    }
+    for col_alias in &mut table_expr.column_aliases {
+        visitor.visit_sql_identifier(col_alias)?;
     }
     Ok(())
 }
@@ -1146,11 +1260,22 @@ pub fn walk_alter_readyset_statement<'a, V: VisitorMut<'a>>(
             .tables
             .iter_mut()
             .try_for_each(|table| visitor.visit_table(table)),
+        AlterReadysetStatement::ShallowCacheAllowlistChange(stmt) => stmt
+            .names
+            .iter_mut()
+            .try_for_each(|name| visitor.visit_sql_identifier(name)),
         AlterReadysetStatement::EnterMaintenanceMode
         | AlterReadysetStatement::ExitMaintenanceMode
         | AlterReadysetStatement::SetLogLevel(_)
         | AlterReadysetStatement::SetEviction(_)
-        | AlterReadysetStatement::ChangeUpstream(_) => Ok(()),
+        | AlterReadysetStatement::ChangeUpstream(_)
+        | AlterReadysetStatement::StopReplication
+        | AlterReadysetStatement::StartReplication
+        | AlterReadysetStatement::SetReplicationPosition(_)
+        | AlterReadysetStatement::ChangeCdc(_)
+        | AlterReadysetStatement::AddUser(_)
+        | AlterReadysetStatement::ModifyUser(_)
+        | AlterReadysetStatement::DropUser(_) => Ok(()),
     }
 }
 
@@ -1292,6 +1417,7 @@ pub fn walk_set_statement<'a, V: VisitorMut<'a>>(
         SetStatement::PostgresParameter(set_postgres_parameter) => {
             visitor.visit_set_postgres_parameter(set_postgres_parameter)
         }
+        SetStatement::SessionAuthorization(_) => Ok(()),
     }
 }
 
@@ -1386,6 +1512,10 @@ pub fn walk_sql_query<'a, V: VisitorMut<'a>>(
         SqlQuery::CreateCache(statement) => visitor.visit_create_cache_statement(statement),
         SqlQuery::DropCache(statement) => visitor.visit_drop_cache_statement(statement),
         SqlQuery::DropAllCaches(statement) => visitor.visit_drop_all_caches_statement(statement),
+        SqlQuery::FlushAllShallowCaches(statement) => {
+            visitor.visit_flush_all_shallow_caches_statement(statement)
+        }
+        SqlQuery::FlushCache(statement) => visitor.visit_flush_cache_statement(statement),
         SqlQuery::DropAllProxiedQueries(statement) => {
             visitor.visit_drop_all_proxied_queries_statement(statement)
         }
@@ -1399,6 +1529,10 @@ pub fn walk_sql_query<'a, V: VisitorMut<'a>>(
         SqlQuery::CreateDatabase(statement) => visitor.visit_create_database_statement(statement),
         SqlQuery::CreateRls(statement) => visitor.visit_create_rls_statement(statement),
         SqlQuery::DropRls(statement) => visitor.visit_drop_rls_statement(statement),
+        SqlQuery::CreateMcpToken(_)
+        | SqlQuery::DropMcpToken(_)
+        | SqlQuery::AlterMcpToken(_)
+        | SqlQuery::Discard(_) => Ok(()),
     }
 }
 
@@ -1582,6 +1716,7 @@ mod tests {
                     name: "users".into(),
                 }),
                 alias: None,
+                column_aliases: vec![],
             }],
             ..Default::default()
         });
@@ -1614,6 +1749,7 @@ mod tests {
                     name: "users".into(),
                 }),
                 alias: None,
+                column_aliases: vec![],
             }],
             ..Default::default()
         });
@@ -1648,6 +1784,7 @@ mod tests {
                     name: "users".into(),
                 }),
                 alias: None,
+                column_aliases: vec![],
             }],
             join: vec![JoinClause {
                 operator: JoinOperator::Join,
@@ -1669,10 +1806,12 @@ mod tests {
                                 name: "users".into(),
                             }),
                             alias: None,
+                            column_aliases: vec![],
                         }],
                         ..Default::default()
                     })),
                     alias: Some("s".into()),
+                    column_aliases: vec![],
                 }),
                 constraint: JoinConstraint::On(Expr::BinaryOp {
                     lhs: Box::new(Expr::Column(Column {
@@ -1723,6 +1862,7 @@ mod tests {
                     name: "users".into(),
                 }),
                 alias: None,
+                column_aliases: vec![],
             }],
             limit_clause: LimitClause::LimitOffset {
                 limit: Some(LimitValue::Literal(Literal::Integer(3))),
@@ -1759,6 +1899,7 @@ mod tests {
                     name: "users".into(),
                 }),
                 alias: None,
+                column_aliases: vec![],
             }],
             limit_clause: LimitClause::LimitOffset {
                 limit: Some(LimitValue::Literal(Literal::Integer(3))),
@@ -1795,6 +1936,7 @@ mod tests {
                     name: "users".into(),
                 }),
                 alias: None,
+                column_aliases: vec![],
             }],
             limit_clause: LimitClause::OffsetCommaLimit {
                 limit: LimitValue::Literal(Literal::Integer(3)),

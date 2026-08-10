@@ -1,5 +1,5 @@
 use readyset_data::DfType;
-use readyset_errors::{invariant, ReadySetResult};
+use readyset_errors::{ReadySetResult, invariant};
 use serde::{Deserialize, Serialize};
 
 use crate::node::AuxiliaryNodeState;
@@ -80,6 +80,14 @@ impl GroupedOperation for ExtremumOperator {
 
     fn group_by(&self) -> &[usize] {
         &self.group[..]
+    }
+
+    fn empty_value(&self) -> Option<DfValue> {
+        Some(DfValue::None)
+    }
+
+    fn emit_empty(&self) -> bool {
+        self.group_by().is_empty()
     }
 
     fn to_diff(&self, r: &[DfValue], pos: bool) -> ReadySetResult<Self::Diff> {
@@ -168,7 +176,7 @@ impl GroupedOperation for ExtremumOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ops, LookupIndex};
+    use crate::{LookupIndex, ops};
 
     fn setup(op: Extremum, mat: bool) -> ops::test::MockGraph {
         let mut g = ops::test::MockGraph::new();

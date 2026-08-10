@@ -52,7 +52,9 @@ fn push_view_key(query: &mut MirQuery<'_>, node_idx: NodeIndex) -> ReadySetResul
             }
             query.swap_with_child(node_idx)?;
         }
-        MirNodeInner::JoinAggregates => internal!("Unexpected JoinAggregates in push_view_key"),
+        MirNodeInner::JoinAggregates { .. } => {
+            internal!("Unexpected JoinAggregates in push_view_key")
+        }
         // TODO: left joins are tricky if we're coming from the right side
         MirNodeInner::LeftJoin { .. } => unsupported!(
             "Parameters in subqueries on the right-hand side of LEFT JOIN not supported"
@@ -97,6 +99,7 @@ fn push_view_key(query: &mut MirQuery<'_>, node_idx: NodeIndex) -> ReadySetResul
             query.remove_node(node_idx)?;
         }
         MirNodeInner::Base { .. } => internal!("Encountered Base node with a parent (???)"),
+        MirNodeInner::Constant { .. } => internal!("Encountered Constant node with a parent (???)"),
     }
 
     Ok(())
@@ -140,6 +143,7 @@ mod tests {
                     generated: None,
                     constraints: vec![],
                     comment: None,
+                    invisible: false,
                 }],
                 primary_key: None,
                 unique_keys: Default::default(),

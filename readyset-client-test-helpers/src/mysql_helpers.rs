@@ -1,17 +1,31 @@
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Display;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use database_utils::TlsMode;
 use mysql_async::prelude::Queryable;
-use mysql_srv::MySqlIntermediary;
-use readyset_adapter::backend::QueryInfo;
+use mysql_srv::{AuthCache, AuthKeys, AuthPlugin, MySqlIntermediary};
+use readyset_adapter::backend::{QueryInfo, UsersSync};
 use readyset_adapter::upstream_database::LazyUpstream;
 use readyset_mysql::{Backend, MySqlQueryHandler, MySqlUpstream};
 use readyset_util::retry_with_exponential_backoff;
 use tokio::net::TcpStream;
 
 use crate::Adapter;
+
+/// Keeps the `caching_sha2_password` [`AuthCache`] in step with runtime mutations of the
+/// allowed-users map, mirroring `AuthCacheSync` in the adapter binary so tests exercise the same
+/// fast-auth refresh path.
+#[derive(Debug)]
+struct AuthCacheSync(Arc<AuthCache>);
+
+impl UsersSync for AuthCacheSync {
+    fn refresh(&self, users: &HashMap<String, String>) {
+        self.0.set_all(users);
+    }
+}
 
 pub fn upstream_config() -> mysql_async::OptsBuilder {
     mysql_async::OptsBuilder::default()
@@ -130,7 +144,10 @@ impl Adapter for MySQLAdapter {
     async fn run_backend(
         backend: readyset_adapter::Backend<Self::Upstream, Self::Handler>,
         s: TcpStream,
+        auth_plugin: AuthPlugin,
+        auth_cache: Arc<AuthCache>,
     ) {
+        let _ = AuthKeys::initialize(None);
         MySqlIntermediary::run_on_tcp(
             Backend {
                 noria: backend,
@@ -140,8 +157,14 @@ impl Adapter for MySQLAdapter {
             false,
             None,
             TlsMode::Optional,
+            auth_cache,
+            auth_plugin,
         )
         .await
         .unwrap()
+    }
+
+    fn users_sync(auth_cache: &Arc<AuthCache>) -> Option<Arc<dyn UsersSync>> {
+        Some(Arc::new(AuthCacheSync(Arc::clone(auth_cache))))
     }
 }

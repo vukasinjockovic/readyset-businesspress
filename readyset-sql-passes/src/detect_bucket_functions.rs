@@ -1,6 +1,8 @@
 use readyset_errors::{ReadySetError, ReadySetResult, invalid_query};
 use readyset_sql::analysis::visit::{Visitor, walk_function_expr};
-use readyset_sql::ast::{CacheInner, CreateCacheStatement, FunctionExpr, SelectStatement};
+use readyset_sql::ast::{
+    CacheInner, CreateCacheStatement, FunctionExpr, SelectStatement, TrxCachePolicy,
+};
 
 /// A trait for detecting bucket functions in queries and validating that the ALWAYS keyword
 /// is present. This is because the bucket function is Readyset-specific; it doesn't exist
@@ -22,7 +24,7 @@ impl DetectBucketFunctions for CreateCacheStatement {
             CacheInner::Id(_) => return Ok(()),
         };
 
-        if has_bucket_function && !self.always {
+        if has_bucket_function && !matches!(self.trx_cache_policy, TrxCachePolicy::Always) {
             invalid_query!(
                 "CREATE CACHE statements containing Bucket function must use the ALWAYS keyword (CREATE CACHE ALWAYS ...)"
             )
@@ -97,6 +99,7 @@ mod tests {
                     name: SqlIdentifier::from("test_table"),
                 }),
                 alias: None,
+                column_aliases: vec![],
             }],
             ..Default::default()
         };
@@ -128,6 +131,7 @@ mod tests {
                     name: SqlIdentifier::from("test_table"),
                 }),
                 alias: None,
+                column_aliases: vec![],
             }],
             ..Default::default()
         };
@@ -145,8 +149,11 @@ mod tests {
                 shallow: Err("Not used".to_string()),
             },
             unparsed_create_cache_statement: None,
-            always: false, // should cause error
+            trx_cache_policy: TrxCachePolicy::Never, // should cause error
             concurrently: false,
+            adaptive: false,
+            topk_buffer_multiplier: None,
+            autoparam: Default::default(),
         };
 
         let result = cache_stmt.detect_and_validate_bucket_always();
@@ -186,6 +193,7 @@ mod tests {
                     name: SqlIdentifier::from("test_table"),
                 }),
                 alias: None,
+                column_aliases: vec![],
             }],
             ..Default::default()
         };
@@ -203,8 +211,11 @@ mod tests {
                 shallow: Err("Not used".to_string()),
             },
             unparsed_create_cache_statement: None,
-            always: true, // should succeed
+            trx_cache_policy: TrxCachePolicy::Always, // should succeed
             concurrently: false,
+            adaptive: false,
+            topk_buffer_multiplier: None,
+            autoparam: Default::default(),
         };
 
         let result = cache_stmt.detect_and_validate_bucket_always();
@@ -232,6 +243,7 @@ mod tests {
                     name: SqlIdentifier::from("test_table"),
                 }),
                 alias: None,
+                column_aliases: vec![],
             }],
             ..Default::default()
         };
@@ -249,8 +261,11 @@ mod tests {
                 shallow: Err("Not used".to_string()),
             },
             unparsed_create_cache_statement: None,
-            always: false,
+            trx_cache_policy: TrxCachePolicy::Never,
             concurrently: false,
+            adaptive: false,
+            topk_buffer_multiplier: None,
+            autoparam: Default::default(),
         };
 
         let result = cache_stmt.detect_and_validate_bucket_always();
@@ -260,7 +275,7 @@ mod tests {
         );
 
         assert!(
-            !cache_stmt.always,
+            !matches!(cache_stmt.trx_cache_policy, TrxCachePolicy::Always),
             "ALWAYS should remain unchanged when no bucket function is detected"
         );
     }
@@ -295,6 +310,7 @@ mod tests {
                     name: SqlIdentifier::from("events"),
                 }),
                 alias: None,
+                column_aliases: vec![],
             }],
             where_clause: Some(where_condition),
             ..Default::default()

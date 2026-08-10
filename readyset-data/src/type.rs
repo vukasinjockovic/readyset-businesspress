@@ -41,7 +41,12 @@ pub enum DfType {
     /// however this type does not represent that.
     Unknown,
 
-    Row,
+    /// An anonymous composite value built by a `ROW` constructor, carrying the type of each field.
+    ///
+    /// PostgreSQL reports these as the `record`
+    /// [pseudo type](https://www.postgresql.org/docs/current/datatype-pseudo.html), whose wire
+    /// encoding is field-wise and so needs the field types. MySQL has no projectable row type.
+    Row(Box<[DfType]>),
 
     /// [PostgreSQL `T[]`](https://www.postgresql.org/docs/current/arrays.html).
     Array(Box<DfType>),
@@ -167,25 +172,17 @@ pub enum DfType {
     Date,
 
     /// [MySQL `datetime`](https://dev.mysql.com/doc/refman/8.0/en/datetime.html).
-    DateTime {
-        subsecond_digits: u16,
-    },
+    DateTime { subsecond_digits: u16 },
 
     /// [MySQL `time`](https://dev.mysql.com/doc/refman/8.0/en/datetime.html).
-    Time {
-        subsecond_digits: u16,
-    },
+    Time { subsecond_digits: u16 },
 
     /// [MySQL `timestamp`](https://dev.mysql.com/doc/refman/8.0/en/datetime.html) or
     /// [PostgreSQL `timestamp`](https://www.postgresql.org/docs/current/datatype-datetime.html).
-    Timestamp {
-        subsecond_digits: u16,
-    },
+    Timestamp { subsecond_digits: u16 },
 
     /// [PostgreSQL `timestamptz`/`timestamp with timezone`](https://www.postgresql.org/docs/current/datatype-datetime.html).
-    TimestampTz {
-        subsecond_digits: u16,
-    },
+    TimestampTz { subsecond_digits: u16 },
 
     /// [PostgreSQL `macaddr`](https://www.postgresql.org/docs/current/datatype-net-types.html).
     MacAddr,
@@ -249,6 +246,64 @@ impl DfType {
     pub const DEFAULT_NUMERIC_SCALE: u8 = 0;
 
     pub const DEFAULT_BIT: Self = Self::Bit(1);
+
+    /// Returns the MySQL output type for AVG() given the input column type.
+    ///
+    /// Per MySQL's [precision math examples][examples] and the
+    /// [`div_precision_increment`][dpi] system variable (default 4):
+    ///
+    /// - Integer input → `DECIMAL(decimal_precision + incr, 0 + incr)`
+    /// - `DECIMAL(prec, scale)` input → `DECIMAL(min(prec+incr, 65), min(scale+incr, 30))`
+    /// - Float/Double/Text input → `DOUBLE`
+    ///
+    /// The `decimal_precision` for each integer type is the number of decimal
+    /// digits needed to represent the type's maximum value
+    /// (`floor(log10(max_value)) + 1`):
+    ///
+    /// | Type       | Signed | Unsigned |
+    /// |------------|--------|----------|
+    /// | TINYINT    |      3 |        3 |
+    /// | SMALLINT   |      5 |        5 |
+    /// | MEDIUMINT  |      7 |        8 |
+    /// | INT        |     10 |       10 |
+    /// | BIGINT     |     19 |       20 |
+    ///
+    /// We hardcode the increment to 4 (MySQL's default). If we ever need to support
+    /// non-default `div_precision_increment`, this should be parameterized.
+    ///
+    /// [examples]: https://dev.mysql.com/doc/refman/8.4/en/precision-math-examples.html
+    /// [dpi]: https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_div_precision_increment
+    pub fn mysql_avg_output_type(over_col_ty: &DfType) -> DfType {
+        const DIV_PREC_INCR: u16 = 4;
+        if let Some(dec_prec) = over_col_ty.mysql_decimal_precision() {
+            DfType::Numeric {
+                prec: (dec_prec + DIV_PREC_INCR).min(65),
+                scale: (DIV_PREC_INCR as u8).min(30),
+            }
+        } else if let DfType::Numeric { prec, scale } = over_col_ty {
+            DfType::Numeric {
+                prec: (*prec + DIV_PREC_INCR).min(65),
+                scale: (*scale + DIV_PREC_INCR as u8).min(30),
+            }
+        } else {
+            DfType::Double
+        }
+    }
+
+    /// Returns the decimal precision for MySQL integer types, or `None` for non-integer types.
+    /// This is the number of decimal digits needed to represent the type's maximum value.
+    pub fn mysql_decimal_precision(&self) -> Option<u16> {
+        match self {
+            Self::TinyInt | Self::UnsignedTinyInt => Some(3),
+            Self::SmallInt | Self::UnsignedSmallInt => Some(5),
+            Self::MediumInt => Some(7),
+            Self::UnsignedMediumInt => Some(8),
+            Self::Int | Self::UnsignedInt => Some(10),
+            Self::BigInt => Some(19),
+            Self::UnsignedBigInt => Some(20),
+            _ => None,
+        }
+    }
 }
 
 /// Conversions to/from [`SqlType`].
@@ -389,7 +444,7 @@ impl DfType {
         match self {
             DfType::Unknown => PgTypeCategory::Unknown,
             DfType::Array(_) => PgTypeCategory::Array,
-            DfType::Row => PgTypeCategory::Composite,
+            DfType::Row(_) => PgTypeCategory::Composite,
             DfType::Bool => PgTypeCategory::Boolean,
             DfType::Int
             | DfType::UnsignedInt
@@ -637,6 +692,18 @@ impl DfType {
         }
     }
 
+    /// Returns a copy of this type with the given collation, for text types. Non-text types
+    /// are returned unchanged.
+    #[inline]
+    pub fn with_collation(&self, c: Collation) -> Self {
+        match self {
+            Self::Text(_) => Self::Text(c),
+            Self::Char(n, _) => Self::Char(*n, c),
+            Self::VarChar(n, _) => Self::VarChar(*n, c),
+            other => other.clone(),
+        }
+    }
+
     /// Returns the deepest nested type in [`DfType::Array`], otherwise returns `self`.
     #[inline]
     pub fn innermost_array_type(&self) -> &Self {
@@ -867,12 +934,13 @@ impl fmt::Display for DfType {
             | Self::MacAddr
             | Self::Uuid
             | Self::Json
-            | Self::Jsonb
-            | Self::Row => write!(f, "{kind:?}"),
+            | Self::Jsonb => write!(f, "{kind:?}"),
 
             Self::Text(collation) => write!(f, "Text_{collation}"),
 
             Self::Array(ref ty) => write!(f, "{ty}[]"),
+
+            Self::Row(ref fields) => write!(f, "Row({})", fields.iter().join(", ")),
 
             Self::Char(n, ..)
             | Self::VarChar(n, ..)

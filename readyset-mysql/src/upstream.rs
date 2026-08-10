@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::{Stream, StreamExt};
-use mysql_async::consts::{Command, StatusFlags};
+use metrics::gauge;
+use mysql_async::consts::{CapabilityFlags, Command, StatusFlags};
 use mysql_async::prelude::Queryable;
 use mysql_async::{
     ChangeUserOpts, Column, Conn, Opts, OptsBuilder, ResultSetStream, Row, UrlError,
@@ -20,13 +21,15 @@ use database_utils::tls::{get_mysql_tls_config, ServerCertVerification};
 use readyset_adapter::upstream_database::{Refresh, UpstreamDestination, UpstreamStatementId};
 use readyset_adapter::{UpstreamConfig, UpstreamDatabase, UpstreamPrepare};
 use readyset_adapter_types::{DeallocateId, PreparedStatementType};
-use readyset_client_metrics::{recorded, QueryDestination};
+use readyset_client_metrics::QueryDestination;
+use readyset_data::encoding::Encoding;
 use readyset_data::upstream_system_props::DEFAULT_TIMEZONE_NAME;
 use readyset_data::DfValue;
 use readyset_errors::{internal, unsupported, ReadySetError, ReadySetResult};
-use readyset_shallow::{CacheInsertGuard, MySqlMetadata, QueryMetadata};
-use readyset_sql::ast::{SqlIdentifier, StartTransactionStatement};
+use readyset_shallow::{CacheInsertGuard, ContentHash, MySqlMetadata, QueryMetadata};
+use readyset_sql::ast::SqlIdentifier;
 use readyset_sql::Dialect;
+use readyset_util::hash::hash;
 use readyset_util::redacted::RedactedString;
 use readyset_util::SizeOf;
 
@@ -35,6 +38,9 @@ use crate::{handle_error, Error};
 
 type StatementID = u32;
 
+/// One row of a shallow cache entry. Entries are keyed per results charset and filled from
+/// results the upstream converted into that charset. Text values are stored as canonical UTF-8
+/// [`DfValue`]s and encoded back into the key's charset when served.
 #[derive(Debug)]
 pub enum CacheEntry {
     Text(Vec<DfValue>),
@@ -49,9 +55,18 @@ impl SizeOf for CacheEntry {
             }
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         match self {
             Self::Text(values) | Self::Binary(values) => values.is_empty(),
+        }
+    }
+}
+
+impl ContentHash for CacheEntry {
+    fn content_hash(&self) -> u64 {
+        match self {
+            Self::Text(values) => hash(&(0u8, values)),
+            Self::Binary(values) => hash(&(1u8, values)),
         }
     }
 }
@@ -63,6 +78,30 @@ const MIN_UPSTREAM_MINOR_VERSION: u16 = 7;
 
 fn dt_to_value_params(dt: &[DfValue]) -> ReadySetResult<Vec<mysql_async::Value>> {
     dt.iter().map(|v| v.try_into()).collect()
+}
+
+/// Convert an upstream wire value to the [`DfValue`] stored in a shallow cache entry. Values of
+/// text columns are decoded from the column's charset to UTF-8, so entries store canonical text
+/// regardless of the charset the upstream converted the result into. Values of binary columns
+/// (charset 63) are kept as raw bytes.
+fn cache_df_value(col: &mysql_async::Value, column_charset: u16) -> io::Result<DfValue> {
+    if let mysql_async::Value::Bytes(bytes) = col {
+        let encoding = Encoding::from_mysql_collation_id(column_charset);
+        if !matches!(encoding, Encoding::Binary) {
+            return encoding.decode(bytes).map(DfValue::from).map_err(|e| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("failed decoding {col:?} as {encoding}: {e}"),
+                )
+            });
+        }
+    }
+    col.try_into().map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("failed converting {col:?} to DfValue"),
+        )
+    })
 }
 
 #[pin_project(project = ReadResultStreamProj)]
@@ -127,11 +166,18 @@ impl<'a> QueryResult<'a> {
     /// When `status_flags_override` is `None`, the flags from mysql-async are
     /// forwarded verbatim (used only for cache-refresh paths that have no
     /// client writer).
+    ///
+    /// `results_encoding` is the results charset of the session (or, on a refresh, of the entry
+    /// being refreshed), which the upstream connection's `character_set_results` mirrors. Shallow
+    /// cache entries are keyed per results charset and filled from results the upstream converted
+    /// into that charset. Cached copies of text values are decoded to UTF-8 and encoded back into
+    /// the key's charset when served.
     pub async fn process<S>(
         self,
         writer: Option<QueryResultWriter<'_, S>>,
-        mut cache: Option<CacheInsertGuard<Vec<DfValue>, CacheEntry>>,
+        mut cache: Option<CacheInsertGuard<readyset_adapter::shallow_key::ShallowKey, CacheEntry>>,
         status_flags_override: Option<StatusFlags>,
+        results_encoding: Encoding,
     ) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -167,7 +213,25 @@ impl<'a> QueryResult<'a> {
             } => {
                 let is_binary = matches!(stream, ReadResultStream::Binary(_));
 
-                let formatted_cols = columns.iter().map(|c| c.into()).collect::<Vec<_>>();
+                // Cache entries store text values as UTF-8 DfValues, decoded from the charset
+                // each column's metadata reports. Skip filling the cache when that isn't
+                // possible: a `binary` results charset suppresses the upstream's conversion to
+                // a known charset, and an unsupported column charset can't be decoded.
+                if matches!(results_encoding, Encoding::Binary | Encoding::OtherMySql(_))
+                    || columns.iter().any(|c| {
+                        matches!(
+                            Encoding::from_mysql_collation_id(c.character_set()),
+                            Encoding::OtherMySql(_)
+                        )
+                    })
+                {
+                    cache = None;
+                }
+
+                let formatted_cols = columns
+                    .iter()
+                    .map(|c| mysql_srv::Column::from_mysql(c, results_encoding))
+                    .collect::<Vec<_>>();
                 let mut rw = if let Some(writer) = writer {
                     Some(writer.start(&formatted_cols).await?)
                 } else {
@@ -186,17 +250,14 @@ impl<'a> QueryResult<'a> {
                         }
                     };
 
-                    let mut copy = cache.as_ref().map(|_| Vec::new());
+                    let mut copy = cache
+                        .as_ref()
+                        .map(|_| Vec::with_capacity(row.columns_ref().len()));
                     for i in 0..row.columns_ref().len() {
                         let col = row.as_ref(i).expect("Must match column number");
 
                         if let Some(ref mut copy) = copy {
-                            copy.push(col.try_into().map_err(|_| {
-                                io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    format!("failed converting {col:?} to DfValue"),
-                                )
-                            })?);
+                            copy.push(cache_df_value(col, row.columns_ref()[i].character_set())?);
                         }
 
                         if let Some(ref mut rw) = rw {
@@ -229,6 +290,7 @@ impl<'a> QueryResult<'a> {
                 if let Some(ref mut cache) = cache {
                     cache.set_metadata(QueryMetadata::MySql(MySqlMetadata {
                         columns: Arc::clone(&columns),
+                        columns_encoding: results_encoding,
                     }));
                     drop(cache.filled());
                 }
@@ -243,11 +305,16 @@ impl<'a> QueryResult<'a> {
 impl Refresh for QueryResult<'_> {
     type Entry = CacheEntry;
 
-    async fn refresh(self, cache: CacheInsertGuard<Vec<DfValue>, Self::Entry>) -> io::Result<()> {
+    async fn refresh(
+        self,
+        cache: CacheInsertGuard<readyset_adapter::shallow_key::ShallowKey, Self::Entry>,
+        encoding: Encoding,
+    ) -> io::Result<()> {
         self.process(
             None::<QueryResultWriter<'_, tokio::net::TcpStream>>,
             Some(cache),
             None, // No status flags override for cache refresh (no client writer)
+            encoding,
         )
         .await
     }
@@ -336,6 +403,7 @@ impl MySqlUpstream {
         upstream_config: UpstreamConfig,
         username: Option<String>,
         password: Option<String>,
+        interactive: bool,
     ) -> Result<(Conn, HashMap<StatementID, mysql_async::Statement>), Error> {
         let url = upstream_config
             .upstream_db_url
@@ -360,6 +428,17 @@ impl MySqlUpstream {
         }
         if let Some(password) = password {
             builder = builder.pass(Some(password));
+        }
+        if let Some(program_name) = upstream_config.program_name.as_deref() {
+            builder = builder.connect_attributes(HashMap::from([(
+                "_program_name".to_string(),
+                program_name.to_string(),
+            )]));
+        }
+        // Mirror the client's CLIENT_INTERACTIVE capability so the upstream session honors
+        // interactive_timeout rather than wait_timeout when the client is interactive.
+        if interactive {
+            builder = builder.add_capability(CapabilityFlags::CLIENT_INTERACTIVE);
         }
         let opts: Opts = builder.into();
         let span = info_span!(
@@ -387,7 +466,7 @@ impl MySqlUpstream {
         }
 
         span.in_scope(|| debug!("Established connection to upstream"));
-        metrics::gauge!(recorded::CLIENT_UPSTREAM_CONNECTIONS).increment(1.0);
+        gauge!(metric::CLIENT_UPSTREAM_CONNECTIONS).increment(1.0);
         let prepared_statements = HashMap::new();
         Ok((conn, prepared_statements))
     }
@@ -409,9 +488,10 @@ impl UpstreamDatabase for MySqlUpstream {
         upstream_config: UpstreamConfig,
         username: Option<String>,
         password: Option<String>,
+        interactive: bool,
     ) -> Result<Self, Error> {
         let (conn, prepared_statements) =
-            Self::connect_inner(upstream_config, username, password).await?;
+            Self::connect_inner(upstream_config, username, password, interactive).await?;
         Ok(Self {
             conn,
             prepared_statements,
@@ -505,7 +585,7 @@ impl UpstreamDatabase for MySqlUpstream {
             statement_id: statement.id(),
             meta: StatementMeta {
                 params: statement.params().to_owned(),
-                schema: statement.columns().to_owned(),
+                schema: statement.columns().to_vec(),
             },
         })
     }
@@ -557,6 +637,13 @@ impl UpstreamDatabase for MySqlUpstream {
         Ok(())
     }
 
+    async fn set_results_character_set(&mut self, charset: &str) -> Result<(), Self::Error> {
+        self.conn
+            .query_drop(format!("SET character_set_results = {charset}"))
+            .await?;
+        Ok(())
+    }
+
     async fn query<'a>(&'a mut self, query: &'a str) -> Result<Self::QueryResult<'a>, Error> {
         let result = self.conn.query_iter(query).await?;
         handle_query_result!(result)
@@ -578,11 +665,8 @@ impl UpstreamDatabase for MySqlUpstream {
         unsupported!("MySQL does not have a simple_query protocol");
     }
 
-    async fn start_tx<'a>(
-        &'a mut self,
-        stmt: &StartTransactionStatement,
-    ) -> Result<Self::QueryResult<'a>, Error> {
-        self.conn.query_drop(stmt.to_string()).await?;
+    async fn start_tx<'a>(&'a mut self, query: &'a str) -> Result<Self::QueryResult<'a>, Error> {
+        self.conn.query_drop(query).await?;
 
         Ok(QueryResult::Command {
             status_flags: self.conn.status(),
@@ -647,6 +731,14 @@ impl UpstreamDatabase for MySqlUpstream {
         self.lower_case_table_names().await
     }
 
+    async fn group_concat_max_len(&mut self) -> Result<usize, Self::Error> {
+        let res: Vec<u64> = self.conn.query("select @@group_concat_max_len").await?;
+        let [v] = &res[..] else {
+            internal!("upstream is missing group_concat_max_len system variable");
+        };
+        Ok(*v as usize)
+    }
+
     async fn shallow_exec_meta(
         &mut self,
         _meta: &Self::ExecMeta,
@@ -661,7 +753,7 @@ impl UpstreamDatabase for MySqlUpstream {
 
 impl Drop for MySqlUpstream {
     fn drop(&mut self) {
-        metrics::gauge!(recorded::CLIENT_UPSTREAM_CONNECTIONS).decrement(1.0);
+        gauge!(metric::CLIENT_UPSTREAM_CONNECTIONS).decrement(1.0);
         // Properly close the connection unless this is a test using a single-threaded runtime
         let rt = tokio::runtime::Handle::current();
         if rt.runtime_flavor() != RuntimeFlavor::CurrentThread {
@@ -669,5 +761,23 @@ impl Drop for MySqlUpstream {
                 let _ = rt.block_on(self.conn.write_command_data(Command::COM_QUIT, &[]));
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_entry_content_hash() {
+        let a = CacheEntry::Text(vec![DfValue::from(1), DfValue::from("x")]);
+        let b = CacheEntry::Text(vec![DfValue::from(1), DfValue::from("x")]);
+        let c = CacheEntry::Text(vec![DfValue::from(2), DfValue::from("x")]);
+        assert_eq!(a.content_hash(), b.content_hash());
+        assert_ne!(a.content_hash(), c.content_hash());
+
+        let text = CacheEntry::Text(vec![DfValue::from(1)]);
+        let binary = CacheEntry::Binary(vec![DfValue::from(1)]);
+        assert_ne!(text.content_hash(), binary.content_hash());
     }
 }

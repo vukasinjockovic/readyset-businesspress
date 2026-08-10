@@ -1,6 +1,6 @@
 use std::env::current_dir;
 use std::fmt::{Display, Formatter};
-use std::path::Path;
+use std::fs::read_dir;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, ensure, Error, Result};
@@ -8,14 +8,13 @@ use futures::future::join_all;
 use regex::{Captures, Regex};
 use sysinfo::Disks;
 use tracing::info;
-use walkdir::WalkDir;
 
 use database_utils::tls::ServerCertVerification;
 use database_utils::{
     DatabaseConnection, DatabaseError, DatabaseType, DatabaseURL, QueryableConnection,
 };
 use readyset_sql::Dialect;
-use replicators::MYSQL_INTERNAL_DBS;
+use replicators::{replication_slot_name, MYSQL_INTERNAL_DBS};
 
 use crate::Options;
 
@@ -131,18 +130,22 @@ async fn verify_users(
     .into_iter()
     .collect::<Result<Vec<(String, Result<()>)>>>()?;
 
-    let mut failed: Vec<String> = users
+    let mut failed: Vec<(String, Error)> = users
         .into_iter()
         .filter_map(|(user, res)| match res {
             Ok(()) => None,
-            Err(_) => Some(user),
+            Err(e) => Some((user, e)),
         })
         .collect();
-    failed.sort();
+    failed.sort_by(|a, b| a.0.cmp(&b.0));
 
     if !failed.is_empty() {
         let s = if failed.len() == 1 { "" } else { "s" };
-        let users = failed.join(", ");
+        let users = failed
+            .iter()
+            .map(|(user, err)| format!("{user} ({err})"))
+            .collect::<Vec<_>>()
+            .join(", ");
         bail!("Failed to establish connection for user{s}: {users}");
     }
     Ok(())
@@ -269,6 +272,42 @@ async fn verify_replication(conn: &mut DatabaseConnection) -> Result<()> {
     Ok(())
 }
 
+/// A Postgres logical replication slot is bound to the database it was created in, but slot names
+/// are unique across the whole cluster. If a slot with the name Readyset would use already exists
+/// for a different database, Readyset cannot use it and the replicator would otherwise crash-loop
+/// on `START_REPLICATION`. Fail fast here with an actionable message instead.
+async fn verify_replication_slot(conn: &mut DatabaseConnection, options: &Options) -> Result<()> {
+    match conn.dialect() {
+        Dialect::PostgreSQL => {}
+        Dialect::MySQL => return Ok(()),
+    }
+
+    let slot_name = replication_slot_name(&options.server_worker_options.replicator_config);
+    let row = conn
+        .query(&format!(
+            "SELECT database, current_database() FROM pg_replication_slots \
+             WHERE slot_name = '{slot_name}'"
+        ))
+        .await
+        .map_err(|e| anyhow!("Failed to query replication slots: {e}"))?
+        .into_iter()
+        .next();
+
+    if let Some(row) = row {
+        let owning_db: String = row.get(0)?;
+        let current_db: String = row.get(1)?;
+        ensure!(
+            owning_db == current_db,
+            "Replication slot \"{slot_name}\" already exists for database \"{owning_db}\", but \
+             this instance replicates \"{current_db}\". Use a distinct --replication-server-id per \
+             Readyset deployment connected to the same upstream cluster, or drop the stale slot."
+        );
+    }
+
+    info!("Verified replication slot");
+    Ok(())
+}
+
 async fn verify_permissions(conn: &mut DatabaseConnection, options: &Options) -> Result<()> {
     match conn.dialect() {
         Dialect::MySQL => {
@@ -312,15 +351,6 @@ async fn verify_permissions(conn: &mut DatabaseConnection, options: &Options) ->
     Ok(())
 }
 
-fn dir_size(dir: &Path) -> u64 {
-    WalkDir::new(dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
-        .sum()
-}
-
 async fn verify_disk_space(conn: &mut DatabaseConnection, options: &Options) -> Result<()> {
     let config = &options.server_worker_options.replicator_config;
     if config.replication_tables.is_some() || config.replication_tables_ignore.is_some() {
@@ -331,6 +361,11 @@ async fn verify_disk_space(conn: &mut DatabaseConnection, options: &Options) -> 
     let deployment_dir = options
         .server_worker_options
         .storage_dir(&options.deployment);
+    if read_dir(&deployment_dir).is_ok_and(|mut files| files.next().is_some()) {
+        info!("Verified disk space for snapshot (files already exist)");
+        return Ok(());
+    }
+
     let display = deployment_dir.display().to_string();
     let mut dir = deployment_dir.clone();
     // Remove deployment directory from path, as it likely doesn't exist for new deployments.
@@ -360,14 +395,6 @@ async fn verify_disk_space(conn: &mut DatabaseConnection, options: &Options) -> 
             anyhow!("Could not find mountpoint containing storage directory {display}")
         })?;
 
-    let free_bytes = disk.available_space();
-    let used_bytes = if deployment_dir.exists() {
-        // A preexisting deployment exists, get its size to discount it from the estimate.
-        dir_size(&deployment_dir)
-    } else {
-        0
-    };
-
     let query = match conn.dialect() {
         Dialect::MySQL => &format!(
             "SELECT COALESCE(SUM(data_length), 0) FROM information_schema.tables \
@@ -380,15 +407,14 @@ async fn verify_disk_space(conn: &mut DatabaseConnection, options: &Options) -> 
         ),
         Dialect::PostgreSQL => "SELECT pg_database_size(current_database())",
     };
-    let estimated_total_bytes: i64 = query_one_value(conn, query)
+    let estimated_bytes: i64 = query_one_value(conn, query)
         .await
         .map_err(|e| anyhow!("Failed to query estimated snapshot size: {e}"))?;
-    let estimated_total_bytes = estimated_total_bytes as u64 * DISK_SPACE_REQUIREMENT_FACTOR;
-    let estimated_required_bytes = estimated_total_bytes.saturating_sub(used_bytes);
-
+    let estimated_bytes = estimated_bytes as u64 * DISK_SPACE_REQUIREMENT_FACTOR;
+    let free_bytes = disk.available_space();
     ensure!(
-        free_bytes > estimated_required_bytes,
-        "Estimated space required for snapshot is {estimated_required_bytes} bytes, but only have \
+        free_bytes > estimated_bytes,
+        "Estimated space required for snapshot is {estimated_bytes} bytes, but only have \
          {free_bytes} free bytes in storage directory {display}"
     );
 
@@ -439,6 +465,7 @@ pub async fn verify(options: &Options) -> Result<()> {
         if let Some(mut conn) = conn {
             add_err!(verify_version(&mut conn).await);
             add_err!(verify_replication(&mut conn).await);
+            add_err!(verify_replication_slot(&mut conn, options).await);
             add_err!(verify_permissions(&mut conn, options).await);
             add_err!(verify_disk_space(&mut conn, options).await);
         }

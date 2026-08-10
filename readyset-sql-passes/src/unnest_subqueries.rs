@@ -1,42 +1,48 @@
+use crate::derived_tables_rewrite::promote_null_rejecting_outer_joins_where;
 use crate::detect_problematic_self_joins::contains_problematic_self_joins;
+use crate::drop_redundant_join::UniqueColumnsSchema;
+use crate::inline_subquery::limit_clause_as_numbers;
 use crate::lateral_join::unnest_lateral_subqueries;
 use crate::rewrite_utils::{
     NO_REWRITES_STATUS, OnAtom, RewriteStatus, SINGLE_REWRITE_STATUS,
     align_group_by_and_windows_with_correlation, analyse_lone_aggregates_subquery_fields,
-    and_predicates_skip_true, as_sub_query_with_alias, as_sub_query_with_alias_mut,
-    bubble_alias_to_anchor_top, classify_on_atom, collect_local_from_items, columns_iter,
-    construct_is_not_null_expr, construct_projecting_wrapper, construct_scalar_expr,
-    contains_select, decompose_conjuncts, default_alias_for_select_item_expression,
-    ensure_first_field_alias, expect_field_as_expr, expect_field_as_expr_mut,
-    expect_only_subquery_from_with_alias, expect_only_subquery_from_with_alias_mut,
-    expect_sub_query_with_alias, expect_sub_query_with_alias_mut,
-    extract_aggregate_fallback_for_expr, find_group_by_key, find_rhs_join_clause,
-    for_each_aggregate, get_from_item_reference_name, get_unique_alias, has_alias,
-    is_aggregate_only_without_group_by, is_aggregated_expr, is_aggregated_select,
+    and_predicates_skip_true, are_group_by_keys_pinned_by_correlation, as_sub_query_with_alias,
+    as_sub_query_with_alias_mut, bubble_alias_to_anchor_top, classify_on_atom,
+    collect_local_from_items, columns_iter, conjoin_all_dedup, construct_null_check_expr,
+    construct_projecting_wrapper, construct_scalar_expr, contains_select, decompose_conjuncts,
+    default_alias_for_select_item_expression, ensure_first_field_alias, expect_field_as_expr,
+    expect_field_as_expr_mut, expect_only_subquery_from_with_alias,
+    expect_only_subquery_from_with_alias_mut, expect_sub_query_with_alias,
+    expect_sub_query_with_alias_mut, extract_aggregate_fallback_for_expr, extract_correlation_keys,
+    find_group_by_key, find_rhs_join_clause, for_each_window_function,
+    get_from_item_reference_name, get_unique_alias, has_alias, is_aggregate_only_without_group_by,
+    is_aggregated_expr, is_aggregated_select, is_literal_one, is_literal_positive, is_literal_zero,
     make_first_field_ref_name, move_correlated_constraints_from_join_to_where,
-    project_statement_columns_if, resolve_field_expr_by_alias, rewrite_top_k_in_place,
-    rewrite_top_k_in_place_with_partition, split_correlated_constraint,
-    split_correlated_expression, split_expr_mut,
+    partition_correlated_predicates, preserve_uncorrelated_top_k, project_statement_columns_if,
+    resolve_field_expr_by_alias, rewrite_top_k_in_place, rewrite_top_k_in_place_with_partition,
+    split_expr_mut,
 };
 use crate::unnest_subqueries_3vl::{
     ProbeRegistry, RhsContext, SelectList3vlFlags, SelectList3vlInput,
     add_3vl_for_not_in_where_subquery, add_3vl_for_select_list_in_subquery,
     is_first_field_null_free, is_select_expr_null_free,
 };
+use crate::util::is_correlated;
 use crate::{
-    RewriteContext, get_local_from_items_iter, get_local_from_items_iter_mut, is_column_of,
+    BaseSchemasContext, get_local_from_items_iter, get_local_from_items_iter_mut, is_column_of,
 };
 use itertools::{Either, Itertools};
 use readyset_errors::{
     ReadySetError, ReadySetResult, internal, invalid_query, invalid_query_err, invariant,
     unsupported,
 };
+
 use readyset_sql::analysis::visit_mut::{VisitorMut, walk_expr};
 use readyset_sql::ast::JoinOperator::{InnerJoin, LeftOuterJoin};
 use readyset_sql::ast::{
     BinaryOperator, Column, ColumnConstraint, Expr, FieldDefinitionExpr, FieldReference,
-    FunctionExpr, InValue, JoinClause, JoinConstraint, JoinOperator, Literal, SelectStatement,
-    SqlIdentifier, TableExpr, UnaryOperator,
+    FunctionExpr, InValue, JoinClause, JoinConstraint, JoinOperator, LimitClause, Literal,
+    SelectStatement, SqlIdentifier, TableExpr, UnaryOperator,
 };
 use readyset_sql::ast::{JoinRightSide, Relation, TableExprInner};
 use readyset_sql::{Dialect, DialectDisplay};
@@ -44,6 +50,29 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::iter;
 use std::mem;
 use tracing::trace;
+
+/// True when the engine's `extract_limit_offset`
+/// (`readyset-server/src/controller/sql/query_graph.rs`) accepts this
+/// `LimitClause` in subquery pagination position.  Mirrors the engine's
+/// acceptance set so the SQL rewrite pipeline preserves LIMIT only when
+/// the engine can lower it; engine-incompatible shapes route through
+/// `rewrite_top_k_in_place` and reach the engine as materialised
+/// `__rn`-filter predicates.
+///
+/// Eligible shapes:
+///   - LIMIT: literal non-negative integer (`Integer` / `UnsignedInteger`).
+///   - OFFSET: absent or literal `0`.
+///
+/// `Literal::Placeholder` cannot appear in LIMIT/OFFSET at this point in
+/// the pipeline: question-mark placeholders short-circuit the entire
+/// rewrite pipeline at the adapter gate (`adapter_rewrites/mod.rs`), and
+/// dollar-number / colon-number placeholders are synthesised by
+/// autoparameterisation which runs after this pass.
+/// `limit_clause_as_numbers` returns `Err` on any non-numeric literal
+/// regardless, routing them to materialisation.
+fn limit_clause_eligible_for_native_pagination(limit_clause: &LimitClause) -> bool {
+    matches!(limit_clause_as_numbers(limit_clause), Ok((_, 0)))
+}
 
 #[derive(Default, Copy, Clone, Debug)]
 pub(crate) enum SubqueryContext {
@@ -55,10 +84,10 @@ pub(crate) enum SubqueryContext {
 
 #[derive(Default)]
 pub(crate) struct SubqueryPredicateDesc {
-    ctx: SubqueryContext,
-    negated: bool,
-    lhs_and_op: Option<(Expr, BinaryOperator)>,
-    stmt: SelectStatement,
+    pub(crate) ctx: SubqueryContext,
+    pub(crate) negated: bool,
+    pub(crate) lhs_and_op: Option<(Expr, BinaryOperator)>,
+    pub(crate) stmt: SelectStatement,
 }
 
 pub(crate) enum DeriveTableJoinKind {
@@ -107,22 +136,46 @@ pub(crate) trait NonNullSchema {
     fn not_null_columns_of(&self, rel: &Relation) -> HashSet<Column>;
 }
 
-pub(crate) struct UnnestContext<'a> {
+pub(crate) struct UnnestContext<'a, U: UniqueColumnsSchema> {
     pub(crate) schema: &'a dyn NonNullSchema,
+    pub(crate) unique_cols_schema: &'a U,
     pub(crate) probes: ProbeRegistry,
     // Pre-hoist hints keyed by LATERAL alias (as Relations)
     pub(crate) pre_hoist_lateral_exactly_one: HashSet<Relation>,
+    /// LATERAL aliases whose body is correlation-pinned GROUP BY (or
+    /// otherwise AtMostOne per outer row).  Distinct from
+    /// `pre_hoist_lateral_exactly_one` because these bodies produce
+    /// ZERO rows (not "one row with default values") for outer rows
+    /// without a match — so the existing COALESCE-zero / LEFT-OUTER-
+    /// JOIN promotion in `get_join_operator_for_lateral` MUST NOT be
+    /// applied to them.
+    pub(crate) pre_hoist_lateral_at_most_one: HashSet<Relation>,
     pub(crate) lateral_trivial_on: HashSet<Relation>,
+    /// Relations from ancestor LATERAL scopes, for correlation
+    /// detection. Each nesting level pushes its preceding items
+    /// before recursing, pops on return.
+    pub(crate) ancestor_scope: HashSet<Relation>,
+    /// Same relations in left-to-right FROM order, for ON
+    /// normalization LHS selection via
+    /// `split_on_for_rhs_against_preceding_lhs`.
+    pub(crate) ancestor_scope_ordered: Vec<Relation>,
 }
 
 pub trait UnnestSubqueries: Sized {
-    fn unnest_subqueries<C: RewriteContext>(&mut self, ctx: C) -> ReadySetResult<&mut Self>;
+    fn unnest_subqueries<U: UniqueColumnsSchema>(
+        &mut self,
+        schema: &dyn NonNullSchema,
+        unique_cols_schema: &U,
+    ) -> ReadySetResult<&mut Self>;
 }
 
 impl UnnestSubqueries for SelectStatement {
-    fn unnest_subqueries<C: RewriteContext>(&mut self, ctx: C) -> ReadySetResult<&mut Self> {
-        let schema = NonNullSchemaImpl::from(ctx);
-        if unnest_subqueries_main(self, &schema)?.has_rewrites() {
+    fn unnest_subqueries<U: UniqueColumnsSchema>(
+        &mut self,
+        schema: &dyn NonNullSchema,
+        unique_cols_schema: &U,
+    ) -> ReadySetResult<&mut Self> {
+        if unnest_subqueries_main(self, schema, unique_cols_schema)?.has_rewrites() {
             trace!(target: "unnest_subqueries",
                 statement = %self.display(Dialect::PostgreSQL),
                 ">Decorrelated statement"
@@ -135,26 +188,59 @@ impl UnnestSubqueries for SelectStatement {
 // The entry point for the entire unnesting pass.
 // **NOTE**: This IS NOT a helper function to use internally.
 // This is the main entry point and should be called once per statement.
-pub(crate) fn unnest_subqueries_main(
+pub(crate) fn unnest_subqueries_main<U: UniqueColumnsSchema>(
     stmt: &mut SelectStatement,
     schema: &dyn NonNullSchema,
+    unique_cols_schema: &U,
 ) -> ReadySetResult<RewriteStatus> {
     let mut ctx = UnnestContext {
         schema,
+        unique_cols_schema,
         probes: ProbeRegistry::new(),
         pre_hoist_lateral_exactly_one: HashSet::new(),
+        pre_hoist_lateral_at_most_one: HashSet::new(),
         lateral_trivial_on: HashSet::new(),
+        ancestor_scope: HashSet::new(),
+        ancestor_scope_ordered: Vec::new(),
     };
 
     let mut rewrite_status = RewriteStatus::default();
 
-    // Collect pre-hoist LATERAL hints (ExactlyOne + original ON triviality) before any reshaping
-    collect_pre_hoist_lateral_hints(&*stmt, &mut ctx)?;
+    // Collect LATERAL hints from the **pre-hoist** AST.  Pre-hoist
+    // visibility is load-bearing for the ExactlyOne classification
+    // (aggregate-only-no-GROUP-BY) on TOP-K-bearing bodies:
+    // `rewrite_top_k_for_lateral` (called by the hoister below)
+    // materializes LIMIT/ORDER via partitioned `ROW_NUMBER`, which
+    // injects a window function into SELECT — destroying the
+    // aggregate-only-no-GROUP-BY shape that consumers like
+    // `get_join_operator_for_lateral`'s COALESCE-zero promotion rely on.
+    // The `lateral_trivial_on` classification (outer-wrap JOIN ON
+    // shape) is also captured here.
+    collect_lateral_hints(stmt, &mut ctx)?;
 
     // Run the hoister; it also handles TOP-K in nested derived tables
     if hoist_correlated_from_nested_and_rewrite_top_k(stmt)? {
         rewrite_status.rewrite();
     }
+
+    // Refresh LATERAL hints against the **post-hoist** AST.  Set
+    // inserts are additive — the pre-hoist call's entries are
+    // preserved; this call only adds.  Both timings cover different
+    // structural concerns:
+    //   - ExactlyOne: aggregate-only-no-GBY shape is captured pre-hoist
+    //     (the hoist may demote via TOP-K materialization but never
+    //     promotes a non-agg body to agg).
+    //   - AtMostOne: `is_correlation_pinned_at_most_one` internally
+    //     clones the body and runs `move_correlated_constraints_from_
+    //     join_to_where` before classifying, so JOIN-ON correlation is
+    //     admitted at either timing.  The post-hoist call still helps
+    //     when the hoist enables a previously-blocked classification
+    //     (e.g., new groupings exposed by TOP-K materialization).
+    //   - trivial_on: outer-wrap JOIN ON, untouched by either timing.
+    //
+    // Background: closes the I3 pass-ordering gap documented in
+    // `known_core_limitations.md` §5.5.
+    collect_lateral_hints(stmt, &mut ctx)?;
 
     // Rewrite supported cases of subqueries found in `lateral` FROM, WHERE and select list
     let rewrite_status_1 = unnest_all_subqueries(stmt, &mut ctx)?;
@@ -162,18 +248,18 @@ pub(crate) fn unnest_subqueries_main(
     Ok(rewrite_status.combine(rewrite_status_1))
 }
 
-struct NonNullSchemaImpl {
+pub(crate) struct NonNullSchemaImpl {
     nonnull_schema: HashMap<Relation, HashSet<Column>>,
 }
 
-impl<C: RewriteContext> From<C> for NonNullSchemaImpl {
+impl<C: BaseSchemasContext> From<C> for NonNullSchemaImpl {
     fn from(ctx: C) -> Self {
         let mut schema = NonNullSchemaImpl {
             nonnull_schema: HashMap::new(),
         };
 
-        for (rel, body) in ctx.base_schemas().iter() {
-            let nonnull_cols = body
+        for (rel, body) in ctx.base_schemas() {
+            let mut nonnull_cols = body
                 .fields
                 .iter()
                 .filter_map(|col_spec| {
@@ -186,8 +272,35 @@ impl<C: RewriteContext> From<C> for NonNullSchemaImpl {
                     }
                 })
                 .collect::<HashSet<_>>();
+
+            // Table-level PRIMARY KEY implies NOT NULL for every column in
+            // the key.  Unlike table-level UNIQUE (which alone does not
+            // guarantee per-column non-nullness), the SQL standard requires
+            // every member of a PRIMARY KEY — even composite — to be
+            // individually NOT NULL.  Without this walk, schemas using the
+            // `CREATE TABLE t (id INT, PRIMARY KEY(id))` form (column
+            // declarations bare, key declared at the table level) would
+            // miss the NOT NULL fact entirely and downstream nullability
+            // inference in correlated-subquery analysis would
+            // over-conservatively treat `id` as nullable.
+            //
+            // Table-level UNIQUE is intentionally NOT added here: UNIQUE
+            // alone permits multiple NULL rows under the SQL `NULLS
+            // DISTINCT` default, and `NULLS NOT DISTINCT` only limits the
+            // count of NULL rows without making the column non-null in
+            // expression semantics.
+            if let Some(keys) = &body.keys {
+                for key in keys {
+                    if key.is_primary_key() {
+                        for col in key.get_columns() {
+                            nonnull_cols.insert(col.clone());
+                        }
+                    }
+                }
+            }
+
             if !nonnull_cols.is_empty() {
-                schema.nonnull_schema.insert((*rel).clone(), nonnull_cols);
+                schema.nonnull_schema.insert(rel.clone(), nonnull_cols);
             }
         }
 
@@ -209,7 +322,7 @@ fn split_correlated_expr(
     expr: &Expr,
     local_from_items: &HashSet<Relation>,
 ) -> (Option<Expr>, Option<Expr>) {
-    split_correlated_expression(expr, &|rel| is_outer_from_item(rel, local_from_items))
+    partition_correlated_predicates(expr, &|rel| is_outer_from_item(rel, local_from_items))
 }
 
 fn contains_outer_columns(expr: &Expr, local_from_items: &HashSet<Relation>) -> bool {
@@ -238,16 +351,35 @@ fn grouping_key_is_projected(fields: &[FieldDefinitionExpr], fe: &FieldReference
     }
 }
 
-fn contains_other_than_extremum_window_functions(stmt: &SelectStatement) -> ReadySetResult<bool> {
+/// A window function is duplicate-sensitive when its output depends on the exact
+/// row multiplicity fed to the window (as opposed to the set of distinct values).
+/// MIN and MAX are duplicate-insensitive: repeating rows does not change their
+/// output.  Everything else — COUNT, SUM, AVG, and ranking functions like RANK,
+/// ROW_NUMBER, DENSE_RANK, LEAD/LAG, etc. — is duplicate-sensitive.
+///
+/// `wf_expr` must be `Expr::WindowFunction`; anything else is not a WF and the
+/// classifier returns `false`.
+fn wf_is_duplicate_sensitive(wf_expr: &Expr) -> bool {
+    let Expr::WindowFunction { function, .. } = wf_expr else {
+        return false;
+    };
+    !matches!(function, FunctionExpr::Min(_) | FunctionExpr::Max(_))
+}
+
+/// True when any SELECT-list field contains a duplicate-sensitive window function.
+/// Guard used by `make_subquery_distinct` before dropping `stmt.group_by`: if a
+/// duplicate-sensitive WF is present, dropping GROUP BY changes the WF's input
+/// row multiplicity and would produce different output values.
+fn contains_duplicate_sensitive_window_function(stmt: &SelectStatement) -> ReadySetResult<bool> {
     for fe in &stmt.fields {
         let (expr, _) = expect_field_as_expr(fe);
-        let mut contains = false;
-        for_each_aggregate(expr, true, &mut |agg| {
-            if !matches!(agg, FunctionExpr::Min(_) | FunctionExpr::Max(_)) {
-                contains = true;
+        let mut found = false;
+        for_each_window_function(expr, &mut |wf| {
+            if wf_is_duplicate_sensitive(wf) {
+                found = true;
             }
         })?;
-        if contains {
+        if found {
             return Ok(true);
         }
     }
@@ -262,7 +394,7 @@ fn make_subquery_distinct(stmt: &mut SelectStatement) -> ReadySetResult<()> {
             .all(|fe| grouping_key_is_projected(&stmt.fields, fe))
         {
             stmt.distinct = true;
-            if !is_aggregated_select(stmt)? && !contains_other_than_extremum_window_functions(stmt)?
+            if !is_aggregated_select(stmt)? && !contains_duplicate_sensitive_window_function(stmt)?
             {
                 stmt.group_by = None;
             }
@@ -294,9 +426,33 @@ fn hoist_correlated_from_where_clause_and_rewrite_top_k(
     stmt: &mut SelectStatement,
     stmt_alias: SqlIdentifier,
     locals: &HashSet<Relation>,
+    // True when `stmt` is a FROM-position derived-table subquery whose LIMIT
+    // (if uncorrelated) is eligible for native MIR lowering — see
+    // `preserve_uncorrelated_top_k`.  False when called from the predicate-
+    // subquery path (`as_joinable_derived_table_with_opts` for IN / EXISTS /
+    // Scalar): the predicate-rewrite logic that follows depends on
+    // `make_subquery_distinct` to enforce set semantics over the subquery's
+    // output, which is incompatible with retaining the LIMIT inside.
+    top_k_in_subquery_position: bool,
     mut check_for_local_cols_eq_group_keys: impl FnMut(bool) -> ReadySetResult<()>,
     mut check_for_uncorrelated_where: impl FnMut(&mut SelectStatement) -> ReadySetResult<()>,
 ) -> ReadySetResult<Option<Expr>> {
+    // Strip redundant LIMIT/ORDER BEFORE the correlation hoist.  At this point
+    // the subquery is still in its original shape — `agg_only_no_gby_cardinality`
+    // correctly classifies it as ExactlyOne/AtMostOne.  After the hoist,
+    // `align_group_by_and_windows_with_correlation` may inject a GROUP BY (for
+    // correlated aggregates), which would make the subquery no longer
+    // aggregate-only-no-GBY, and the strip would miss the redundant LIMIT.
+    //
+    // NOTE: when called from `as_joinable_derived_table_with_opts` (line 1068),
+    // this strip is redundant — an earlier strip already ran on the base stmt
+    // before `hoist_correlated_from_nested_and_rewrite_top_k`.  It remains
+    // necessary here for the other call site: inner FROM-item subqueries
+    // processed by `hoist_correlated_from_nested_and_rewrite_top_k` (line 596),
+    // which calls this function directly without going through
+    // `as_joinable_derived_table_with_opts`.
+    strip_redundant_limit_for_agg_no_gby(stmt)?;
+
     if let Some(where_expr) = &stmt.where_clause {
         let (mut correlated, remaining) = split_correlated_expr(where_expr, locals);
 
@@ -311,7 +467,7 @@ fn hoist_correlated_from_where_clause_and_rewrite_top_k(
 
         if let Some(corr) = &mut correlated {
             // (1) Build a set of pairs (local_column : correlated_column)
-            let cols_set = split_correlated_constraint(corr, locals)?;
+            let cols_set = extract_correlation_keys(corr, locals)?;
 
             // (2) align against original local shape, and get a flag if either `stmt`
             // has no GROUP BY or all local columns are the only grouping keys, and
@@ -333,7 +489,7 @@ fn hoist_correlated_from_where_clause_and_rewrite_top_k(
             // (4) keep only local remainder inside the subquery
             stmt.where_clause = remaining;
 
-            // (5) apply TOP-K now
+            // (5) apply TOP-K if present (redundant agg-only LIMIT already stripped at entry)
             if !stmt.limit_clause.is_empty() {
                 rewrite_correlated_top_k_in_place(stmt, &cols_set)?;
             }
@@ -347,7 +503,38 @@ fn hoist_correlated_from_where_clause_and_rewrite_top_k(
 
     check_for_uncorrelated_where(stmt)?;
 
-    if !stmt.limit_clause.is_empty() {
+    // Apply TOP-K if present (redundant agg-only LIMIT already stripped at entry).
+    // Gated by `preserve_uncorrelated_top_k()` AND the caller's position flag
+    // AND the per-query pagination-eligibility check: when all three indicate
+    // preservation, leave LIMIT/ORDER on the (FROM-position) uncorrelated
+    // subquery so MIR can lower it to a native `TopK`/`Paginate` node instead
+    // of materialising a `ROW_NUMBER() <= K` filter wrapper.
+    //
+    // The two callers set `top_k_in_subquery_position` to encode their context:
+    //
+    // - The FROM-loop in `hoist_correlated_from_nested_and_rewrite_top_k`
+    //   passes `true`.  This is the load-bearing setting for FROM-position
+    //   preservation.
+    //
+    // - `as_joinable_derived_table_with_opts` (predicate-subquery context: IN,
+    //   NOT IN, Scalar) passes `false`.  Today this is a defensive backstop:
+    //   the predicate-subquery entry point pre-wraps LIMIT-bearing eligible
+    //   subqueries into a FROM-position derived table BEFORE reaching this
+    //   function, so the stmt at this point either has no LIMIT (pre-wrap
+    //   fired) or is in a case that must materialise anyway (correlated, or
+    //   engine-incompatible pagination).  The `false` setting ensures
+    //   materialisation if a future path bypasses the pre-wrap and reaches
+    //   here with a preservation-eligible LIMIT still in place.
+    //
+    // Engine-incompatible pagination shapes (literal non-zero OFFSET,
+    // parameterised LIMIT, NULL literals, etc.) fall back to materialisation
+    // via the eligibility check so they reach the engine as `__rn`-filter
+    // predicates rather than tripping `extract_limit_offset`'s `unsupported!`
+    // exits at recipe-extend time.
+    let preserve_limit = top_k_in_subquery_position
+        && preserve_uncorrelated_top_k()
+        && limit_clause_eligible_for_native_pagination(&stmt.limit_clause);
+    if !stmt.limit_clause.is_empty() && !preserve_limit {
         rewrite_top_k_in_place(stmt)?;
     }
 
@@ -388,7 +575,7 @@ pub(crate) fn force_empty_select(stmt: &mut SelectStatement) {
     // Inject WHERE FALSE there; on the way *up*, clear LIMIT/ORDER at each wrapper but keep its WHERE.
     fn force_deep(s: &mut SelectStatement) -> bool {
         // If LIMIT 0 is local, inject emptiness here and sanitize children.
-        if matches!(s.limit_clause.limit(), Some(Literal::Integer(0))) {
+        if s.limit_clause.limit().is_some_and(is_literal_zero) {
             clear_limits_here(s);
             clear_limits_children_rec(s);
             // ⟵ choose HAVING FALSE for aggregate-only/no-GBY, else WHERE FALSE
@@ -442,6 +629,30 @@ fn scrub_empty_agg_no_gby(stmt: &mut SelectStatement) -> ReadySetResult<bool> {
     )
 }
 
+/// If this SELECT is aggregate-only without GROUP BY and produces at most one row
+/// (ExactlyOne or AtMostOne), LIMIT and ORDER BY are redundant — you can't order or
+/// limit a single row.  Strip them to prevent unnecessary TOP-K (ROW_NUMBER)
+/// materialization and to avoid blocking downstream optimizations (e.g., DISTINCT
+/// normalization checks `order.is_some()` as a TOP-K signal).
+///
+/// Returns `true` if LIMIT or ORDER BY were stripped.
+fn strip_redundant_limit_for_agg_no_gby(stmt: &mut SelectStatement) -> ReadySetResult<bool> {
+    if (!stmt.limit_clause.is_empty() || stmt.order.is_some())
+        && agg_only_no_gby_cardinality(stmt)?.is_some_and(|card| {
+            matches!(
+                card,
+                AggNoGbyCardinality::ExactlyOne | AggNoGbyCardinality::AtMostOne
+            )
+        })
+    {
+        stmt.limit_clause = Default::default();
+        stmt.order = None;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 pub(crate) fn rewrite_top_k_for_lateral(
     stmt: &mut SelectStatement,
     stmt_locals: &HashSet<Relation>,
@@ -457,6 +668,12 @@ pub(crate) fn rewrite_top_k_for_lateral(
         return Ok(true);
     }
 
+    // Aggregate-only/no-GBY produces at most 1 row — LIMIT/ORDER are redundant.
+    // Strip them to avoid unnecessary ROW_NUMBER materialization.
+    if strip_redundant_limit_for_agg_no_gby(stmt)? {
+        return Ok(false); // no TOP-K rewrite needed
+    }
+
     // Inspect correlation in the inner WHERE but DO NOT hoist it; use it only
     // to align windows and to derive PARTITION BY for TOP‑K.
     if let Some(where_expr) = &stmt.where_clause {
@@ -464,7 +681,7 @@ pub(crate) fn rewrite_top_k_for_lateral(
 
         if let Some(corr) = maybe_corr {
             // Build (local_col, outer_col) set and align before TOP‑K
-            let cols_set = split_correlated_constraint(&corr, stmt_locals)?;
+            let cols_set = extract_correlation_keys(&corr, stmt_locals)?;
             align_group_by_and_windows_with_correlation(stmt, &cols_set)?;
 
             // Apply partitioned TOP‑K if present
@@ -475,8 +692,17 @@ pub(crate) fn rewrite_top_k_for_lateral(
         }
     }
 
-    if !stmt.limit_clause.is_empty() {
-        // No WHERE, or no correlation in WHERE, but TOP‑K present → global RN
+    // No WHERE, or no correlation in WHERE, but TOP‑K present → global RN.
+    // Gated by `preserve_uncorrelated_top_k()` and the per-query pagination-
+    // eligibility check: when both indicate we should preserve, leave
+    // LIMIT/ORDER on the (uncorrelated) LATERAL body so MIR can lower it
+    // natively.  Engine-incompatible pagination shapes (literal non-zero
+    // OFFSET, parameterised LIMIT, etc.) fall back to materialisation so
+    // they reach the engine as `__rn`-filter predicates rather than tripping
+    // `extract_limit_offset`'s `unsupported!` exits at recipe-extend time.
+    let preserve_limit = preserve_uncorrelated_top_k()
+        && limit_clause_eligible_for_native_pagination(&stmt.limit_clause);
+    if !stmt.limit_clause.is_empty() && !preserve_limit {
         rewrite_top_k_in_place(stmt)?;
         return Ok(true);
     }
@@ -507,6 +733,19 @@ fn hoist_correlated_from_nested_and_rewrite_top_k(
 ) -> ReadySetResult<bool> {
     // Track if any rewrite (e.g., TOP-K inside LATERAL) happened, even if not hoisting
     let mut any_rewrite = false;
+
+    // Clear the LEFT-OUTER hoist barrier for spuriously-outer joins that attach a
+    // subquery derived table: when a downstream null-rejecting predicate proves the
+    // RHS present, the join is equivalent to INNER, so the correlated subquery can
+    // hoist normally instead of bailing below. Restricted to subquery-RHS joins (the
+    // only shapes that reach the barrier) so base-table LOJs are left untouched for
+    // the dedicated post-unnest pass. Local -- this function recurses per level.
+    if promote_null_rejecting_outer_joins_where(
+        stmt,
+        |s, i| matches!(&s.join[i].right, JoinRightSide::Table(te) if as_sub_query_with_alias(te).is_some()),
+    )? {
+        any_rewrite = true;
+    }
 
     // Set of 0-based indexes of all inner-joined relations.
     let mut inner_joined_from_items_indexes = HashSet::new();
@@ -557,6 +796,9 @@ fn hoist_correlated_from_nested_and_rewrite_top_k(
                     inner_stmt,
                     inner_alias.clone(),
                     &inner_locals,
+                    // FROM-position derived table: eligible for LIMIT-preservation
+                    // when `preserve_uncorrelated_top_k()` returns `true`.
+                    true,
                     |_| Ok(()),
                     |_| Ok(()),
                 )?
@@ -669,10 +911,10 @@ pub(crate) fn agg_only_no_gby_cardinality(
     if is_aggregate_only_without_group_by(stmt)? {
         // Aggregate-only SELECT produce at most one row. Any OFFSET > 0 or LIMIT 0
         // eliminates that single row, so the cardinality is ExactlyZero.
-        if matches!(stmt.limit_clause.limit(), Some(Literal::Integer(0))) {
+        if stmt.limit_clause.limit().is_some_and(is_literal_zero) {
             return Ok(Some(AggNoGbyCardinality::ExactlyZero));
         }
-        if matches!(stmt.limit_clause.offset(), Some(Literal::Integer(n)) if *n > 0) {
+        if stmt.limit_clause.offset().is_some_and(is_literal_positive) {
             return Ok(Some(AggNoGbyCardinality::ExactlyZero));
         }
         return Ok(match &stmt.having {
@@ -701,10 +943,10 @@ pub(crate) fn agg_only_no_gby_cardinality(
         && let Ok((inner, _alias)) = expect_only_subquery_from_with_alias(stmt)
     {
         // This-level LIMIT/OFFSET checks for quick zero-row outcome.
-        if matches!(stmt.limit_clause.limit(), Some(Literal::Integer(0))) {
+        if stmt.limit_clause.limit().is_some_and(is_literal_zero) {
             return Ok(Some(AggNoGbyCardinality::ExactlyZero));
         }
-        if matches!(stmt.limit_clause.offset(), Some(Literal::Integer(n)) if *n > 0) {
+        if stmt.limit_clause.offset().is_some_and(is_literal_positive) {
             return Ok(Some(AggNoGbyCardinality::ExactlyZero));
         }
 
@@ -739,7 +981,7 @@ pub(crate) fn has_limit_one_deep(stmt: &SelectStatement) -> bool {
     let mut cur = stmt;
     loop {
         // Local LIMIT 1 (any OFFSET) => AtMostOne row after TOP-K materialization
-        if matches!(cur.limit_clause.limit(), Some(Literal::Integer(1))) {
+        if cur.limit_clause.limit().is_some_and(is_literal_one) {
             return true;
         }
         // Descend if this SELECT has exactly one FROM item which is a subquery with alias.
@@ -752,13 +994,24 @@ pub(crate) fn has_limit_one_deep(stmt: &SelectStatement) -> bool {
     }
 }
 
-/// Returns true if the subquery WHERE clause contains correlation to outer columns.
-#[inline]
+/// Returns true if the subquery WHERE clause or any INNER JOIN ON clause contains
+/// correlation to outer columns.  JOIN ON correlations are checked because
+/// `move_correlated_constraints_from_join_to_where` (which normalizes them into
+/// WHERE) runs after this check in `as_joinable_derived_table_with_opts`.
 fn subquery_has_correlation(stmt: &SelectStatement, locals: &HashSet<Relation>) -> bool {
-    match &stmt.where_clause {
-        Some(expr) => contains_outer_columns(expr, locals),
-        None => false,
+    if let Some(expr) = &stmt.where_clause
+        && contains_outer_columns(expr, locals)
+    {
+        return true;
     }
+    for jc in &stmt.join {
+        if let JoinConstraint::On(on_expr) = &jc.constraint
+            && contains_outer_columns(on_expr, locals)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Returns true iff this SELECT **or** a chain of single‑child projecting wrappers
@@ -778,7 +1031,7 @@ pub(crate) fn has_limit_zero_deep(stmt: &SelectStatement) -> bool {
     let mut cur = stmt;
     loop {
         // (1) Local LIMIT 0 (regardless of OFFSET)
-        if matches!(cur.limit_clause.limit(), Some(Literal::Integer(0))) {
+        if cur.limit_clause.limit().is_some_and(is_literal_zero) {
             return true;
         }
         // (2) Aggregate‑only without GROUP BY: outer still yields one row → not empty.
@@ -833,8 +1086,10 @@ fn is_definitely_empty_subquery(stmt: &SelectStatement) -> ReadySetResult<bool> 
 ///   satisfy that requirement (even when `force_wrapper` is `false`).
 /// - `bubble_alias_to_anchor_top`: ensure the **original first field**’s alias is available
 ///   at the anchor top by bubbling it through nested wrappers (the expression itself is not recomputed).
-/// - `preserve_top_k_for_exists`: if the probe needs to respect a subquery TOP-K, keep LIMIT/OFFSET
-///   and ORDER; otherwise, normalize them away (set `DISTINCT`, drop ORDER/LIMIT).
+/// - `preserve_top_k_for_exists`: if the probe needs to respect subquery TOP-K (NP path), keep
+///   LIMIT/OFFSET and ORDER. Otherwise (EP/regular EXISTS normalization), we drop ORDER BY and
+///   normalize away LIMIT/OFFSET only when OFFSET is absent/0 (set semantics via `DISTINCT`).
+///   When OFFSET > 0 we keep OFFSET and avoid `DISTINCT` to preserve bag semantics for emptiness.
 ///
 /// ## Behavior by context
 /// - `Exists`: we inject/protect a `present_` column (1 literal) in the projection so probes
@@ -859,14 +1114,15 @@ fn is_definitely_empty_subquery(stmt: &SelectStatement) -> ReadySetResult<bool> 
 /// ## Errors & limits
 /// - Same limitations as the decorrelation framework (equality correlations, no outer-join correlation, etc.).
 /// - Bubble requires an aliasable first field; this function ensures such an alias before any field clearing.
-pub(crate) fn as_joinable_derived_table_with_opts(
+pub(crate) fn as_joinable_derived_table_with_opts<U: UniqueColumnsSchema>(
     ctx: SubqueryContext,
     stmt: &mut SelectStatement,
     stmt_alias: SqlIdentifier,
     opts: AsJoinableOpts,
+    unique_cols_schema: &U,
 ) -> ReadySetResult<(TableExpr, Option<Expr>)> {
     // True iff this SELECT **or** a chain of single-child projecting wrappers beneath it
-    // contains an explicit `LIMIT 1` (with any OFFSET). Capture this *before*
+    // contains an explicit `LIMIT 1` (with optional `OFFSET 0`). Capture this *before*
     // TOP-K materialization; afterward, ORDER/LIMIT are consumed into ROW_NUMBER() and gone.
     // We use this flag to:
     //  - relax scalar validation (allow non-aggregated scalar with LIMIT 1),
@@ -874,8 +1130,55 @@ pub(crate) fn as_joinable_derived_table_with_opts(
     //  - skip (and explicitly drop) DISTINCT as redundant after RN <= 1.
     let has_limit_one = has_limit_one_deep(stmt);
 
+    // Strip redundant LIMIT/ORDER for aggregate-only-no-GBY subqueries (ExactlyOne
+    // or AtMostOne) BEFORE the nested hoist.  The nested hoist may inject GROUP BY
+    // into inner subqueries (for correlated aggregates), which would change the
+    // inner from aggregate-only-no-GBY to grouped — making `agg_only_no_gby_cardinality`
+    // fail on the wrapper and preventing the strip later.  Stripping now, while the
+    // inner is still in its original shape, is semantically safe: a ≤1-row subquery's
+    // LIMIT and ORDER BY are no-ops.
+    strip_redundant_limit_for_agg_no_gby(stmt)?;
+
+    // Pre-wrap eligibility: lift a LIMIT-bearing uncorrelated predicate subquery
+    // into a FROM-position derived table so the LIMIT is preserved at the inner
+    // level (the nested-hoist FROM-loop's `top_k_in_subquery_position = true`
+    // gate preserves it for native MIR TopK lowering) while the outer level
+    // has empty `limit_clause` — satisfying `make_subquery_distinct`'s invariant
+    // and giving the IN-unnest / Scalar machinery a clean outer SELECT to add
+    // DISTINCT and marker columns to.  `has_limit_one_deep` walks projecting
+    // wrappers, so the LIMIT-1 detection above remains correct across the wrap.
+    //
+    // Runs AFTER `strip_redundant_limit_for_agg_no_gby` so ExactlyOne/AtMostOne
+    // aggregate-only-no-GBY shapes (where LIMIT is semantically redundant) take
+    // the cheaper stripped path instead of incurring the wrap.
+    //
+    // For `SubqueryContext::Exists`, the wrap fires only when the caller has
+    // requested TOP-K preservation in the probe (`preserve_top_k_for_exists`)
+    // — i.e., the NP_3VL probe path, which needs to detect NULL in the
+    // LIMITed bag specifically and so requires the LIMIT to survive.  The EP
+    // probe path (`!preserve_top_k_for_exists`) takes the LIMIT-stripping
+    // simplification later in this function (LIMIT and ORDER BY don't affect
+    // emptiness; stripping yields cheaper dataflow than preservation).
+    let wrap_eligible_for_exists =
+        matches!(ctx, SubqueryContext::Exists) && opts.preserve_top_k_for_exists;
+    if (!matches!(ctx, SubqueryContext::Exists) || wrap_eligible_for_exists)
+        && !stmt.limit_clause.is_empty()
+        && preserve_uncorrelated_top_k()
+        && limit_clause_eligible_for_native_pagination(&stmt.limit_clause)
+        && !is_correlated(stmt)
+    {
+        let inner_alias = get_unique_alias(&collect_local_from_items(stmt)?, "INNER");
+        let mut wrapped = construct_projecting_wrapper(TableExpr {
+            inner: TableExprInner::Subquery(Box::new(mem::take(stmt))),
+            alias: Some(inner_alias),
+            column_aliases: vec![],
+        })?;
+        let (outer, _) = expect_sub_query_with_alias_mut(&mut wrapped);
+        *stmt = mem::take(outer);
+    }
+
     // Bubble up correlation from nested derived tables (one level, recursively)
-    // (Runs *after* we captured LIMIT 1 information.)
+    // (Runs *after* we captured LIMIT 1 information and stripped redundant LIMIT/ORDER.)
     hoist_correlated_from_nested_and_rewrite_top_k(stmt)?;
 
     // Base-local FROM items
@@ -903,11 +1206,34 @@ pub(crate) fn as_joinable_derived_table_with_opts(
                 stmt.fields.push(present_field_expr!());
             }
 
-            // If 3VL needs per-partition TOP-K semantics preserved in the probe, keep ORDER/LIMIT.
-            // Otherwise, normalize to set semantics: DISTINCT + drop ORDER/LIMIT.
+            // If 3VL needs TOP-K semantics preserved in the probe (NP path), keep ORDER/LIMIT/OFFSET.
+            // Otherwise (EP/regular EXISTS normalization), we may drop TOP-K *only when that does not
+            // change emptiness*:
+            //   - ORDER BY never affects emptiness for EXISTS, so we always drop it here.
+            //   - When OFFSET is absent or 0, EXISTS is insensitive to multiplicity; we can normalize to
+            //     set semantics by setting DISTINCT and clearing LIMIT/OFFSET.
+            //   - When OFFSET > 0, multiplicity affects emptiness (OFFSET applies to row *count*), so we
+            //     must NOT set DISTINCT. We keep OFFSET (and drop LIMIT, since LIMIT>0 does not affect
+            //     emptiness for EXISTS; LIMIT 0 is short-circuited earlier by `is_definitely_empty_subquery`).
+            // Keeping a non-empty `limit_clause` in the OFFSET>0 case also ensures TOP-K will be
+            // materialized later via ROW_NUMBER() in `hoist_correlated_from_where_clause_and_rewrite_top_k`.
             if !opts.preserve_top_k_for_exists {
-                stmt.distinct = true;
-                stmt.limit_clause = Default::default();
+                match stmt.limit_clause.offset() {
+                    None => {
+                        stmt.distinct = true;
+                        stmt.limit_clause = Default::default();
+                    }
+                    Some(lit) if is_literal_zero(lit) => {
+                        stmt.distinct = true;
+                        stmt.limit_clause = Default::default();
+                    }
+                    offs => {
+                        stmt.limit_clause = LimitClause::LimitOffset {
+                            limit: None,
+                            offset: offs.cloned(),
+                        };
+                    }
+                }
                 stmt.order = None;
             }
         }
@@ -917,12 +1243,18 @@ pub(crate) fn as_joinable_derived_table_with_opts(
             let is_single_by_shape = matches!(ctx, SubqueryContext::Scalar)
                 && matches!(
                     agg_only_no_gby_cardinality(stmt)?,
-                    Some(AggNoGbyCardinality::ExactlyOne)
+                    Some(AggNoGbyCardinality::ExactlyOne | AggNoGbyCardinality::AtMostOne)
                 );
             // If the subquery WHERE is correlated, hoisting may align GROUP BY with the correlated keys,
             // yielding "exactly one row per outer row" even when the top-level field is not an aggregate
             // and there's no explicit LIMIT 1. Defer rejection to the post-hoist checks in that case.
             let may_be_single_via_corr = subquery_has_correlation(stmt, &local_from_items);
+            // (d') Structural single-row proof via unique-key pinning on the inner FROM.
+            // `WHERE base.pk_col = <rhs>` (or every column of a composite unique key) with
+            // an RHS that doesn't reference the base table — see `is_unique_key_pinned_scalar`.
+            // Independent of correlation: a constant equi-pin on a PK proves at-most-one row.
+            let is_single_by_unique_key = matches!(ctx, SubqueryContext::Scalar)
+                && is_unique_key_pinned_scalar(stmt, unique_cols_schema)?;
             // Scalar validation and WHERE-correlation/top-k handling
             let (field_expr, field_expr_alias) = expect_field_as_expr_mut(
                 stmt.fields
@@ -934,15 +1266,17 @@ pub(crate) fn as_joinable_derived_table_with_opts(
                 *field_expr_alias = Some(default_alias_for_select_item_expression(field_expr));
             }
             if matches!(ctx, SubqueryContext::Scalar) {
-                // Accept three ways to be single-valued for Scalar:
+                // Accept four ways to be single-valued for Scalar:
                 //  (a) the projected field is an aggregated expression, OR
                 //  (b) there is an explicit LIMIT 1 (possibly under wrappers), OR
                 //  (c) the subquery is aggregate-only without GROUP BY and HAVING is TRUE/absent
-                //      (wrapper-aware via agg_only_no_gby_cardinality).
+                //      (wrapper-aware via agg_only_no_gby_cardinality), OR
+                //  (d) structural unique-key pinning by WHERE equi-predicates.
                 if !is_aggregated_expr(field_expr)?
                     && !has_limit_one
                     && !is_single_by_shape
                     && !may_be_single_via_corr
+                    && !is_single_by_unique_key
                 {
                     invalid_query!("Subquery should be aggregated or have LIMIT 1");
                 }
@@ -950,6 +1284,7 @@ pub(crate) fn as_joinable_derived_table_with_opts(
                     && !has_limit_one
                     && !is_single_by_shape
                     && !may_be_single_via_corr
+                    && !is_single_by_unique_key
                 {
                     invalid_query!("Subquery returns more than 1 row");
                 }
@@ -997,6 +1332,10 @@ pub(crate) fn as_joinable_derived_table_with_opts(
             stmt,
             stmt_alias.clone(),
             &local_from_items,
+            // Predicate-subquery (IN / EXISTS / Scalar) context: keep
+            // materialising LIMIT — the downstream unnest relies on the
+            // RN-rewritten shape (DISTINCT + flat row set) for set semantics.
+            false,
             check_for_local_cols_eq_group_keys,
             check_for_uncorrelated_where,
         )?
@@ -1006,14 +1345,23 @@ pub(crate) fn as_joinable_derived_table_with_opts(
     // Additionally, for Scalar with explicit LIMIT 1, DISTINCT is redundant:
     // after rewrite_top_k_in_place(_with_partition), LIMIT/ORDER are consumed and
     // RN <= 1 ensures at most one row (globally or per partition), so de-dup is unnecessary.
-    if !(matches!(ctx, SubqueryContext::Exists) && opts.preserve_top_k_for_exists) {
+    //
+    // The `stmt.limit_clause.is_empty()` guard makes this block self-defending against
+    // future call paths that bypass both materialisation (`rewrite_top_k_in_place`,
+    // `rewrite_correlated_top_k_in_place`) and the pre-wrap above: setting
+    // `stmt.distinct = true` on a LIMIT-bearing subquery would silently turn "first N
+    // rows" into "first N distinct rows" — a different query.  `make_subquery_distinct`
+    // would `invariant!` on that input; the gate here keeps the failure mode local.
+    if !(matches!(ctx, SubqueryContext::Exists) && opts.preserve_top_k_for_exists)
+        && stmt.limit_clause.is_empty()
+    {
         #[cfg(debug_assertions)]
         {
-            // Invariant for DISTINCT phase: TOP-K must have been materialized already.
-            // ORDER BY and LIMIT/OFFSET are expected to be cleared at this point.
+            // ORDER BY is expected to be cleared alongside LIMIT at this point: both
+            // `rewrite_top_k_in_place(_with_partition)` and the pre-wrap clear it.
             debug_assert!(
-                stmt.limit_clause.is_empty() && stmt.order.is_none(),
-                "TOP-K should have been materialized before DISTINCT handling"
+                stmt.order.is_none(),
+                "ORDER BY should have been cleared with LIMIT before DISTINCT handling"
             );
         }
         if matches!(ctx, SubqueryContext::Scalar) && has_limit_one {
@@ -1042,6 +1390,7 @@ pub(crate) fn as_joinable_derived_table_with_opts(
     let mut derived_table = TableExpr {
         inner: TableExprInner::Subquery(Box::new(mem::take(stmt))),
         alias: Some(stmt_alias),
+        column_aliases: vec![],
     };
 
     if matches!(ctx, SubqueryContext::Exists) {
@@ -1183,12 +1532,19 @@ fn apply_exists_probe_shaping(
 }
 
 /// Backwards-compatible wrapper (existing callers stay unchanged).
-pub(crate) fn as_joinable_derived_table(
+pub(crate) fn as_joinable_derived_table<U: UniqueColumnsSchema>(
     ctx: SubqueryContext,
     stmt: &mut SelectStatement,
     stmt_alias: SqlIdentifier,
+    unique_cols_schema: &U,
 ) -> ReadySetResult<(TableExpr, Option<Expr>)> {
-    as_joinable_derived_table_with_opts(ctx, stmt, stmt_alias, AsJoinableOpts::default())
+    as_joinable_derived_table_with_opts(
+        ctx,
+        stmt,
+        stmt_alias,
+        AsJoinableOpts::default(),
+        unique_cols_schema,
+    )
 }
 
 fn is_comparison_op(op: &BinaryOperator) -> bool {
@@ -1241,7 +1597,9 @@ pub(crate) fn is_supported_subquery_predicate(expr: &Expr) -> bool {
 // cloning the original statement and adding more contextual data.
 // **NOTE**: Any changes regarding what subquery predicates we support, should
 // be reflected in the function above `is_supported_subquery_predicate()`
-fn as_supported_subquery_predicate(expr: &Expr) -> ReadySetResult<SubqueryPredicateDesc> {
+pub(crate) fn as_supported_subquery_predicate(
+    expr: &Expr,
+) -> ReadySetResult<SubqueryPredicateDesc> {
     Ok(match expr {
         Expr::UnaryOp {
             op: UnaryOperator::Not,
@@ -1253,7 +1611,9 @@ fn as_supported_subquery_predicate(expr: &Expr) -> ReadySetResult<SubqueryPredic
                 negated: true,
                 ..SubqueryPredicateDesc::default()
             },
-            _ => unreachable!("Just checked this"),
+            // SAFETY: the outer guard `matches!(rhs.as_ref(), Expr::Exists(_))` guarantees
+            // this arm is unreachable — the inner match is exhaustive for Expr::Exists.
+            _ => unreachable!("guard guarantees Expr::Exists"),
         },
         Expr::Exists(sq) => SubqueryPredicateDesc {
             ctx: SubqueryContext::Exists,
@@ -1330,10 +1690,10 @@ fn build_rhs_expr_for_aggregate_only_derived_table(
     // Try to compute a zero-argument substitute for the first-field expression
     // by peeling allowed wrappers and/or descending through single-child wrappers.
     if let Some(f_zero) = extract_aggregate_fallback_for_expr(ff_expr, derived_table_stmt)? {
-        return Ok(Some(Expr::Call(FunctionExpr::Call {
-            name: "coalesce".into(),
-            arguments: Some(vec![first_field_ref.clone(), f_zero]),
-        })));
+        return Ok(Some(Expr::Call(FunctionExpr::Coalesce(vec![
+            first_field_ref.clone(),
+            f_zero,
+        ]))));
     }
 
     Ok(None)
@@ -1470,7 +1830,11 @@ pub(crate) fn split_on_for_rhs_against_preceding_lhs(
     let chosen_lhs: Option<&Relation> = if bound_idxs.is_empty() {
         None
     } else if bound_idxs.len() == 1 {
-        let idx = *bound_idxs.iter().next().unwrap();
+        // SAFETY: guarded by `bound_idxs.len() == 1` on the line above.
+        let idx = *bound_idxs
+            .iter()
+            .next()
+            .expect("bound_idxs has exactly one element");
         Some(&preceding_lhs[idx])
     } else {
         pick_closest_lhs(preceding_lhs, &bound_idxs)
@@ -1484,7 +1848,8 @@ pub(crate) fn split_on_for_rhs_against_preceding_lhs(
             fully_supported: false,
         };
     }
-    let chosen = chosen_lhs.unwrap();
+    // SAFETY: the `if chosen_lhs.is_none() { return ... }` guard above guarantees `Some` here.
+    let chosen = chosen_lhs.expect("chosen_lhs verified Some above");
 
     // Pass 2: extract atoms that are allowed to remain in ON for the chosen LHS,
     // and leave the rest as remainder to move to WHERE.
@@ -1517,10 +1882,7 @@ pub(crate) fn split_on_for_rhs_against_preceding_lhs(
     );
 
     // Rebuild ON out of accepted atoms; remainder becomes WHERE.
-    let mut on_expr: Option<Expr> = None;
-    for atom in accepted_atoms {
-        on_expr = and_predicates_skip_true(on_expr, atom);
-    }
+    let on_expr = conjoin_all_dedup(accepted_atoms);
 
     // Fully supported iff we kept at least one rhs<->chosen equality AND nothing was moved.
     let fully_supported = found_cross_eq && remainder.is_none();
@@ -1651,7 +2013,7 @@ pub(crate) fn join_derived_table(
             }
             add_to_where = and_predicates_skip_true(
                 add_to_where,
-                construct_is_not_null_expr(
+                construct_null_check_expr(
                     make_first_field_ref_name(derived_table_stmt, derived_table_alias.clone())?,
                     true,
                 ),
@@ -1673,22 +2035,27 @@ pub(crate) fn join_derived_table(
         );
     }
 
+    let was_inner_join = join_clause.operator.is_inner_join();
     base_stmt.join.push(join_clause);
 
-    Ok(if contains_problematic_self_joins(base_stmt) {
-        // The only mutation so far was pushing a new JOIN, so pop it to restore `base_stmt`
-        base_stmt.join.pop();
-        false
-    } else {
-        if let Some(add_to_where) = add_to_where {
-            base_stmt.where_clause =
-                and_predicates_skip_true(mem::take(&mut base_stmt.where_clause), add_to_where);
-        }
-        true
-    })
+    Ok(
+        if contains_problematic_self_joins(base_stmt) && !was_inner_join {
+            // The only mutation so far was pushing a new JOIN, so pop it to restore `base_stmt`
+            base_stmt.join.pop();
+            false
+        } else {
+            if let Some(add_to_where) = add_to_where {
+                base_stmt.where_clause =
+                    and_predicates_skip_true(mem::take(&mut base_stmt.where_clause), add_to_where);
+            }
+            true
+        },
+    )
 }
 
-fn collect_subquery_predicates(expr: &Expr) -> ReadySetResult<(Vec<Expr>, Option<Expr>)> {
+pub(crate) fn collect_subquery_predicates(
+    expr: &Expr,
+) -> ReadySetResult<(Vec<Expr>, Option<Expr>)> {
     let mut subquery_predicates = Vec::new();
     let remaining_expr = split_expr_mut(
         expr,
@@ -1728,9 +2095,9 @@ fn turn_into_not_eq_scalar(subquery_desc: &mut SubqueryPredicateDesc) {
     }
 }
 
-fn unnest_subqueries_in_where(
+fn unnest_subqueries_in_where<U: UniqueColumnsSchema>(
     stmt: &mut SelectStatement,
-    ctx: &mut UnnestContext,
+    ctx: &mut UnnestContext<U>,
 ) -> ReadySetResult<RewriteStatus> {
     let Some(where_expr) = &stmt.where_clause else {
         return Ok(NO_REWRITES_STATUS);
@@ -1746,6 +2113,21 @@ fn unnest_subqueries_in_where(
     let mut rewrite_status = RewriteStatus::default();
 
     stmt.where_clause = remaining_expr;
+
+    // Snapshot the JOIN count before the loop.  If a constant-fold short-circuits
+    // the entire WHERE to FALSE (e.g., NOT EXISTS on an ExactlyOne aggregate),
+    // we truncate back to discard any JOINs added by earlier loop iterations —
+    // they are semantically dead under WHERE FALSE and would be dangling.
+    let join_len_before = stmt.join.len();
+
+    // Fold the entire WHERE to FALSE: discard dangling JOINs and return.
+    macro_rules! fold_where_false {
+        () => {{
+            stmt.join.truncate(join_len_before);
+            stmt.where_clause = Some(Expr::Literal(false.into()));
+            return Ok(SINGLE_REWRITE_STATUS);
+        }};
+    }
 
     for subquery_predicate in subquery_predicates {
         //
@@ -1763,14 +2145,12 @@ fn unnest_subqueries_in_where(
                         continue;
                     } else {
                         // EXISTS(empty) / IN(empty) ⇒ FALSE (whole WHERE becomes FALSE)
-                        stmt.where_clause = Some(Expr::Literal(false.into()));
-                        return Ok(SINGLE_REWRITE_STATUS);
+                        fold_where_false!();
                     }
                 }
                 SubqueryContext::Scalar => {
                     // WHERE (scalar with zero rows) ⇒ NULL → filtered → FALSE
-                    stmt.where_clause = Some(Expr::Literal(false.into()));
-                    return Ok(SINGLE_REWRITE_STATUS);
+                    fold_where_false!();
                 }
             }
         }
@@ -1784,8 +2164,7 @@ fn unnest_subqueries_in_where(
                     // EXISTS/NOT EXISTS folding is safe regardless of correlation in agg-only no-GBY.
                     if matches!(subquery_desc.ctx, SubqueryContext::Exists) {
                         if subquery_desc.negated {
-                            stmt.where_clause = Some(Expr::Literal(false.into()));
-                            return Ok(SINGLE_REWRITE_STATUS);
+                            fold_where_false!();
                         } else {
                             // EXISTS(always-one-row) → TRUE (drop this conjunct)
                             rewrite_status.rewrite();
@@ -1835,6 +2214,7 @@ fn unnest_subqueries_in_where(
             subquery_desc.ctx,
             &mut subquery_desc.stmt,
             get_unique_alias(&collect_local_from_items(stmt)?, "GNL"),
+            ctx.unique_cols_schema,
         )?;
 
         let mut apply_3vl_guard = None;
@@ -1885,7 +2265,8 @@ fn unnest_subqueries_in_where(
                 &first_field,
             )? {
                 join_op = LeftOuterJoin; // avoid null-reject; preserve zero-on-empty
-                let (lhs, op) = mem::take(&mut lhs_and_op).unwrap();
+                // SAFETY: guarded by `lhs_and_op.is_some()` in the enclosing `if` condition.
+                let (lhs, op) = mem::take(&mut lhs_and_op).expect("lhs_and_op verified Some");
                 add_to_where = and_predicates_skip_true(
                     add_to_where,
                     construct_scalar_expr(lhs, op, rhs_for_where),
@@ -1905,7 +2286,7 @@ fn unnest_subqueries_in_where(
             let lhs = lhs.clone();
 
             apply_3vl_guard = Some(
-                move |base_stmt: &mut SelectStatement, ctx: &mut UnnestContext| {
+                move |base_stmt: &mut SelectStatement, ctx: &mut UnnestContext<U>| {
                     let is_lhs_null_free = is_select_expr_null_free(&lhs, base_stmt, ctx.schema)?;
                     if !is_lhs_null_free || !rhs_ctx.is_null_free() {
                         Some(add_3vl_for_not_in_where_subquery(
@@ -2008,9 +2389,9 @@ fn assert_local_columns_are_grouped(
     Ok(())
 }
 
-fn unnest_subqueries_in_fields(
+fn unnest_subqueries_in_fields<U: UniqueColumnsSchema>(
     stmt: &mut SelectStatement,
-    ctx: &mut UnnestContext,
+    ctx: &mut UnnestContext<U>,
 ) -> ReadySetResult<RewriteStatus> {
     let mut rewrite_status = RewriteStatus::default();
 
@@ -2082,6 +2463,7 @@ fn unnest_subqueries_in_fields(
                 subquery_desc.ctx,
                 &mut subquery_desc.stmt,
                 get_unique_alias(&local_from_items, "GNL"),
+                ctx.unique_cols_schema,
             )?;
 
             if let Some(join_on_expr) = &join_on {
@@ -2109,7 +2491,7 @@ fn unnest_subqueries_in_fields(
             let replace_subquery_predicate_with =
                 if matches!(subquery_desc.ctx, SubqueryContext::Exists) {
                     // EXISTS in SELECT-list → use presence via left-join null extension
-                    Either::Left(construct_is_not_null_expr(rhs, subquery_desc.negated))
+                    Either::Left(construct_null_check_expr(rhs, subquery_desc.negated))
                 } else if let Some((lhs, op)) = subquery_desc.lhs_and_op {
                     invariant!(matches!(
                         subquery_desc.ctx,
@@ -2137,12 +2519,13 @@ fn unnest_subqueries_in_fields(
                             let is_not_in = subquery_desc.negated;
 
                             Either::Right(
-                                move |base_stmt: &mut SelectStatement, ctx: &mut UnnestContext| {
+                                move |base_stmt: &mut SelectStatement,
+                                      ctx: &mut UnnestContext<U>| {
                                     let is_lhs_null_free =
                                         is_select_expr_null_free(&lhs, base_stmt, ctx.schema)?;
                                     if is_lhs_null_free && rhs_ctx.is_null_free() {
                                         // With left-joined equality, membership reduces to "rhs IS [NOT] NULL"
-                                        Ok(construct_is_not_null_expr(rhs.clone(), is_not_in))
+                                        Ok(construct_null_check_expr(rhs.clone(), is_not_in))
                                     } else {
                                         add_3vl_for_select_list_in_subquery(
                                             base_stmt,
@@ -2150,7 +2533,10 @@ fn unnest_subqueries_in_fields(
                                                 lhs,
                                                 rhs: rhs.clone(),
                                                 preserved_rhs_stmt: preserved_subquery_stmt
-                                                    .expect("Should be Some"),
+                                                    // SAFETY: `preserved_subquery_stmt` is set to `Some` in the
+                                                    // `SubqueryContext::In` guard above; this closure is only
+                                                    // constructed in that same `In` branch.
+                                                    .expect("set to Some for SubqueryContext::In"),
                                                 rhs_ctx,
                                                 flags: SelectList3vlFlags {
                                                     is_lhs_null_free,
@@ -2202,36 +2588,253 @@ fn unnest_subqueries_in_fields(
 //  - WHERE should always be done first, as the replacement joins are simulating rows filtering,
 //  - The select-list should apply after, as their replacement joins never filter
 //  - LATERAL should be the last operation.
-pub(crate) fn unnest_all_subqueries(
+pub(crate) fn unnest_all_subqueries<U: UniqueColumnsSchema>(
     stmt: &mut SelectStatement,
-    ctx: &mut UnnestContext,
+    ctx: &mut UnnestContext<U>,
 ) -> ReadySetResult<RewriteStatus> {
+    // Subqueries in HAVING are handled upstream by
+    // `normalize_subquery_positions`, which wraps the SELECT and migrates
+    // supported HAVING subquery predicates into the wrapper's WHERE.
+    // Backstop for shapes outside `is_supported_subquery_predicate` (e.g. a
+    // top-level OR-conjunct predicate the wrap's per-conjunct split does not
+    // touch): a HAVING that still carries a subquery here has no cacheable
+    // decorrelation path, so reject with a clean adapter-fallback error
+    // instead of letting it drift through the pipeline as latent wrong-
+    // results potential.
+    if let Some(having) = &stmt.having
+        && contains_select(having)
+    {
+        unsupported!("Subquery in HAVING outside the supported predicate set");
+    }
+
+    // GROUP BY subquery guardrail.  Standard SQL allows subqueries in
+    // GROUP BY (uncorrelated -> single group; correlated -> per-row-
+    // derived key), but no rewrite pass in this pipeline decorrelates
+    // GROUP BY subqueries.  Reject cleanly here rather than letting the
+    // shape drift to MIR lowering with a worse error.
+    if let Some(group_by) = &stmt.group_by
+        && group_by
+            .fields
+            .iter()
+            .any(|f| matches!(f, FieldReference::Expr(e) if contains_select(e)))
+    {
+        unsupported!("Subquery in GROUP BY is not supported");
+    }
+
     let status1 = unnest_subqueries_in_where(stmt, ctx)?;
     let status2 = unnest_subqueries_in_fields(stmt, ctx)?;
     let status3 = unnest_lateral_subqueries(stmt, ctx)?;
     Ok(status1.combine(status2).combine(status3))
 }
 
-/// Walk the statement and collect, for each LATERAL subquery, two pre-hoist hints:
-///  (1) whether its body is agg-only/no-GBY and **ExactlyOne** (wrapper-aware), and
-///  (2) whether its original ON was trivial (Empty / ON TRUE / comma segment).
-fn collect_pre_hoist_lateral_hints(
+/// A `UniqueColumnsSchema` impl that reports no unique keys for any relation.
+/// Used as a placeholder by call sites that route through
+/// `as_joinable_derived_table_with_opts` exclusively with `SubqueryContext::Exists`
+/// (where the unique-key cardinality proof never fires) and that do not have a
+/// real schema handy.
+pub(crate) struct UnusedUniqueColumnsSchema;
+
+impl UniqueColumnsSchema for UnusedUniqueColumnsSchema {
+    fn unique_columns_of(&self, _rel: &Relation) -> Option<HashSet<Column>> {
+        None
+    }
+}
+
+/// Returns `true` if `stmt` is structurally proven to return at most one row,
+/// based on the WHERE clause pinning every column of some unique key on the
+/// inner FROM's base table.
+///
+/// Shape:
+///   - exactly one local FROM item, which is a base `Table` (not a subquery
+///     / VALUES / nested derived);
+///   - no `GROUP BY` (those cases route through
+///     [`is_correlation_pinned_at_most_one`] / `is_at_most_one_deep`'s GBY arm);
+///   - WHERE is a top-level conjunction whose equi-predicates of shape
+///     `base_alias.col = <rhs>` collectively name every column of some unique
+///     key on `base_table` per `unique_keys_of`.
+///
+/// The right-hand side of each equi-predicate must not itself reference the
+/// base table — otherwise the predicate constrains the join of `base` with
+/// itself rather than pinning to a single row.  Outer-scope references,
+/// placeholders, literals, and other-relation references are all admissible
+/// RHS shapes.  Non-equi atoms (range, IS NULL, function predicates) are
+/// ignored: they may further restrict the row set but do not contribute to
+/// the cardinality proof.
+///
+/// Both operand orders are accepted (`col = rhs` and `rhs = col`): the join
+/// canonicalization pass that swaps eq-operands runs later in the pipeline,
+/// so the check must be order-agnostic here.
+fn is_unique_key_pinned_scalar<U: UniqueColumnsSchema>(
     stmt: &SelectStatement,
-    ctx: &mut UnnestContext,
+    unique_cols_schema: &U,
+) -> ReadySetResult<bool> {
+    let [table_expr] = stmt.tables.as_slice() else {
+        return Ok(false);
+    };
+    if !stmt.join.is_empty() || stmt.group_by.is_some() {
+        return Ok(false);
+    }
+    let TableExprInner::Table(base_table) = &table_expr.inner else {
+        return Ok(false);
+    };
+    let base_alias = get_from_item_reference_name(table_expr)?;
+    let Some(where_expr) = &stmt.where_clause else {
+        return Ok(false);
+    };
+
+    let mut pinned: HashSet<SqlIdentifier> = HashSet::new();
+    let atoms = decompose_conjuncts(where_expr).unwrap_or_else(|| vec![where_expr.clone()]);
+    for atom in &atoms {
+        let Expr::BinaryOp {
+            lhs,
+            op: BinaryOperator::Equal,
+            rhs,
+        } = atom
+        else {
+            continue;
+        };
+        let (col_expr, other_expr) = match (lhs.as_ref(), rhs.as_ref()) {
+            (Expr::Column(c), other) if c.table.as_ref() == Some(&base_alias) => (c, other),
+            (other, Expr::Column(c)) if c.table.as_ref() == Some(&base_alias) => (c, other),
+            _ => continue,
+        };
+        if columns_iter(other_expr).any(|c| c.table.as_ref() == Some(&base_alias)) {
+            continue;
+        }
+        pinned.insert(col_expr.name.clone());
+    }
+
+    let Some(keys) = unique_cols_schema.unique_keys_of(base_table) else {
+        return Ok(false);
+    };
+    Ok(keys.iter().any(|key| {
+        key.iter()
+            .all(|k| k.table.as_ref() == Some(base_table) && pinned.contains(&k.name))
+    }))
+}
+
+/// Returns `true` if the body's GROUP BY is fully pinned by correlation
+/// predicates referencing relations OUTSIDE the body's local FROM, so each
+/// outer row produces at most one body group.
+///
+/// Adapts the correlation-pinning branch of
+/// `inline_subquery_checks::is_at_most_one_deep` to the per-LATERAL-body
+/// context.  Distinct from `agg_only_no_gby_cardinality(stmt) == ExactlyOne`
+/// (which detects aggregate-only-no-GROUP-BY bodies that always yield 1 row
+/// regardless of match): this function detects bodies that yield 0 OR 1 row
+/// per outer.
+///
+/// Requirements:
+///   - body has a GROUP BY,
+///   - every GROUP BY column is correlation-pinned by at least one
+///     equality predicate against an outside relation, supplied via
+///     WHERE OR via an INNER JOIN ON (which is structurally equivalent
+///     to WHERE under selection-pushdown commutativity),
+///   - HAVING is permitted regardless of its predicate: when HAVING drops
+///     the single group the body yields 0 rows, which still satisfies
+///     AtMostOne (0 OR 1 row per outer).
+///
+/// JOIN-ON correlation is admitted by running
+/// `move_correlated_constraints_from_join_to_where` on a clone of `stmt`
+/// before classifying.  The clone keeps the caller's `stmt` untouched,
+/// so the function is safe to invoke at any pipeline phase without
+/// disturbing later passes.
+pub(crate) fn is_correlation_pinned_at_most_one(stmt: &SelectStatement) -> ReadySetResult<bool> {
+    let Some(_group_by) = &stmt.group_by else {
+        return Ok(false);
+    };
+    let locals = collect_local_from_items(stmt)?;
+    let mut normalized = stmt.clone();
+    move_correlated_constraints_from_join_to_where(&mut normalized, &|rel| !locals.contains(rel))?;
+    let Some(where_expr) = &normalized.where_clause else {
+        return Ok(false);
+    };
+    let (Some(corr), _remaining) =
+        partition_correlated_predicates(where_expr, &|rel| !locals.contains(rel))
+    else {
+        return Ok(false);
+    };
+    let cols_set = extract_correlation_keys(&corr, &locals)?;
+    are_group_by_keys_pinned_by_correlation(&cols_set, &normalized)
+}
+
+/// Walk the statement and collect, for each LATERAL subquery, three hints:
+///  (1) whether its body is agg-only/no-GBY and **ExactlyOne** (wrapper-aware),
+///  (2) whether its body is correlation-pinned **AtMostOne** GROUP BY, and
+///  (3) whether its original ON was trivial (Empty / ON TRUE / comma segment).
+///
+/// Hints (1) and (2) are mutually exclusive: agg-only/no-GBY bodies and
+/// grouped-with-correlation bodies are different shapes, and conflating
+/// them on the ExactlyOne side would silently corrupt the COALESCE-zero
+/// promotion in `get_join_operator_for_lateral`.
+///
+/// The three hint sets are keyed by alias-as-`Relation` with no scope
+/// discriminator.  When two LATERAL subqueries at different nesting levels
+/// in the input share an alias, a consumer at one scope would silently
+/// inherit the classification recorded from the other scope's LATERAL and
+/// misapply it (`get_join_operator_for_lateral` promoting a JOIN that
+/// doesn't have agg-empty defaults; ILDT/DTR admitting an inlining not
+/// backed by AtMostOne cardinality; the hoister skipping ON-clause
+/// preservation on a non-trivial JOIN).  Skip classification entirely for
+/// aliases that occur on LATERAL FROM items at more than one nesting level
+/// — the absent hint routes consumers through the conservative fallback
+/// path already used when no classification fires.
+pub(crate) fn collect_lateral_hints<U: UniqueColumnsSchema>(
+    stmt: &SelectStatement,
+    ctx: &mut UnnestContext<U>,
+) -> ReadySetResult<()> {
+    let mut lateral_counts: HashMap<Relation, usize> = HashMap::new();
+    count_lateral_aliases(stmt, &mut lateral_counts);
+    let collision_aliases: HashSet<Relation> = lateral_counts
+        .into_iter()
+        .filter_map(|(rel, n)| (n > 1).then_some(rel))
+        .collect();
+
+    collect_lateral_hints_impl(stmt, ctx, &collision_aliases)
+}
+
+fn collect_lateral_hints_impl<U: UniqueColumnsSchema>(
+    stmt: &SelectStatement,
+    ctx: &mut UnnestContext<U>,
+    collision_aliases: &HashSet<Relation>,
 ) -> ReadySetResult<()> {
     for (tab_expr_idx, tab_expr) in get_local_from_items_iter!(stmt).enumerate() {
         if let Some((inner, alias)) = as_sub_query_with_alias(tab_expr) {
             // Recurse first to collect nested hints
-            collect_pre_hoist_lateral_hints(inner, ctx)?;
+            collect_lateral_hints_impl(inner, ctx, collision_aliases)?;
 
             if inner.lateral {
+                let alias_rel: Relation = alias.clone().into();
+
+                // Skip classification for cross-scope alias collisions; the
+                // three hint sets can't distinguish scopes and a consumer at
+                // this scope would inherit a classification recorded from
+                // another.  See the doc comment on `collect_lateral_hints`.
+                if collision_aliases.contains(&alias_rel) {
+                    continue;
+                }
+
+                // Existing ExactlyOne detection (aggregate-only-no-GROUP-BY).
                 if matches!(
                     agg_only_no_gby_cardinality(inner)?,
                     Some(AggNoGbyCardinality::ExactlyOne)
                 ) {
-                    ctx.pre_hoist_lateral_exactly_one
-                        .insert(alias.clone().into());
+                    ctx.pre_hoist_lateral_exactly_one.insert(alias_rel.clone());
                 }
+
+                // AtMostOne via correlation-pinned GROUP BY.
+                // Mutually exclusive with the ExactlyOne set: aggregate-only-
+                // no-GROUP-BY and grouped-with-correlation are different
+                // shapes, and the existing ExactlyOne consumer
+                // (`get_join_operator_for_lateral`) relies on the
+                // ExactlyOne-with-aggregate-empty-defaults contract that
+                // grouped bodies do NOT satisfy.
+                if !ctx.pre_hoist_lateral_exactly_one.contains(&alias_rel)
+                    && is_correlation_pinned_at_most_one(inner)?
+                {
+                    ctx.pre_hoist_lateral_at_most_one.insert(alias_rel.clone());
+                }
+
                 let trivial = if let Some((jc_idx, _)) = find_rhs_join_clause(stmt, tab_expr_idx) {
                     matches!(
                         stmt.join[jc_idx].constraint,
@@ -2242,10 +2845,319 @@ fn collect_pre_hoist_lateral_hints(
                     true // comma/CROSS segment behaves like ON TRUE
                 };
                 if trivial {
-                    ctx.lateral_trivial_on.insert(alias.clone().into());
+                    ctx.lateral_trivial_on.insert(alias_rel);
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Count LATERAL subquery aliases across every scope reachable from `stmt`
+/// (nested subquery bodies included).  Non-LATERAL subquery aliases are not
+/// counted — only LATERAL FROM items feed `collect_lateral_hints`'s
+/// classification, so a non-LATERAL alias that happens to match a LATERAL
+/// alias elsewhere can't cause a hint-set misapplication.
+fn count_lateral_aliases(stmt: &SelectStatement, out: &mut HashMap<Relation, usize>) {
+    for tab_expr in get_local_from_items_iter!(stmt) {
+        if let Some((inner, alias)) = as_sub_query_with_alias(tab_expr) {
+            if inner.lateral {
+                *out.entry(alias.into()).or_insert(0) += 1;
+            }
+            count_lateral_aliases(inner, out);
+        }
+    }
+}
+
+#[cfg(test)]
+mod nonnull_schema_impl_tests {
+    use super::*;
+    use readyset_sql::ast::{
+        ColumnSpecification, CreateTableBody, IndexKeyPart, SqlType, TableKey,
+    };
+
+    /// Build a minimal `CreateTableBody` with the given column names, inline
+    /// constraints, and table-level keys.  Mirrors the helper in
+    /// `drop_redundant_join`'s test module.
+    fn make_body(
+        cols: &[(&str, &str, Vec<ColumnConstraint>)],
+        keys: Vec<TableKey>,
+    ) -> CreateTableBody {
+        CreateTableBody {
+            fields: cols
+                .iter()
+                .map(|(table, name, constraints)| ColumnSpecification {
+                    column: Column {
+                        name: (*name).into(),
+                        table: Some(Relation::from(*table)),
+                    },
+                    sql_type: SqlType::Int(None),
+                    constraints: constraints.clone(),
+                    generated: None,
+                    comment: None,
+                    invisible: false,
+                })
+                .collect(),
+            keys: if keys.is_empty() { None } else { Some(keys) },
+        }
+    }
+
+    fn mk_col(table: &str, name: &str) -> Column {
+        Column {
+            name: name.into(),
+            table: Some(Relation::from(table)),
+        }
+    }
+
+    /// Inline `PRIMARY KEY` on a single column produces a NOT NULL entry.
+    /// Baseline coverage of the existing field-walk branch.
+    #[test]
+    fn inline_pk_column_is_not_null() {
+        let rel: Relation = "t".into();
+        let body = make_body(
+            &[
+                ("t", "id", vec![ColumnConstraint::PrimaryKey]),
+                ("t", "name", vec![]),
+            ],
+            vec![],
+        );
+        let schema = NonNullSchemaImpl::from(HashMap::from([(rel.clone(), body)]));
+        let nn = schema.not_null_columns_of(&rel);
+        assert!(nn.contains(&mk_col("t", "id")));
+        assert!(!nn.contains(&mk_col("t", "name")));
+    }
+
+    /// Inline `NOT NULL` produces a NOT NULL entry.  Baseline coverage of
+    /// the existing field-walk branch.
+    #[test]
+    fn inline_not_null_column_is_not_null() {
+        let rel: Relation = "t".into();
+        let body = make_body(&[("t", "email", vec![ColumnConstraint::NotNull])], vec![]);
+        let schema = NonNullSchemaImpl::from(HashMap::from([(rel.clone(), body)]));
+        assert!(
+            schema
+                .not_null_columns_of(&rel)
+                .contains(&mk_col("t", "email"))
+        );
+    }
+
+    /// Single-column table-level `PRIMARY KEY` produces a NOT NULL entry.
+    /// Pins the table-level PK walk.  Without it, schemas using the
+    /// `CREATE TABLE t (id INT, PRIMARY KEY(id))` form miss the NOT NULL
+    /// fact entirely.
+    #[test]
+    fn table_level_pk_single_column_is_not_null() {
+        let rel: Relation = "t".into();
+        let body = make_body(
+            &[("t", "id", vec![]), ("t", "name", vec![])],
+            vec![TableKey::PrimaryKey {
+                constraint_name: None,
+                constraint_timing: None,
+                index_name: None,
+                columns: vec![IndexKeyPart::Column(mk_col("t", "id"))],
+            }],
+        );
+        let schema = NonNullSchemaImpl::from(HashMap::from([(rel.clone(), body)]));
+        let nn = schema.not_null_columns_of(&rel);
+        assert!(nn.contains(&mk_col("t", "id")));
+        assert!(!nn.contains(&mk_col("t", "name")));
+    }
+
+    /// Composite table-level `PRIMARY KEY` produces a NOT NULL entry for
+    /// EVERY column member.  Asymmetric vs `UniqueColumnsSchemaImpl`: a
+    /// composite UNIQUE does NOT imply per-column uniqueness, but a
+    /// composite PRIMARY KEY DOES imply per-column NOT NULL (SQL standard).
+    #[test]
+    fn table_level_composite_pk_all_columns_are_not_null() {
+        let rel: Relation = "t".into();
+        let body = make_body(
+            &[
+                ("t", "tenant_id", vec![]),
+                ("t", "row_id", vec![]),
+                ("t", "data", vec![]),
+            ],
+            vec![TableKey::PrimaryKey {
+                constraint_name: None,
+                constraint_timing: None,
+                index_name: None,
+                columns: vec![
+                    IndexKeyPart::Column(mk_col("t", "tenant_id")),
+                    IndexKeyPart::Column(mk_col("t", "row_id")),
+                ],
+            }],
+        );
+        let schema = NonNullSchemaImpl::from(HashMap::from([(rel.clone(), body)]));
+        let nn = schema.not_null_columns_of(&rel);
+        assert!(nn.contains(&mk_col("t", "tenant_id")));
+        assert!(nn.contains(&mk_col("t", "row_id")));
+        assert!(!nn.contains(&mk_col("t", "data")));
+    }
+
+    /// Table-level `UNIQUE` alone does NOT produce a NOT NULL entry.
+    /// UNIQUE permits multiple NULL rows under `NULLS DISTINCT` (the SQL
+    /// default), and `NULLS NOT DISTINCT` only limits the count, not the
+    /// nullability.  Pins the asymmetry against the PK branch.
+    #[test]
+    fn table_level_unique_alone_is_not_not_null() {
+        let rel: Relation = "t".into();
+        let body = make_body(
+            &[("t", "id", vec![])],
+            vec![TableKey::UniqueKey {
+                constraint_name: None,
+                constraint_timing: None,
+                index_name: None,
+                columns: vec![IndexKeyPart::Column(mk_col("t", "id"))],
+                index_type: None,
+                nulls_distinct: None,
+            }],
+        );
+        let schema = NonNullSchemaImpl::from(HashMap::from([(rel.clone(), body)]));
+        assert!(
+            !schema
+                .not_null_columns_of(&rel)
+                .contains(&mk_col("t", "id"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod collect_lateral_hints_tests {
+    use super::*;
+    use crate::unnest_subqueries_3vl::ProbeRegistry;
+    use readyset_sql::Dialect;
+    use readyset_sql_parsing::parse_select;
+
+    struct NoNonNulls;
+    impl NonNullSchema for NoNonNulls {
+        fn not_null_columns_of(&self, _rel: &Relation) -> HashSet<Column> {
+            HashSet::new()
+        }
+    }
+
+    struct PermissiveUniqueSchema;
+    impl UniqueColumnsSchema for PermissiveUniqueSchema {
+        fn unique_columns_of(&self, rel: &Relation) -> Option<HashSet<Column>> {
+            Some(HashSet::from([Column {
+                name: "k".into(),
+                table: Some(rel.clone()),
+            }]))
+        }
+    }
+
+    fn empty_ctx<'a>(
+        schema: &'a NoNonNulls,
+        unique: &'a PermissiveUniqueSchema,
+    ) -> UnnestContext<'a, PermissiveUniqueSchema> {
+        UnnestContext {
+            schema,
+            unique_cols_schema: unique,
+            probes: ProbeRegistry::new(),
+            pre_hoist_lateral_exactly_one: HashSet::new(),
+            pre_hoist_lateral_at_most_one: HashSet::new(),
+            lateral_trivial_on: HashSet::new(),
+            ancestor_scope: HashSet::new(),
+            ancestor_scope_ordered: Vec::new(),
+        }
+    }
+
+    /// A LATERAL subquery whose body is agg-only-no-GBY at the outer scope
+    /// gets classified as `ExactlyOne`; a differently-shaped LATERAL with
+    /// the SAME alias at a nested scope must not inherit the classification.
+    /// Skip classification for both — the hint sets are alias-keyed with no
+    /// scope discriminator, so applying either scope's classification to
+    /// the other's LATERAL would silently produce wrong results.
+    #[test]
+    fn cross_scope_alias_collision_skips_classification() {
+        // Outer's LATERAL `sub`: agg-only-no-GBY → would be ExactlyOne.
+        // Inner's LATERAL `sub`: correlated non-agg-non-grouped → neither
+        // ExactlyOne nor AtMostOne, but same alias.
+        let stmt = parse_select(
+            Dialect::PostgreSQL,
+            "SELECT outer_t.k, sub.m, wrap.x
+             FROM outer_t,
+                  LATERAL (SELECT MAX(b.v) AS m FROM b WHERE b.k = outer_t.k) AS sub,
+                  (SELECT inner_t.k, sub.x
+                   FROM inner_t,
+                        LATERAL (SELECT c.v AS x FROM c WHERE c.k = inner_t.k) AS sub) AS wrap",
+        )
+        .expect("parse");
+
+        let schema = NoNonNulls;
+        let unique = PermissiveUniqueSchema;
+        let mut ctx = empty_ctx(&schema, &unique);
+        collect_lateral_hints(&stmt, &mut ctx).expect("collect");
+
+        let sub_rel: Relation = "sub".into();
+        assert!(
+            !ctx.pre_hoist_lateral_exactly_one.contains(&sub_rel),
+            "colliding alias must not be classified as ExactlyOne"
+        );
+        assert!(
+            !ctx.pre_hoist_lateral_at_most_one.contains(&sub_rel),
+            "colliding alias must not be classified as AtMostOne"
+        );
+        assert!(
+            !ctx.lateral_trivial_on.contains(&sub_rel),
+            "colliding alias must not be classified as trivial-ON"
+        );
+    }
+
+    /// A LATERAL alias that appears at exactly one scope should still be
+    /// classified normally — the collision filter only fires on multi-scope
+    /// occurrences.
+    #[test]
+    fn unique_lateral_alias_classifies_normally() {
+        let stmt = parse_select(
+            Dialect::PostgreSQL,
+            "SELECT outer_t.k, sub.m
+             FROM outer_t,
+                  LATERAL (SELECT MAX(b.v) AS m FROM b WHERE b.k = outer_t.k) AS sub",
+        )
+        .expect("parse");
+
+        let schema = NoNonNulls;
+        let unique = PermissiveUniqueSchema;
+        let mut ctx = empty_ctx(&schema, &unique);
+        collect_lateral_hints(&stmt, &mut ctx).expect("collect");
+
+        let sub_rel: Relation = "sub".into();
+        // Non-colliding agg-only-no-GBY body classifies as ExactlyOne.
+        assert!(
+            ctx.pre_hoist_lateral_exactly_one.contains(&sub_rel),
+            "unique-alias agg-only-no-GBY LATERAL should classify as ExactlyOne"
+        );
+        // Comma segment: treated as trivial-ON.
+        assert!(
+            ctx.lateral_trivial_on.contains(&sub_rel),
+            "comma-segment LATERAL should classify as trivial-ON"
+        );
+    }
+
+    /// Non-LATERAL subquery aliases don't participate in classification, so
+    /// they don't count toward the collision check either — a LATERAL and a
+    /// non-LATERAL sharing an alias should leave the LATERAL classified.
+    #[test]
+    fn non_lateral_shadow_does_not_trigger_collision() {
+        let stmt = parse_select(
+            Dialect::PostgreSQL,
+            "SELECT outer_t.k, sub.m
+             FROM outer_t,
+                  LATERAL (SELECT MAX(b.v) AS m FROM b WHERE b.k = outer_t.k) AS sub,
+                  (SELECT inner_t.k, sub.n
+                   FROM inner_t,
+                        (SELECT c.v AS n FROM c) AS sub) AS wrap",
+        )
+        .expect("parse");
+
+        let schema = NoNonNulls;
+        let unique = PermissiveUniqueSchema;
+        let mut ctx = empty_ctx(&schema, &unique);
+        collect_lateral_hints(&stmt, &mut ctx).expect("collect");
+
+        let sub_rel: Relation = "sub".into();
+        assert!(
+            ctx.pre_hoist_lateral_exactly_one.contains(&sub_rel),
+            "outer LATERAL should classify despite a same-alias non-LATERAL elsewhere"
+        );
+    }
 }

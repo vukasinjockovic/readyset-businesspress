@@ -10,7 +10,7 @@ use proptest::prelude::*;
 use readyset_data::DfValue;
 use readyset_sql::ast::TimestampField;
 use readyset_util::arbitrary::{arbitrary_date_time_timezone, arbitrary_timestamp_naive_date_time};
-use test_utils::tags;
+use test_utils::{tags, upstream};
 
 use crate::common::parse_lower_eval;
 
@@ -29,7 +29,7 @@ fn config() -> Config {
     config
 }
 
-fn postgres_eval(expr: &str, client: &mut Client) -> Result<DfValue, anyhow::Error> {
+fn postgres_eval(expr: &str, client: &mut Client) -> Result<DfValue, postgres::Error> {
     Ok(client.query_one(&format!("SELECT {expr};"), &[])?.get(0))
 }
 
@@ -48,7 +48,8 @@ fn compare_eval(expr: &str, client: &mut Client) {
     );
 }
 
-#[tags(serial, postgres_upstream)]
+#[tags(serial)]
+#[upstream(postgres)]
 #[test]
 fn example_exprs_eval_same_as_postgres() {
     let mut client = config().connect(NoTls).unwrap();
@@ -162,7 +163,8 @@ fn example_exprs_eval_same_as_postgres() {
     }
 }
 
-#[tags(serial, postgres15_upstream)]
+#[tags(serial)]
+#[upstream(postgres, 15)]
 #[test]
 fn example_exprs_eval_same_as_postgres15() {
     let mut client = config().connect(NoTls).unwrap();
@@ -198,7 +200,7 @@ fn normalize_offset(datetime: DateTime<FixedOffset>) -> DateTime<FixedOffset> {
 /// Test the `date_trunc` built-in function. Passes a simple timestamp,
 /// with no timezone information, and does not pass the optional timezone
 /// for normalized conversions.
-#[tags(postgres_upstream)]
+#[upstream(postgres)]
 #[test]
 fn date_trunc_timestamp_no_opt_tz() {
     let client = RefCell::new(config().connect(NoTls).unwrap());
@@ -213,7 +215,7 @@ fn date_trunc_timestamp_no_opt_tz() {
 /// Test the `date_trunc` built-in function. Passes a timestamp with
 /// timezone information, and does not pass the optional timezone for
 /// normalized conversions.
-#[tags(postgres_upstream)]
+#[upstream(postgres)]
 #[test]
 fn date_trunc_timestamptz_no_opt_tz() {
     let client = RefCell::new(config().connect(NoTls).unwrap());
@@ -229,7 +231,7 @@ fn date_trunc_timestamptz_no_opt_tz() {
 /// Test the `date_trunc` built-in function. Passes a timestamp with
 /// timezone information but casts to a timestamp, and does not pass
 /// the optional timezone for normalized conversions.
-#[tags(postgres_upstream)]
+#[upstream(postgres)]
 #[test]
 fn date_trunc_timestamptz_downcast_no_opt_tz() {
     let client = RefCell::new(config().connect(NoTls).unwrap());
@@ -245,7 +247,7 @@ fn date_trunc_timestamptz_downcast_no_opt_tz() {
 /// Test the `date_trunc` built-in function. Passes a timestamp without
 /// timezone information but casts to a timestamptz, and does not pass
 /// the optional timezone for normalized conversions.
-#[tags(postgres_upstream)]
+#[upstream(postgres)]
 #[test]
 fn date_trunc_timestamp_upcast_no_opt_tz() {
     let client = RefCell::new(config().connect(NoTls).unwrap());
@@ -304,10 +306,12 @@ mod extract {
                 );
             }
             (Err(pg_err), Err(our_err)) => {
+                let pg_err_str = readyset_errors::postgres_err(&pg_err);
+
                 let mut asserted = false;
-                if re.is_match(&pg_err.to_string()) {
+                if re.is_match(&pg_err_str) {
                     if let Some((our_err, pg_err)) =
-                        extract_message_body(&our_err.to_string(), &pg_err.to_string())
+                        extract_message_body(&our_err.to_string(), &pg_err_str)
                     {
                         assert_eq!(
                             our_err, pg_err,
@@ -319,7 +323,7 @@ mod extract {
                 if !asserted {
                     assert_eq!(
                         our_err.to_string(),
-                        pg_err.to_string(),
+                        pg_err_str,
                         "mismatched error message for {expr} (left: us, right: postgres)"
                     );
                 }
@@ -352,7 +356,7 @@ mod extract {
         }
     }
 
-    #[tags(postgres15_upstream)]
+    #[upstream(postgres, 15)]
     #[test]
     fn timestamptz() {
         let client = RefCell::new(config().connect(NoTls).unwrap());
@@ -369,7 +373,7 @@ mod extract {
         });
     }
 
-    #[tags(postgres15_upstream)]
+    #[upstream(postgres, 15)]
     #[test]
     fn timestamp() {
         let client = RefCell::new(config().connect(NoTls).unwrap());
@@ -386,7 +390,7 @@ mod extract {
         });
     }
 
-    #[tags(postgres15_upstream)]
+    #[upstream(postgres, 15)]
     #[test]
     fn date() {
         let client = RefCell::new(config().connect(NoTls).unwrap());
@@ -427,25 +431,25 @@ mod extract {
         });
     }
 
-    #[tags(postgres15_upstream)]
+    #[upstream(postgres, 15)]
     #[test]
     fn time_from_date() {
         test_extract_time_from("date");
     }
 
-    #[tags(postgres15_upstream)]
+    #[upstream(postgres, 15)]
     #[test]
     fn time_from_timestamp_with_date_only() {
         test_extract_time_from("timestamp");
     }
 
-    #[tags(postgres15_upstream)]
+    #[upstream(postgres, 15)]
     #[test]
     fn time_from_timestamptz_with_date_only() {
         test_extract_time_from("timestamptz");
     }
 
-    #[tags(postgres15_upstream)]
+    #[upstream(postgres, 15)]
     #[test]
     fn timeee() {
         let client = RefCell::new(config().connect(NoTls).unwrap());
@@ -459,7 +463,7 @@ mod extract {
         });
     }
 
-    #[tags(postgres15_upstream)]
+    #[upstream(postgres, 15)]
     #[test]
     fn ethan() {
         use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone};

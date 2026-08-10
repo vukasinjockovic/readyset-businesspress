@@ -15,12 +15,15 @@ categories = ["api-bindings", "database"]
 antithesis_sdk = { workspace = true }
 anyhow = { workspace = true }
 async-bincode = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive", "env"] }
 fail = { workspace = true }
-hyper = { workspace = true, features = ["stream", "client", "http2", "tcp", "runtime"] }
+bytes = { workspace = true }
 serde = { workspace = true, features = ["rc", "derive"] }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
 rmp-serde = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 bincode = { workspace = true }
@@ -28,7 +31,7 @@ vec_map = { workspace = true, features = ["eders"] }
 petgraph = { workspace = true, features = ["serde-1"] }
 ahash = { workspace = true }
 tower-service = { workspace = true }
-tokio-tower = { workspace = true }
+readyset-multiplex = { path = "../readyset-multiplex" }
 tower = { workspace = true, features = [
     "limit",
     "balance",
@@ -66,14 +69,15 @@ enum_dispatch = { workspace = true }
 async-trait = { workspace = true }
 
 # metrics/
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
 
 # Local dependencies
-array2 = { path = "../array2" }
 dataflow-expression = { path = "../dataflow-expression" }
 failpoint-macros = { path = "../failpoint-macros" }
+metric = { path = "../metric" }
 readyset-data = { path = "../readyset-data" }
 readyset-errors = { path = "../readyset-errors" }
+readyset-post-lookup = { path = "../readyset-post-lookup" }
 readyset-sql = { path = "../readyset-sql" }
 readyset-sql-parsing = { path = "../readyset-sql-parsing" }
 readyset-sql-passes = { path = "../readyset-sql-passes" }
@@ -84,11 +88,19 @@ schema-catalog = { path = "../schema-catalog" }
 tournament-kway = { path = "../tournament-kway" }
 
 [dev-dependencies]
+axum = { workspace = true }
+criterion = { workspace = true }
 tempfile = { workspace = true }
 test-utils = { path = "../test-utils" }
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 failure_injection = ["fail/failpoints", "readyset-util/failure_injection"]
+test-util = []
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "post_lookup_aggregation"
+harness = false

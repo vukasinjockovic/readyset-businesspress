@@ -396,6 +396,12 @@ impl Protocol {
             database.ok_or_else(|| Error::Unsupported("database is required".to_string()))?;
         let response = match backend.on_init(database.borrow()).await? {
             crate::CredentialsNeeded::None => {
+                // Establish the session even with authentication disabled, so
+                // the per-connection context (RLS startup user, etc.) is set up
+                // with the startup user, matching the authenticated path.
+                if let Some(user) = user.as_ref() {
+                    backend.set_auth_info(user, None).await;
+                }
                 self.state = State::Ready;
                 Self::get_ready_message(backend.version())
             }
@@ -432,7 +438,7 @@ impl Protocol {
             .filter(|c| match c {
                 Credentials::Any => true,
                 Credentials::CleartextPassword(expected_password) => {
-                    &password == *expected_password
+                    &password == expected_password.as_str()
                 }
             })
             .ok_or_else(|| Error::AuthenticationFailure {
@@ -632,9 +638,9 @@ impl Protocol {
         let response = backend.on_query(query).await?;
         if let Select { schema, resultset } = response {
             let mut field_descriptions = Vec::with_capacity(schema.len());
-            for i in schema {
+            for i in &*schema {
                 field_descriptions.push(
-                    make_field_description(&i, Text, backend, &mut self.extended_types).await?,
+                    make_field_description(i, Text, backend, &mut self.extended_types).await?,
                 );
             }
 
@@ -1111,6 +1117,10 @@ async fn data_type_size<B: PsqlBackend>(
         Column::Column { col_type, .. } => match col_type.kind() {
             Kind::Array(_) => TYPLEN_VARLENA,
             Kind::Enum(_) => TYPLEN_VARLENA,
+            // An anonymous `record` is built with `Kind::Composite`, so it never compares equal to
+            // the built-in `Type::RECORD` below; matching on the kind keeps it off the
+            // extended-type lookup, which queries `pg_catalog.pg_type` upstream.
+            Kind::Composite(_) => TYPLEN_VARLENA,
             _ => match *col_type {
                 Type::BOOL => TYPLEN_1,
                 Type::BYTEA => TYPLEN_VARLENA,
@@ -1262,7 +1272,7 @@ mod tests {
         last_execute_id: Option<u32>,
         last_execute_params: Option<Vec<PsqlValue>>,
         last_transfer_formats: Option<Vec<TransferFormat>>,
-        needed_credentials: Option<Credentials<'static>>,
+        needed_credentials: Option<Credentials>,
     }
 
     impl Backend {
@@ -1301,8 +1311,8 @@ mod tests {
             }
         }
 
-        fn credentials_for_user(&self, _user: &str) -> Option<Credentials<'_>> {
-            self.needed_credentials
+        fn credentials_for_user(&self, _user: &str) -> Option<Credentials> {
+            self.needed_credentials.clone()
         }
 
         async fn on_query(&mut self, query: &str) -> Result<QueryResponse<Self::Resultset>, Error> {
@@ -1311,7 +1321,7 @@ mod tests {
                 Err(Error::InternalError("error requested".to_string()))
             } else if self.is_query_read {
                 Ok(QueryResponse::Select {
-                    schema: vec![
+                    schema: Arc::new(vec![
                         Column::Column {
                             name: "col1".into(),
                             table_oid: None,
@@ -1324,7 +1334,7 @@ mod tests {
                             attnum: None,
                             col_type: Type::FLOAT8,
                         },
-                    ],
+                    ]),
                     resultset: stream::iter(vec![
                         Ok(vec![PsqlValue::Int(88), PsqlValue::Double(0.123)].into()),
                         Ok(vec![PsqlValue::Int(22), PsqlValue::Double(0.456)].into()),
@@ -1379,7 +1389,7 @@ mod tests {
                 Err(Error::InternalError("error requested".to_string()))
             } else if self.is_query_read {
                 Ok(QueryResponse::Select {
-                    schema: vec![
+                    schema: Arc::new(vec![
                         Column::Column {
                             name: "col1".into(),
                             table_oid: None,
@@ -1392,7 +1402,7 @@ mod tests {
                             attnum: None,
                             col_type: Type::FLOAT8,
                         },
-                    ],
+                    ]),
                     resultset: stream::iter(vec![
                         Ok(vec![PsqlValue::Int(88), PsqlValue::Double(0.123)].into()),
                         Ok(vec![PsqlValue::Int(22), PsqlValue::Double(0.456)].into()),
@@ -1504,7 +1514,9 @@ mod tests {
             application_name: None,
         };
         let mut backend = Backend::new();
-        backend.needed_credentials = Some(Credentials::CleartextPassword(expected_password));
+        backend.needed_credentials = Some(Credentials::CleartextPassword(
+            expected_password.to_string(),
+        ));
         let mut channel = Channel::<NullBytestream>::new(NullBytestream);
         match block_on(protocol.on_request(request, &mut backend, &mut channel)).unwrap() {
             Response::Messages(ms) => assert!(matches!(
@@ -1558,7 +1570,9 @@ mod tests {
             application_name: None,
         };
         let mut backend = Backend::new();
-        backend.needed_credentials = Some(Credentials::CleartextPassword(expected_password));
+        backend.needed_credentials = Some(Credentials::CleartextPassword(
+            expected_password.to_string(),
+        ));
         let mut channel = Channel::<NullBytestream>::new(NullBytestream);
         match block_on(protocol.on_request(request, &mut backend, &mut channel)).unwrap() {
             Response::Messages(ms) => assert!(matches!(

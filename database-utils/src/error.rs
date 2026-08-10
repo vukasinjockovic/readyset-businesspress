@@ -7,7 +7,7 @@ use {mysql_async as mysql, tokio_postgres as pgsql};
 /// Base error enum for this library. Represents many types of potential errors we may encounter.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
-    #[error(transparent)]
+    #[error("{}", readyset_errors::postgres_err(.0))]
     PostgreSQL(#[from] pgsql::Error),
 
     #[error(transparent)]
@@ -89,7 +89,8 @@ pub enum DatabaseURLParseError {
     MissingPostgresDbName,
 
     #[error(
-        "Invalid database URL format: {0}; Make sure any special characters are percent-encoded. See https://docs.readyset.io/reference/cli/readyset#--upstream-db-url for more details."
+        "Invalid database URL format: {}; Make sure any special characters are percent-encoded. See https://docs.readyset.io/reference/cli/readyset#--upstream-db-url for more details.",
+        readyset_errors::postgres_err(.0)
     )]
     PostgreSQL(#[from] pgsql::Error),
 

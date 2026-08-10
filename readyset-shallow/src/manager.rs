@@ -2,29 +2,35 @@ use std::fmt::{Debug, Formatter};
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use metrics::counter;
+use metrics::{counter, gauge};
 use moka::future::Cache as MokaCache;
 use moka::notification::RemovalCause;
 use papaya::HashMap;
 use seize::Collector;
+use tokio::sync::watch::Sender;
 use tracing::info;
 
 use readyset_client::consensus::CacheDDLRequest;
-use readyset_client::metrics::recorded;
 use readyset_client::query::QueryId;
-use readyset_errors::{ReadySetError, ReadySetResult, internal};
-use readyset_sql::ast::{Relation, ShallowCacheQuery, SqlIdentifier};
+use readyset_errors::{ReadySetError, ReadySetResult, internal, internal_err};
+use readyset_sql::ast::{Relation, ShallowCacheQuery, SqlIdentifier, TrxCachePolicy};
 use readyset_util::SizeOf;
+use readyset_util::shutdown::ShutdownReceiver;
 
-use crate::cache::{Cache, CacheEntry, CacheEntryInfo, CacheExpiration, CacheInfo, InnerCache};
-use crate::{EvictionPolicy, QueryMetadata};
+use crate::cache::{
+    AdaptiveState, Cache, CacheEntry, CacheEntryInfo, CacheExpiration, CacheInfo, CacheState,
+    DEFAULT_MAX_EXTRA_LOAD_PERCENT, InnerCache, Lookup, WastedRefreshes,
+};
+use crate::{ContentHash, EvictionPolicy, QueryMetadata};
 use readyset_util::hash::hash;
 
 pub type RequestRefresh<K, V> = Arc<dyn Fn(CacheInsertGuard<K, V>) + Send + Sync>;
 
+/// Entry weight for size accounting. The deep byte size of key plus value is what counts
+/// against the store's configured memory capacity.
 fn weight<K, V>(k: &K, v: &V) -> u32
 where
     K: SizeOf,
@@ -33,6 +39,18 @@ where
     (k.deep_size_of() + v.deep_size_of())
         .try_into()
         .unwrap_or(u32::MAX)
+}
+
+/// Entry cost for cost-aware TinyLFU admission. When the store is at capacity, a new entry is
+/// admitted only if its access frequency weighted by this cost beats that of the entries it
+/// would displace. Wiring the cost to upstream execution time biases retention toward results
+/// that are expensive to recompute, maximizing the upstream work the cache saves rather than
+/// the raw hit rate. Cost plays no part in size accounting, which is handled by [`weight`].
+fn cost<K, V>(_k: &(u64, K), v: &Arc<CacheEntry<V>>) -> u32 {
+    match v.as_ref() {
+        CacheEntry::Present(values) => values.execution_ms.try_into().unwrap_or(u32::MAX),
+        CacheEntry::Loading(_) => 0,
+    }
 }
 
 pub struct CacheManager<K, V>
@@ -44,6 +62,10 @@ where
     names: HashMap<Relation, u64>,
     query_ids: HashMap<QueryId, u64>,
     inner: InnerCache<K, V>,
+    /// Per-cache state keyed by cache id, shared with the store's eviction listener.
+    cache_states: Arc<HashMap<u64, Arc<CacheState>>>,
+    adaptive_max_extra_load_percent: u64,
+    max_entry_bytes: Option<usize>,
     // This lock also synchronizes inserts into the three HashMaps.
     next_id: Mutex<u64>,
 }
@@ -58,13 +80,29 @@ where
     K: Clone + Hash + Eq + Send + Sync + SizeOf + 'static,
     V: Send + Sync + SizeOf + 'static,
 {
-    pub(crate) fn new_inner(max_capacity: Option<u64>) -> InnerCache<K, V> {
+    pub(crate) fn new_inner(
+        max_capacity: Option<u64>,
+        cache_states: Arc<HashMap<u64, Arc<CacheState>>>,
+    ) -> InnerCache<K, V> {
         let mut builder = MokaCache::builder()
+            .support_invalidation_closures()
+            .eviction_policy(moka::policy::EvictionPolicy::cost_aware_lfu())
             .expire_after(CacheExpiration)
             .weigher(weight)
-            .eviction_listener(|_, _, cause| {
+            .cost(cost)
+            .eviction_listener(move |key: Arc<(u64, K)>, value, cause| {
                 if cause == RemovalCause::Size {
-                    counter!(recorded::SHALLOW_EVICT_MEMORY).increment(1);
+                    counter!(metric::SHALLOW_EVICT_MEMORY).increment(1);
+                }
+                if let CacheEntry::Present(values) = &*value
+                    && let Some(state) = cache_states.pin().get(&key.0)
+                {
+                    if let Some(adaptive) = &state.adaptive {
+                        adaptive.remove(values);
+                    }
+                    if cause != RemovalCause::Explicit && !values.served.load(Ordering::Relaxed) {
+                        state.wasted_refreshes.increment();
+                    }
                 }
             });
         if let Some(capacity) = max_capacity {
@@ -73,13 +111,46 @@ where
         Arc::new(builder.build())
     }
 
-    pub fn new(max_capacity: Option<u64>) -> Self {
+    pub fn new(max_capacity: Option<u64>, max_entry_bytes: Option<usize>) -> Self {
+        let cache_states: Arc<HashMap<u64, Arc<CacheState>>> = Arc::new(new_table());
         Self {
             caches: new_table(),
             names: new_table(),
             query_ids: new_table(),
-            inner: Self::new_inner(max_capacity),
+            inner: Self::new_inner(max_capacity, Arc::clone(&cache_states)),
+            cache_states,
+            adaptive_max_extra_load_percent: DEFAULT_MAX_EXTRA_LOAD_PERCENT,
+            max_entry_bytes,
             next_id: Default::default(),
+        }
+    }
+
+    /// Set the maximum extra refresh load adaptive caches may send upstream, as a percentage
+    /// of the load required to refresh every current entry at the configured period. Applies
+    /// to caches created after the call.
+    pub fn set_adaptive_max_extra_load_percent(&mut self, percent: u64) {
+        self.adaptive_max_extra_load_percent = percent;
+    }
+
+    /// Periodically flush the entry store's pending maintenance and report gauges for its total
+    /// size and entry count. The flush processes evictions, whose listener updates the adaptive
+    /// refresh statistics, so this must run even when metrics are unused. Runs until shutdown is
+    /// signaled.
+    pub async fn report_metrics(self: Arc<Self>, mut shutdown_rx: ShutdownReceiver) {
+        const REPORT_INTERVAL: Duration = Duration::from_secs(1);
+        let bytes = gauge!(metric::SHALLOW_MEMORY_BYTES);
+        let entries = gauge!(metric::SHALLOW_ENTRIES);
+        let mut interval = tokio::time::interval(REPORT_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Flush pending maintenance so size accounting stays current when idle.
+                    self.inner.run_pending_tasks().await;
+                    bytes.set(self.inner.weighted_size() as f64);
+                    entries.set(self.inner.entry_count() as f64);
+                }
+                _ = shutdown_rx.recv() => break,
+            }
         }
     }
 
@@ -98,6 +169,22 @@ where
         name.map(|n| n.name.to_string())
             .or_else(|| query_id.map(|q| q.to_string()))
             .unwrap()
+    }
+
+    /// Current (actual, baseline) adaptive load sums for a cache, for tests.
+    #[cfg(test)]
+    pub(crate) fn adaptive_load(&self, query_id: &QueryId) -> Option<(u64, u64)> {
+        let id = self.get_cache_id(None, Some(query_id))?;
+        let guard = self.cache_states.pin();
+        guard.get(&id)?.adaptive.as_ref().map(|s| s.load_ppm())
+    }
+
+    /// Number of wasted refreshes recorded for a cache, for tests.
+    #[cfg(test)]
+    pub(crate) fn wasted_refresh_count(&self, query_id: &QueryId) -> Option<u64> {
+        let id = self.get_cache_id(None, Some(query_id))?;
+        let guard = self.cache_states.pin();
+        guard.get(&id).map(|s| s.wasted_refreshes.count())
     }
 
     fn get_cache_id(&self, name: Option<&Relation>, query_id: Option<&QueryId>) -> Option<u64> {
@@ -122,16 +209,19 @@ where
     pub fn create_cache(
         &self,
         name: Option<Relation>,
-        query_id: Option<QueryId>,
+        query_id: QueryId,
         query: ShallowCacheQuery,
         schema_search_path: Vec<SqlIdentifier>,
         policy: EvictionPolicy,
         ddl_req: CacheDDLRequest,
-        always: bool,
+        trx_cache_policy: TrxCachePolicy,
         coalesce_ms: Option<Duration>,
-    ) -> ReadySetResult<()> {
-        Self::check_identifiers(name.as_ref(), query_id.as_ref())?;
-        let display_name = Self::format_name(name.as_ref(), query_id.as_ref());
+        adaptive: bool,
+    ) -> ReadySetResult<()>
+    where
+        V: ContentHash,
+    {
+        let display_name = Self::format_name(name.as_ref(), Some(&query_id));
 
         let mut next_id = self
             .next_id
@@ -140,12 +230,22 @@ where
         let id = *next_id;
         *next_id += 1;
 
-        if self
-            .get_cache_id(name.as_ref(), query_id.as_ref())
-            .is_some()
-        {
+        if self.get_cache_id(name.as_ref(), Some(&query_id)).is_some() {
             return Err(ReadySetError::ViewAlreadyExists(display_name));
         }
+
+        let adaptive_state = adaptive.then(|| {
+            Arc::new(AdaptiveState::new(
+                policy.refresh_ms(),
+                self.adaptive_max_extra_load_percent,
+                query_id,
+            ))
+        });
+        let state = Arc::new(CacheState {
+            adaptive: adaptive_state,
+            wasted_refreshes: WastedRefreshes::new(query_id),
+        });
+        self.cache_states.pin().insert(id, Arc::clone(&state));
 
         let inner = Arc::clone(&self.inner);
         let cache = Cache::new(
@@ -157,18 +257,16 @@ where
             query,
             schema_search_path,
             ddl_req,
-            always,
+            trx_cache_policy,
             coalesce_ms,
+            state,
+            self.max_entry_bytes,
         );
 
         if let Some(name) = name {
-            let guard = self.names.pin();
-            guard.insert(name, id);
+            self.names.pin().insert(name, id);
         }
-        if let Some(query_id) = query_id {
-            let guard = self.query_ids.pin();
-            guard.insert(query_id, id);
-        }
+        self.query_ids.pin().insert(query_id, id);
 
         self.caches.pin().insert(id, cache);
 
@@ -197,15 +295,16 @@ where
         cache.stop();
 
         if let Some(name) = cache.name() {
-            let names_guard = self.names.pin();
-            names_guard.remove(name);
+            self.names.pin().remove(name);
         }
-        if let Some(query_id) = cache.query_id() {
-            let queries_guard = self.query_ids.pin();
-            queries_guard.remove(query_id);
-        }
+        self.query_ids.pin().remove(cache.query_id());
 
         guard.remove(&id);
+        if let Some(state) = self.cache_states.pin().remove(&id)
+            && let Some(adaptive) = &state.adaptive
+        {
+            adaptive.zero_gauges();
+        }
 
         info!("dropped shallow cache {display_name}");
         Ok(())
@@ -224,6 +323,47 @@ where
         caches.clear();
         self.names.pin().clear();
         self.query_ids.pin().clear();
+        let states = self.cache_states.pin();
+        for state in states.values() {
+            if let Some(adaptive) = &state.adaptive {
+                adaptive.zero_gauges();
+            }
+        }
+        states.clear();
+    }
+
+    /// Flush a single shallow cache by name or query_id: clears cached entries
+    /// but preserves the cache definition, scheduler, and all metadata.
+    pub async fn flush_cache(
+        &self,
+        name: Option<&Relation>,
+        query_id: Option<&QueryId>,
+    ) -> ReadySetResult<()> {
+        Self::check_identifiers(name, query_id)?;
+        let display_name = Self::format_name(name, query_id);
+        let cache = self
+            .get(name, query_id)
+            .ok_or_else(|| ReadySetError::ViewNotFound(display_name.clone()))?;
+        cache
+            .flush()
+            .await
+            .map_err(|e| internal_err!("failed to flush shallow cache {display_name}: {e}"))?;
+        info!("flushed shallow cache {display_name}");
+        Ok(())
+    }
+
+    /// Flush all shallow caches: clears all Moka entries but preserves cache
+    /// definitions, schedulers, name/query_id mappings, and all metadata.
+    /// A no-op if no caches exist.
+    pub async fn flush_all_caches(&self) {
+        // invalidate_all() schedules all entries for removal (sync).
+        // run_pending_tasks() ensures they are fully evicted before returning.
+        self.inner.invalidate_all();
+        self.inner.run_pending_tasks().await;
+        info!(
+            num_caches = self.caches.pin().len(),
+            "Flushed all shallow caches"
+        );
     }
 
     /// List the current shallow caches.
@@ -240,7 +380,7 @@ where
             .values()
             .filter(|cache| {
                 (query_id.is_none() && name.is_none())
-                    || *cache.query_id() == query_id
+                    || Some(*cache.query_id()) == query_id
                     || cache.name().as_ref() == name
             })
             .map(|cache| cache.get_info())
@@ -289,12 +429,16 @@ where
             match entry.as_ref() {
                 CacheEntry::Present(values) => {
                     let entry_id = hash(&key.1);
+                    let bytes = entry.deep_size_of();
                     Some(CacheEntryInfo {
                         query_id: cache_query_id,
                         entry_id,
                         last_accessed_ms: values.accessed_ms.load(Ordering::Relaxed),
                         last_refreshed_ms: values.refreshed_ms,
                         refresh_time_ms: values.execution_ms,
+                        refresh_period_ms: values.period_ms,
+                        bytes,
+                        served: values.served.load(Ordering::Relaxed),
                     })
                 }
                 CacheEntry::Loading(_) => None,
@@ -323,14 +467,21 @@ where
         self.get(relation, query_id).is_some()
     }
 
-    fn make_guard(cache: Arc<Cache<K, V>>, key: K) -> CacheInsertGuard<K, V> {
+    fn make_guard(
+        cache: Arc<Cache<K, V>>,
+        key: K,
+        refreshing: Option<Arc<AtomicBool>>,
+    ) -> CacheInsertGuard<K, V> {
         CacheInsertGuard {
             cache,
             key: Some(key),
             results: Some(Vec::new()),
             metadata: None,
-            filled: false,
+            filled: FillState::Pending,
             requested: Instant::now(),
+            done: None,
+            refresh: refreshing.is_some(),
+            refreshing,
         }
     }
 
@@ -346,23 +497,33 @@ where
         let Some(cache) = self.get(None, Some(query_id)) else {
             return CacheResult::NotCached;
         };
-        let res = cache.get(key.clone()).await;
-
-        match res {
-            Some((res, needs_refresh)) if res.values.first().is_none_or(&is_compatible) => {
-                cache.increment_hit();
-                if needs_refresh && !cache.is_scheduled() {
-                    let guard = Self::make_guard(cache, key);
-                    CacheResult::HitAndRefresh(res, guard)
-                } else {
-                    CacheResult::Hit(res)
+        let (res, key) = cache.get(key).await;
+        let (res, refreshing, key) = match res {
+            Some((res, refreshing)) if res.values.first().is_none_or(&is_compatible) => {
+                (res, refreshing, key)
+            }
+            Some(_) | None => match cache.get_on_miss(key.clone()).await {
+                Lookup::Hit(res, refreshing) if res.values.first().is_none_or(&is_compatible) => {
+                    (res, refreshing, key)
                 }
-            }
-            Some(_) | None => {
-                cache.increment_miss();
-                let guard = Self::make_guard(cache, key);
-                CacheResult::Miss(guard)
-            }
+                Lookup::Hit(..) => {
+                    // An entry was there, but it wasn't compatible.
+                    cache.increment_miss();
+                    return CacheResult::Miss(Self::make_guard(cache, key, None));
+                }
+                Lookup::Miss(guard) => {
+                    cache.increment_miss();
+                    return CacheResult::Miss(guard);
+                }
+            },
+        };
+        cache.increment_hit();
+        if let Some(refreshing) = refreshing
+            && !cache.is_scheduled()
+        {
+            CacheResult::HitAndRefresh(res, Self::make_guard(cache, key, Some(refreshing)))
+        } else {
+            CacheResult::Hit(res)
         }
     }
 
@@ -426,6 +587,13 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillState {
+    Pending,
+    Filled,
+    Consumed,
+}
+
 pub struct CacheInsertGuard<K, V>
 where
     K: Clone + Hash + Eq + Send + Sync + 'static,
@@ -435,8 +603,14 @@ where
     pub(crate) key: Option<K>,
     pub(crate) results: Option<Vec<V>>,
     pub(crate) metadata: Option<QueryMetadata>,
-    pub(crate) filled: bool,
+    pub(crate) filled: FillState,
     pub(crate) requested: Instant,
+    /// If set, dropping the guard will notify any listeners.
+    pub(crate) done: Option<Sender<()>>,
+    /// If set, dropping the guard will update the referenced refreshing state to false.
+    pub(crate) refreshing: Option<Arc<AtomicBool>>,
+    /// Whether this guard writes back a refresh rather than an initial load.
+    pub(crate) refresh: bool,
 }
 
 impl<K, V> Debug for CacheInsertGuard<K, V>
@@ -457,9 +631,19 @@ where
     K: Clone + Hash + Eq + Send + Sync + 'static,
     V: Send + Sync + 'static,
 {
+    /// The display name of the cache this guard will insert into.
+    pub fn cache_display_name(&self) -> Option<String> {
+        self.cache.display_name()
+    }
+
     /// Add a row to the result set.
     pub fn push(&mut self, row: V) {
         self.results.as_mut().unwrap().push(row);
+    }
+
+    /// The key this guard inserts under, if it has not yet been consumed.
+    pub fn key(&self) -> Option<&K> {
+        self.key.as_ref()
     }
 
     /// Set the metadata for this result set.
@@ -485,23 +669,43 @@ where
     /// inserted and become immediately visible.  Otherwise, when the guard is dropped, the
     /// insertion will be scheduled to happen asynchronously.
     pub fn filled(&mut self) -> impl Future<Output = ()> {
-        self.filled = true;
+        self.filled = FillState::Filled;
         async {
-            if self.filled {
-                let (metadata, cache, key, results, execution) = self.take();
-                cache.insert(key, results, metadata, execution).await;
+            if self.filled == FillState::Filled {
+                let (metadata, cache, key, results, execution, done) = self.take();
+                cache
+                    .insert(key, results, metadata, execution, self.refresh)
+                    .await;
+                drop(done);
             }
         }
     }
 
     #[allow(clippy::type_complexity)]
-    fn take(&mut self) -> (QueryMetadata, Arc<Cache<K, V>>, K, Vec<V>, Duration) {
+    fn take(
+        &mut self,
+    ) -> (
+        QueryMetadata,
+        Arc<Cache<K, V>>,
+        K,
+        Vec<V>,
+        Duration,
+        Option<Sender<()>>,
+    ) {
         let metadata = self.metadata.take().expect("no metadata for result set");
         let cache = Arc::clone(&self.cache);
         let key = self.key.take().unwrap();
         let results = self.results.take().unwrap();
-        self.filled = false;
-        (metadata, cache, key, results, self.requested.elapsed())
+        let done = self.done.take();
+        self.filled = FillState::Consumed;
+        (
+            metadata,
+            cache,
+            key,
+            results,
+            self.requested.elapsed(),
+            done,
+        )
     }
 }
 
@@ -511,11 +715,27 @@ where
     V: Send + Sync + 'static,
 {
     fn drop(&mut self) {
-        if self.filled {
-            let (metadata, cache, key, results, execution) = self.take();
-            tokio::spawn(async move {
-                cache.insert(key, results, metadata, execution).await;
-            });
+        match self.filled {
+            FillState::Filled => {
+                let (metadata, cache, key, results, execution, done) = self.take();
+                let refresh = self.refresh;
+                tokio::spawn(async move {
+                    cache
+                        .insert(key, results, metadata, execution, refresh)
+                        .await;
+                    drop(done);
+                });
+                return;
+            }
+            FillState::Pending => {
+                if self.refresh {
+                    self.cache.increment_refresh_dropped();
+                }
+            }
+            FillState::Consumed => {}
+        }
+        if let Some(refreshing) = self.refreshing.take() {
+            refreshing.store(false, Ordering::Release);
         }
     }
 }
@@ -536,6 +756,7 @@ mod tests {
             unparsed_stmt: "CREATE SHALLOW CACHE test AS SELECT 1".to_string(),
             schema_search_path: vec![],
             dialect: readyset_sql::Dialect::PostgreSQL.into(),
+            cache_name: None,
         }
     }
 
@@ -547,14 +768,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_entries_empty_manager() {
-        let manager: CacheManager<String, String> = CacheManager::new(None);
+        let manager: CacheManager<String, String> = CacheManager::new(None, None);
         let entries = manager.list_entries(None, None);
         assert!(entries.is_empty());
     }
 
     #[tokio::test]
     async fn test_list_entries_returns_all_entries() {
-        let manager: CacheManager<Vec<&str>, Vec<&str>> = CacheManager::new(None);
+        let manager: CacheManager<Vec<&str>, Vec<&str>> = CacheManager::new(None, None);
 
         let query_id_1 = QueryId::from_unparsed_select("SELECT 1");
         let query_id_2 = QueryId::from_unparsed_select("SELECT 2");
@@ -563,26 +784,28 @@ mod tests {
         manager
             .create_cache(
                 None,
-                Some(query_id_1),
+                query_id_1,
                 ShallowCacheQuery::default(),
                 vec![],
                 default_policy(),
                 test_ddl_req(),
-                false,
+                TrxCachePolicy::Never,
                 None,
+                false,
             )
             .unwrap();
 
         manager
             .create_cache(
                 None,
-                Some(query_id_2),
+                query_id_2,
                 ShallowCacheQuery::default(),
                 vec![],
                 default_policy(),
                 test_ddl_req(),
-                false,
+                TrxCachePolicy::Never,
                 None,
+                false,
             )
             .unwrap();
 
@@ -591,24 +814,26 @@ mod tests {
         let cache_2 = manager.get(None, Some(&query_id_2)).unwrap();
 
         // Mark intent and insert for cache 1
-        let _ = cache_1.get(vec!["key1"]).await;
+        let _ = cache_1.get_on_miss(vec!["key1"]).await;
         cache_1
             .insert(
                 vec!["key1"],
                 vec![vec!["value1"]],
                 crate::QueryMetadata::Test,
                 Duration::ZERO,
+                false,
             )
             .await;
 
         // Mark intent and insert for cache 2
-        let _ = cache_2.get(vec!["key2"]).await;
+        let _ = cache_2.get_on_miss(vec!["key2"]).await;
         cache_2
             .insert(
                 vec!["key2"],
                 vec![vec!["value2"]],
                 crate::QueryMetadata::Test,
                 Duration::ZERO,
+                false,
             )
             .await;
 
@@ -617,14 +842,14 @@ mod tests {
         assert_eq!(entries.len(), 2);
 
         // Verify both query_ids are present
-        let query_ids: Vec<_> = entries.iter().filter_map(|e| e.query_id).collect();
+        let query_ids: Vec<_> = entries.iter().map(|e| e.query_id).collect();
         assert!(query_ids.contains(&query_id_1));
         assert!(query_ids.contains(&query_id_2));
     }
 
     #[tokio::test]
     async fn test_list_entries_filters_by_query_id() {
-        let manager: CacheManager<Vec<&str>, Vec<&str>> = CacheManager::new(None);
+        let manager: CacheManager<Vec<&str>, Vec<&str>> = CacheManager::new(None, None);
 
         let query_id_1 = QueryId::from_unparsed_select("SELECT 1");
         let query_id_2 = QueryId::from_unparsed_select("SELECT 2");
@@ -633,26 +858,28 @@ mod tests {
         manager
             .create_cache(
                 None,
-                Some(query_id_1),
+                query_id_1,
                 ShallowCacheQuery::default(),
                 vec![],
                 default_policy(),
                 test_ddl_req(),
-                false,
+                TrxCachePolicy::Never,
                 None,
+                false,
             )
             .unwrap();
 
         manager
             .create_cache(
                 None,
-                Some(query_id_2),
+                query_id_2,
                 ShallowCacheQuery::default(),
                 vec![],
                 default_policy(),
                 test_ddl_req(),
-                false,
+                TrxCachePolicy::Never,
                 None,
+                false,
             )
             .unwrap();
 
@@ -660,40 +887,42 @@ mod tests {
         let cache_1 = manager.get(None, Some(&query_id_1)).unwrap();
         let cache_2 = manager.get(None, Some(&query_id_2)).unwrap();
 
-        let _ = cache_1.get(vec!["key1"]).await;
+        let _ = cache_1.get_on_miss(vec!["key1"]).await;
         cache_1
             .insert(
                 vec!["key1"],
                 vec![vec!["value1"]],
                 crate::QueryMetadata::Test,
                 Duration::ZERO,
+                false,
             )
             .await;
 
-        let _ = cache_2.get(vec!["key2"]).await;
+        let _ = cache_2.get_on_miss(vec!["key2"]).await;
         cache_2
             .insert(
                 vec!["key2"],
                 vec![vec!["value2"]],
                 crate::QueryMetadata::Test,
                 Duration::ZERO,
+                false,
             )
             .await;
 
         // Filter by query_id_1
         let entries = manager.list_entries(Some(query_id_1), None);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].query_id, Some(query_id_1));
+        assert_eq!(entries[0].query_id, query_id_1);
 
         // Filter by query_id_2
         let entries = manager.list_entries(Some(query_id_2), None);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].query_id, Some(query_id_2));
+        assert_eq!(entries[0].query_id, query_id_2);
     }
 
     #[tokio::test]
     async fn test_list_entries_nonexistent_query_id() {
-        let manager: CacheManager<Vec<&str>, Vec<&str>> = CacheManager::new(None);
+        let manager: CacheManager<Vec<&str>, Vec<&str>> = CacheManager::new(None, None);
 
         let query_id_1 = QueryId::from_unparsed_select("SELECT 1");
         let nonexistent = QueryId::from_unparsed_select("SELECT nonexistent");
@@ -702,24 +931,26 @@ mod tests {
         manager
             .create_cache(
                 None,
-                Some(query_id_1),
+                query_id_1,
                 ShallowCacheQuery::default(),
                 vec![],
                 default_policy(),
                 test_ddl_req(),
-                false,
+                TrxCachePolicy::Never,
                 None,
+                false,
             )
             .unwrap();
 
         let cache = manager.get(None, Some(&query_id_1)).unwrap();
-        let _ = cache.get(vec!["key"]).await;
+        let _ = cache.get_on_miss(vec!["key"]).await;
         cache
             .insert(
                 vec!["key"],
                 vec![vec!["value"]],
                 crate::QueryMetadata::Test,
                 Duration::ZERO,
+                false,
             )
             .await;
 
@@ -730,20 +961,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_entries_respects_limit() {
-        let manager: CacheManager<String, String> = CacheManager::new(None);
+        let manager: CacheManager<String, String> = CacheManager::new(None, None);
 
         let query_id = QueryId::from_unparsed_select("SELECT 1");
 
         manager
             .create_cache(
                 None,
-                Some(query_id),
+                query_id,
                 ShallowCacheQuery::default(),
                 vec![],
                 default_policy(),
                 test_ddl_req(),
-                false,
+                TrxCachePolicy::Never,
                 None,
+                false,
             )
             .unwrap();
 
@@ -752,13 +984,14 @@ mod tests {
         // Insert multiple entries with different keys
         for i in 0..5 {
             let key = format!("key{}", i);
-            let _ = cache.get(key.clone()).await;
+            let _ = cache.get_on_miss(key.clone()).await;
             cache
                 .insert(
                     key,
                     vec!["value".to_string()],
                     crate::QueryMetadata::Test,
                     Duration::ZERO,
+                    false,
                 )
                 .await;
         }
@@ -782,40 +1015,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_entries_skips_loading_entries() {
-        let manager: CacheManager<Vec<&str>, Vec<&str>> = CacheManager::new(None);
+        let manager: CacheManager<Vec<&str>, Vec<&str>> = CacheManager::new(None, None);
 
         let query_id = QueryId::from_unparsed_select("SELECT 1");
 
         manager
             .create_cache(
                 None,
-                Some(query_id),
+                query_id,
                 ShallowCacheQuery::default(),
                 vec![],
                 default_policy(),
                 test_ddl_req(),
-                false,
+                TrxCachePolicy::Never,
                 None,
+                false,
             )
             .unwrap();
 
         let cache = manager.get(None, Some(&query_id)).unwrap();
 
-        // Create a Loading entry by calling get without inserting
-        let _ = cache.get(vec!["loading_key"]).await;
+        // Create a Loading entry by calling get_on_miss without inserting
+        let _ = cache.get_on_miss(vec!["loading_key"]).await;
 
         // The Loading entry should not appear in list_entries
         let entries = manager.list_entries(None, None);
         assert!(entries.is_empty());
 
         // Now insert a real entry
-        let _ = cache.get(vec!["real_key"]).await;
+        let _ = cache.get_on_miss(vec!["real_key"]).await;
         cache
             .insert(
                 vec!["real_key"],
                 vec![vec!["value"]],
                 crate::QueryMetadata::Test,
                 Duration::ZERO,
+                false,
             )
             .await;
 

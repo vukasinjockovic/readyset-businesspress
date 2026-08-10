@@ -1,6 +1,7 @@
+use std::assert_matches;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use database_utils::UpstreamConfig;
 use mysql_async::prelude::Queryable;
@@ -12,17 +13,18 @@ use readyset_client_test_helpers::{
     psql_helpers::{self, PostgreSQLAdapter},
 };
 use readyset_tracing::init_test_logging;
-use test_utils::tags;
+use test_utils::{tags, upstream};
 use tokio::sync::RwLock;
 use tokio::{test, time::sleep};
 use tokio_postgres::SimpleQueryMessage;
 
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn scheduled_refresh_expiration() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -62,18 +64,18 @@ async fn scheduled_refresh_expiration() {
         .query_drop("SELECT a, RAND(), SLEEP(3) FROM foo WHERE a = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream
+        QueryDestination::ReadysetThenUpstream(_)
     );
 
     readyset
         .query_drop("SELECT a, RAND(), SLEEP(3) FROM foo WHERE a = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow
+        QueryDestination::ReadysetShallow(_)
     );
 
     sleep(Duration::from_secs(11)).await;
@@ -82,20 +84,21 @@ async fn scheduled_refresh_expiration() {
         .query_drop("SELECT a, RAND(), SLEEP(3) FROM foo WHERE a = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream
+        QueryDestination::ReadysetThenUpstream(_)
     );
 
     shutdown_tx.shutdown().await;
 }
 
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn execution_longer_than_ttl_is_cacheable() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -134,18 +137,18 @@ async fn execution_longer_than_ttl_is_cacheable() {
         .query_drop("SELECT a, SLEEP(6) FROM foo WHERE a = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream
+        QueryDestination::ReadysetThenUpstream(_)
     );
 
     readyset
         .query_drop("SELECT a, SLEEP(6) FROM foo WHERE a = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow
+        QueryDestination::ReadysetShallow(_)
     );
 
     sleep(Duration::from_secs(1)).await;
@@ -154,20 +157,21 @@ async fn execution_longer_than_ttl_is_cacheable() {
         .query_drop("SELECT a, SLEEP(6) FROM foo WHERE a = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow
+        QueryDestination::ReadysetShallow(_)
     );
 
     shutdown_tx.shutdown().await;
 }
 
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn scheduled_refresh_starts_immediately() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -207,9 +211,9 @@ async fn scheduled_refresh_starts_immediately() {
         .query_drop("SELECT RAND(), SLEEP(5) FROM foo WHERE a = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream
+        QueryDestination::ReadysetThenUpstream(_)
     );
 
     async fn collect_rand_cache_result(readyset: &mut mysql_async::Conn, i: i32) -> String {
@@ -218,9 +222,9 @@ async fn scheduled_refresh_starts_immediately() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
+        assert_matches!(
             last_query_info(readyset).await.destination,
-            QueryDestination::ReadysetShallow,
+            QueryDestination::ReadysetShallow(_),
             "[{i}] Should have hit shallow cache"
         );
         rand.to_string()
@@ -259,11 +263,646 @@ async fn scheduled_refresh_starts_immediately() {
 }
 
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn show_shallow_caches() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE foo (a INT, b INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO foo VALUES (1, 10)")
+        .await
+        .unwrap();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    readyset
+        .query_drop("DROP ALL SHALLOW CACHES")
+        .await
+        .unwrap();
+    readyset
+        .query_drop(
+            "CREATE SHALLOW CACHE POLICY
+               TTL 32 SECONDS
+               REFRESH 8 SECONDS
+               COALESCE 2 SECONDS
+             some_cache FROM SELECT * FROM foo WHERE a = ?",
+        )
+        .await
+        .unwrap();
+
+    readyset
+        .query_drop("SELECT * FROM foo WHERE a = 1")
+        .await
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetThenUpstream(_)
+    );
+    readyset
+        .query_drop("SELECT * FROM foo WHERE a = 1")
+        .await
+        .unwrap();
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    // Check SHOW CACHES.
+    let rows: Vec<(String, String, String, String, String)> =
+        readyset.query("SHOW SHALLOW CACHES").await.unwrap();
+    assert_eq!(rows.len(), 1, "expected exactly one shallow cache");
+
+    let (query_id, name, query, properties, count) = &rows[0];
+    assert_eq!(query_id, "q_9de6aaf2d6625055");
+    assert_eq!(name, "some_cache");
+    assert_eq!(query, "SELECT * FROM foo WHERE a = $1");
+    let count: u64 = count.parse().unwrap();
+    assert!(count >= 1, "expected at least one shallow hit, got {count}");
+
+    let mut properties: HashSet<_> = properties.split(",").map(|p| p.trim().to_string()).collect();
+    assert!(properties.remove("shallow"), "missing expected shallow property: {properties:?}");
+    assert!(properties.remove("ttl 32000 ms"), "missing expected ttl: {properties:?}");
+    assert!(properties.remove("refresh 8000 ms"), "missing expected refresh: {properties:?}");
+    assert!(properties.remove("coalesce 2000 ms"), "missing expected coalesce: {properties:?}");
+    assert!(properties.is_empty(), "unexpected properties remaining: {properties:?}");
+
+    // Check the shallow_caches vrel.
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(String, String, String, u64, u64, u64, bool, bool, u64, u64)> = readyset
+        .query(
+            "SELECT query_id, name, query, ttl_ms, refresh_ms, coalesce_ms, always, schedule,
+                    hits, misses
+             FROM readyset.shallow_caches",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "expected exactly one shallow cache");
+
+    let (query_id, name, query, ttl_ms, refresh_ms, coalesce_ms, always, schedule, hits, misses) =
+        &rows[0];
+    assert_eq!(query_id, "q_9de6aaf2d6625055");
+    assert_eq!(name, "some_cache");
+    assert_eq!(query, "SELECT * FROM foo WHERE a = $1");
+    assert_eq!(*ttl_ms, 32000);
+    assert_eq!(*refresh_ms, 8000);
+    assert_eq!(*coalesce_ms, 2000);
+    assert_eq!(*always, false);
+    assert_eq!(*schedule, false);
+    assert!(*hits >= 1, "expected at least one shallow hit, got {hits}");
+    assert!(*misses >= 1, "expected at least one shallow miss, got {misses}");
+
+    // Check the shallow_cache_refresh_stats vrel: this cache is neither adaptive nor scheduled, so
+    // the load and scheduler stats are NULL; wasted_refreshes and dropped_refreshes are counters, so
+    // they read 0.
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(String, u64, u64, Option<u64>, Option<u64>, Option<bool>, Option<u64>)> = readyset
+        .query(
+            "SELECT query_id, wasted_refreshes, dropped_refreshes, load_actual_ppm,
+                    load_baseline_ppm, over_cap, scheduler_queue_len
+             FROM readyset.shallow_cache_refresh_stats",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "expected exactly one shallow cache");
+
+    let (
+        query_id,
+        wasted_refreshes,
+        dropped_refreshes,
+        load_actual_ppm,
+        load_baseline_ppm,
+        over_cap,
+        scheduler_queue_len,
+    ) = &rows[0];
+    assert_eq!(query_id, "q_9de6aaf2d6625055");
+    assert_eq!(*wasted_refreshes, 0);
+    assert_eq!(*dropped_refreshes, 0);
+    assert_eq!(*load_actual_ppm, None);
+    assert_eq!(*load_baseline_ppm, None);
+    assert_eq!(*over_cap, None);
+    assert_eq!(*scheduler_queue_len, None);
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Sub-second units (`MILLISECONDS`, `MS`) and mixed units should propagate to the cache
+/// manager at millisecond resolution.
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn shallow_cache_millisecond_units() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE foo (a INT, b INT)")
+        .await
+        .unwrap();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    readyset
+        .query_drop("DROP ALL SHALLOW CACHES")
+        .await
+        .unwrap();
+    // Mix SECONDS, MILLISECONDS, and MS in a single statement; use a sub-second REFRESH.
+    readyset
+        .query_drop(
+            "CREATE SHALLOW CACHE POLICY
+               TTL 5 SECONDS
+               REFRESH 500 MILLISECONDS
+               COALESCE 250 MS
+             ms_cache FROM SELECT * FROM foo WHERE a = ?",
+        )
+        .await
+        .unwrap();
+
+    let rows: Vec<(String, u64, u64, u64)> = readyset
+        .query("SELECT name, ttl_ms, refresh_ms, coalesce_ms FROM readyset.shallow_caches")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "expected exactly one shallow cache");
+
+    let (name, ttl_ms, refresh_ms, coalesce_ms) = &rows[0];
+    assert_eq!(name, "ms_cache");
+    assert_eq!(*ttl_ms, 5000, "TTL should be 5000 ms");
+    assert_eq!(*refresh_ms, 500, "REFRESH should be 500 ms");
+    assert_eq!(*coalesce_ms, 250, "COALESCE should be 250 ms");
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Concurrent identical requests against a slow upstream query should coalesce onto a single
+/// in-flight load. The coalesce count surfaces in `shallow_caches` (`coalesces`), and the
+/// timeout/abort counts, wait times, and an estimated savings in `shallow_cache_coalesce_stats`.
+#[test]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn shallow_coalesce_stats() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    upstream
+        .query_drop("CREATE TABLE coalesce_foo (a INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO coalesce_foo VALUES (1)")
+        .await
+        .unwrap();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts.clone()).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    readyset
+        .query_drop("DROP ALL SHALLOW CACHES")
+        .await
+        .unwrap();
+    // A slow upstream query (SLEEP) under a generous coalesce window, so concurrent identical
+    // requests wait on one in-flight load rather than each hitting upstream.
+    readyset
+        .query_drop(
+            "CREATE SHALLOW CACHE POLICY
+               TTL 120 SECONDS
+               REFRESH 60 SECONDS
+               COALESCE 30 SECONDS
+             coalesce_cache FROM SELECT a, SLEEP(3) FROM coalesce_foo WHERE a = ?",
+        )
+        .await
+        .unwrap();
+
+    async fn connect(opts: mysql_async::Opts, db: &str) -> mysql_async::Conn {
+        let mut conn = mysql_async::Conn::new(opts).await.unwrap();
+        conn.query_drop(format!("USE {db}")).await.unwrap();
+        conn
+    }
+
+    async fn run_cached_query(mut conn: mysql_async::Conn) {
+        conn.query_drop("SELECT a, SLEEP(3) FROM coalesce_foo WHERE a = 1")
+            .await
+            .unwrap();
+    }
+
+    // Open every connection up front, so the leader's head start below only has to cover query
+    // dispatch rather than connection setup.
+    let leader_conn = connect(readyset_opts.clone(), &test_name).await;
+    let mut follower_conns = Vec::new();
+    for _ in 0..4 {
+        follower_conns.push(connect(readyset_opts.clone(), &test_name).await);
+    }
+
+    // Leader: the first request misses and runs the slow query upstream, holding the loading stub.
+    let leader = tokio::spawn(run_cached_query(leader_conn));
+
+    // Let the leader install the stub before the followers arrive.
+    sleep(Duration::from_secs(1)).await;
+
+    // Followers: arrive mid-flight and coalesce onto the leader's load.
+    let followers: Vec<_> = follower_conns
+        .into_iter()
+        .map(|conn| tokio::spawn(run_cached_query(conn)))
+        .collect();
+
+    leader.await.unwrap();
+    for follower in followers {
+        follower.await.unwrap();
+    }
+
+    // Let the query logger flush the upstream execution time behind the saved estimate.
+    sleep(Duration::from_secs(2)).await;
+
+    let rows: Vec<(u64,)> = readyset
+        .query(
+            "SELECT coalesces \
+             FROM readyset.shallow_caches WHERE name = 'coalesce_cache'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "expected exactly one shallow cache");
+    let (coalesces,) = rows[0];
+    assert!(coalesces >= 1, "expected coalesced requests, got {coalesces}");
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(u64, u64, u64, u64, u64, u64, u64, u64)> = readyset
+        .query(
+            "SELECT total_us, avg_us, coalesce_timeouts, coalesce_aborts, \
+                    timeout_total_us, abort_total_us, upstream_saved_total_us, \
+                    upstream_saved_avg_us \
+             FROM readyset.shallow_cache_coalesce_stats",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "expected exactly one shallow cache");
+    let (
+        total_us,
+        avg_us,
+        timeouts,
+        aborts,
+        timeout_total_us,
+        abort_total_us,
+        upstream_saved_total_us,
+        upstream_saved_avg_us,
+    ) = rows[0];
+    assert!(
+        total_us > 0,
+        "expected positive total coalesce wait, got {total_us}"
+    );
+    assert!(avg_us > 0, "expected positive avg coalesce wait, got {avg_us}");
+    assert_eq!(timeouts, 0, "expected no coalesce timeouts, got {timeouts}");
+    assert_eq!(aborts, 0, "expected no coalesce aborts, got {aborts}");
+    assert_eq!(
+        timeout_total_us, 0,
+        "expected no timeout wait, got {timeout_total_us}"
+    );
+    assert_eq!(
+        abort_total_us, 0,
+        "expected no abort wait, got {abort_total_us}"
+    );
+    assert!(
+        upstream_saved_total_us > 0,
+        "expected positive estimated total savings, got {upstream_saved_total_us}"
+    );
+    assert!(
+        upstream_saved_avg_us > 0,
+        "expected positive estimated avg savings, got {upstream_saved_avg_us}"
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Concurrent requests against a slow query with a coalesce window shorter than the query: the
+/// followers time out before the leader finishes and go upstream, surfacing in
+/// `shallow_cache_coalesce_stats`.
+#[test]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn shallow_coalesce_timeout_stats() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    upstream
+        .query_drop("CREATE TABLE coalesce_foo (a INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO coalesce_foo VALUES (1)")
+        .await
+        .unwrap();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts.clone()).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    readyset
+        .query_drop("DROP ALL SHALLOW CACHES")
+        .await
+        .unwrap();
+    // The coalesce window (1s) is shorter than the query (SLEEP 4), so followers give up waiting on
+    // the leader's in-flight load and run upstream themselves.
+    readyset
+        .query_drop(
+            "CREATE SHALLOW CACHE POLICY
+               TTL 120 SECONDS
+               REFRESH 60 SECONDS
+               COALESCE 1 SECONDS
+             coalesce_cache FROM SELECT a, SLEEP(4) FROM coalesce_foo WHERE a = ?",
+        )
+        .await
+        .unwrap();
+
+    async fn connect(opts: mysql_async::Opts, db: &str) -> mysql_async::Conn {
+        let mut conn = mysql_async::Conn::new(opts).await.unwrap();
+        conn.query_drop(format!("USE {db}")).await.unwrap();
+        conn
+    }
+
+    async fn run_cached_query(mut conn: mysql_async::Conn) {
+        conn.query_drop("SELECT a, SLEEP(4) FROM coalesce_foo WHERE a = 1")
+            .await
+            .unwrap();
+    }
+
+    // Open every connection up front, so the leader's head start below only has to cover query
+    // dispatch rather than connection setup.
+    let leader_conn = connect(readyset_opts.clone(), &test_name).await;
+    let mut follower_conns = Vec::new();
+    for _ in 0..4 {
+        follower_conns.push(connect(readyset_opts.clone(), &test_name).await);
+    }
+
+    // Leader: misses and holds the loading stub for the length of the slow query.
+    let leader = tokio::spawn(run_cached_query(leader_conn));
+
+    // Let the leader install the stub before the followers arrive.
+    sleep(Duration::from_secs(1)).await;
+
+    // Followers: coalesce onto the leader, then time out after the 1s window with it still loading.
+    let followers: Vec<_> = follower_conns
+        .into_iter()
+        .map(|conn| tokio::spawn(run_cached_query(conn)))
+        .collect();
+
+    leader.await.unwrap();
+    for follower in followers {
+        follower.await.unwrap();
+    }
+
+    let rows: Vec<(u64, u64, u64, u64)> = readyset
+        .query(
+            "SELECT coalesce_timeouts, coalesce_aborts, timeout_total_us, abort_total_us \
+             FROM readyset.shallow_cache_coalesce_stats",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "expected exactly one shallow cache");
+    let (timeouts, aborts, timeout_total_us, abort_total_us) = rows[0];
+    assert!(timeouts >= 1, "expected coalesce timeouts, got {timeouts}");
+    assert!(
+        timeout_total_us > 0,
+        "expected positive timeout wait, got {timeout_total_us}"
+    );
+    assert_eq!(aborts, 0, "expected no coalesce aborts, got {aborts}");
+    assert_eq!(abort_total_us, 0, "expected no abort wait, got {abort_total_us}");
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A leader whose upstream load fails mid-flight drops the loading stub without a result, so a
+/// follower coalescing on it aborts, surfacing in `shallow_cache_coalesce_stats`.
+#[test]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn shallow_coalesce_abort_stats() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    upstream
+        .query_drop("CREATE TABLE coalesce_foo (a INT, j TEXT)")
+        .await
+        .unwrap();
+    // The second row's invalid JSON makes the cached query fail upstream, but only after the
+    // per-row SLEEPs (evaluated first in the select list) have held the load in flight long
+    // enough for the follower to coalesce onto it.
+    upstream
+        .query_drop("INSERT INTO coalesce_foo VALUES (1, '{}'), (1, 'not json')")
+        .await
+        .unwrap();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts.clone()).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    readyset
+        .query_drop("DROP ALL SHALLOW CACHES")
+        .await
+        .unwrap();
+    readyset
+        .query_drop(
+            "CREATE SHALLOW CACHE POLICY
+               TTL 120 SECONDS
+               REFRESH 60 SECONDS
+               COALESCE 30 SECONDS
+             coalesce_cache FROM
+               SELECT a, SLEEP(3), JSON_EXTRACT(j, '$.x') FROM coalesce_foo WHERE a = ?",
+        )
+        .await
+        .unwrap();
+
+    async fn connect(opts: mysql_async::Opts, db: &str) -> mysql_async::Conn {
+        let mut conn = mysql_async::Conn::new(opts).await.unwrap();
+        conn.query_drop(format!("USE {db}")).await.unwrap();
+        conn
+    }
+
+    // The query errors on the poisoned row, so both the leader and the follower (which loads
+    // upstream itself after its coalesce aborts) get an error back.
+    async fn run_failing_query(mut conn: mysql_async::Conn) {
+        let result = conn
+            .query_drop("SELECT a, SLEEP(3), JSON_EXTRACT(j, '$.x') FROM coalesce_foo WHERE a = 1")
+            .await;
+        assert!(result.is_err(), "expected the poisoned query to fail");
+    }
+
+    // Open both connections up front, so the leader's head start below only has to cover query
+    // dispatch rather than connection setup.
+    let leader_conn = connect(readyset_opts.clone(), &test_name).await;
+    let follower_conn = connect(readyset_opts.clone(), &test_name).await;
+
+    // Leader: misses and holds the loading stub until the upstream query fails.
+    let leader = tokio::spawn(run_failing_query(leader_conn));
+
+    // Let the leader install the stub before the follower arrives.
+    sleep(Duration::from_secs(1)).await;
+
+    // Follower: coalesces onto the leader's load, then aborts when the failed load drops the stub.
+    let follower = tokio::spawn(run_failing_query(follower_conn));
+
+    leader.await.unwrap();
+    follower.await.unwrap();
+
+    let rows: Vec<(u64, u64)> = readyset
+        .query("SELECT coalesce_aborts, abort_total_us FROM readyset.shallow_cache_coalesce_stats")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "expected exactly one shallow cache");
+    let (aborts, abort_total_us) = rows[0];
+    assert!(aborts >= 1, "expected coalesce aborts, got {aborts}");
+    assert!(
+        abort_total_us > 0,
+        "expected positive abort wait, got {abort_total_us}"
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test(flavor = "multi_thread", worker_threads = 4)]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn coalescing_handles_query_burst() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    upstream
+        .query_drop("CREATE TABLE foo (a INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO foo VALUES (1)")
+        .await
+        .unwrap();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts.clone()).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    readyset
+        .query_drop("CREATE SHALLOW CACHE FROM SELECT a FROM foo WHERE a = ?")
+        .await
+        .unwrap();
+
+    // Create a number of connections that will concurrently query the cache on barrier signal.
+    let barrier = Arc::new(tokio::sync::Barrier::new(24));
+    let readers: Vec<_> = (0..24)
+        .map(|_| {
+            let (opts, db, barrier) =
+                (readyset_opts.clone(), test_name.clone(), Arc::clone(&barrier));
+            tokio::spawn(async move {
+                let mut conn = mysql_async::Conn::new(opts).await.unwrap();
+                conn.query_drop(format!("USE {db}")).await.unwrap();
+                barrier.wait().await;
+                conn.query_drop("SELECT a FROM foo WHERE a = 1")
+                    .await
+                    .unwrap();
+            })
+        })
+        .collect();
+    for reader in readers {
+        reader.await.unwrap();
+    }
+
+    // Verify that we properly coalesced all the misses into a single upstream query.
+    let rows: Vec<(u64, u64, u64)> = readyset
+        .query(
+            "SELECT misses, coalesce_timeouts, coalesce_aborts
+             FROM readyset.shallow_caches JOIN readyset.shallow_cache_coalesce_stats
+             USING (query_id)",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let (misses, timeouts, aborts) = rows[0];
+    assert_eq!(misses, 1);
+    assert_eq!(timeouts, 0);
+    assert_eq!(aborts, 0);
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn show_shallow_cache_entries() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -311,15 +950,26 @@ async fn show_shallow_cache_entries() {
         .unwrap();
 
     // Test SHOW SHALLOW CACHE ENTRIES returns all entries
-    let entries: Vec<(String, String, String, String, String)> =
+    let entries: Vec<(String, String, String, String, String, String, String)> =
         readyset.query("SHOW SHALLOW CACHE ENTRIES").await.unwrap();
     assert_eq!(entries.len(), 2, "Should have 2 cache entries");
+    let vrel_entries: Vec<(String, String, u64, u64, u64, u64, bool)> = readyset
+        .query(
+            "SELECT query_id, entry_id, last_accessed_ms, last_refreshed_ms, refresh_time_ms,
+                    bytes, served
+             FROM readyset.shallow_cache_entries",
+        )
+        .await
+        .unwrap();
+    assert_eq!(vrel_entries.len(), 2);
+    // Both entries were just miss-filled, whose data was served as the miss response.
+    assert!(vrel_entries.iter().all(|e| e.6));
 
     // Get the query_id from one of the entries
     let query_id = &entries[0].0;
 
     // Test SHOW SHALLOW CACHE ENTRIES WHERE query_id = '...'
-    let filtered: Vec<(String, String, String, String, String)> = readyset
+    let filtered: Vec<(String, String, String, String, String, String, String)> = readyset
         .query(format!(
             "SHOW SHALLOW CACHE ENTRIES WHERE query_id = '{query_id}'"
         ))
@@ -330,16 +980,24 @@ async fn show_shallow_cache_entries() {
         2,
         "Filtered by query_id should return both entries for this cache"
     );
+    let vrel_filtered: Vec<(String, String, u64, u64, u64, u64)> = readyset
+        .query(format!(
+            "SELECT query_id, entry_id, last_accessed_ms, last_refreshed_ms, refresh_time_ms, bytes
+             FROM readyset.shallow_cache_entries WHERE query_id = '{query_id}'"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(vrel_filtered.len(), 2);
 
     // Test SHOW SHALLOW CACHE ENTRIES LIMIT 1
-    let limited: Vec<(String, String, String, String, String)> = readyset
+    let limited: Vec<(String, String, String, String, String, String, String)> = readyset
         .query("SHOW SHALLOW CACHE ENTRIES LIMIT 1")
         .await
         .unwrap();
     assert_eq!(limited.len(), 1, "LIMIT 1 should return only 1 entry");
 
     // Test SHOW SHALLOW CACHE ENTRIES WHERE query_id = '...' LIMIT 1
-    let filtered_limited: Vec<(String, String, String, String, String)> = readyset
+    let filtered_limited: Vec<(String, String, String, String, String, String, String)> = readyset
         .query(format!(
             "SHOW SHALLOW CACHE ENTRIES WHERE query_id = '{query_id}' LIMIT 1"
         ))
@@ -352,7 +1010,7 @@ async fn show_shallow_cache_entries() {
     );
 
     // Test filtering with non-existent query_id returns empty
-    let non_existent: Vec<(String, String, String, String, String)> = readyset
+    let non_existent: Vec<(String, String, String, String, String, String, String)> = readyset
         .query("SHOW SHALLOW CACHE ENTRIES WHERE query_id = 'q_12345'")
         .await
         .unwrap();
@@ -360,16 +1018,86 @@ async fn show_shallow_cache_entries() {
         non_existent.is_empty(),
         "Non-existent query_id should return empty results"
     );
+    let vrel_non_existent: Vec<(String, String, u64, u64, u64, u64)> = readyset
+        .query(
+            "SELECT query_id, entry_id, last_accessed_ms, last_refreshed_ms, refresh_time_ms, bytes
+             FROM readyset.shallow_cache_entries WHERE query_id = 'q_12345'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(vrel_non_existent.len(), 0);
 
     shutdown_tx.shutdown().await;
 }
 
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn shallow_cache_entry_bytes() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    async fn assert_size(readyset: &mut mysql_async::Conn, low: u64, high: u64) {
+        // Verify bytes via SHOW SHALLOW CACHE ENTRIES.
+        let entries: Vec<(String, String, String, String, String, String, String)> =
+            readyset.query("SHOW SHALLOW CACHE ENTRIES").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        let bytes: u64 = entries[0].6.parse().expect("bytes column should be numeric");
+        assert!((low..high).contains(&bytes), "unexpected size: {bytes}");
+
+        // Verify bytes via vrel.
+        let vrel_entries: Vec<u64> = readyset
+            .query("SELECT bytes FROM readyset.shallow_cache_entries")
+            .await
+            .unwrap();
+        assert_eq!(vrel_entries.len(), 1);
+        let bytes = vrel_entries[0];
+        assert!((low..high).contains(&bytes), "unexpected size: {bytes}");
+    }
+
+    // Create a shallow cache with a 1024 byte entry.
+    readyset
+        .query_drop("SELECT /*rs+ CREATE SHALLOW CACHE */ REPEAT(CHAR(0x41), 1024)")
+        .await
+        .unwrap();
+
+    assert_size(&mut readyset, 1024, 1536).await;
+
+    // Drop and recreate with a 10240 byte entry.
+    readyset
+        .query_drop("DROP ALL SHALLOW CACHES")
+        .await
+        .unwrap();
+    readyset
+        .query_drop("SELECT /*rs+ CREATE SHALLOW CACHE */ REPEAT(CHAR(0x41), 10240)")
+        .await
+        .unwrap();
+
+    assert_size(&mut readyset, 10240, 15360).await;
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn mysql_change_upstream() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     let db_a = format!("{test_name}_a");
     let db_b = format!("{test_name}_b");
 
@@ -409,7 +1137,7 @@ async fn mysql_change_upstream() {
 
     let (rs_opts, _handle, shutdown_tx) = TestBuilder::new(backend_builder)
         .recreate_database(false)
-        .replicate_db(db_a.clone())
+        .replicate_db(&db_a)
         .fallback(true)
         .migration_mode(MigrationMode::OutOfBand)
         .build::<MySQLAdapter>()
@@ -418,11 +1146,9 @@ async fn mysql_change_upstream() {
     let mut rs = mysql_async::Conn::new(rs_opts.clone()).await.unwrap();
     rs.query_drop(format!("USE {db_a}")).await.unwrap();
 
-    rs.query_drop(
-        "CREATE SHALLOW CACHE POLICY TTL 2 SECONDS FROM SELECT b FROM foo WHERE a = ?",
-    )
-    .await
-    .expect("create shallow cache");
+    rs.query_drop("CREATE SHALLOW CACHE POLICY TTL 2 SECONDS FROM SELECT b FROM foo WHERE a = ?")
+        .await
+        .expect("create shallow cache");
 
     // First query goes upstream to db_a.
     let row: (i32,) = rs
@@ -431,9 +1157,9 @@ async fn mysql_change_upstream() {
         .expect("query db_a (1st)")
         .expect("row should exist");
     assert_eq!(row.0, 100);
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut rs).await.destination,
-        QueryDestination::Upstream,
+        QueryDestination::ReadysetThenUpstream(_),
     );
 
     // Second query hits shallow cache.
@@ -443,9 +1169,9 @@ async fn mysql_change_upstream() {
         .expect("query db_a (2nd)")
         .expect("row should exist");
     assert_eq!(row.0, 100);
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut rs).await.destination,
-        QueryDestination::ReadysetShallow,
+        QueryDestination::ReadysetShallow(_)
     );
 
     // Switch upstream to db_b.
@@ -470,7 +1196,8 @@ async fn mysql_change_upstream() {
     // Wait for TTL to expire so the shallow cache is stale.
     sleep(Duration::from_secs(3)).await;
 
-    // Query should go upstream to db_b.
+    // Query should go upstream to db_b. The shallow cache is keyed by query id, which
+    // covers the schema search path, so under db_b nothing shallow is attempted at all.
     let row: (i32,) = rs
         .query_first("SELECT b FROM foo WHERE a = 1")
         .await
@@ -487,11 +1214,12 @@ async fn mysql_change_upstream() {
 
 /// Verify that a `/*rs+ CREATE SHALLOW CACHE */` hint creates a shallow cache and returns results.
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn hint_creates_shallow_cache() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -523,9 +1251,9 @@ async fn hint_creates_shallow_cache() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(1, 100)]);
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream
+        QueryDestination::ReadysetThenUpstream(_)
     );
 
     // Second query (same, with hint): should hit the shallow cache.
@@ -534,9 +1262,9 @@ async fn hint_creates_shallow_cache() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(1, 100)]);
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow
+        QueryDestination::ReadysetShallow(_)
     );
 
     shutdown_tx.shutdown().await;
@@ -544,11 +1272,12 @@ async fn hint_creates_shallow_cache() {
 
 /// Verify that a `/*rs+ CREATE SHALLOW CACHE */` hint works on a UNION query.
 #[test]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn hint_creates_shallow_cache_union() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -579,9 +1308,9 @@ async fn hint_creates_shallow_cache_union() {
         .query_drop("SELECT /*rs+ CREATE SHALLOW CACHE */ RAND() UNION SELECT RAND()")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream
+        QueryDestination::ReadysetThenUpstream(_)
     );
 
     // Second query without hint: should hit the shallow cache.
@@ -589,9 +1318,9 @@ async fn hint_creates_shallow_cache_union() {
         .query_drop("SELECT RAND() UNION SELECT RAND()")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow
+        QueryDestination::ReadysetShallow(_)
     );
 
     shutdown_tx.shutdown().await;
@@ -599,11 +1328,12 @@ async fn hint_creates_shallow_cache_union() {
 
 /// Verify that a `/*rs+ CREATE SHALLOW CACHE */` hint works with a CTE.
 #[test]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn hint_creates_shallow_cache_cte() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -631,14 +1361,12 @@ async fn hint_creates_shallow_cache_cte() {
 
     // CTE with hint on the outer SELECT.
     readyset
-        .query_drop(
-            "WITH cte AS (SELECT 1 AS x) SELECT /*rs+ CREATE SHALLOW CACHE */ * FROM cte",
-        )
+        .query_drop("WITH cte AS (SELECT 1 AS x) SELECT /*rs+ CREATE SHALLOW CACHE */ * FROM cte")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream
+        QueryDestination::ReadysetThenUpstream(_)
     );
 
     // Same CTE query without hint: should hit the shallow cache.
@@ -646,9 +1374,9 @@ async fn hint_creates_shallow_cache_cte() {
         .query_drop("WITH cte AS (SELECT 1 AS x) SELECT * FROM cte")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow
+        QueryDestination::ReadysetShallow(_)
     );
 
     shutdown_tx.shutdown().await;
@@ -656,11 +1384,12 @@ async fn hint_creates_shallow_cache_cte() {
 
 /// Verify that a `/*rs+ CREATE SHALLOW CACHE */` hint works with a window function.
 #[test]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql, modern)]
 async fn hint_creates_shallow_cache_window_function() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -693,9 +1422,9 @@ async fn hint_creates_shallow_cache_window_function() {
         )
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream
+        QueryDestination::ReadysetThenUpstream(_)
     );
 
     // Same window function query without hint: should hit the shallow cache.
@@ -703,9 +1432,9 @@ async fn hint_creates_shallow_cache_window_function() {
         .query_drop("SELECT ROW_NUMBER() OVER (ORDER BY id), id FROM t")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow
+        QueryDestination::ReadysetShallow(_)
     );
 
     shutdown_tx.shutdown().await;
@@ -713,11 +1442,12 @@ async fn hint_creates_shallow_cache_window_function() {
 
 /// Verify that a `/*rs+ CREATE SHALLOW CACHE */` hint works with a derived table (subquery).
 #[test]
-#[tags(serial, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn hint_creates_shallow_cache_subquery() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -745,14 +1475,12 @@ async fn hint_creates_shallow_cache_subquery() {
 
     // Subquery (derived table) with hint.
     readyset
-        .query_drop(
-            "SELECT /*rs+ CREATE SHALLOW CACHE */ * FROM (SELECT id FROM t) AS sub",
-        )
+        .query_drop("SELECT /*rs+ CREATE SHALLOW CACHE */ * FROM (SELECT id FROM t) AS sub")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream
+        QueryDestination::ReadysetThenUpstream(_)
     );
 
     // Same subquery without hint: should hit the shallow cache.
@@ -760,9 +1488,9 @@ async fn hint_creates_shallow_cache_subquery() {
         .query_drop("SELECT * FROM (SELECT id FROM t) AS sub")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow
+        QueryDestination::ReadysetShallow(_)
     );
 
     shutdown_tx.shutdown().await;
@@ -776,11 +1504,12 @@ fn first_row_col(rows: &[SimpleQueryMessage], col: usize) -> &str {
 }
 
 #[test]
-#[tags(serial, slow, postgres_upstream)]
+#[tags(serial, slow)]
+#[upstream(postgres)]
 async fn pg_change_upstream() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     let db_a = format!("{test_name}_a");
     let db_b = format!("{test_name}_b");
 
@@ -822,7 +1551,7 @@ async fn pg_change_upstream() {
 
     let (rs_opts, _handle, shutdown_tx) = TestBuilder::new(backend_builder)
         .recreate_database(false)
-        .replicate_db(db_a.clone())
+        .replicate_db(&db_a)
         .fallback(true)
         .migration_mode(MigrationMode::OutOfBand)
         .build::<PostgreSQLAdapter>()
@@ -844,9 +1573,9 @@ async fn pg_change_upstream() {
         .await
         .expect("query db_a (1st)");
     assert_eq!(first_row_col(&rows, 0), "100");
-    assert_eq!(
+    assert_matches!(
         psql_helpers::last_query_info(&rs).await.destination,
-        QueryDestination::Upstream,
+        QueryDestination::ReadysetThenUpstream(_),
     );
 
     // Second query hits shallow cache.
@@ -855,9 +1584,9 @@ async fn pg_change_upstream() {
         .await
         .expect("query db_a (2nd)");
     assert_eq!(first_row_col(&rows, 0), "100");
-    assert_eq!(
+    assert_matches!(
         psql_helpers::last_query_info(&rs).await.destination,
-        QueryDestination::ReadysetShallow,
+        QueryDestination::ReadysetShallow(_)
     );
 
     // Switch upstream to db_b.
@@ -888,9 +1617,9 @@ async fn pg_change_upstream() {
         .await
         .expect("query after change upstream");
     assert_eq!(first_row_col(&rows, 0), "200");
-    assert_eq!(
+    assert_matches!(
         psql_helpers::last_query_info(&rs).await.destination,
-        QueryDestination::Upstream,
+        QueryDestination::ReadysetThenUpstream(_),
     );
 
     // Second query should hit shallow cache with db_b data.
@@ -899,9 +1628,9 @@ async fn pg_change_upstream() {
         .await
         .expect("query db_b (cached)");
     assert_eq!(first_row_col(&rows, 0), "200");
-    assert_eq!(
+    assert_matches!(
         psql_helpers::last_query_info(&rs).await.destination,
-        QueryDestination::ReadysetShallow,
+        QueryDestination::ReadysetShallow(_)
     );
 
     shutdown_tx.shutdown().await;
@@ -909,11 +1638,12 @@ async fn pg_change_upstream() {
 
 /// Verify that the same query without a hint uses the cache created by a hint.
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn hint_query_id_matches_without_hint() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -950,9 +1680,9 @@ async fn hint_query_id_matches_without_hint() {
         .query_drop("SELECT id, val FROM t2 WHERE id = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow
+        QueryDestination::ReadysetShallow(_)
     );
 
     shutdown_tx.shutdown().await;
@@ -960,11 +1690,12 @@ async fn hint_query_id_matches_without_hint() {
 
 /// Verify that a second hinted query is idempotent when the cache already exists.
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn hint_idempotent_when_cache_exists() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -1003,10 +1734,10 @@ async fn hint_idempotent_when_cache_exists() {
             .await
             .unwrap();
         assert_eq!(rows, vec![(1,)]);
-        assert_eq!(
-            last_query_info(&mut readyset).await.destination,
-            QueryDestination::ReadysetShallow
-        );
+        assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
     }
 
     shutdown_tx.shutdown().await;
@@ -1017,11 +1748,12 @@ async fn hint_idempotent_when_cache_exists() {
 /// We create a cache with a short TTL (no refresh) and verify that the entry expires
 /// after the TTL elapses, proving the policy was applied.
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn hint_ttl_option_applies() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -1052,9 +1784,9 @@ async fn hint_ttl_option_applies() {
         .query_drop("SELECT /*rs+ CREATE SHALLOW CACHE POLICY TTL 3 SECONDS */ id, val FROM t4 WHERE id = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream,
+        QueryDestination::ReadysetThenUpstream(_),
         "First query should be a cache miss (upstream)"
     );
 
@@ -1063,9 +1795,9 @@ async fn hint_ttl_option_applies() {
         .query_drop("SELECT id, val FROM t4 WHERE id = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow,
+        QueryDestination::ReadysetShallow(_),
         "Second query should hit shallow cache"
     );
 
@@ -1077,9 +1809,9 @@ async fn hint_ttl_option_applies() {
         .query_drop("SELECT id, val FROM t4 WHERE id = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream,
+        QueryDestination::ReadysetThenUpstream(_),
         "After TTL expiry the entry should be evicted"
     );
 
@@ -1089,11 +1821,12 @@ async fn hint_ttl_option_applies() {
 /// Verify that a hinted prepared statement creates a shallow cache and executes correctly
 /// via the binary protocol (plan_prepare + execute path).
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn hint_prepared_statement_creates_cache() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -1130,9 +1863,9 @@ async fn hint_prepared_statement_creates_cache() {
         .unwrap()
         .unwrap();
     assert_eq!(row, (1, 10));
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream,
+        QueryDestination::ReadysetThenUpstream(_),
         "First prepared exec should be a cache miss (upstream)"
     );
 
@@ -1146,9 +1879,9 @@ async fn hint_prepared_statement_creates_cache() {
         .unwrap()
         .unwrap();
     assert_eq!(row, (1, 10));
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow,
+        QueryDestination::ReadysetShallow(_),
         "Second prepared exec should hit shallow cache"
     );
 
@@ -1160,9 +1893,9 @@ async fn hint_prepared_statement_creates_cache() {
         .unwrap()
         .unwrap();
     assert_eq!(row, (1, 10));
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow,
+        QueryDestination::ReadysetShallow(_),
         "Non-hinted prepared exec should use the same cache"
     );
 
@@ -1172,13 +1905,14 @@ async fn hint_prepared_statement_creates_cache() {
 /// Verify that when `allow_cache_ddl` is false, hints do not create caches.
 /// The query should fall through to normal execution without error.
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial)]
+#[upstream(mysql)]
 async fn hint_skipped_when_cache_ddl_disabled() {
     use readyset_adapter::BackendBuilder;
 
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -1196,12 +1930,11 @@ async fn hint_skipped_when_cache_ddl_disabled() {
     let backend_builder = BackendBuilder::default()
         .require_authentication(false)
         .allow_cache_ddl(false);
-    let (readyset_opts, _readyset_handle, shutdown_tx) =
-        TestBuilder::new(backend_builder)
-            .recreate_database(false)
-            .fallback(true)
-            .build::<MySQLAdapter>()
-            .await;
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::new(backend_builder)
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
     let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
     readyset
         .query_drop(format!("USE {test_name}"))
@@ -1215,9 +1948,11 @@ async fn hint_skipped_when_cache_ddl_disabled() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(1, 42)]);
-    assert_ne!(
-        last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow,
+    assert!(
+        !matches!(
+            last_query_info(&mut readyset).await.destination,
+            QueryDestination::ReadysetShallow(_)
+        ),
         "Should NOT hit a shallow cache since DDL is disabled"
     );
 
@@ -1226,9 +1961,11 @@ async fn hint_skipped_when_cache_ddl_disabled() {
         .query_drop("SELECT id, val FROM t6 WHERE id = 1")
         .await
         .unwrap();
-    assert_ne!(
-        last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow,
+    assert!(
+        !matches!(
+            last_query_info(&mut readyset).await.destination,
+            QueryDestination::ReadysetShallow(_)
+        ),
         "No shallow cache should have been created"
     );
 
@@ -1245,11 +1982,12 @@ async fn hint_skipped_when_cache_ddl_disabled() {
 /// Verify that a malformed hint (unrecognized text) does not prevent query execution.
 /// The query should fall through to normal execution and return correct results.
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn malformed_hint_falls_through() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -1287,9 +2025,11 @@ async fn malformed_hint_falls_through() {
         .query_drop("SELECT id, val FROM t7 WHERE id = 1")
         .await
         .unwrap();
-    assert_ne!(
-        last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow,
+    assert!(
+        !matches!(
+            last_query_info(&mut readyset).await.destination,
+            QueryDestination::ReadysetShallow(_)
+        ),
         "Malformed hint should not create a shallow cache"
     );
 
@@ -1299,11 +2039,12 @@ async fn malformed_hint_falls_through() {
 /// Verify that queries with different extra `/*rs+` hints all hit the same shallow cache,
 /// rather than creating duplicate cache entries.
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn multiple_hints_produce_same_cache() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -1331,14 +2072,12 @@ async fn multiple_hints_produce_same_cache() {
 
     // First query with a single valid hint — creates the cache.
     readyset
-        .query_drop(
-            "SELECT /*rs+ CREATE SHALLOW CACHE */ id, val FROM t_multi WHERE id = 1",
-        )
+        .query_drop("SELECT /*rs+ CREATE SHALLOW CACHE */ id, val FROM t_multi WHERE id = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream,
+        QueryDestination::ReadysetThenUpstream(_),
         "First hinted query should be a cache miss"
     );
 
@@ -1349,9 +2088,9 @@ async fn multiple_hints_produce_same_cache() {
         )
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow,
+        QueryDestination::ReadysetShallow(_),
         "Query with two hints should hit the same shallow cache"
     );
 
@@ -1360,9 +2099,9 @@ async fn multiple_hints_produce_same_cache() {
         .query_drop("SELECT id, val FROM t_multi WHERE id = 1")
         .await
         .unwrap();
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow,
+        QueryDestination::ReadysetShallow(_),
         "Query with no hints should hit the same shallow cache"
     );
 
@@ -1377,11 +2116,12 @@ async fn multiple_hints_produce_same_cache() {
 /// discard the successfully-parsed inner query on hint-parse failure, causing
 /// the cache lookup to be skipped entirely.
 #[test]
-#[tags(serial, slow, mysql_upstream)]
+#[tags(serial, slow)]
+#[upstream(mysql)]
 async fn malformed_hint_does_not_bypass_existing_cache() {
     init_test_logging();
 
-    let test_name = derive_test_name!();
+    let test_name = derive_test_name();
     mysql_helpers::recreate_database(&test_name).await;
 
     let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
@@ -1421,9 +2161,9 @@ async fn malformed_hint_does_not_bypass_existing_cache() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(1, 77)]);
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::Upstream,
+        QueryDestination::ReadysetThenUpstream(_),
     );
 
     // Second query (no hint): should hit the shallow cache.
@@ -1432,9 +2172,9 @@ async fn malformed_hint_does_not_bypass_existing_cache() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(1, 77)]);
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow,
+        QueryDestination::ReadysetShallow(_)
     );
 
     // Same query with a malformed hint — the hint text is invalid (`POLICY TT`
@@ -1447,11 +2187,1069 @@ async fn malformed_hint_does_not_bypass_existing_cache() {
         .await
         .unwrap();
     assert_eq!(rows, vec![(1, 77)]);
-    assert_eq!(
+    assert_matches!(
         last_query_info(&mut readyset).await.destination,
-        QueryDestination::ReadysetShallow,
+        QueryDestination::ReadysetShallow(_),
         "Malformed hint must not bypass an existing shallow cache"
     );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Verify that `/*rs+ SKIP CACHE */` bypasses the shallow cache and routes to upstream.
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn skip_cache_hint_bypasses_shallow_cache() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE t (id INT, val INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .await
+        .unwrap();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    // Create a shallow cache via DDL.
+    readyset
+        .query_drop("CREATE SHALLOW CACHE FROM SELECT id, val FROM t WHERE id = ?")
+        .await
+        .unwrap();
+
+    // First query: cache miss, goes to upstream and populates the cache.
+    let rows: Vec<(i32, i32)> = readyset
+        .query("SELECT id, val FROM t WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 100)]);
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetThenUpstream(_),
+        "First query should go to upstream (cache miss)"
+    );
+
+    // Second query: cache hit, served from shallow cache.
+    let rows: Vec<(i32, i32)> = readyset
+        .query("SELECT id, val FROM t WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 100)]);
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_),
+        "Second query should hit the shallow cache"
+    );
+
+    // Update upstream data so we can verify SKIP CACHE reads fresh data.
+    upstream
+        .query_drop("UPDATE t SET val = 999 WHERE id = 1")
+        .await
+        .unwrap();
+
+    // Third query with SKIP CACHE hint: should bypass shallow cache and go to upstream.
+    let rows: Vec<(i32, i32)> = readyset
+        .query("SELECT /*rs+ SKIP CACHE */ id, val FROM t WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 999)], "SKIP CACHE should return fresh data from upstream");
+    assert_eq!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::Upstream,
+        "SKIP CACHE should route to upstream"
+    );
+
+    // Fourth query without hint: should still serve from the shallow cache (stale data).
+    let rows: Vec<(i32, i32)> = readyset
+        .query("SELECT id, val FROM t WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![(1, 100)], "Without hint, cache should still serve stale data");
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_),
+        "Without hint, query should hit the shallow cache"
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Verify that `/*rs+ SKIP CACHE */` bypasses the shallow cache for prepared statements
+/// via the binary protocol (plan_prepare + execute path).
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn skip_cache_hint_bypasses_shallow_cache_prepared() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE t (id INT, val INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .await
+        .unwrap();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    // Create a shallow cache via DDL.
+    readyset
+        .query_drop("CREATE SHALLOW CACHE FROM SELECT id, val FROM t WHERE id = ?")
+        .await
+        .unwrap();
+
+    // First exec_first (no hint): cache miss, goes to upstream.
+    let row: (i32, i32) = readyset
+        .exec_first("SELECT id, val FROM t WHERE id = ?", (1,))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row, (1, 100));
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetThenUpstream(_),
+        "First prepared exec should be a cache miss (upstream)"
+    );
+
+    // Second exec_first (no hint): should hit the shallow cache.
+    let row: (i32, i32) = readyset
+        .exec_first("SELECT id, val FROM t WHERE id = ?", (1,))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row, (1, 100));
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_),
+        "Second prepared exec should hit shallow cache"
+    );
+
+    // Update upstream data so we can verify SKIP CACHE reads fresh data.
+    upstream
+        .query_drop("UPDATE t SET val = 999 WHERE id = 1")
+        .await
+        .unwrap();
+
+    // Prepared exec with SKIP CACHE hint: should bypass shallow cache, go to upstream.
+    let row: (i32, i32) = readyset
+        .exec_first(
+            "SELECT /*rs+ SKIP CACHE */ id, val FROM t WHERE id = ?",
+            (1,),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row, (1, 999), "SKIP CACHE prepared exec should return fresh data from upstream");
+    assert_eq!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::Upstream,
+        "SKIP CACHE prepared exec should route to upstream"
+    );
+
+    // Prepared exec without hint: should still serve from shallow cache (stale data).
+    let row: (i32, i32) = readyset
+        .exec_first("SELECT id, val FROM t WHERE id = ?", (1,))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row, (1, 100), "Without hint, cache should still serve stale data");
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_),
+        "Without hint, prepared exec should hit the shallow cache"
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+// --- PostgreSQL hint e2e tests ---
+//
+// These mirror the MySQL hint e2e tests above, exercising the
+// `/*rs+ CREATE SHALLOW CACHE */` and `/*rs+ SKIP CACHE */` directives
+// against the PostgreSQL adapter. The underlying hint logic is
+// dialect-agnostic, but upstream sqlparser only emits optimizer hints for
+// dialects that opt in via `supports_comment_optimizer_hint`; these tests
+// verify the PostgreSQL dialect does so.
+
+fn pg_first_col_i32(rows: &[SimpleQueryMessage], col: usize) -> i32 {
+    first_row_col(rows, col)
+        .parse::<i32>()
+        .expect("column should parse as i32")
+}
+
+/// Verify that a `/*rs+ CREATE SHALLOW CACHE */` hint creates a shallow cache
+/// on the PostgreSQL adapter and the next identical query hits the cache.
+#[test]
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn pg_hint_creates_shallow_cache() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    PostgreSQLAdapter::recreate_database(&test_name).await;
+
+    let mut cfg = psql_helpers::upstream_config();
+    cfg.dbname(&test_name);
+    let upstream = psql_helpers::connect(cfg).await;
+    upstream
+        .simple_query("CREATE TABLE t (id INT, val INT)")
+        .await
+        .expect("create table");
+    upstream
+        .simple_query("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .await
+        .expect("insert");
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .replicate_db(&test_name)
+        .fallback(true)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let mut rs_cfg = rs_opts.clone();
+    rs_cfg.dbname(&test_name);
+    let rs = psql_helpers::connect(rs_cfg).await;
+
+    // First hinted query: creates the cache and returns from upstream.
+    let rows = rs
+        .simple_query("SELECT /*rs+ CREATE SHALLOW CACHE */ id, val FROM t WHERE id = 1")
+        .await
+        .expect("first hinted query");
+    assert_eq!(pg_first_col_i32(&rows, 0), 1);
+    assert_eq!(pg_first_col_i32(&rows, 1), 100);
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetThenUpstream(_),
+    );
+
+    // Second query (same, with hint): should hit the shallow cache.
+    let rows = rs
+        .simple_query("SELECT /*rs+ CREATE SHALLOW CACHE */ id, val FROM t WHERE id = 1")
+        .await
+        .expect("second hinted query");
+    assert_eq!(pg_first_col_i32(&rows, 0), 1);
+    assert_eq!(pg_first_col_i32(&rows, 1), 100);
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    // Same query with no hint: same QueryId, should also hit the cache.
+    rs.simple_query("SELECT id, val FROM t WHERE id = 1")
+        .await
+        .expect("non-hinted query");
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Verify that `SHOW SHALLOW CACHE ENTRIES` succeeds on the PostgreSQL
+/// adapter. Before the fix, converting this command's integer columns
+/// (`refresh_time_ms`, `refresh_period_ms`, `bytes`) to the Postgres wire
+/// type failed server-side because they were declared as text; this
+/// regressed on every non-empty result.
+#[test]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn pg_show_shallow_cache_entries() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    PostgreSQLAdapter::recreate_database(&test_name).await;
+
+    let mut cfg = psql_helpers::upstream_config();
+    cfg.dbname(&test_name);
+    let upstream = psql_helpers::connect(cfg).await;
+    upstream
+        .simple_query("CREATE TABLE t (id INT, val INT)")
+        .await
+        .expect("create table");
+    upstream
+        .simple_query("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .await
+        .expect("insert");
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .replicate_db(&test_name)
+        .fallback(true)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let mut rs_cfg = rs_opts.clone();
+    rs_cfg.dbname(&test_name);
+    let rs = psql_helpers::connect(rs_cfg).await;
+
+    // Create a shallow cache with a scheduled refresh (so refresh_period_ms is
+    // populated rather than NULL) and populate two entries.
+    rs.simple_query(
+        "SELECT /*rs+ CREATE SHALLOW CACHE POLICY TTL 60 SECONDS REFRESH EVERY 30 SECONDS */ \
+         id, val FROM t WHERE id = 1",
+    )
+    .await
+    .expect("create cache via hint");
+    rs.simple_query(
+        "SELECT /*rs+ CREATE SHALLOW CACHE POLICY TTL 60 SECONDS REFRESH EVERY 30 SECONDS */ \
+         id, val FROM t WHERE id = 2",
+    )
+    .await
+    .expect("populate second entry");
+
+    let rows = rs
+        .simple_query("SHOW SHALLOW CACHE ENTRIES")
+        .await
+        .expect("SHOW SHALLOW CACHE ENTRIES should succeed");
+    let entry_rows = rows
+        .iter()
+        .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(entry_rows, 2, "should have 2 cache entries");
+
+    // The simple query protocol always returns values as text on the wire, so parsing
+    // these columns as integers doesn't confirm the exact declared wire type; it does
+    // confirm the fix, since converting these DfValues to Postgres's wire type is what
+    // failed server-side (SQLSTATE 0A000) before the columns were declared as integers.
+    let refresh_time_ms: i64 = first_row_col(&rows, 4)
+        .parse()
+        .expect("refresh_time_ms should be numeric");
+    assert!(refresh_time_ms < 60_000, "refresh should be well under the 60s TTL");
+    let refresh_period_ms: i64 = first_row_col(&rows, 5)
+        .parse()
+        .expect("refresh_period_ms should be numeric, not NULL, given REFRESH EVERY 30 SECONDS");
+    assert_eq!(refresh_period_ms, 30_000);
+    let bytes: i64 = first_row_col(&rows, 6)
+        .parse()
+        .expect("bytes should be numeric");
+    assert!(bytes > 0);
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Verify that a hinted prepared statement creates a shallow cache on the
+/// PostgreSQL adapter via the extended protocol (prepare + execute path).
+#[test]
+#[tags(serial, slow)]
+#[upstream(postgres)]
+async fn pg_hint_prepared_statement_creates_cache() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    PostgreSQLAdapter::recreate_database(&test_name).await;
+
+    let mut cfg = psql_helpers::upstream_config();
+    cfg.dbname(&test_name);
+    let upstream = psql_helpers::connect(cfg).await;
+    upstream
+        .simple_query("CREATE TABLE t5 (id INT, val INT)")
+        .await
+        .expect("create table");
+    upstream
+        .simple_query("INSERT INTO t5 VALUES (1, 10), (2, 20)")
+        .await
+        .expect("insert");
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .replicate_db(&test_name)
+        .fallback(true)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let mut rs_cfg = rs_opts.clone();
+    rs_cfg.dbname(&test_name);
+    let rs = psql_helpers::connect(rs_cfg).await;
+
+    let hinted_stmt = rs
+        .prepare("SELECT /*rs+ CREATE SHALLOW CACHE */ id, val FROM t5 WHERE id = $1")
+        .await
+        .expect("prepare hinted");
+
+    // First execute: cache miss, goes to upstream (cache creation happens here).
+    let row = rs
+        .query_one(&hinted_stmt, &[&1i32])
+        .await
+        .expect("first exec");
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert_eq!(row.get::<_, i32>(1), 10);
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetThenUpstream(_),
+    );
+
+    // Second execute: same prepared statement should hit the shallow cache.
+    let row = rs
+        .query_one(&hinted_stmt, &[&1i32])
+        .await
+        .expect("second exec");
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert_eq!(row.get::<_, i32>(1), 10);
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    // A separately-prepared, non-hinted version of the same query should
+    // also hit the cache (same QueryId after hint stripping).
+    let plain_stmt = rs
+        .prepare("SELECT id, val FROM t5 WHERE id = $1")
+        .await
+        .expect("prepare plain");
+    let row = rs
+        .query_one(&plain_stmt, &[&1i32])
+        .await
+        .expect("plain exec");
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert_eq!(row.get::<_, i32>(1), 10);
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Verify that `/*rs+ SKIP CACHE */` bypasses the shallow cache and routes
+/// to upstream on the PostgreSQL adapter (simple query protocol).
+#[test]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn pg_skip_cache_hint_bypasses_shallow_cache() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    PostgreSQLAdapter::recreate_database(&test_name).await;
+
+    let mut cfg = psql_helpers::upstream_config();
+    cfg.dbname(&test_name);
+    let upstream = psql_helpers::connect(cfg).await;
+    upstream
+        .simple_query("CREATE TABLE t (id INT, val INT)")
+        .await
+        .expect("create table");
+    upstream
+        .simple_query("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .await
+        .expect("insert");
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .replicate_db(&test_name)
+        .fallback(true)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let mut rs_cfg = rs_opts.clone();
+    rs_cfg.dbname(&test_name);
+    let rs = psql_helpers::connect(rs_cfg).await;
+
+    // Create a shallow cache via DDL, then populate it.
+    rs.simple_query("CREATE SHALLOW CACHE FROM SELECT id, val FROM t WHERE id = $1")
+        .await
+        .expect("create shallow cache");
+    rs.simple_query("SELECT id, val FROM t WHERE id = 1")
+        .await
+        .expect("populate cache");
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetThenUpstream(_),
+    );
+    rs.simple_query("SELECT id, val FROM t WHERE id = 1")
+        .await
+        .expect("cache hit");
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    // Mutate upstream so we can tell SKIP CACHE read fresh data.
+    upstream
+        .simple_query("UPDATE t SET val = 999 WHERE id = 1")
+        .await
+        .expect("update upstream");
+
+    // SKIP CACHE hint: should bypass the shallow cache and go to upstream.
+    let rows = rs
+        .simple_query("SELECT /*rs+ SKIP CACHE */ id, val FROM t WHERE id = 1")
+        .await
+        .expect("skip cache query");
+    assert_eq!(pg_first_col_i32(&rows, 1), 999);
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::Upstream,
+    );
+
+    // Without the hint, the cache should still serve the stale value.
+    let rows = rs
+        .simple_query("SELECT id, val FROM t WHERE id = 1")
+        .await
+        .expect("cached query after SKIP");
+    assert_eq!(pg_first_col_i32(&rows, 1), 100);
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+/// Verify that `/*rs+ SKIP CACHE */` bypasses the shallow cache for prepared
+/// statements on the PostgreSQL adapter (extended protocol).
+#[test]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn pg_skip_cache_hint_bypasses_shallow_cache_prepared() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    PostgreSQLAdapter::recreate_database(&test_name).await;
+
+    let mut cfg = psql_helpers::upstream_config();
+    cfg.dbname(&test_name);
+    let upstream = psql_helpers::connect(cfg).await;
+    upstream
+        .simple_query("CREATE TABLE t (id INT, val INT)")
+        .await
+        .expect("create table");
+    upstream
+        .simple_query("INSERT INTO t VALUES (1, 100), (2, 200)")
+        .await
+        .expect("insert");
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .replicate_db(&test_name)
+        .fallback(true)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let mut rs_cfg = rs_opts.clone();
+    rs_cfg.dbname(&test_name);
+    let rs = psql_helpers::connect(rs_cfg).await;
+
+    rs.simple_query("CREATE SHALLOW CACHE FROM SELECT id, val FROM t WHERE id = $1")
+        .await
+        .expect("create shallow cache");
+
+    let plain_stmt = rs
+        .prepare("SELECT id, val FROM t WHERE id = $1")
+        .await
+        .expect("prepare plain");
+
+    // Populate the shallow cache via two plain exec calls.
+    rs.query_one(&plain_stmt, &[&1i32])
+        .await
+        .expect("first exec");
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetThenUpstream(_),
+    );
+    rs.query_one(&plain_stmt, &[&1i32])
+        .await
+        .expect("cache hit exec");
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    upstream
+        .simple_query("UPDATE t SET val = 999 WHERE id = 1")
+        .await
+        .expect("update upstream");
+
+    // Prepared exec with SKIP CACHE hint: should bypass and return fresh data.
+    let skip_stmt = rs
+        .prepare("SELECT /*rs+ SKIP CACHE */ id, val FROM t WHERE id = $1")
+        .await
+        .expect("prepare skip");
+    let row = rs
+        .query_one(&skip_stmt, &[&1i32])
+        .await
+        .expect("skip exec");
+    assert_eq!(row.get::<_, i32>(1), 999);
+    assert_eq!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::Upstream,
+    );
+
+    // Plain prepared exec still reads from the shallow cache.
+    let row = rs
+        .query_one(&plain_stmt, &[&1i32])
+        .await
+        .expect("plain exec after skip");
+    assert_eq!(row.get::<_, i32>(1), 100);
+    assert_matches!(
+        psql_helpers::last_query_info(&rs).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn coalesce_upstream_query_failure_midflight() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    let mut readyset_a = mysql_async::Conn::new(readyset_opts.clone()).await.unwrap();
+    let mut readyset_b = mysql_async::Conn::new(readyset_opts.clone()).await.unwrap();
+    readyset_a.query_drop(format!("USE {test_name}")).await.unwrap();
+    readyset_b.query_drop(format!("USE {test_name}")).await.unwrap();
+
+    let create_table = "CREATE TABLE foo (a INT); INSERT INTO foo VALUES (42)";
+    let drop_table = "DROP TABLE foo";
+    let query = "SELECT a FROM foo WHERE a = 42";
+    let create_cache = format!(
+        "CREATE SHALLOW CACHE POLICY TTL 60 SECONDS COALESCE 5 SECONDS FROM {query}",
+    );
+
+    // Create the cache.
+    upstream.query_drop(create_table).await.unwrap();
+    readyset_a.query_drop(create_cache).await.unwrap();
+
+    // Drop the table so the first miss fails to get a result from upstream.
+    upstream.query_drop(drop_table).await.unwrap();
+    assert_matches!(readyset_a.query_drop(query).await, Err(..));
+
+    // Restore the table so the next miss can complete.
+    upstream.query_drop(create_table).await.unwrap();
+
+    // Measure how long the second query takes.
+    let start = Instant::now();
+    readyset_b.query_drop(query).await.unwrap();
+    let elapsed = start.elapsed();
+    let destination = last_query_info(&mut readyset_b).await.destination;
+    assert_matches!(destination, QueryDestination::ReadysetThenUpstream(_));
+
+    // Check if the second miss waited the COALESCE window or not (REA-6673).
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "second query waited for COALESCE window, even though first query failed",
+    );
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn refresh_resumes_after_upstream_failure() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset.query_drop(format!("USE {test_name}")).await.unwrap();
+
+    let create_table = "CREATE TABLE foo (a INT)";
+    let drop_table = "DROP TABLE foo";
+    let query = "SELECT * FROM foo";
+    let create_cache = format!(
+        "CREATE SHALLOW CACHE POLICY TTL 60 SECONDS REFRESH 1 SECONDS FROM {query}"
+    );
+
+    // Create and fill the cache, and then let the entry go stale.
+    upstream.query_drop(create_table).await.unwrap();
+    upstream.query_drop("INSERT INTO foo VALUES (1)").await.unwrap();
+    readyset.query_drop(create_cache).await.unwrap();
+    let (v,): (i32,) = readyset.query_first(query).await.unwrap().unwrap();
+    assert_eq!(v, 1);
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetThenUpstream(_)
+    );
+    sleep(Duration::from_secs(2)).await;
+
+    // Drop the table so the refresh triggered by this hit fails.
+    upstream.query_drop(drop_table).await.unwrap();
+    let (v,): (i32,) = readyset.query_first(query).await.unwrap().unwrap();
+    assert_eq!(v, 1);
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    // Wait a little for the refresh to run and fail.
+    sleep(Duration::from_secs(1)).await;
+
+    // Restore the table so the next hit can trigger a refresh (of a new table value).
+    upstream.query_drop(create_table).await.unwrap();
+    upstream.query_drop("INSERT INTO foo VALUES (2)").await.unwrap();
+    let (v,): (i32,) = readyset.query_first(query).await.unwrap().unwrap();
+    assert_eq!(v, 1);
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    // Wait a little for the refresh to run and succeed.
+    sleep(Duration::from_secs(1)).await;
+
+    // Did the refresh now succeed?
+    let (v,): (i32,) = readyset.query_first(query).await.unwrap().unwrap();
+    assert_eq!(v, 2);
+    assert_matches!(
+        last_query_info(&mut readyset).await.destination,
+        QueryDestination::ReadysetShallow(_)
+    );
+
+    // The refresh against the dropped table was counted as dropped; the later one that repopulated
+    // the entry was counted as a successful refresh.
+    let rows: Vec<(u64,)> = readyset
+        .query("SELECT dropped_refreshes FROM readyset.shallow_cache_refresh_stats")
+        .await
+        .unwrap();
+    assert!(rows[0].0 >= 1, "expected a dropped refresh, got {}", rows[0].0);
+
+    let rows: Vec<(u64,)> = readyset
+        .query("SELECT refreshes FROM readyset.shallow_caches")
+        .await
+        .unwrap();
+    assert!(rows[0].0 >= 1, "expected a successful refresh, got {}", rows[0].0);
+
+    shutdown_tx.shutdown().await;
+}
+
+/// An ADAPTIVE scheduled cache shortens a key's refresh period while its value keeps changing
+/// upstream, and stretches it back to the configured period once the value settles.
+#[test]
+#[tags(serial, slow)]
+#[upstream(mysql)]
+async fn adaptive_refresh_period_adapts() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE counters (id INT, val INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO counters VALUES (1, 0)")
+        .await
+        .unwrap();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    readyset
+        .query_drop(
+            "CREATE SHALLOW CACHE
+             WITH (POLICY TTL 60 SECONDS REFRESH EVERY 1 SECONDS, ADAPTIVE)
+             FROM SELECT val FROM counters WHERE id = ?",
+        )
+        .await
+        .unwrap();
+
+    // The flag shows up in SHOW SHALLOW CACHES properties and the shallow_caches vrel.
+    let rows: Vec<(String, String, String, String, String)> =
+        readyset.query("SHOW SHALLOW CACHES").await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].3.split(",").any(|p| p.trim() == "adaptive"),
+        "missing adaptive property: {}",
+        rows[0].3
+    );
+    let adaptive: Vec<bool> = readyset
+        .query("SELECT adaptive FROM readyset.shallow_caches")
+        .await
+        .unwrap();
+    assert_eq!(adaptive, vec![true]);
+
+    // Populate the entry; it starts at the configured refresh period.
+    readyset
+        .query_drop("SELECT val FROM counters WHERE id = 1")
+        .await
+        .unwrap();
+
+    async fn entry_period(readyset: &mut mysql_async::Conn) -> u64 {
+        let periods: Vec<u64> = readyset
+            .query("SELECT refresh_period_ms FROM readyset.shallow_cache_entries")
+            .await
+            .unwrap();
+        assert_eq!(periods.len(), 1);
+        periods[0]
+    }
+
+    assert_eq!(entry_period(&mut readyset).await, 1000);
+
+    // Churn the upstream value for a while; scheduled refreshes observe the changes and
+    // shorten the period.
+    for i in 1..=11 {
+        upstream
+            .query_drop(format!("UPDATE counters SET val = {i} WHERE id = 1"))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(500)).await;
+    }
+    let churned = entry_period(&mut readyset).await;
+    assert!(churned < 1000, "period should have shrunk, got {churned}");
+
+    // Load accounting is visible through the refresh stats vrel: the churned entry refreshes
+    // faster than its baseline, and the scheduled cache reports a queue length.
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(Option<u64>, Option<u64>, Option<bool>, Option<u64>)> = readyset
+        .query(
+            "SELECT load_actual_ppm, load_baseline_ppm, over_cap, scheduler_queue_len
+             FROM readyset.shallow_cache_refresh_stats",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let (actual, baseline, over_cap, queue_len) = rows[0];
+    let actual = actual.expect("adaptive cache reports actual load");
+    let baseline = baseline.expect("adaptive cache reports baseline load");
+    assert!(
+        actual >= baseline && baseline > 0,
+        "expected actual >= baseline > 0, got {actual}/{baseline}"
+    );
+    assert!(over_cap.is_some(), "adaptive cache reports over-cap state");
+    assert!(queue_len.is_some(), "scheduled cache reports queue length");
+
+    // Once the value settles, refreshes stretch the period back out to the configured one.
+    sleep(Duration::from_secs(10)).await;
+    assert_eq!(entry_period(&mut readyset).await, 1000);
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A `/*rs+ CREATE SHALLOW CACHE WITH (ADAPTIVE) */` hint creates an adaptive cache.
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn hint_creates_adaptive_shallow_cache() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+    mysql_helpers::recreate_database(&test_name).await;
+
+    let upstream_opts = mysql_helpers::upstream_config().db_name(Some(&test_name));
+    let mut upstream = mysql_async::Conn::new(upstream_opts).await.unwrap();
+
+    upstream
+        .query_drop("CREATE TABLE t (id INT, val INT)")
+        .await
+        .unwrap();
+    upstream
+        .query_drop("INSERT INTO t VALUES (1, 100)")
+        .await
+        .unwrap();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .recreate_database(false)
+        .fallback(true)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+
+    readyset
+        .query_drop(
+            "SELECT /*rs+ CREATE SHALLOW CACHE WITH (ADAPTIVE) */ id, val FROM t WHERE id = 1",
+        )
+        .await
+        .unwrap();
+
+    let adaptive: Vec<bool> = readyset
+        .query("SELECT adaptive FROM readyset.shallow_caches")
+        .await
+        .unwrap();
+    assert_eq!(adaptive, vec![true]);
+
+    // A hint without the option creates a non-adaptive cache.
+    readyset
+        .query_drop("SELECT /*rs+ CREATE SHALLOW CACHE */ val FROM t WHERE id = 1")
+        .await
+        .unwrap();
+    let mut adaptive: Vec<bool> = readyset
+        .query("SELECT adaptive FROM readyset.shallow_caches")
+        .await
+        .unwrap();
+    adaptive.sort();
+    assert_eq!(adaptive, vec![false, true]);
+
+    shutdown_tx.shutdown().await;
+}
+
+/// A list of queries that are expected to fully-parameterize with parameters in locations not
+/// supported by prepared statements.
+const QUERIES_WITH_PARAMETERIZATION_BEYOND_PREPARE: &[&str] = &[
+    "SELECT CURRENT_TIME(4)",
+    "SELECT * FROM foo ORDER BY 2, 1",
+    "SELECT DISTINCT a, b FROM foo ORDER BY 2, 1",
+    "SELECT a, b, COUNT(*) FROM foo GROUP BY 1, 2",
+    "SELECT a, COUNT(*) FROM foo GROUP BY 1 ORDER BY 1",
+    "SELECT a, b FROM foo WHERE a = 1 ORDER BY 2",
+    "SELECT * FROM (SELECT a, b FROM foo ORDER BY 2 LIMIT 10) AS sub WHERE a = 1",
+    "SELECT a FROM foo UNION SELECT b FROM foo ORDER BY 1",
+];
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn shallow_cache_checks_support_without_excessive_parameterization_mysql() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .replicate(false)
+        .fallback_without_replication(&test_name)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+    readyset
+        .query_drop(format!("USE {test_name}"))
+        .await
+        .unwrap();
+    readyset
+        .query_drop("CREATE TABLE foo (a INT, b INT)")
+        .await
+        .unwrap();
+
+    for query in QUERIES_WITH_PARAMETERIZATION_BEYOND_PREPARE {
+        readyset
+            .query_drop(format!("CREATE SHALLOW CACHE FROM {query}"))
+            .await
+            .unwrap_or_else(|e| panic!("CREATE SHALLOW CACHE FROM {query}: {e}"));
+    }
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(postgres)]
+async fn shallow_cache_checks_support_without_excessive_parameterization_psql() {
+    init_test_logging();
+
+    let test_name = derive_test_name();
+
+    let (rs_opts, _handle, shutdown_tx) = TestBuilder::default()
+        .replicate(false)
+        .fallback_without_replication(&test_name)
+        .build::<PostgreSQLAdapter>()
+        .await;
+    let mut rs_cfg = rs_opts;
+    rs_cfg.dbname(&test_name);
+    let rs = psql_helpers::connect(rs_cfg).await;
+    rs.simple_query("CREATE TABLE foo (a INT, b INT)")
+        .await
+        .expect("create table");
+
+    for query in QUERIES_WITH_PARAMETERIZATION_BEYOND_PREPARE {
+        rs.simple_query(&format!("CREATE SHALLOW CACHE FROM {query}"))
+            .await
+            .unwrap_or_else(|e| panic!("CREATE SHALLOW CACHE FROM {query}: {e}"));
+    }
+
+    shutdown_tx.shutdown().await;
+}
+
+#[test]
+#[tags(serial)]
+#[upstream(mysql)]
+async fn shallow_cache_create_from_id_using_original_query_text() {
+    init_test_logging();
+
+    let (readyset_opts, _readyset_handle, shutdown_tx) = TestBuilder::default()
+        .fallback(true)
+        .cache_mode(readyset_client::CacheMode::Shallow)
+        .migration_mode(MigrationMode::OutOfBand)
+        .build::<MySQLAdapter>()
+        .await;
+    let mut readyset = mysql_async::Conn::new(readyset_opts).await.unwrap();
+
+    // Use a query that that depends on us saving the original query text to accurately determine
+    // support (our full-parameterized version does not successfully prepare).
+    readyset
+        .query_drop("SELECT CURRENT_TIMESTAMP(4)")
+        .await
+        .unwrap();
+
+    // Get that query's query id.
+    let rows: Vec<mysql_async::Row> = readyset
+        .query("EXPLAIN CREATE CACHE FROM SELECT CURRENT_TIMESTAMP(4)")
+        .await
+        .unwrap();
+    let row = rows.first().expect("EXPLAIN returns a row");
+    let id: String = row.get(0).unwrap();
+    let supported: String = row.get(2).unwrap();
+    assert_eq!(supported, "yes");
+
+    // This should only succeed if we successfully use the original query text to check support.
+    readyset
+        .query_drop(format!("CREATE CACHE FROM {id}"))
+        .await
+        .expect("CREATE CACHE FROM <id> should succeed by probing the original query");
 
     shutdown_tx.shutdown().await;
 }

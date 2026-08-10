@@ -5,17 +5,18 @@ use std::time::Duration;
 
 use clap::builder::NonEmptyStringValueParser;
 use clap::Parser;
-use common::ulimit::maybe_increase_nofile_limit;
-use dataflow_state::init_parallel_row_pool;
 use futures_util::future::{self, Either};
+use metrics::{counter, gauge};
+use tracing::{error, info, warn};
+
+use common::startup::init_early_common;
+use dataflow_state::init_parallel_row_pool;
 use readyset_alloc::ThreadBuildWrapper;
-use readyset_client::metrics::recorded;
+use readyset_metrics::init_global_recorder;
 use readyset_server::consensus::AuthorityType;
-use readyset_server::metrics::{install_global_recorder, PrometheusBuilder};
 use readyset_server::{resolve_addr, Builder, WorkerOptions};
 use readyset_telemetry_reporter::{TelemetryEvent, TelemetryInitializer};
 use readyset_version::*;
-use tracing::{error, info, warn};
 
 // readyset_alloc initializes the global allocator
 extern crate readyset_alloc;
@@ -165,10 +166,9 @@ fn main() -> anyhow::Result<()> {
         }
     });
     info!(?opts, "Starting Readyset server");
-
     info!(version = %VERSION_STR_ONELINE);
 
-    maybe_increase_nofile_limit(opts.worker_options.replicator_config.ignore_ulimit_check)?;
+    init_early_common(&opts.worker_options.replicator_config)?;
 
     let telemetry_sender = rt.block_on(TelemetryInitializer::init(
         opts.disable_telemetry,
@@ -191,16 +191,12 @@ fn main() -> anyhow::Result<()> {
         // `PrometheusBuilder::build_recorder` spawns an upkeep task, so we need to execute it in
         // the context of the runtime
         rt.block_on(async {
-            install_global_recorder(
-                PrometheusBuilder::new()
-                    .add_global_label("deployment", &opts.deployment)
-                    .build_recorder(),
-            );
+            init_global_recorder(&[("deployment", opts.deployment.as_str())]);
         });
     }
 
-    metrics::gauge!(
-        recorded::READYSET_SERVER_VERSION,
+    gauge!(
+        metric::READYSET_SERVER_VERSION,
         &[
             ("release_version", READYSET_VERSION.release_version),
             ("commit_id", READYSET_VERSION.commit_id),
@@ -211,11 +207,7 @@ fn main() -> anyhow::Result<()> {
         ]
     )
     .set(1.0);
-    metrics::counter!(recorded::READYSET_SERVER_STARTUPS).increment(1);
-
-    if let Some(volume_id) = &opts.worker_options.volume_id {
-        info!(%volume_id);
-    }
+    counter!(metric::READYSET_SERVER_STARTUPS).increment(1);
 
     let deployment_dir = opts.worker_options.storage_dir(&opts.deployment);
     let authority = opts.authority.clone();

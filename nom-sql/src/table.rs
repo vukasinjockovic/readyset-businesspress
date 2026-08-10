@@ -2,15 +2,16 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case};
 use nom::combinator::{map, opt};
 use nom::multi::separated_list1;
-use nom::sequence::terminated;
+use nom::sequence::{delimited, preceded, terminated};
 use nom_locate::LocatedSpan;
 use readyset_sql::{ast::*, Dialect};
 
 use crate::common::{as_alias, ws_sep_comma};
 use crate::dialect::DialectParser;
+use crate::expression::expression;
 use crate::index_hint::index_hint_list;
 use crate::select::nested_selection;
-use crate::whitespace::whitespace0;
+use crate::whitespace::{whitespace0, whitespace1};
 use crate::NomSqlResult;
 
 // Parse a reference to a named schema.table
@@ -46,6 +47,32 @@ fn subquery(
     }
 }
 
+/// Parse a VALUES clause used as a table source: `(VALUES ('a', 1), ('b', 2))`
+fn values_clause(
+    dialect: Dialect,
+) -> impl Fn(LocatedSpan<&[u8]>) -> NomSqlResult<&[u8], TableExprInner> {
+    move |i| {
+        let (i, _) = tag("(")(i)?;
+        let (i, _) = whitespace0(i)?;
+        let (i, _) = tag_no_case("values")(i)?;
+        let (i, _) = whitespace1(i)?;
+        let (i, rows) = separated_list1(
+            ws_sep_comma,
+            delimited(
+                terminated(
+                    preceded(opt(terminated(tag_no_case("row"), whitespace0)), tag("(")),
+                    whitespace0,
+                ),
+                separated_list1(ws_sep_comma, expression(dialect)),
+                preceded(whitespace0, tag(")")),
+            ),
+        )(i)?;
+        let (i, _) = whitespace0(i)?;
+        let (i, _) = tag(")")(i)?;
+        Ok((i, TableExprInner::Values { rows }))
+    }
+}
+
 fn table_expr_inner(
     dialect: Dialect,
 ) -> impl Fn(LocatedSpan<&[u8]>) -> NomSqlResult<&[u8], TableExprInner> {
@@ -54,6 +81,7 @@ fn table_expr_inner(
             map(subquery(dialect), |sq| {
                 TableExprInner::Subquery(Box::new(sq))
             }),
+            values_clause(dialect),
             map(relation(dialect), TableExprInner::Table),
         ))(i)
     }
@@ -65,8 +93,20 @@ pub fn table_expr(
     move |i| {
         let (i, inner) = table_expr_inner(dialect)(i)?;
         let (i, alias) = opt(as_alias(dialect))(i)?;
+        let (i, column_aliases) = opt(delimited(
+            terminated(tag("("), whitespace0),
+            separated_list1(ws_sep_comma, dialect.identifier()),
+            preceded(whitespace0, tag(")")),
+        ))(i)?;
         let (i, _) = opt(index_hint_list(dialect))(i)?;
-        Ok((i, TableExpr { inner, alias }))
+        Ok((
+            i,
+            TableExpr {
+                inner,
+                alias,
+                column_aliases: column_aliases.unwrap_or_default(),
+            },
+        ))
     }
 }
 

@@ -14,27 +14,44 @@ path = "tests.rs"
 test-discovery = { path = "../test-discovery" }
 
 [dev-dependencies]
-assert_matches = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
 database-utils = { path = "../database-utils" }
 dataflow-state = { path = "../dataflow-state" }
+fallible-iterator = { workspace = true }
 futures = { workspace = true }
 itertools = { workspace = true }
 mysql_async = { workspace = true }
 mysql_common = { workspace = true }
+mysql-srv = { path = "../mysql-srv" }
 paste = { workspace = true }
+postgres-protocol = { workspace = true }
 postgres-types = { workspace = true }
 pretty_assertions = { workspace = true }
 proptest = { workspace = true }
+rand = { workspace = true }
+rsa = { workspace = true }
 readyset-adapter = { path = "../readyset-adapter" }
+replication-offset = { path = "../replication-offset" }
+readyset-client = { path = "../readyset-client" }
 readyset-client-metrics = { path = "../readyset-client-metrics" }
+readyset-data = { path = "../readyset-data" }
 readyset-client-test-helpers = { path = "../readyset-client-test-helpers" }
+readyset-mcp = { path = "../readyset-mcp" }
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
+tokio-util = "0.7"
 readyset-tracing = { path = "../readyset-tracing" }
 readyset-server = { path = "../readyset-server" }
+readyset-schema = { path = "../readyset-schema" }
+readyset-shallow = { path = "../readyset-shallow" }
 readyset-sql = { path = "../readyset-sql" }
 readyset-sql-parsing = { path = "../readyset-sql-parsing" }
+readyset-sql-passes = { path = "../readyset-sql-passes" }
 readyset-util = { path = "../readyset-util" }
 schema-catalog = { path = "../schema-catalog" }
+tempfile = { workspace = true }
 test-strategy = { workspace = true }
 test-utils = { path = "../test-utils" }
 tokio = { workspace = true, features = ["full"] }
@@ -46,7 +63,9 @@ utf8mb4_all_codepoints_test = []
 # Tests that rely on failpoints to inject schema catalog races.
 failure_injection = [
     "fail/failpoints",
+    "mysql-srv/failure_injection",
     "readyset-adapter/failure_injection",
+    "readyset-server/failure_injection",
     "readyset-util/failure_injection",
     "schema-catalog/failure_injection",
 ]

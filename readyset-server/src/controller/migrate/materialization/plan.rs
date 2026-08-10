@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryFrom;
 
-use dataflow::payload::{PrepareStateKind, ReplayPathSegment, SourceSelection, TriggerEndpoint};
+use dataflow::payload::{PrepareStateKind, ReplayPathSegment, TriggerEndpoint};
 use dataflow::prelude::*;
 use dataflow::DomainRequest;
 use readyset_errors::ReadySetError;
@@ -260,7 +260,7 @@ impl<'a> Plan<'a> {
                 path.segments().iter().enumerate().filter_map(
                     move |(at, &IndexRef { node, .. })| {
                         let n = &graph[node];
-                        if n.is_union() && !n.is_shard_merger() {
+                        if n.is_union() {
                             let suffix = match path.segments().get((at + 1)..) {
                                 Some(x) => x,
                                 None => {
@@ -445,20 +445,6 @@ impl<'a> Plan<'a> {
                 partial = Some(path.source().index.clone().unwrap());
             }
 
-            // if this is a partial replay path, and the target node is sharded, then we need to
-            // make sure that the last sharder on the path knows to only send the replay response
-            // to the requesting shard, as opposed to all shards. in order to do that, that sharder
-            // needs to know who it is!
-            let mut partial_unicast_sharder = None;
-            if partial.is_some() && !self.graph[path.target().node].sharded_by().is_none() {
-                partial_unicast_sharder = path
-                    .segments()
-                    .iter()
-                    .rev()
-                    .map(|&IndexRef { node, .. }| node)
-                    .find(|&ni| self.graph[ni].is_sharder());
-            }
-
             // first, find out which domains we are crossing
             let mut segments: Vec<(
                 DomainIndex,
@@ -468,6 +454,13 @@ impl<'a> Plan<'a> {
             for (i, IndexRef { node, index }) in
                 path.segments_with_extension().iter().cloned().enumerate()
             {
+                // Source nodes don't have domains assigned. They can appear in replay
+                // paths for Constant nodes (which are direct children of Source, like
+                // Base nodes). Skip them since they have no state to replay through.
+                if self.graph[node].is_graph_root() {
+                    continue;
+                }
+
                 let domain = self.graph[node].domain();
 
                 #[allow(clippy::unwrap_used)]
@@ -569,36 +562,17 @@ impl<'a> Plan<'a> {
                 };
 
                 #[allow(clippy::expect_used)]
-                let our_replicas = self
-                    .dmp
-                    .num_replicas(domain)
+                self.dmp
+                    .check_domain(domain)
                     .expect("Domain should exist at this point");
-                let source_replicas = segments
-                    .first()
-                    .and_then(|(source_domain, _)| self.dmp.num_replicas(*source_domain).ok());
-                let replica_fanout = match source_replicas {
-                    Some(source_replicas) if source_replicas == our_replicas => {
-                        // Same number of replicas, no fanount
-                        false
-                    }
-
-                    Some(source_replicas) => {
-                        invariant_eq!(
-                            source_replicas,
-                            1,
-                            "Can't currently go from replicated n-ways to replicated m-ways"
-                        );
-                        // Replicating 1-way -> replicating n-ways
-                        true
-                    }
-                    None => {
+                if let Some((source_domain, _)) = segments.first() {
+                    if self.dmp.check_domain(*source_domain).is_err() {
                         // Since we iterate in topological order, this shouldn't happen (we should
                         // have set the number of replicas for the domain by
                         // now)
-                        internal!("Could not find replicas at source of replay path")
+                        internal!("Could not find replicas at source of replay path");
                     }
-                };
-
+                }
                 // build the message we send to this domain to tell it about this replay path.
                 let mut setup = DomainRequest::SetupReplayPath {
                     tag,
@@ -606,9 +580,7 @@ impl<'a> Plan<'a> {
                     source_index: path.source().index.clone(),
                     path: locals,
                     notify_done: false,
-                    partial_unicast_sharder,
                     trigger: TriggerEndpoint::None,
-                    replica_fanout,
                 };
 
                 // the first domain also gets to know source node
@@ -631,139 +603,8 @@ impl<'a> Plan<'a> {
                             // first domain needs to be told about partial replay trigger
                             *trigger = TriggerEndpoint::Start(key.clone());
                         } else if i == segments.len() - 1 {
-                            // if the source is sharded, we need to know whether we should ask all
-                            // the shards, or just one. if the replay key is the same as the
-                            // sharding key, we just ask one, and all is good. if the replay key
-                            // and the sharding key differs, we generally have to query *all* the
-                            // shards.
-                            //
-                            // there is, however, an exception to this: if we have two domains that
-                            // have the same sharding, but a replay path between them on some other
-                            // key than the sharding key, the right thing to do is to *only* query
-                            // the same shard as ourselves. this is because any answers from other
-                            // shards would necessarily just be with records that do not match our
-                            // sharding key anyway, and that we should thus never see.
-
-                            // Note : segments[0] looks something like this :
-                            // ( DomainIndex(0),
-                            //     [
-                            //          (NodeIndex(1), Some([1])),
-                            //          (NodeIndex(3), Some([1])),
-                            //          (NodeIndex(4), Some([0])),
-                            //          (NodeIndex(11), Some([0]))
-                            //     ]
-                            // )
-                            //
-                            // NOTE(eta): I have mixed feelings about how the writer of the above
-                            //            note thought to be helpful and put the structure thing
-                            //            there, but did not think to be helpful enough to refactor
-                            //            it to use a more sane data structure...
-                            //
-                            let first_domain_segments = &segments[0].1;
-                            invariant!(!first_domain_segments.is_empty());
-
-                            let first_domain_node_key = &first_domain_segments[0];
-
-                            let src_sharding = self.graph[first_domain_node_key.0].sharded_by();
-                            let shards = src_sharding.shards().unwrap_or(1);
-                            let lookup_key_index_to_shard = match src_sharding {
-                                Sharding::Random(..) => None,
-                                Sharding::ByColumn(c, _) => {
-                                    // we want to check the source of the key column. If the source
-                                    // node is sharded by that
-                                    // column, we are able to ONLY look at a single
-                                    // shard on the source. Otherwise, we need to check all of the
-                                    // shards.
-                                    let key_column_source = &first_domain_node_key.1;
-                                    match key_column_source {
-                                        Some(source_index) => {
-                                            if source_index.len() == 1 {
-                                                if source_index[0] == c {
-                                                    // the source node is sharded by the key column.
-                                                    Some(0)
-                                                } else {
-                                                    // the node is sharded by a different column
-                                                    // than
-                                                    // the key column, so we need to go ahead and
-                                                    // query all
-                                                    // shards. BUMMER.
-                                                    None
-                                                }
-                                            } else {
-                                                // we're using a compound key to look up into a node
-                                                // that's
-                                                // sharded by a single column. if the sharding key
-                                                // is one
-                                                // of the lookup keys, then we indeed only need to
-                                                // look at
-                                                // one shard, otherwise we need to ask all
-                                                source_index
-                                                    .columns
-                                                    .iter()
-                                                    .position(|source_column| source_column == &c)
-                                            }
-                                        }
-                                        // This means the key column has no provenance in
-                                        // the source. This could be because it comes from multiple
-                                        // columns.
-                                        // Or because the node is fully materialized so replays are
-                                        // not necessary.
-                                        None => None,
-                                    }
-                                }
-                                s if s.is_none() => None,
-                                s => internal!("unhandled new sharding pattern {:?}", s),
-                            };
-
-                            let selection = if let Some(i) = lookup_key_index_to_shard {
-                                // if we are not sharded, all is okay.
-                                //
-                                // if we are sharded:
-                                //
-                                //  - if there is a shuffle above us, a shard merger + sharder above
-                                //    us will ensure that we hear the replay response.
-                                //
-                                //  - if there is not, we are sharded by the same column as the
-                                //    source. this also means that the replay key in the destination
-                                //    is the sharding key of the destination. to see why, consider
-                                //    the case where the destination is sharded by x. the source
-                                //    must also be sharded by x for us to be in this case. we also
-                                //    know that the replay lookup key on the source must be x since
-                                //    lookup_on_shard_key == true. since no shuffle was introduced,
-                                //    src.x must resolve to dst.x assuming x is not aliased in dst.
-                                //    because of this, it should be the case that KeyShard ==
-                                //    SameShard; if that were not the case, the value in dst.x
-                                //    should never have reached dst in the first place.
-                                SourceSelection::KeyShard {
-                                    key_i_to_shard: i,
-                                    nshards: shards,
-                                }
-                            } else {
-                                // replay key != sharding key
-                                // normally, we'd have to query all shards, but if we are sharded
-                                // the same as the source (i.e., there are no shuffles between the
-                                // source and us), then we should *only* query the same shard of
-                                // the source (since it necessarily holds all records we could
-                                // possibly see).
-                                //
-                                // note that the no-sharding case is the same as "ask all shards"
-                                // except there is only one (shards == 1).
-                                if src_sharding.is_none()
-                                    || segments
-                                        .iter()
-                                        .flat_map(|s| s.1.iter())
-                                        .any(|&(n, _, _)| self.graph[n].is_shard_merger())
-                                {
-                                    SourceSelection::AllShards(shards)
-                                } else {
-                                    SourceSelection::SameShard
-                                }
-                            };
-
-                            debug!(policy = ?selection, %tag, "picked source selection policy");
-                            {
-                                *trigger = TriggerEndpoint::End(selection, segments[0].0);
-                            }
+                            // last domain needs to know which source domain to ask for replays.
+                            *trigger = TriggerEndpoint::End(segments[0].0);
                         }
                     }
                 } else {
@@ -804,39 +645,38 @@ impl<'a> Plan<'a> {
 
                 if i != segments.len() - 1 {
                     // since there is a later domain, the last node of any non-final domain
-                    // must either be an egress or a Sharder. If it's an egress, we need
-                    // to tell it about this replay path so that it knows
+                    // must be an egress. tell it about this replay path so that it knows
                     // what path to forward replay packets on.
                     #[allow(clippy::unwrap_used)] // nodes>0 checked by invariant
                     let n = &self.graph[nodes.last().unwrap().0];
-                    if n.is_egress() {
-                        let later_domain_segments = &segments[i + 1].1;
-                        invariant!(!later_domain_segments.is_empty());
-                        let (ingress_node, _, _) = later_domain_segments[0];
-                        self.dmp.add_message(
-                            domain,
-                            DomainRequest::AddEgressTag {
-                                egress_node: n.local_addr(),
-                                tag,
-                                ingress_node,
-                            },
-                        )?;
-                    } else {
-                        invariant!(n.is_sharder());
-                    }
+                    invariant!(n.is_egress());
+                    let later_domain_segments = &segments[i + 1].1;
+                    invariant!(!later_domain_segments.is_empty());
+                    let (ingress_node, _, _) = later_domain_segments[0];
+                    self.dmp.add_message(
+                        domain,
+                        DomainRequest::AddEgressTag {
+                            egress_node: n.local_addr(),
+                            tag,
+                            ingress_node,
+                        },
+                    )?;
                 }
 
                 trace!(domain = %domain.index(), "telling domain about replay path");
                 self.dmp.add_message(domain, setup)?;
             }
 
-            if !self.partial && !self.graph[self.node].is_base() {
+            if !self.partial
+                && !self.graph[self.node].is_base()
+                && !self.graph[self.node].is_constant()
+            {
                 // this path requires doing a replay and then waiting for the replay to finish
                 if let Some(pending) = pending {
                     self.pending.push(pending);
                 } else {
                     internal!(
-                        "no replay planned for fully materialized non-base node {}!",
+                        "no replay planned for fully materialized non-base, non-constant node {}!",
                         self.node.index()
                     );
                 }
@@ -868,7 +708,6 @@ impl<'a> Plan<'a> {
 
                 // the node index we were created with is in graph...
                 let last_domain = self.graph[self.node].domain();
-                let num_shards = self.dmp.num_shards(last_domain)?;
 
                 // since we're partially materializing a reader node,
                 // we need to give it a way to trigger replays.
@@ -877,7 +716,6 @@ impl<'a> Plan<'a> {
                     num_columns: self.graph[self.node].columns().len(),
                     index,
                     trigger_domain: last_domain,
-                    num_shards,
                 }
             } else {
                 PrepareStateKind::FullReader {
@@ -904,13 +742,20 @@ impl<'a> Plan<'a> {
             }
         };
 
-        self.dmp.add_message(
-            our_node.domain(),
+        let use_non_blocking =
+            self.m.config.non_blocking_index_build && matches!(s, PrepareStateKind::Full { .. });
+        let request = if use_non_blocking {
+            DomainRequest::PrepareStateNonBlocking {
+                node: our_node.local_addr(),
+                state: s,
+            }
+        } else {
             DomainRequest::PrepareState {
                 node: our_node.local_addr(),
                 state: s,
-            },
-        )?;
+            }
+        };
+        self.dmp.add_message(our_node.domain(), request)?;
 
         if self.m.config.packet_filters_enabled {
             self.setup_packet_filter()?;
@@ -961,10 +806,8 @@ impl<'a> Plan<'a> {
                 .neighbors_directed(ingress, petgraph::Incoming)
                 .find(|&n| self.graph[n].is_egress());
             let egress = match egress_opt {
-                // If an ingress node does not have an incoming egress node, that means this reader
-                // domain is behind a shard merger.
-                // We skip the packet filter setup for now.
-                // TODO(fran): Implement packet filtering for shard mergers (https://readysettech.atlassian.net/browse/ENG-183).
+                // If an ingress node does not have an incoming egress node, skip packet
+                // filter setup.
                 None => return Ok(()),
                 Some(e) => e,
             };

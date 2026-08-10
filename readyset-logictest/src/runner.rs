@@ -9,8 +9,8 @@ use std::{io, mem};
 
 use anyhow::{anyhow, bail, Context};
 use itertools::Itertools;
-use tokio::time::sleep;
-use tracing::{debug, info};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "in-process-readyset")]
 use tracing::error;
@@ -30,14 +30,15 @@ use crate::parser;
 #[derive(Debug, Clone)]
 pub struct TestScript {
     path: PathBuf,
-    records: Vec<Record>,
+    /// Records paired with their 1-based line numbers (0 means no line info).
+    records: Vec<(usize, Record)>,
 }
 
 impl From<Vec<Record>> for TestScript {
     fn from(records: Vec<Record>) -> Self {
         TestScript {
             path: "".into(),
-            records,
+            records: records.into_iter().map(|r| (0, r)).collect(),
         }
     }
 }
@@ -50,7 +51,7 @@ impl FromIterator<Record> for TestScript {
 
 impl Extend<Record> for TestScript {
     fn extend<T: IntoIterator<Item = Record>>(&mut self, iter: T) {
-        self.records.extend(iter)
+        self.records.extend(iter.into_iter().map(|r| (0, r)))
     }
 }
 
@@ -65,7 +66,7 @@ impl TestScript {
 
 impl Display for TestScript {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}", self.records().iter().join("\n"))
+        writeln!(f, "{}", self.records.iter().map(|(_, r)| r).join("\n"))
     }
 }
 
@@ -82,6 +83,26 @@ pub struct RunOptions {
     pub enable_reuse: bool,
     pub time: bool,
     pub verbose: bool,
+    /// When true, continue running after query failures and report all failures at the end.
+    /// DDL/DML statement failures still bail immediately since subsequent records depend on them.
+    /// SELECT statement error failures are collected like query failures.
+    pub no_fail_fast: bool,
+    /// Skip query-level `error:` pattern matching; see `--ignore-error-tags` on the CLI.
+    pub ignore_error_tags: bool,
+    /// Re-run each query and rewrite its recorded result section in place from the actual results,
+    /// rather than comparing. See `--rewrite` on the CLI.
+    pub rewrite: bool,
+    /// Per-query timeout. If a single query or statement execution takes longer than this, it will
+    /// be aborted with a timeout error. This prevents hangs when domain threads panic and drop
+    /// response channels.
+    pub query_timeout: Duration,
+    /// Per-script timeout. If set, the script will stop processing new records after this duration
+    /// and report any accumulated failures (in no-fail-fast mode) along with the timeout.
+    pub script_timeout: Option<Duration>,
+    /// Index of the runner task executing this script. Used to derive a per-task upstream database
+    /// name (`<db_name>_<task_idx>`) so concurrent scripts do not race on DROP/CREATE DATABASE
+    /// against the shared upstream.
+    pub task_idx: usize,
 }
 
 impl RunOptions {
@@ -95,8 +116,37 @@ impl RunOptions {
             database_type,
             parsing_preset: ParsingPreset::for_tests(),
             verbose: false,
+            no_fail_fast: false,
+            ignore_error_tags: false,
+            rewrite: false,
+            query_timeout: Duration::from_secs(60),
+            script_timeout: None,
+            task_idx: 0,
         }
     }
+}
+
+/// Return a copy of `base` with its database name suffixed by `_<task_idx>`.
+///
+/// Each concurrent runner task uses a distinct upstream database so that DROP/CREATE DATABASE
+/// in [`recreate_test_database`] does not race across tasks sharing the same upstream server.
+pub fn per_task_db_url(base: &DatabaseURL, task_idx: usize) -> DatabaseURL {
+    let base_name = base
+        .db_name()
+        .expect("--database-url must specify a database name");
+    let mut url = base.clone();
+    url.set_db_name(format!("{base_name}_{task_idx}"));
+    url
+}
+
+fn is_select_statement(command: &str) -> bool {
+    let trimmed = command.trim_start().as_bytes();
+    trimmed
+        .get(..6)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"SELECT"))
+        || trimmed
+            .get(..4)
+            .is_some_and(|b| b.eq_ignore_ascii_case(b"WITH"))
 }
 
 fn compare_results(results: &[Value], expected: &[Value], type_sensitive: bool) -> bool {
@@ -110,6 +160,67 @@ fn compare_results(results: &[Value], expected: &[Value], type_sensitive: bool) 
         .all(|(res, expected)| res.compare_type_insensitive(expected))
 }
 
+/// Whether a record's [`Conditional`]s mean it should be skipped against the current target
+/// (`is_readyset` plus the configured database engine).
+fn should_skip(conditionals: &[Conditional], db_type: &DatabaseType, is_readyset: bool) -> bool {
+    conditionals.iter().any(|s| match s {
+        Conditional::SkipIf(c) if c == "readyset" => is_readyset,
+        Conditional::OnlyIf(c) if c == "readyset" => !is_readyset,
+        Conditional::SkipIf(c) => c == &db_type.to_string(),
+        Conditional::OnlyIf(c) => c != &db_type.to_string(),
+        _ => false,
+    })
+}
+
+/// During `--rewrite`, whether a query's existing recorded results must be kept verbatim rather
+/// than re-recorded from the target. Conditionally-skipped queries never run against the target,
+/// and a query carrying an `error:` tag records a (usually Readyset-specific) failure the target
+/// typically will not reproduce; re-recording either would clobber a valid recording.
+fn rewrite_preserves_recording(query: &Query, opts: &RunOptions, is_readyset: bool) -> bool {
+    should_skip(&query.conditionals, &opts.database_type, is_readyset)
+        || (!opts.ignore_error_tags && query.expected_error.is_some())
+}
+
+/// During `--rewrite`, whether to skip enforcing a statement's recorded pass/fail expectation. A
+/// `statement error` is re-run only for its side effects, so its (usually Readyset-specific)
+/// expectation is neither re-checked nor re-recorded; verify still enforces it.
+fn rewrite_skips_statement_check(result: &StatementResult, rewrite: bool) -> bool {
+    rewrite && matches!(result, StatementResult::Error { .. })
+}
+
+/// Decode `QueryResults` into a row-major `Vec<Vec<Value>>`.
+///
+/// The MySQL wire layer returns NEWDECIMAL as opaque bytes; the type-erased
+/// `TryFrom<QueryResults>` path would decode those as `Value::Text` and lose precision
+/// when comparing upstream and Readyset results. Dispatching on per-column type metadata
+/// preserves the declared numeric semantics.
+fn rows_from_results(results: database_utils::QueryResults) -> anyhow::Result<Vec<Vec<Value>>> {
+    use database_utils::QueryResults;
+    match results {
+        QueryResults::MySql(rows) => rows
+            .into_iter()
+            .map(|mut row| {
+                (0..row.columns_ref().len())
+                    .map(|i| {
+                        let v = row
+                            .take::<mysql_async::Value, _>(i)
+                            .expect("column index in range");
+                        Value::from_mysql_value_with_column(v, &row.columns_ref()[i])
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .collect(),
+        QueryResults::Postgres(rows) => rows
+            .into_iter()
+            .map(|row| {
+                (0..row.len())
+                    .map(|i| row.try_get(i).map_err(anyhow::Error::from))
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .collect(),
+    }
+}
+
 /// Establish a connection to the upstream DB server and recreate the test database
 pub(crate) async fn recreate_test_database(url: &DatabaseURL) -> anyhow::Result<()> {
     let db_name = url
@@ -120,10 +231,18 @@ pub(crate) async fn recreate_test_database(url: &DatabaseURL) -> anyhow::Result<
         DatabaseType::PostgreSQL => "postgres".to_owned(),
         DatabaseType::MySQL => "mysql".to_owned(),
     });
-    let mut admin_conn = admin_url
-        .connect(&ServerCertVerification::Default)
-        .await
-        .with_context(|| "connecting to upstream")?;
+    let mut admin_conn = retry_with_exponential_backoff!(
+        {
+            admin_url
+                .connect(&ServerCertVerification::Default)
+                .await
+                .with_context(|| "connecting to upstream")
+        },
+        retries: 5,
+        delay: 500,
+        backoff: 2,
+    )
+    .with_context(|| "connecting to upstream after retries")?;
 
     admin_conn
         .query_drop(format!("DROP DATABASE IF EXISTS {db_name}"))
@@ -140,6 +259,57 @@ pub(crate) async fn recreate_test_database(url: &DatabaseURL) -> anyhow::Result<
         .with_context(|| "creating database")?;
 
     Ok(())
+}
+
+/// If `pattern` is non-empty, compile it as a regex and verify that `error` matches it.
+/// Returns `Ok(())` if the pattern is empty or matches; returns an error otherwise.
+fn check_error_pattern(error: &dyn Display, pattern: &str) -> anyhow::Result<()> {
+    if !pattern.is_empty() {
+        let err_str = error.to_string();
+        let re = regex::Regex::new(pattern).context("Invalid regex in error pattern")?;
+        if !re.is_match(&err_str) {
+            bail!("Error message: {err_str} (expected to match pattern: {pattern})");
+        }
+    }
+    Ok(())
+}
+
+/// Extract the root cause error message from an anyhow error chain.
+///
+/// This walks the chain to the deepest cause and returns its `Display` output,
+/// which is the actual error message without any wrapping context (like
+/// "Running query ..." or "Query failed after N retries").
+fn root_cause_message(err: &anyhow::Error) -> String {
+    err.root_cause().to_string()
+}
+
+/// Format collected query failures for `--no-fail-fast` output.
+///
+/// Output format (one block per failure, blocks separated by blank lines):
+///
+/// ```text
+///   line 42
+///   error: db error: ERROR: unsupported query
+///
+///   line 56
+///   error: Incorrect values returned from query ...
+/// ```
+///
+/// This format is designed to be unambiguously machine-parseable: the error
+/// message is always on the line starting with `  error: `, and the line
+/// number is always on the line starting with `  line `.
+fn format_query_failures(failures: &[(usize, String)]) -> String {
+    failures
+        .iter()
+        .map(|(line, msg)| {
+            if *line > 0 {
+                format!("  line {line}\n  error: {msg}")
+            } else {
+                format!("  error: {msg}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 impl TestScript {
@@ -172,12 +342,21 @@ impl TestScript {
         &self.path
     }
 
-    pub async fn run(&mut self, opts: RunOptions) -> anyhow::Result<()> {
+    pub async fn run(&mut self, mut opts: RunOptions) -> anyhow::Result<()> {
         info!(path = ?self.path, "Running test script");
 
         // Check filename to determine migration mode.
         // Check comments on MigrationMode for details.
         let out_of_band_migration = self.path.to_string_lossy().contains(".oob.");
+
+        // Suffix the upstream database name with the runner task index so concurrent tasks do not
+        // race on DROP/CREATE DATABASE. Replication mode is left untouched because it already
+        // serializes test execution to a single task (see `max_tasks` in main.rs).
+        if !opts.upstream_database_is_readyset {
+            if let Some(upstream_url) = opts.upstream_database_url.as_mut() {
+                *upstream_url = per_task_db_url(upstream_url, opts.task_idx);
+            }
+        }
 
         // Recreate the test database, unless this is a long-lived remote readyset instance (e.g.
         // running under Antithesis) in which case the state needs to be managed/reset externally;
@@ -192,10 +371,18 @@ impl TestScript {
         }
 
         if let Some(upstream_url) = &opts.upstream_database_url {
-            let mut conn = upstream_url
-                .connect(&ServerCertVerification::Default)
-                .await
-                .with_context(|| "connecting to upstream database")?;
+            let mut conn = retry_with_exponential_backoff!(
+                {
+                    upstream_url
+                        .connect(&ServerCertVerification::Default)
+                        .await
+                        .with_context(|| "connecting to upstream database")
+                },
+                retries: 5,
+                delay: 500,
+                backoff: 2,
+            )
+            .with_context(|| "connecting to upstream database after retries")?;
 
             // We expect it's harmless to always enable the built-in citext extension, which fuzz
             // tests might generate.
@@ -204,8 +391,21 @@ impl TestScript {
                     .await?;
             }
 
-            self.run_on_database(&opts, &mut conn, opts.upstream_database_is_readyset)
-                .await?;
+            if opts.rewrite {
+                let new_results = self
+                    .rewrite_on_database(&opts, &mut conn, opts.upstream_database_is_readyset)
+                    .await?;
+                let src = std::fs::read_to_string(&self.path)
+                    .with_context(|| format!("Reading {} for rewrite", self.path.display()))?;
+                let rewritten = crate::rewrite::substitute_query_results(&src, &new_results)?;
+                std::fs::write(&self.path, rewritten)
+                    .with_context(|| format!("Writing rewritten {}", self.path.display()))?;
+            } else {
+                self.run_on_database(&opts, &mut conn, opts.upstream_database_is_readyset)
+                    .await?;
+            }
+        } else if opts.rewrite {
+            bail!("--rewrite requires an upstream --database-url to record results against");
         } else {
             self.run_on_noria(&opts, out_of_band_migration).await?;
         };
@@ -232,10 +432,18 @@ impl TestScript {
     ) -> anyhow::Result<()> {
         let (_noria_handle, server_shutdown_tx, adapter_shutdown_tx, adapter_task, db_url) =
             crate::in_process_readyset::start_readyset(opts, out_of_band_migration).await;
-        let mut conn = match db_url
-            .connect(&ServerCertVerification::Default)
-            .await
-            .with_context(|| "connecting to adapter")
+        let mut conn = match retry_with_exponential_backoff!(
+            {
+                db_url
+                    .connect(&ServerCertVerification::Default)
+                    .await
+                    .with_context(|| "connecting to adapter")
+            },
+            retries: 5,
+            delay: 500,
+            backoff: 2,
+        )
+        .with_context(|| "connecting to adapter after retries")
         {
             Ok(conn) => conn,
             Err(e) => {
@@ -268,16 +476,6 @@ impl TestScript {
         conn: &mut DatabaseConnection,
         is_readyset: bool,
     ) -> anyhow::Result<()> {
-        let conditional_skip = |conditionals: &[Conditional]| {
-            conditionals.iter().any(|s| match s {
-                Conditional::SkipIf(c) if c == "readyset" => is_readyset,
-                Conditional::OnlyIf(c) if c == "readyset" => !is_readyset,
-                Conditional::SkipIf(c) => c == &opts.database_type.to_string(),
-                Conditional::OnlyIf(c) => c != &opts.database_type.to_string(),
-                _ => false,
-            })
-        };
-
         #[cfg(feature = "in-process-readyset")]
         let mut update_system_timezone = false;
 
@@ -286,10 +484,31 @@ impl TestScript {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(8);
 
-        for record in &self.records {
+        // Collected query failures when no_fail_fast is enabled.
+        // Each entry is (line_number, root_cause_error_message).
+        let mut query_failures: Vec<(usize, String)> = Vec::new();
+
+        let script_start = Instant::now();
+        let script_deadline = opts.script_timeout.map(|t| script_start + t);
+
+        for (line_num, record) in &self.records {
+            if let Some(deadline) = script_deadline {
+                if Instant::now() >= deadline {
+                    let elapsed = script_start.elapsed();
+                    if query_failures.is_empty() {
+                        bail!("Test script timed out after {elapsed:?} with no accumulated errors");
+                    }
+                    let count = query_failures.len();
+                    let details = format_query_failures(&query_failures);
+                    bail!(
+                        "Test script timed out after {elapsed:?} with {count} accumulated query failure(s):\n{details}"
+                    );
+                }
+            }
+
             match record {
                 Record::Statement(stmt) => {
-                    if conditional_skip(&stmt.conditionals) {
+                    if should_skip(&stmt.conditionals, &opts.database_type, is_readyset) {
                         continue;
                     }
                     #[cfg(feature = "in-process-readyset")]
@@ -300,9 +519,9 @@ impl TestScript {
                         update_system_timezone = true;
                     }
                     debug!(command = stmt.command, "Running statement");
-                    retry_with_exponential_backoff!(
+                    let stmt_result = retry_with_exponential_backoff!(
                         {
-                        self.run_statement(stmt, conn)
+                        self.run_statement(stmt, conn, opts.query_timeout, is_readyset, false)
                             .await
                             .with_context(|| format!("Running statement {}", stmt.command))
                         },
@@ -310,11 +529,28 @@ impl TestScript {
                         delay: 100,
                         backoff: 2,
                     )
-                    .with_context(|| format!("Running statement with {retries} retries"))?;
+                    .with_context(|| {
+                        if *line_num > 0 {
+                            format!("Running statement at line {line_num} with {retries} retries")
+                        } else {
+                            format!("Running statement with {retries} retries")
+                        }
+                    });
+
+                    if let Err(e) = stmt_result {
+                        // For read-only statement errors (SELECT or WITH/CTE), no_fail_fast
+                        // can safely collect the failure since they don't affect subsequent
+                        // records.
+                        if opts.no_fail_fast && is_select_statement(&stmt.command) {
+                            query_failures.push((*line_num, root_cause_message(&e)));
+                        } else {
+                            return Err(e);
+                        }
+                    }
                 }
 
                 Record::Query(query) => {
-                    if conditional_skip(&query.conditionals) {
+                    if should_skip(&query.conditionals, &opts.database_type, is_readyset) {
                         continue;
                     }
 
@@ -343,11 +579,10 @@ impl TestScript {
 
                     // 100 ms, 2x backoff
                     // 25.5 seconds total
-                    match retry_with_exponential_backoff!(
+                    let query_result = retry_with_exponential_backoff!(
                         {
-                            {
                                 let query_result = self
-                                    .run_query(query, conn, is_readyset)
+                                    .run_query(query, conn, is_readyset, opts)
                                     .await
                                     .with_context(|| format!("Running query {}", query.query));
 
@@ -358,21 +593,29 @@ impl TestScript {
                                     (Err(e), false) => Err(e),
                                     _ => Ok(()),
                                 }
-                            }
                         },
                         retries: retries,
                         delay: 100,
                         backoff: 2,
-                    ) {
+                    );
+
+                    match query_result {
                         Ok(_) => {
                             if let Some((label, start)) = &timer {
                                 let duration = start.elapsed();
                                 debug!(label, "Query succeeded in {duration:?}");
                             };
-                            Ok(())
                         }
-                        Err(e) => Err(e.context(format!("Query failed after {retries} retries"))),
-                    }?
+                        Err(e) => {
+                            if opts.no_fail_fast {
+                                query_failures.push((*line_num, root_cause_message(&e)));
+                            } else {
+                                return Err(
+                                    e.context(format!("Query failed after {retries} retries"))
+                                );
+                            }
+                        }
+                    }
                 }
                 Record::HashThreshold(_) => {}
                 Record::Halt { .. } => break,
@@ -391,15 +634,88 @@ impl TestScript {
                 }
             }
         }
+
+        if !query_failures.is_empty() {
+            let count = query_failures.len();
+            let details = format_query_failures(&query_failures);
+            bail!("{count} query failure(s):\n{details}");
+        }
+
         Ok(())
+    }
+
+    /// Re-run the script against `conn`, returning one [`QueryResults`] per `query` record (in
+    /// order) reflecting the database's actual output. Statements are executed to build up state
+    /// (their recorded pass/fail expectation is not enforced during a rewrite). Queries that are
+    /// conditionally skipped, carry an `error:` tag, or error against the target keep their existing
+    /// recorded results so the corresponding result block is left unchanged. The result form (hash
+    /// vs. inline values) of each existing recording is preserved so rewrites stay minimal.
+    async fn rewrite_on_database(
+        &self,
+        opts: &RunOptions,
+        conn: &mut DatabaseConnection,
+        is_readyset: bool,
+    ) -> anyhow::Result<Vec<QueryResults>> {
+        let mut new_results = Vec::new();
+        for (line_num, record) in &self.records {
+            match record {
+                Record::Statement(stmt) => {
+                    if should_skip(&stmt.conditionals, &opts.database_type, is_readyset) {
+                        continue;
+                    }
+                    self.run_statement(stmt, conn, opts.query_timeout, is_readyset, true)
+                        .await
+                        .with_context(|| {
+                            format!("Running statement during rewrite: {}", stmt.command)
+                        })?;
+                }
+                Record::Query(query) => {
+                    if rewrite_preserves_recording(query, opts, is_readyset) {
+                        new_results.push(query.results.clone());
+                        continue;
+                    }
+                    match self
+                        .compute_query_vals(query, conn, is_readyset, opts)
+                        .await
+                    {
+                        Ok(vals) => new_results.push(match &query.results {
+                            QueryResults::Hash { .. } => QueryResults::hash(&vals),
+                            QueryResults::Results(_) => QueryResults::Results(vals),
+                        }),
+                        Err(e) => {
+                            warn!(
+                                line = line_num,
+                                query = query.query,
+                                error = %root_cause_message(&e),
+                                "rewrite: query errored, keeping existing recorded results"
+                            );
+                            new_results.push(query.results.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(new_results)
     }
 
     async fn run_statement(
         &self,
         stmt: &Statement,
         conn: &mut DatabaseConnection,
+        query_timeout: Duration,
+        is_readyset: bool,
+        rewrite: bool,
     ) -> anyhow::Result<()> {
-        let res = conn.query_drop(&stmt.command).await;
+        let res = timeout(query_timeout, conn.query_drop(&stmt.command))
+            .await
+            .map_err(|_| anyhow!("Statement timed out after {query_timeout:?}"))?;
+        if rewrite_skips_statement_check(&stmt.result, rewrite) {
+            // A `statement error` is re-run during rewrite only for its side effects; its recorded
+            // pass/fail expectation (often Readyset-specific) is neither re-checked nor re-recorded,
+            // so a success against the target must not abort the re-recording.
+            return Ok(());
+        }
         match stmt.result {
             StatementResult::Ok => {
                 if let Err(e) = res {
@@ -409,17 +725,71 @@ impl TestScript {
             StatementResult::Error { ref pattern } => match res {
                 Err(e) => {
                     if let Some(pattern) = pattern {
-                        if !pattern.is_empty()
-                            && !regex::Regex::new(pattern).unwrap().is_match(&e.to_string())
-                        {
-                            bail!("Statement failed with unexpected error: {} (expected to match: {})", e, pattern);
-                        }
+                        check_error_pattern(&e, pattern)?;
                     }
                 }
-                Ok(_) => bail!("Statement should have failed, but succeeded"),
+                Ok(_) => {
+                    // For SELECT/WITH statements on readyset, a "successful" query_drop
+                    // may have been proxied to upstream. Check EXPLAIN LAST STATEMENT:
+                    // if the query went to upstream, treat it as an expected failure.
+                    if is_readyset && is_select_statement(&stmt.command) {
+                        if let Some(status) = self.check_proxied(conn).await? {
+                            // Query was proxied — if a pattern was given, check the
+                            // readyset error status matches it.
+                            if let Some(pattern) = pattern {
+                                check_error_pattern(&status, pattern)?;
+                            }
+                            return Ok(());
+                        }
+                    }
+
+                    if let Some(pattern) = pattern {
+                        bail!(
+                            "Statement should have failed, but succeeded (expected error matching: {pattern})"
+                        )
+                    } else {
+                        bail!("Statement should have failed, but succeeded")
+                    }
+                }
             },
         }
         Ok(())
+    }
+
+    /// Check if the last statement was proxied to upstream. Returns `Some(status)` if proxied,
+    /// `None` if it went to readyset.
+    async fn check_proxied(&self, conn: &mut DatabaseConnection) -> anyhow::Result<Option<String>> {
+        let explain_results = conn
+            .simple_query("EXPLAIN LAST STATEMENT")
+            .await
+            .context("checking if last statement was proxied")?;
+        let explain_values: Vec<Vec<DfValue>> = explain_results.try_into()?;
+        if let Some(explain) = explain_values.first() {
+            let mut strings = explain.iter().map(|v| -> anyhow::Result<String> {
+                Ok(
+                    v.coerce_to(&DfType::Text(Collation::Utf8), &DfType::Unknown)
+                        .context("coercing EXPLAIN value to text")?
+                        .as_str()
+                        .ok_or_else(|| anyhow!("EXPLAIN value was not a string"))?
+                        .to_string(),
+                )
+            });
+            let destination = strings
+                .next()
+                .transpose()?
+                .map(|s| s.try_into())
+                .transpose()?;
+            let status = strings
+                .next()
+                .transpose()?
+                .unwrap_or_else(|| "no status".to_string());
+            if let Some(destination) = destination {
+                if !matches!(destination, QueryDestination::Readyset(_)) {
+                    return Ok(Some(status));
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn run_query(
@@ -427,7 +797,42 @@ impl TestScript {
         query: &Query,
         conn: &mut DatabaseConnection,
         is_readyset: bool,
+        opts: &RunOptions,
     ) -> anyhow::Result<()> {
+        let result = self.run_query_inner(query, conn, is_readyset, opts).await;
+
+        if opts.ignore_error_tags {
+            return result;
+        }
+
+        if let Some(error_pattern) = &query.expected_error {
+            match result {
+                Err(e) => {
+                    check_error_pattern(&e, error_pattern)?;
+                    Ok(())
+                }
+                Ok(()) => {
+                    bail!(
+                        "Expected query to error, but it succeeded \
+                         (if the bug is fixed, remove the `error` tag)"
+                    )
+                }
+            }
+        } else {
+            result
+        }
+    }
+
+    /// Execute `query` against `conn` and return its results as a flat, sort-mode-applied
+    /// `Vec<Value>`, without comparing against the recorded results. Shared by `run_query_inner`
+    /// (which compares) and the `--rewrite` path (which re-records).
+    async fn compute_query_vals(
+        &self,
+        query: &Query,
+        conn: &mut DatabaseConnection,
+        is_readyset: bool,
+        opts: &RunOptions,
+    ) -> anyhow::Result<Vec<Value>> {
         // If this is readyset, drop proxied queries, so that if we are retrying a SELECT and it was
         // previously unsupported (e.g. because a required table hadn't yet been replicated), we
         // will retry caching it instead of assuming it still can't be cached and just proxying it.
@@ -438,18 +843,25 @@ impl TestScript {
             conn.query_drop("DROP ALL PROXIED QUERIES").await?;
         }
 
+        let query_timeout = opts.query_timeout;
         let results = if query.params.is_empty() {
-            conn.query(&query.query).await?
+            timeout(query_timeout, conn.query(&query.query))
+                .await
+                .map_err(|_| anyhow!("Query timed out after {query_timeout:?}"))??
         } else {
             // We manually prepare and drop the statement, so that we can retry caching it if it was
             // previously unsupported.
-            let stmt = conn.prepare(&query.query).await?;
-            let results = conn.execute(&stmt, query.params.clone()).await?;
+            let stmt = timeout(query_timeout, conn.prepare(&query.query))
+                .await
+                .map_err(|_| anyhow!("Prepare timed out after {query_timeout:?}"))??;
+            let results = timeout(query_timeout, conn.execute(&stmt, query.params.clone()))
+                .await
+                .map_err(|_| anyhow!("Execute timed out after {query_timeout:?}"))??;
             conn.drop_prepared(stmt).await?;
             results
         };
 
-        let mut rows = <Vec<Vec<Value>>>::try_from(results)?.into_iter().map(
+        let mut rows = rows_from_results(results)?.into_iter().map(
             |mut row: Vec<Value>| -> anyhow::Result<Vec<Value>> {
                 if let Some(column_types) = &query.column_types {
                     let row_len = row.len();
@@ -503,6 +915,20 @@ impl TestScript {
             }
         };
 
+        Ok(vals)
+    }
+
+    async fn run_query_inner(
+        &self,
+        query: &Query,
+        conn: &mut DatabaseConnection,
+        is_readyset: bool,
+        opts: &RunOptions,
+    ) -> anyhow::Result<()> {
+        let vals = self
+            .compute_query_vals(query, conn, is_readyset, opts)
+            .await?;
+
         match &query.results {
             QueryResults::Hash { count, digest } => {
                 if *count != vals.len() {
@@ -523,7 +949,11 @@ impl TestScript {
             }
             QueryResults::Results(expected_vals) => {
                 if vals.len() != expected_vals.len() {
-                    bail!("The number of values returned does not match the number of values expected (left: expected, right: actual): \n {}, {}",expected_vals.len(), vals.len());
+                    bail!(
+                        "The number of values returned does not match the number of values expected (left: expected, right: actual): \n {}, {}",
+                        expected_vals.len(),
+                        vals.len()
+                    );
                 }
                 if !compare_results(&vals, expected_vals, query.column_types.is_some()) {
                     bail!(
@@ -536,33 +966,108 @@ impl TestScript {
 
         // If we are running against a remote readyset which could proxy, verify it didn't.
         if is_readyset {
-            let explain_results = conn.simple_query("EXPLAIN LAST STATEMENT").await?;
-            let explain_values: Vec<Vec<DfValue>> = explain_results.try_into()?;
-            if let Some(explain) = explain_values.first() {
-                let mut strings = explain.iter().map(|v| {
-                    v.coerce_to(&DfType::Text(Collation::Utf8), &DfType::Unknown)
-                        .unwrap()
-                        .as_str()
-                        .unwrap()
-                        .to_string()
-                });
-                let destination = strings.next().map(|s| s.try_into()).transpose()?;
-                let status = strings.next().unwrap_or("no status".to_string());
-                if let Some(destination) = destination {
-                    if !matches!(destination, QueryDestination::Readyset(_)) {
-                        bail!("Query destination should be readyset, was {destination}: {status}");
-                    }
-                } else {
-                    bail!("Could not get destination");
-                }
+            if let Some(status) = self.check_proxied(conn).await? {
+                bail!("Query destination should be readyset, was proxied: {status}");
             }
         }
 
         Ok(())
     }
 
-    /// Get a reference to the test script's records.
-    pub fn records(&self) -> &[Record] {
-        &self.records
+    /// Get a reference to the test script's records (without line numbers).
+    pub fn records(&self) -> Vec<&Record> {
+        self.records.iter().map(|(_, r)| r).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_task_db_url_suffixes_db_name_mysql() {
+        let base: DatabaseURL = "mysql://root:noria@localhost:3306/noria_upstream"
+            .parse()
+            .unwrap();
+        let url = per_task_db_url(&base, 3);
+        assert_eq!(url.db_name(), Some("noria_upstream_3"));
+    }
+
+    #[test]
+    fn per_task_db_url_suffixes_db_name_postgres() {
+        let base: DatabaseURL = "postgresql://postgres:noria@localhost:5432/noria_upstream"
+            .parse()
+            .unwrap();
+        let url = per_task_db_url(&base, 7);
+        assert_eq!(url.db_name(), Some("noria_upstream_7"));
+    }
+
+    #[test]
+    fn per_task_db_url_preserves_other_url_components() {
+        let base: DatabaseURL = "postgresql://postgres:noria@localhost:5432/noria_upstream"
+            .parse()
+            .unwrap();
+        let url = per_task_db_url(&base, 0);
+        assert!(url.is_postgres());
+        assert_eq!(url.db_name(), Some("noria_upstream_0"));
+    }
+
+    #[test]
+    fn rewrite_preserves_error_tagged_query() {
+        // A query carrying an `error:` tag records a (usually Readyset-specific) failure that the
+        // rewrite target typically will not reproduce. Re-recording it would clobber the recorded
+        // block while leaving the tag, turning a valid test into one that always fails, so the
+        // rewrite must keep the existing recording.
+        let opts = RunOptions::default_for_database(DatabaseType::MySQL);
+        let tagged = Query {
+            query: "SELECT 1".into(),
+            expected_error: Some("Wrong number of results".into()),
+            ..Default::default()
+        };
+        assert!(rewrite_preserves_recording(&tagged, &opts, false));
+
+        let plain = Query {
+            query: "SELECT 1".into(),
+            ..Default::default()
+        };
+        assert!(!rewrite_preserves_recording(&plain, &opts, false));
+    }
+
+    #[test]
+    fn rewrite_rerecords_error_tagged_query_when_tags_ignored() {
+        // `--ignore-error-tags` opts into re-recording error-tagged queries as ordinary ones.
+        let opts = RunOptions {
+            ignore_error_tags: true,
+            ..RunOptions::default_for_database(DatabaseType::MySQL)
+        };
+        let tagged = Query {
+            query: "SELECT 1".into(),
+            expected_error: Some("boom".into()),
+            ..Default::default()
+        };
+        assert!(!rewrite_preserves_recording(&tagged, &opts, false));
+    }
+
+    #[test]
+    fn rewrite_preserves_conditionally_skipped_query() {
+        // `onlyif readyset` against a non-readyset target is skipped, so its recording is kept.
+        let opts = RunOptions::default_for_database(DatabaseType::MySQL);
+        let skipped = Query {
+            query: "SELECT 1".into(),
+            conditionals: vec![Conditional::OnlyIf("readyset".into())],
+            ..Default::default()
+        };
+        assert!(rewrite_preserves_recording(&skipped, &opts, false));
+    }
+
+    #[test]
+    fn rewrite_runs_statement_errors_for_side_effects_only() {
+        // A `statement error` re-run during rewrite must not abort the file when it succeeds
+        // against the target; verify (rewrite = false) still enforces the expectation, and a
+        // `statement ok` is always enforced.
+        let err = StatementResult::Error { pattern: None };
+        assert!(rewrite_skips_statement_check(&err, true));
+        assert!(!rewrite_skips_statement_check(&err, false));
+        assert!(!rewrite_skips_statement_check(&StatementResult::Ok, true));
     }
 }

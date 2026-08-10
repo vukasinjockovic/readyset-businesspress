@@ -15,7 +15,6 @@ test-discovery = { path = "../test-discovery" }
 
 [dependencies]
 anyhow = { workspace = true }
-assert_matches = { workspace = true }
 async-trait = { workspace = true }
 bit-vec = { workspace = true, features = ["serde"] }
 cidr = { workspace = true }
@@ -37,15 +36,16 @@ tokio = { workspace = true, features = ["full"] }
 tokio-postgres = { workspace = true, features = [
     "with-chrono-0_4",
     "with-eui48-1",
-    "with-uuid-0_8",
+    "with-uuid-1",
     "with-serde_json-1",
-    "with-bit-vec-0_6",
+    "with-bit-vec-0_9",
 ] }
 tracing = { workspace = true, features = ["release_max_level_debug"] }
 tracing-futures = { workspace = true }
 uuid = { workspace = true }
 
 database-utils = { path = "../database-utils" }
+metric = { path = "../metric" }
 psql-srv = { path = "../psql-srv" }
 readyset-adapter = { path = "../readyset-adapter" }
 readyset-adapter-types = { path = "../readyset-adapter-types" }
@@ -55,6 +55,7 @@ readyset-common = { path = "../readyset-common" }
 readyset-data = { path = "../readyset-data" }
 readyset-decimal = { path = "../readyset-decimal" }
 readyset-errors = { path = "../readyset-errors" }
+readyset-schema = { path = "../readyset-schema" }
 readyset-shallow = { path = "../readyset-shallow" }
 readyset-sql = { path = "../readyset-sql" }
 readyset-sql-passes = { path = "../readyset-sql-passes" }
@@ -65,6 +66,7 @@ chrono = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 pretty_assertions = { workspace = true }
 proptest = { workspace = true }
+regex = { workspace = true }
 test-strategy = { workspace = true }
 
 readyset-client-test-helpers = { path = "../readyset-client-test-helpers" }

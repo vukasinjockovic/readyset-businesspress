@@ -35,6 +35,7 @@ use tokio_postgres::types::{to_sql_checked, FromSql, IsNull, Kind, ToSql, Type};
 use uuid::Uuid;
 
 mod array;
+mod average;
 mod collation;
 pub mod dialect;
 pub mod encoding;
@@ -52,13 +53,15 @@ pub use ndarray::{ArrayD, IxDyn};
 use proptest::arbitrary::Arbitrary;
 
 pub use crate::array::Array;
-pub use crate::collation::Collation;
+pub use crate::average::{AverageAccumulator, AvgScaleMode};
+pub use crate::collation::{CharsetFamily, Collation};
 pub use crate::dialect::{Dialect, SqlEngine};
 pub use crate::r#type::{DfType, PgEnumMetadata, PgTypeCategory};
 pub use crate::ranges::{Bound, BoundedRange, IntoBoundedRange, RangeBounds};
-pub use crate::serde::TextRef;
 pub use crate::text::{Text, TinyText};
-pub use crate::timestamp::{TimestampTz, TIMESTAMP_FORMAT, TIMESTAMP_PARSE_FORMAT};
+pub use crate::timestamp::{
+    TimestampTz, DATE_FORMAT, ISO_TIMESTAMP_PARSE_FORMAT, TIMESTAMP_FORMAT, TIMESTAMP_PARSE_FORMAT,
+};
 
 type JsonObject = serde_json::Map<String, JsonValue>;
 
@@ -140,7 +143,8 @@ pub enum DfValue {
     // - make sure to always keep Max last - we use the order of the variants to compare
     // - remember to add that variant to:
     //   - The `proptest::Arbitrary` impl for `DfValue`,
-    //   - The `example_row` in `src/serde.rs`
+    //   - `example_serialized_keys()` in `dataflow-state/src/persistent_state/format_version.rs`
+    //   - Bump `PERSISTENT_STATE_VERSION` in `dataflow-state/src/persistent_state/format_version.rs`
 }
 
 impl SizeOf for DfValue {
@@ -155,7 +159,7 @@ impl SizeOf for DfValue {
         size_of::<Self>() + inner
     }
 
-    fn is_empty(&self) -> bool {
+    fn size_is_empty(&self) -> bool {
         false
     }
 }
@@ -164,11 +168,18 @@ impl TryFrom<DfValue> for JsonValue {
     type Error = ReadySetError;
 
     fn try_from(value: DfValue) -> Result<Self, ReadySetError> {
+        // serde_json cannot represent non-finite floats: `Number::from_f64`
+        // returns None for NaN/Infinity. Surface an error so callers don't panic.
+        fn finite_number(f: f64) -> ReadySetResult<JsonValue> {
+            serde_json::Number::from_f64(f)
+                .map(JsonValue::Number)
+                .ok_or_else(|| invalid_query_err!("cannot encode non-finite float as JSON"))
+        }
         Ok(match value {
             // FIXME: serde_json doesn't support f32, this causes precision errors when using
             // floats
-            DfValue::Float(f) => JsonValue::Number(serde_json::Number::from_f64(f as f64).unwrap()),
-            DfValue::Double(f) => JsonValue::Number(serde_json::Number::from_f64(f).unwrap()),
+            DfValue::Float(f) => finite_number(f as f64)?,
+            DfValue::Double(f) => finite_number(f)?,
             DfValue::Int(i) => JsonValue::Number(i.into()),
             DfValue::UnsignedInt(i) => JsonValue::Number(i.into()),
             DfValue::Text(text) => JsonValue::String(text.as_str().to_string()),
@@ -198,8 +209,20 @@ impl fmt::Display for DfValue {
             }
             DfValue::Int(n) => write!(f, "{n}"),
             DfValue::UnsignedInt(n) => write!(f, "{n}"),
-            DfValue::Float(n) => write!(f, "{n}"),
-            DfValue::Double(n) => write!(f, "{n}"),
+            DfValue::Float(n) => {
+                if let Some(prec) = f.precision() {
+                    write!(f, "{n:.prec$}")
+                } else {
+                    write!(f, "{n}")
+                }
+            }
+            DfValue::Double(n) => {
+                if let Some(prec) = f.precision() {
+                    write!(f, "{n:.prec$}")
+                } else {
+                    write!(f, "{n}")
+                }
+            }
             DfValue::TimestampTz(ref ts) => write!(f, "{ts}"),
             DfValue::Time(ref t) => write!(f, "{t}"),
             DfValue::ByteArray(ref array) => {
@@ -261,6 +284,18 @@ impl DfValue {
         match self {
             DfValue::Text(t) => Some(t.collation()),
             DfValue::TinyText(tt) => Some(tt.collation()),
+            _ => None,
+        }
+    }
+
+    /// Compute a collation sort key for textual variants, returning `None` for everything else.
+    /// Bytewise comparison of two keys yields the same ordering as `Ord` between the underlying
+    /// `Text`/`TinyText` values. Useful for amortizing collation work across repeated
+    /// comparisons (decorate-sort-undecorate).
+    pub fn collation_key(&self) -> Option<Box<[u8]>> {
+        match self {
+            DfValue::Text(t) => Some(t.collation_key()),
+            DfValue::TinyText(t) => Some(t.collation_key()),
             _ => None,
         }
     }
@@ -499,6 +534,26 @@ impl DfValue {
     /// );
     /// ```
     pub fn coerce_to(&self, to_ty: &DfType, from_ty: &DfType) -> ReadySetResult<DfValue> {
+        self.coerce_to_inner(to_ty, from_ty, None)
+    }
+
+    /// Like [`DfValue::coerce_to`], but resolving coercions whose semantics differ between the
+    /// upstreams according to `dialect`.
+    pub fn coerce_to_with_dialect(
+        &self,
+        to_ty: &DfType,
+        from_ty: &DfType,
+        dialect: Dialect,
+    ) -> ReadySetResult<DfValue> {
+        self.coerce_to_inner(to_ty, from_ty, Some(dialect))
+    }
+
+    fn coerce_to_inner(
+        &self,
+        to_ty: &DfType,
+        from_ty: &DfType,
+        dialect: Option<Dialect>,
+    ) -> ReadySetResult<DfValue> {
         use crate::text::TextCoerce;
 
         let mk_err = || ReadySetError::DfValueConversionError {
@@ -541,7 +596,7 @@ impl DfValue {
         match self {
             DfValue::None => Ok(DfValue::None),
             DfValue::Array(arr) => match to_ty {
-                DfType::Row => Ok(DfValue::Array(arr.clone())),
+                DfType::Row(_) => Ok(DfValue::Array(arr.clone())),
                 DfType::Array(t) => Ok(DfValue::from(arr.coerce_to(t, from_ty)?)),
                 DfType::Text(collation) => Ok(DfValue::from_str_and_collation(
                     &arr.to_string(),
@@ -550,8 +605,8 @@ impl DfValue {
                 _ => Err(mk_err()),
             },
             _ if is_clone_coercible() => Ok(self.clone()),
-            DfValue::Text(t) => t.coerce_to(to_ty, from_ty),
-            DfValue::TinyText(tt) => tt.coerce_to(to_ty, from_ty),
+            DfValue::Text(t) => t.coerce_to(to_ty, from_ty, dialect),
+            DfValue::TinyText(tt) => tt.coerce_to(to_ty, from_ty, dialect),
             DfValue::TimestampTz(tz) => tz.coerce_to(to_ty),
             DfValue::Int(v) => handle_enum_or_coerce_int!(v, to_ty, from_ty),
             DfValue::UnsignedInt(v) => handle_enum_or_coerce_int!(v, to_ty, from_ty),
@@ -675,12 +730,12 @@ impl DfValue {
                 }
             }
             (DfValue::TinyText(v), int_types!()) => {
-                if let DfValue::Double(v) = v.coerce_to(&DfType::Double, &DfType::Unknown)? {
+                if let DfValue::Double(v) = v.coerce_to(&DfType::Double, &DfType::Unknown, None)? {
                     return_error_if_disallowed_float!(v);
                 }
             }
             (DfValue::Text(v), int_types!()) => {
-                if let DfValue::Double(v) = v.coerce_to(&DfType::Double, &DfType::Unknown)? {
+                if let DfValue::Double(v) = v.coerce_to(&DfType::Double, &DfType::Unknown, None)? {
                     return_error_if_disallowed_float!(v);
                 }
             }
@@ -801,12 +856,12 @@ impl DfValue {
     /// `serialize(d1) == serialize(d2)`.
     #[inline]
     pub fn transform_for_serialized_key(&self) -> Cow<'_, Self> {
-        match self.as_str_and_collation() {
-            Some((s, collation)) => Cow::Owned(collation.key(s).into()),
-            None => match self {
-                DfValue::Float(f) => Cow::Owned((*f as f64).try_into().unwrap()),
-                _ => Cow::Borrowed(self),
-            },
+        match self {
+            DfValue::Text(t) => Cow::Owned(t.collation().key(t.as_str()).into_vec().into()),
+            DfValue::TinyText(t) => Cow::Owned(t.collation().key(t.as_str()).into_vec().into()),
+            DfValue::Float(f) => Cow::Owned((*f as f64).try_into().unwrap()),
+            DfValue::TimestampTz(ts) => Cow::Owned(DfValue::TimestampTz(ts.normalize_for_key())),
+            _ => Cow::Borrowed(self),
         }
     }
 
@@ -1007,6 +1062,15 @@ impl PartialEq for DfValue {
                 let b: i128 = <i128>::try_from(other).unwrap();
                 a == b
             }
+            (&DfValue::Int(..), DfValue::Numeric(ref b))
+            | (&DfValue::UnsignedInt(..), DfValue::Numeric(ref b)) => {
+                // this unwrap should be safe because no error path in try_from for i128 (&i128) on
+                // Int and UnsignedInt
+                #[allow(clippy::unwrap_used)]
+                let a: i128 = <i128>::try_from(self).unwrap();
+                Decimal::from(a) == **b
+            }
+            (DfValue::Numeric(_), &DfValue::Int(..) | &DfValue::UnsignedInt(..)) => other == self,
             (&DfValue::Float(fa), &DfValue::Float(fb)) => {
                 // We need to compare the *bit patterns* of the floats so that our Hash matches our
                 // Eq
@@ -1203,11 +1267,8 @@ impl Hash for DfValue {
             DfValue::UnsignedInt(n) => n.hash(state),
             DfValue::Float(f) => (f as f64).to_bits().hash(state),
             DfValue::Double(f) => f.to_bits().hash(state),
-            DfValue::Text(..) | DfValue::TinyText(..) => {
-                let collation = self.collation().unwrap();
-                let s = <&str>::try_from(self).unwrap();
-                collation.key(s).hash(state);
-            }
+            DfValue::Text(ref t) => t.collation_hash().hash(state),
+            DfValue::TinyText(ref t) => t.collation_hash().hash(state),
             DfValue::TimestampTz(ts) => ts.hash(state),
             DfValue::Time(ref t) => t.hash(state),
             DfValue::ByteArray(ref array) => array.hash(state),
@@ -1283,19 +1344,33 @@ macro_rules! unsigned_integer_into_value {
 signed_integer_into_value!(isize, i64, i32, i16, i8);
 unsigned_integer_into_value!(usize, u64, u32, u16, u8);
 
+/// Normalizes NaN to a single bit pattern. PostgreSQL treats all NaNs as one value which compares
+/// equal to itself, whereas [`DfValue`]'s `Eq` and `Hash` compare float bit patterns, so NaNs
+/// originating from different operations would otherwise be unequal to each other.
+#[inline]
+pub(crate) fn canonicalize_nan_f32(f: f32) -> f32 {
+    if f.is_nan() {
+        f32::NAN
+    } else {
+        f
+    }
+}
+
+/// See [`canonicalize_nan_f32`].
+#[inline]
+pub(crate) fn canonicalize_nan_f64(f: f64) -> f64 {
+    if f.is_nan() {
+        f64::NAN
+    } else {
+        f
+    }
+}
+
 impl TryFrom<f32> for DfValue {
     type Error = ReadySetError;
 
     fn try_from(f: f32) -> Result<Self, Self::Error> {
-        if !f.is_finite() {
-            return Err(Self::Error::DfValueConversionError {
-                src_type: "f32".to_string(),
-                target_type: "DfValue".to_string(),
-                details: "".to_string(),
-            });
-        }
-
-        Ok(DfValue::Float(f))
+        Ok(DfValue::Float(canonicalize_nan_f32(f)))
     }
 }
 
@@ -1303,15 +1378,7 @@ impl TryFrom<f64> for DfValue {
     type Error = ReadySetError;
 
     fn try_from(f: f64) -> Result<Self, Self::Error> {
-        if !f.is_finite() {
-            return Err(Self::Error::DfValueConversionError {
-                src_type: "f64".to_string(),
-                target_type: "DfValue".to_string(),
-                details: "".to_string(),
-            });
-        }
-
-        Ok(DfValue::Double(f))
+        Ok(DfValue::Double(canonicalize_nan_f64(f)))
     }
 }
 
@@ -1385,7 +1452,10 @@ impl TryFromDialect<&Literal> for DfValue {
             Literal::Boolean(b) => Ok(DfValue::from(*b)),
             Literal::Integer(i) => Ok((*i).into()),
             Literal::UnsignedInteger(i) => Ok((*i).into()),
-            Literal::String(s) => Ok(s.as_str().into()),
+            Literal::String(s) => Ok(DfValue::from_str_and_collation(
+                s,
+                Collation::default_for(dialect.into()),
+            )),
             Literal::Number(s) => match dialect {
                 readyset_sql::Dialect::PostgreSQL => Ok(DfValue::Numeric(Arc::new(
                     Decimal::from_str(s).map_err(|e| {
@@ -1401,6 +1471,11 @@ impl TryFromDialect<&Literal> for DfValue {
             Literal::BitVector(b) => Ok(DfValue::from(b)),
             Literal::Placeholder(_) => {
                 readyset_sql::failed!("Tried to convert a Placeholder literal to a DfValue")
+            }
+            // `Preserved` is a transient autoparam-exclusion marker that must be unwrapped inside
+            // `auto_parameterize_query`. Reaching dataflow lowering means it leaked; fail loudly.
+            Literal::Preserved(_) => {
+                readyset_sql::failed!("Preserved literal escaped the rewrite pipeline")
             }
         }
     }
@@ -1436,9 +1511,7 @@ impl TryFrom<DfValue> for Literal {
             )?)),
             DfValue::ByteArray(ref array) => Ok(Literal::ByteArray(array.as_ref().clone())),
             DfValue::BitVector(ref bits) => Ok(Literal::BitVector(bits.as_ref().clone())),
-            DfValue::Array(_) => Ok(Literal::String(String::try_from(
-                value.coerce_to(&DfType::DEFAULT_TEXT, &DfType::Unknown)?,
-            )?)),
+            DfValue::Array(_) => internal!("Array has no representation as a literal"),
             DfValue::PassThrough(_) => internal!("PassThrough has no representation as a literal"),
             DfValue::Default => internal!("Default has no representation as a literal"),
             DfValue::Max => internal!("MAX has no representation as a literal"),
@@ -2134,6 +2207,34 @@ impl TryFrom<&DfValue> for mysql_common::value::Value {
     }
 }
 
+/// Rejects a non-finite result computed from finite operands, which both upstreams raise an
+/// out-of-range error for. Operands that are already non-finite propagate, per IEEE 754.
+///
+/// Division by zero is not dialect-aware yet: Postgres errors, MySQL evaluates to NULL, and the
+/// integer path already yields NULL through `checked_div`.
+fn float_arithmetic_result_f32(a: f32, b: f32, result: f32) -> Result<DfValue, ReadySetError> {
+    if a.is_finite() && b.is_finite() && !result.is_finite() {
+        return Err(ReadySetError::DfValueConversionError {
+            src_type: "f32".to_string(),
+            target_type: "DfValue".to_string(),
+            details: "arithmetic overflow".to_string(),
+        });
+    }
+    DfValue::try_from(result)
+}
+
+/// See [`float_arithmetic_result_f32`].
+fn float_arithmetic_result_f64(a: f64, b: f64, result: f64) -> Result<DfValue, ReadySetError> {
+    if a.is_finite() && b.is_finite() && !result.is_finite() {
+        return Err(ReadySetError::DfValueConversionError {
+            src_type: "f64".to_string(),
+            target_type: "DfValue".to_string(),
+            details: "arithmetic overflow".to_string(),
+        });
+    }
+    DfValue::try_from(result)
+}
+
 // Performs an arithmetic operation on two numeric DfValues,
 // returning a new DfValue as the result.
 //
@@ -2155,11 +2256,10 @@ macro_rules! arithmetic_operation (
             (first @ &DfValue::Float(..), second @ &DfValue::Int(..)) |
             (first @ &DfValue::Float(..), second @ &DfValue::UnsignedInt(..)) |
             (first @ &DfValue::Float(..), second @ &DfValue::Float(..)) |
-            (first @ &DfValue::Float(..), second @ &DfValue::Double(..)) |
             (first @ &DfValue::Float(..), second @ &DfValue::Numeric(..)) => {
                 let a: f32 = f32::try_from(first)?;
                 let b: f32 = f32::try_from(second)?;
-                DfValue::try_from(a $op b)?
+                float_arithmetic_result_f32(a, b, a $op b)?
             }
 
             (first @ &DfValue::Int(..), second @ &DfValue::Double(..)) |
@@ -2168,10 +2268,11 @@ macro_rules! arithmetic_operation (
             (first @ &DfValue::Double(..), second @ &DfValue::UnsignedInt(..)) |
             (first @ &DfValue::Double(..), second @ &DfValue::Double(..)) |
             (first @ &DfValue::Double(..), second @ &DfValue::Float(..)) |
+            (first @ &DfValue::Float(..), second @ &DfValue::Double(..)) |
             (first @ &DfValue::Double(..), second @ &DfValue::Numeric(..)) => {
                 let a: f64 = f64::try_from(first)?;
                 let b: f64 = f64::try_from(second)?;
-                DfValue::try_from(a $op b)?
+                float_arithmetic_result_f64(a, b, a $op b)?
             }
 
             (first @ &DfValue::Int(..), second @ &DfValue::Numeric(..)) |
@@ -2348,7 +2449,7 @@ mod tests {
 
     #[test]
     fn test_size_and_alignment() {
-        assert_eq!(std::mem::size_of::<DfValue>(), 16);
+        assert_eq!(std::mem::size_of::<DfValue>(), 24);
 
         let timestamp_tz = DfValue::from(
             FixedOffset::west_opt(18_000)
@@ -2368,7 +2469,60 @@ mod tests {
     }
 
     fn non_numeric() -> impl Strategy<Value = DfValue> {
-        any::<DfValue>().prop_filter("Numeric DfValue", |dt| !matches!(dt, DfValue::Numeric(_)))
+        any::<DfValue>().prop_filter("Numeric DfValue", |dt| match dt {
+            DfValue::Numeric(_) => false,
+            DfValue::Array(arr) => !arr.values().any(|v| matches!(v, DfValue::Numeric(_))),
+            _ => true,
+        })
+    }
+
+    #[test]
+    fn is_truthy_nonzero_values() {
+        let cases = vec![
+            DfValue::Int(1),
+            DfValue::UnsignedInt(1),
+            DfValue::Float(1.0),
+            DfValue::Double(1.0),
+            DfValue::from("hello"),
+            DfValue::TinyText(TinyText::from_arr(b"hi")),
+            DfValue::TimestampTz("2024-01-01 00:00:01".parse().unwrap()),
+            DfValue::Time(MySqlTime::from_microseconds(1_000_000)),
+            DfValue::ByteArray(Arc::new(vec![1])),
+            DfValue::Numeric(Arc::new(Decimal::new(1, 0))),
+            DfValue::BitVector(Arc::new(BitVec::from_elem(1, true))),
+            DfValue::from(vec![DfValue::Int(1)]),
+            DfValue::PassThrough(Arc::new(PassThrough {
+                ty: Type::BOOL,
+                format: PassThroughFormat::Binary,
+                data: vec![1].into(),
+            })),
+        ];
+        for val in &cases {
+            assert!(val.is_truthy(), "{val:?} should be truthy");
+        }
+    }
+
+    #[test]
+    fn is_truthy_falsy_values() {
+        let cases = vec![
+            DfValue::None,
+            DfValue::Default,
+            DfValue::Max,
+            DfValue::Int(0),
+            DfValue::UnsignedInt(0),
+            DfValue::Float(0.0),
+            DfValue::Double(0.0),
+            DfValue::from(""),
+            DfValue::TinyText(TinyText::from_arr(b"")),
+            DfValue::TimestampTz(TimestampTz::zero()),
+            DfValue::Time(MySqlTime::from_microseconds(0)),
+            DfValue::ByteArray(Arc::new(vec![])),
+            DfValue::Numeric(Arc::new(Decimal::new(0, 0))),
+            DfValue::BitVector(Arc::new(BitVec::new())),
+        ];
+        for val in &cases {
+            assert!(!val.is_truthy(), "{val:?} should be falsy");
+        }
     }
 
     eq_laws!(DfValue);
@@ -2491,6 +2645,115 @@ mod tests {
         let neg_inf_f = DfValue::Float(f32::NEG_INFINITY);
         assert_eq!(neg_inf_d, neg_inf_f);
         assert_eq!(neg_inf_d.cmp(&neg_inf_f), Ordering::Equal);
+    }
+
+    // ---------------------------------------------------------------
+    // REA-6365: Int/UnsignedInt vs Numeric eq/cmp consistency
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn int_numeric_eq_consistent_with_cmp() {
+        use std::cmp::Ordering;
+
+        // --- Int vs Numeric: equal values ---
+        let int_1 = DfValue::Int(1);
+        let num_1 = DfValue::from(Decimal::from(1));
+        assert_eq!(int_1, num_1, "Int(1) should equal Numeric(1)");
+        assert_eq!(int_1.cmp(&num_1), Ordering::Equal);
+
+        // --- Symmetry: Numeric vs Int ---
+        assert_eq!(num_1, int_1, "Numeric(1) should equal Int(1)");
+        assert_eq!(num_1.cmp(&int_1), Ordering::Equal);
+
+        // --- Zero ---
+        let int_0 = DfValue::Int(0);
+        let num_0 = DfValue::from(Decimal::from(0));
+        assert_eq!(int_0, num_0);
+        assert_eq!(num_0, int_0);
+
+        // --- Negative ---
+        let int_neg = DfValue::Int(-42);
+        let num_neg = DfValue::from(Decimal::from(-42));
+        assert_eq!(int_neg, num_neg);
+        assert_eq!(num_neg, int_neg);
+
+        // --- Not equal ---
+        let int_2 = DfValue::Int(2);
+        assert_ne!(int_1, DfValue::from(Decimal::from(2)));
+        assert_ne!(int_2, num_1);
+
+        // --- Fractional Numeric should NOT equal Int ---
+        let num_1_5 = DfValue::from(Decimal::new(15, 1)); // 1.5
+        assert_ne!(int_1, num_1_5);
+        assert_ne!(int_2, num_1_5);
+
+        // --- UnsignedInt vs Numeric ---
+        let uint_1 = DfValue::UnsignedInt(1);
+        assert_eq!(uint_1, num_1, "UnsignedInt(1) should equal Numeric(1)");
+        assert_eq!(num_1, uint_1, "Numeric(1) should equal UnsignedInt(1)");
+        assert_eq!(uint_1.cmp(&num_1), Ordering::Equal);
+        assert_eq!(num_1.cmp(&uint_1), Ordering::Equal);
+
+        // --- Large UnsignedInt ---
+        let big_val = u64::MAX;
+        let uint_big = DfValue::UnsignedInt(big_val);
+        let num_big = DfValue::from(Decimal::from(big_val));
+        assert_eq!(uint_big, num_big);
+        assert_eq!(num_big, uint_big);
+        assert_eq!(uint_big.cmp(&num_big), Ordering::Equal);
+
+        // --- Ordering (not just equality) ---
+        let int_5 = DfValue::Int(5);
+        let num_10 = DfValue::from(Decimal::from(10));
+        assert_ne!(int_5, num_10);
+        assert_eq!(int_5.cmp(&num_10), Ordering::Less);
+        assert_eq!(num_10.cmp(&int_5), Ordering::Greater);
+    }
+
+    /// Proptest for Int vs Numeric eq/cmp consistency.
+    #[tags(no_retry)]
+    #[proptest]
+    fn int_numeric_eq_consistent_with_cmp_proptest(a: i64) {
+        let int_val = DfValue::Int(a);
+        let num_val = DfValue::from(Decimal::from(a));
+        prop_assert_eq!(
+            int_val == num_val,
+            int_val.cmp(&num_val) == std::cmp::Ordering::Equal,
+            "eq/cmp inconsistency: Int({}) vs Numeric({})",
+            a,
+            a
+        );
+        // Symmetry
+        prop_assert_eq!(
+            num_val == int_val,
+            num_val.cmp(&int_val) == std::cmp::Ordering::Equal,
+            "eq/cmp inconsistency (reversed): Numeric({}) vs Int({})",
+            a,
+            a
+        );
+    }
+
+    /// Proptest for UnsignedInt vs Numeric eq/cmp consistency.
+    #[tags(no_retry)]
+    #[proptest]
+    fn unsigned_int_numeric_eq_consistent_with_cmp_proptest(a: u64) {
+        let uint_val = DfValue::UnsignedInt(a);
+        let num_val = DfValue::from(Decimal::from(a));
+        prop_assert_eq!(
+            uint_val == num_val,
+            uint_val.cmp(&num_val) == std::cmp::Ordering::Equal,
+            "eq/cmp inconsistency: UnsignedInt({}) vs Numeric({})",
+            a,
+            a
+        );
+        // Symmetry
+        prop_assert_eq!(
+            num_val == uint_val,
+            num_val.cmp(&uint_val) == std::cmp::Ordering::Equal,
+            "eq/cmp inconsistency (reversed): Numeric({}) vs UnsignedInt({})",
+            a,
+            a
+        );
     }
 
     #[derive(Debug, derive_more::From, derive_more::Into)]
@@ -2797,6 +3060,15 @@ mod tests {
         assert_eq!((&DfValue::Int(1) + &DfValue::Int(2)).unwrap(), 3.into());
         assert_eq!((&DfValue::from(1) + &DfValue::Int(2)).unwrap(), 3.into());
         assert_eq!((&DfValue::Int(2) + &DfValue::from(1)).unwrap(), 3.into());
+    }
+
+    #[test]
+    fn float_double_arithmetic_yields_double() {
+        // DfValue equality compares Float and Double numerically, so assert on the variant.
+        let float = DfValue::try_from(1.5_f32).unwrap();
+        let double = DfValue::try_from(2.5_f64).unwrap();
+        assert!(matches!((&float + &double).unwrap(), DfValue::Double(_)));
+        assert!(matches!((&double + &float).unwrap(), DfValue::Double(_)));
     }
 
     #[test]
@@ -3304,6 +3576,109 @@ mod tests {
         Ok(())
     }
 
+    /// Postgres sorts NaN above every number, including Infinity.
+    #[test]
+    fn non_finite_float_ordering_matches_postgres() {
+        assert!(DfValue::Double(f64::NEG_INFINITY) < DfValue::Double(42.0));
+        assert!(DfValue::Double(42.0) < DfValue::Double(f64::INFINITY));
+        assert!(DfValue::Double(f64::INFINITY) < DfValue::Double(f64::NAN));
+
+        assert!(DfValue::Float(f32::NEG_INFINITY) < DfValue::Float(42.0));
+        assert!(DfValue::Float(42.0) < DfValue::Float(f32::INFINITY));
+        assert!(DfValue::Float(f32::INFINITY) < DfValue::Float(f32::NAN));
+    }
+
+    /// Postgres treats all NaNs as one value equal to itself, and `Eq`/`Hash` compare bit patterns.
+    #[test]
+    fn nan_is_canonicalized_on_construction() {
+        fn hash_of(value: &DfValue) -> u64 {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        // A negative NaN and a NaN with a non-default payload are the same value as f64::NAN.
+        let nans = [
+            f64::NAN,
+            -f64::NAN,
+            f64::from_bits(0x7FF8_0000_0000_0001),
+            f64::from_bits(0xFFF8_0000_0000_0001),
+        ]
+        .map(|f| DfValue::try_from(f).unwrap());
+
+        for nan in &nans {
+            assert_eq!(*nan, nans[0]);
+            assert_eq!(hash_of(nan), hash_of(&nans[0]));
+        }
+
+        let float_nans = [f32::NAN, -f32::NAN].map(|f| DfValue::try_from(f).unwrap());
+        assert_eq!(float_nans[0], float_nans[1]);
+        assert_eq!(hash_of(&float_nans[0]), hash_of(&float_nans[1]));
+    }
+
+    #[test]
+    fn non_finite_float_serde_round_trip() {
+        use bincode::Options;
+
+        let test_cases = vec![
+            DfValue::Float(f32::NAN),
+            DfValue::Float(f32::INFINITY),
+            DfValue::Float(f32::NEG_INFINITY),
+            DfValue::Double(f64::NAN),
+            DfValue::Double(f64::INFINITY),
+            DfValue::Double(f64::NEG_INFINITY),
+        ];
+        for value in test_cases {
+            let serialized = bincode::options().serialize(&value).unwrap();
+            let deserialized: DfValue = bincode::options().deserialize(&serialized).unwrap();
+            assert_eq!(value, deserialized);
+        }
+    }
+
+    #[test]
+    fn non_finite_float_and_numeric_compare_equal() {
+        for (float, decimal) in [
+            (f64::INFINITY, Decimal::Infinity),
+            (f64::NEG_INFINITY, Decimal::NegativeInfinity),
+            (f64::NAN, Decimal::NaN),
+        ] {
+            assert_eq!(
+                DfValue::try_from(float).unwrap(),
+                DfValue::Numeric(Arc::new(decimal))
+            );
+        }
+    }
+
+    /// Postgres raises "value out of range: overflow" and "division by zero" for these.
+    #[test]
+    fn float_arithmetic_rejects_overflow_and_division_by_zero() {
+        let max = DfValue::Double(f64::MAX);
+        assert!((&max + &max).is_err());
+        assert!((&max * &DfValue::Double(2.0)).is_err());
+        assert!((&DfValue::Double(-f64::MAX) - &max).is_err());
+        assert!((&DfValue::Double(1.0) / &DfValue::Double(0.0)).is_err());
+    }
+
+    #[test]
+    fn float_arithmetic_propagates_non_finite() {
+        let inf = DfValue::Double(f64::INFINITY);
+        let neg_inf = DfValue::Double(f64::NEG_INFINITY);
+        let nan = DfValue::Double(f64::NAN);
+        let one = DfValue::Double(1.0);
+        let zero = DfValue::Double(0.0);
+
+        assert_eq!((&inf + &one).unwrap(), inf);
+        assert_eq!((&inf - &one).unwrap(), inf);
+        assert_eq!((&nan + &one).unwrap(), nan);
+
+        // Postgres: inf - inf, inf / inf and inf * 0 are all NaN.
+        assert_eq!((&inf - &inf).unwrap(), nan);
+        assert_eq!((&inf / &inf).unwrap(), nan);
+        assert_eq!((&inf * &zero).unwrap(), nan);
+        assert_eq!((&inf + &neg_inf).unwrap(), nan);
+    }
+
     #[test]
     fn deeply_nested_json_roundtrip() -> Result<(), Box<dyn Error + Sync + Send>> {
         let nesting_level = 1_000_000;
@@ -3319,6 +3694,22 @@ mod tests {
             "JSON data malformed during roundtrip"
         );
         Ok(())
+    }
+
+    #[test]
+    fn try_from_dfvalue_for_jsonvalue_rejects_non_finite_floats() {
+        // serde_json::Number::from_f64 returns None for NaN/Infinity. The
+        // conversion surfaces an error rather than unwrap-panicking, so any
+        // caller handing it a non-finite float gets a recoverable error.
+        for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            JsonValue::try_from(DfValue::Double(f)).unwrap_err();
+            JsonValue::try_from(DfValue::Float(f as f32)).unwrap_err();
+        }
+        // A finite float still converts to a JSON number.
+        assert_eq!(
+            JsonValue::try_from(DfValue::Double(1.5)).unwrap(),
+            JsonValue::Number(serde_json::Number::from_f64(1.5).unwrap()),
+        );
     }
 
     #[test]
@@ -3794,12 +4185,21 @@ mod tests {
                                 .unwrap(),
                             DfValue::try_from(source as $to).unwrap()
                         );
-                    } else {
+                    } else if source.is_finite() {
+                        // Narrowing a finite value into a non-finite one is an overflow.
                         assert!(DfValue::try_from(source)
                             .unwrap()
                             .coerce_to(&$df_type, &DfType::Unknown)
                             .is_err());
-                        assert!(DfValue::try_from(source as $to).is_err());
+                    } else {
+                        // A source that is already non-finite converts to the same value.
+                        assert_eq!(
+                            DfValue::try_from(source)
+                                .unwrap()
+                                .coerce_to(&$df_type, &DfType::Unknown)
+                                .unwrap(),
+                            DfValue::try_from(source as $to).unwrap()
+                        );
                     }
                 }
             };
@@ -3912,6 +4312,48 @@ mod tests {
                     .unwrap(),
                 DfValue::from(MySqlTime::from_hmsus(true, 10, 11, 12, 0))
             );
+
+            // Negative integer: MySQL CAST(-101112 AS TIME) → -10:11:12
+            assert_eq!(
+                DfValue::from(-101112i64)
+                    .coerce_to(&DfType::Time { subsecond_digits }, &DfType::Unknown)
+                    .unwrap(),
+                DfValue::from(MySqlTime::from_hmsus(false, 10, 11, 12, 0))
+            );
+
+            // Negative small values: CAST(-1 AS TIME) → -00:00:01
+            assert_eq!(
+                DfValue::from(-1i64)
+                    .coerce_to(&DfType::Time { subsecond_digits }, &DfType::Unknown)
+                    .unwrap(),
+                DfValue::from(MySqlTime::from_hmsus(false, 0, 0, 1, 0))
+            );
+
+            // CAST(-100 AS TIME) → -00:01:00
+            assert_eq!(
+                DfValue::from(-100i64)
+                    .coerce_to(&DfType::Time { subsecond_digits }, &DfType::Unknown)
+                    .unwrap(),
+                DfValue::from(MySqlTime::from_hmsus(false, 0, 1, 0, 0))
+            );
+
+            // Negative zero: CAST(-0 AS TIME) → 00:00:00 (positive)
+            assert_eq!(
+                DfValue::from(0i64)
+                    .coerce_to(&DfType::Time { subsecond_digits }, &DfType::Unknown)
+                    .unwrap(),
+                DfValue::from(MySqlTime::from_hmsus(true, 0, 0, 0, 0))
+            );
+
+            // Negative with invalid seconds: CAST(-101161 AS TIME) → NULL
+            DfValue::from(-101161i64)
+                .coerce_to(&DfType::Time { subsecond_digits }, &DfType::Unknown)
+                .unwrap_err();
+
+            // Negative with invalid minutes: CAST(-106100 AS TIME) → NULL
+            DfValue::from(-106100i64)
+                .coerce_to(&DfType::Time { subsecond_digits }, &DfType::Unknown)
+                .unwrap_err();
         }
 
         #[test]
@@ -4204,6 +4646,60 @@ mod tests {
             );
         }
 
+        #[test]
+        fn bitvector_coerce_to_varbit_unlimited() {
+            let bv = DfValue::BitVector(Arc::new(BitVec::from_elem(100, true)));
+            assert_eq!(
+                bv.coerce_to(&DfType::VarBit(None), &DfType::Unknown)
+                    .unwrap(),
+                DfValue::BitVector(Arc::new(BitVec::from_elem(100, true)))
+            );
+        }
+
+        #[test]
+        fn bitvector_coerce_to_varbit_within_limit() {
+            let bv = DfValue::BitVector(Arc::new(BitVec::from_elem(8, true)));
+            assert_eq!(
+                bv.coerce_to(&DfType::VarBit(Some(10)), &DfType::Unknown)
+                    .unwrap(),
+                DfValue::BitVector(Arc::new(BitVec::from_elem(8, true)))
+            );
+        }
+
+        #[test]
+        fn bitvector_coerce_to_varbit_exceeds_limit() {
+            let bv = DfValue::BitVector(Arc::new(BitVec::from_elem(16, true)));
+            bv.coerce_to(&DfType::VarBit(Some(8)), &DfType::Unknown)
+                .unwrap_err();
+        }
+
+        #[test]
+        fn bitvector_coerce_to_varbit_exact_limit() {
+            // Exactly at the limit should succeed
+            let bv = DfValue::BitVector(Arc::new(BitVec::from_elem(8, true)));
+            assert_eq!(
+                bv.coerce_to(&DfType::VarBit(Some(8)), &DfType::Unknown)
+                    .unwrap(),
+                DfValue::BitVector(Arc::new(BitVec::from_elem(8, true)))
+            );
+        }
+
+        #[test]
+        fn bitvector_coerce_to_bit() {
+            let bv = DfValue::BitVector(Arc::new(BitVec::from_elem(8, true)));
+            assert_eq!(
+                bv.coerce_to(&DfType::Bit(8), &DfType::Unknown).unwrap(),
+                DfValue::BitVector(Arc::new(BitVec::from_elem(8, true)))
+            );
+        }
+
+        #[test]
+        fn bitvector_coerce_to_bit_length_mismatch_currently_allowed() {
+            // TODO: Bit(n) should reject vectors of length != n (see TODO in coerce_to)
+            let bv = DfValue::BitVector(Arc::new(BitVec::from_elem(4, true)));
+            bv.coerce_to(&DfType::Bit(8), &DfType::Unknown).unwrap();
+        }
+
         macro_rules! check_comparison {
             ($a:expr, $ty:expr, invalid $(,)?) => {
                 match $a.coerce_for_comparison(&$ty) {
@@ -4225,32 +4721,97 @@ mod tests {
         }
 
         #[test]
-        fn float_and_numeric_conversions() {
-            // check_comparison!(DfValue::Float(42.1), DfType::BigInt, invalid);
-            // check_comparison!(DfValue::Double(42.1), DfType::BigInt, invalid);
+        fn numeric_coerce_for_comparison_rejects_fractional() {
             check_comparison!(
                 DfValue::Numeric(Decimal::try_from(42.1).unwrap().into()),
                 DfType::BigInt,
                 invalid,
             );
-            // check_comparison!(
-            //     DfValue::Numeric(Decimal::try_from(42.0).unwrap().into()),
-            //     DfType::BigInt,
-            //     DfValue::Int(42),
-            //     DfValue::UnsignedInt(42),
-            // );
-            // check_comparison!(
-            //     DfValue::Float(42.0),
-            //     DfType::BigInt,
-            //     DfValue::Int(42),
-            //     DfValue::UnsignedInt(42),
-            // );
-            // check_comparison!(
-            //     DfValue::Double(42.0),
-            //     DfType::BigInt,
-            //     DfValue::Int(42),
-            //     DfValue::UnsignedInt(42),
-            // );
+        }
+
+        #[test]
+        fn float_coerce_for_comparison_rejects_fractional() {
+            // Fractional floats must be rejected when comparing to int types,
+            // not silently rounded via coerce_to
+            check_comparison!(DfValue::Float(42.1), DfType::BigInt, invalid);
+            check_comparison!(DfValue::Double(42.1), DfType::BigInt, invalid);
+            check_comparison!(DfValue::Float(42.1), DfType::Int, invalid);
+            check_comparison!(DfValue::Double(42.1), DfType::TinyInt, invalid);
+            check_comparison!(DfValue::Float(42.1), DfType::UnsignedBigInt, invalid);
+            check_comparison!(DfValue::Double(42.1), DfType::UnsignedInt, invalid);
+        }
+
+        #[test]
+        fn float_coerce_for_comparison_allows_whole() {
+            check_comparison!(DfValue::Float(42.0), DfType::BigInt, DfValue::Int(42),);
+            check_comparison!(DfValue::Double(42.0), DfType::BigInt, DfValue::Int(42),);
+            check_comparison!(
+                DfValue::Float(42.0),
+                DfType::UnsignedBigInt,
+                DfValue::UnsignedInt(42),
+            );
+            check_comparison!(
+                DfValue::Double(42.0),
+                DfType::UnsignedInt,
+                DfValue::UnsignedInt(42),
+            );
+        }
+
+        #[test]
+        fn numeric_coerce_for_comparison_allows_whole() {
+            check_comparison!(
+                DfValue::Numeric(Decimal::try_from(42.0).unwrap().into()),
+                DfType::BigInt,
+                DfValue::Int(42),
+            );
+            check_comparison!(
+                DfValue::Numeric(Decimal::try_from(42.0).unwrap().into()),
+                DfType::UnsignedBigInt,
+                DfValue::UnsignedInt(42),
+            );
+        }
+
+        #[test]
+        fn text_coerce_for_comparison_rejects_fractional() {
+            check_comparison!(DfValue::from("3.14"), DfType::BigInt, invalid);
+            check_comparison!(
+                DfValue::TinyText(TinyText::from_arr(b"3.14")),
+                DfType::BigInt,
+                invalid,
+            );
+        }
+
+        #[test]
+        fn text_coerce_for_comparison_allows_whole() {
+            check_comparison!(DfValue::from("42"), DfType::BigInt, DfValue::Int(42));
+            check_comparison!(
+                DfValue::TinyText(TinyText::from_arr(b"42")),
+                DfType::BigInt,
+                DfValue::Int(42),
+            );
+        }
+
+        #[test]
+        fn byte_array_coerce_for_comparison_binary() {
+            // ByteArray → Binary should return as-is without padding
+            let bytes = DfValue::ByteArray(Arc::new(vec![1, 2, 3]));
+            check_comparison!(bytes.clone(), DfType::Binary(10), bytes.clone());
+            check_comparison!(bytes.clone(), DfType::VarBinary(10), bytes);
+        }
+
+        #[test]
+        fn text_coerce_for_comparison_binary() {
+            // Text → Binary should convert to raw bytes
+            check_comparison!(
+                DfValue::from("abc"),
+                DfType::Binary(10),
+                DfValue::ByteArray(Arc::new(b"abc".to_vec())),
+            );
+            check_comparison!(
+                DfValue::TinyText(TinyText::from_arr(b"abc")),
+                DfType::VarBinary(10),
+                DfValue::ByteArray(Arc::new(b"abc".to_vec())),
+            );
         }
 
         #[test]
@@ -4264,5 +4825,21 @@ mod tests {
             );
             check_comparison!(point_bytes.clone(), DfType::PostgisPolygon, point_bytes);
         }
+    }
+
+    #[test]
+    fn display_double_with_precision() {
+        let v = DfValue::Double(35634.28571428572);
+        assert_eq!(format!("{v:.4}"), "35634.2857");
+        assert_eq!(format!("{v:.0}"), "35634");
+        // Without precision, full f64 representation
+        assert_eq!(format!("{v}"), "35634.28571428572");
+    }
+
+    #[test]
+    fn display_float_with_precision() {
+        let v = DfValue::Float(1.23456);
+        assert_eq!(format!("{v:.2}"), "1.23");
+        assert_eq!(format!("{v}"), "1.23456");
     }
 }

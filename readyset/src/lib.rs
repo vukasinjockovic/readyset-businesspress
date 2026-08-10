@@ -2,13 +2,13 @@
 
 pub mod mysql;
 pub mod psql;
-pub mod query_logger;
 pub mod verify;
 
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::remove_dir_all;
 use std::future::Future;
+use std::io::Read;
 use std::marker::Send;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -26,33 +26,51 @@ use failpoint_macros::set_failpoint;
 use futures_util::future::FutureExt;
 use futures_util::stream::{SelectAll, StreamExt};
 use health_reporter::{HealthReporter as AdapterHealthReporter, State as AdapterState};
-use readyset_adapter::backend::noria_connector::{NoriaConnector, ReadBehavior};
-use readyset_adapter::backend::{MigrationMode, UnsupportedSetMode};
+use metrics::{counter, gauge};
+use tokio::net;
+use tokio::sync::RwLock;
+use tokio::time::{sleep, timeout};
+use tokio_native_tls::{native_tls, TlsAcceptor};
+use tokio_stream::wrappers::TcpListenerStream;
+use tracing::{debug, debug_span, error, info, info_span, span, warn, Level};
+use tracing_futures::Instrument;
+
+use readyset_adapter::backend::noria_connector::NoriaConnector;
+use readyset_adapter::backend::{AllowedUsers, MigrationMode, UnsupportedSetMode};
 use readyset_adapter::http_router::NoriaAdapterHttpRouter;
-use readyset_adapter::metrics_handle::MetricsHandle;
 use readyset_adapter::migration_handler::MigrationHandler;
 use readyset_adapter::proxied_queries_reporter::ProxiedQueriesReporter;
-use readyset_adapter::query_status_cache::{MigrationStyle, QueryStatusCache};
+use readyset_adapter::query_status_cache::{
+    MigrationStyle, QscSchemaChangeAdapter, QueryStatusCache,
+};
 use readyset_adapter::shallow_refresh_pool::ShallowRefreshPool;
 use readyset_adapter::views_synchronizer::ViewsSynchronizer;
 use readyset_adapter::{
-    Backend, BackendBuilder, DeploymentMode, QueryHandler, ReadySetStatusReporter, UpstreamDatabase,
+    Backend, BackendBuilder, ConnectionInfo, DeploymentMode, QueryHandler, ReadySetStatusReporter,
+    UpstreamDatabase,
 };
 use readyset_alloc::{StdThreadBuildWrapper, ThreadBuildWrapper};
 use readyset_alloc_metrics::report_allocator_metrics;
-use readyset_client::consensus::{AuthorityControl, AuthorityType};
-use readyset_client::metrics::recorded;
+use readyset_client::consensus::{AuthorityControl, AuthorityType, UserStore};
 use readyset_client::{CacheMode, ReadySetHandle};
 use readyset_client_metrics::QueryLogMode;
-use readyset_common::ulimit::maybe_increase_nofile_limit;
+use readyset_common::host_info::collect_host_info;
+use readyset_common::startup::init_early_common;
 use readyset_data::upstream_system_props::{init_system_props, UpstreamSystemProperties};
 use readyset_dataflow::Readers;
 use readyset_errors::{internal_err, ReadySetError};
-use readyset_server::worker::readers::{retry_misses, Ack, BlockingRead, ReadRequestHandler};
-use readyset_server::{PrometheusBuilder, WorkerOptions};
+use readyset_metrics::init_global_recorder;
+use readyset_query_logger::QueryLogger;
+use readyset_schema::ReadysetSchema;
+use readyset_server::worker::readers::{retry_misses, BlockingRead, ReadRequestHandler, Reply};
+use readyset_server::WorkerOptions;
 use readyset_shallow::CacheManager;
-use readyset_sql::ast::Relation;
+use readyset_sql::ast::{Relation, ShallowCacheAllowlistKind};
+use readyset_sql_parsing::ParsingPreset;
 use readyset_sql_passes::adapter_rewrites::AdapterRewriteParams;
+use readyset_sql_passes::shallow::{
+    ShallowCacheAllowlist, ShallowCacheAllowlists, ShallowCacheEligibility,
+};
 use readyset_telemetry_reporter::{TelemetryBuilder, TelemetryEvent, TelemetryInitializer};
 use readyset_tracing::TracingGuard;
 #[cfg(feature = "failure_injection")]
@@ -64,15 +82,6 @@ use readyset_util::shared_cache::SharedCache;
 use readyset_util::shutdown;
 use readyset_version::*;
 use schema_catalog::SchemaCatalogSynchronizer;
-use tokio::net;
-use tokio::sync::RwLock;
-use tokio::time::{sleep, timeout};
-use tokio_stream::wrappers::TcpListenerStream;
-use tracing::{debug, debug_span, error, info, info_span, span, warn, Level};
-use tracing_futures::Instrument;
-
-use std::io::Read;
-use tokio_native_tls::{native_tls, TlsAcceptor};
 
 // readyset_alloc initializes the global allocator
 extern crate readyset_alloc;
@@ -96,6 +105,17 @@ pub trait ConnectionHandler {
         stream: net::TcpStream,
         error_message: String,
     ) -> impl Future<Output = ()> + Send;
+
+    /// Warm handler-specific caches from the configured users. Called once
+    /// during adapter startup, after the user list has been resolved.
+    fn warm_up(&mut self, _users: &HashMap<String, String>) {}
+
+    /// Returns a hook for keeping handler-specific authentication state in sync with the shared
+    /// allowed-users map when it is mutated at runtime (`ALTER READYSET ADD|MODIFY|DROP USER`).
+    /// `None` (the default) means there is no fast-auth cache to refresh.
+    fn users_sync(&self) -> Option<Arc<dyn readyset_adapter::backend::UsersSync>> {
+        None
+    }
 }
 
 /// Parse and normalize the given string as an [`IpAddr`]
@@ -121,8 +141,11 @@ where
     H: ConnectionHandler,
 {
     pub description: &'static str,
-    pub default_address: SocketAddr,
-    /// Address used to listen for incoming connections
+    /// Addresses used to listen for incoming connections when `--address` is
+    /// not set.  A single adapter can bind multiple sockets (e.g. an IPv4 and
+    /// an IPv6 loopback) so clients on either family reach the adapter by
+    /// default.
+    pub default_addresses: Vec<SocketAddr>,
     pub connection_handler: H,
     pub database_type: DatabaseType,
     /// SQL dialect to use when parsing queries
@@ -135,21 +158,26 @@ where
 #[command(version = VERSION_STR_PRETTY)]
 #[group(skip)]
 pub struct Options {
-    /// IP:PORT to listen on
-    #[arg(long, short = 'a', env = "LISTEN_ADDRESS")]
-    address: Option<SocketAddr>,
+    /// IP:PORT to listen on.  May be specified multiple times or as a
+    /// comma-separated list to bind several sockets (e.g. an IPv4 and an
+    /// IPv6 interface).  If unset, the MySQL adapter listens on
+    /// `[::]:3307` (dual-stack, all interfaces) and the PostgreSQL
+    /// adapter listens on `127.0.0.1:5433` and `[::1]:5433` (dual-stack
+    /// loopback).
+    #[arg(long, short = 'a', env = "LISTEN_ADDRESS", value_delimiter = ',')]
+    address: Vec<SocketAddr>,
 
     /// ReadySet deployment ID. All nodes in a deployment must have the same deployment ID.
     #[arg(long, env = "DEPLOYMENT", default_value = "readyset.db", value_parser = NonEmptyStringValueParser::new(), hide = true)]
     pub deployment: String,
 
     /// Database engine protocol to emulate. If omitted, will be inferred from the
-    /// `upstream-db-url`
+    /// `upstream-db-url` or `cdc-db-url`
     #[arg(
         long,
         env = "DATABASE_TYPE",
         value_enum,
-        required_unless_present("upstream_db_url"),
+        required_unless_present_any(["upstream_db_url", "cdc_db_url"]),
         hide = true
     )]
     pub database_type: Option<DatabaseType>,
@@ -161,8 +189,7 @@ pub struct Options {
     ///
     /// When running in embedded_readers mode, this process will run a ReadySet adapter with reader
     /// replicas (and only reader replicas) embedded in the adapter.  This mode should be combined
-    /// with `--no-readers` and `--reader-replicas` set to the number of adapter instances to each
-    /// server process.
+    /// with `--no-readers`.
     ///
     /// When running in adapter mode, this process will run a ReadySet adapter with no locally
     /// cached data.
@@ -207,7 +234,13 @@ pub struct Options {
 
     /// Specify the migration mode for ReadySet to use. The default "explicit" mode is the only
     /// non-experimental mode.
-    #[arg(long, env = "QUERY_CACHING", default_value = "explicit", hide = true)]
+    #[arg(
+        long,
+        env = "QUERY_CACHING",
+        default_value = "explicit",
+        hide = true,
+        conflicts_with = "auto_cache"
+    )]
     query_caching: MigrationStyle,
 
     /// Sets the maximum time in minutes that we will retry migrations for in the
@@ -235,6 +268,17 @@ pub struct Options {
     /// IP:PORT to host endpoint for scraping metrics from the adapter.
     #[arg(long, env = "METRICS_ADDRESS", default_value = "0.0.0.0:6034")]
     metrics_address: SocketAddr,
+
+    /// Enable the embedded MCP (Model Context Protocol) HTTP server.
+    /// Allows AI assistants to interact with this Readyset instance.
+    #[arg(long, env = "ENABLE_MCP", default_value = "false")]
+    enable_mcp: bool,
+
+    /// IP:PORT for the MCP HTTP server (only used when --enable-mcp is set).
+    /// Defaults to the loopback interface; bind to a non-loopback address only
+    /// behind a TLS-terminating proxy — the endpoint speaks plaintext HTTP.
+    #[arg(long, env = "MCP_ADDRESS", default_value = "127.0.0.1:6035")]
+    mcp_address: SocketAddr,
 
     /// Comma list of allowed usernames:passwords to authenticate database connections with.
     /// If not set, the username and password in --upstream-db-url will be used.
@@ -278,6 +322,10 @@ pub struct Options {
     /// readyset-psql-specific options
     #[command(flatten)]
     pub psql_options: psql::Options,
+
+    /// readyset-mysql-specific options
+    #[command(flatten)]
+    pub mysql_options: mysql::MySqlOptions,
 
     /// Configure how ReadySet behaves when receiving unsupported SET statements.
     ///
@@ -338,10 +386,6 @@ pub struct Options {
     )]
     fallback_recovery_seconds: u64,
 
-    /// Whether to use non-blocking or blocking reads against the cache.
-    #[arg(long, env = "NON_BLOCKING_READS", hide = true)]
-    non_blocking_reads: bool,
-
     /// Percentage of memory-limit to allocate for shallow cache (0.0-100.0).
     /// Only applies when memory-limit is set. If not specified, shallow cache has no memory limit.
     #[arg(
@@ -351,6 +395,13 @@ pub struct Options {
     )]
     shallow_memory_percent: Option<f64>,
 
+    /// Maximum size in bytes of a single shallow cache entry's values. Result sets larger than
+    /// this are served from upstream but not cached.  This parameter is only intended to be
+    /// tuned in the event that cost-aware admission control is insufficient in a pathological
+    /// situation.  (0 = unlimited)
+    #[arg(long, env = "SHALLOW_MAX_ENTRY_BYTES", default_value = "1073741824")]
+    shallow_max_entry_bytes: usize,
+
     /// Specifies how large the pool of shallow cache refresh workers should be.
     ///
     /// These workers are responsible for refreshing shallow caches by running queries on the
@@ -358,6 +409,43 @@ pub struct Options {
     /// the upstream.
     #[arg(long, env = "SHALLOW_REFRESH_WORKERS", default_value = "40")]
     shallow_refresh_workers: usize,
+
+    /// Maximum extra refresh load an adaptive shallow cache may send to the upstream, as a
+    /// percentage of the load required to refresh every current entry at the cache's
+    /// configured refresh period.
+    #[arg(
+        long,
+        env = "SHALLOW_ADAPTIVE_MAX_EXTRA_LOAD_PERCENT",
+        default_value = "100"
+    )]
+    shallow_adaptive_max_extra_load_percent: u64,
+
+    /// Postgres Row Level Security awareness for shallow caching. On by
+    /// default; refuses to start if the RLS catalog cannot be loaded.
+    ///
+    /// Setting this to `false` is DANGEROUS: the RLS catalog is not consulted
+    /// and every shallow cache is created Plain. Only safe if no table has, or
+    /// ever gains, RLS -- enabling RLS on a cached table afterwards would serve
+    /// one tenant's rows to another. Intended for non-RLS Postgres deployments
+    /// whose connection role cannot read the catalog.
+    #[arg(
+        long = "enable-rls",
+        env = "RLS_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    enabled_rls: bool,
+
+    /// How often, in seconds, the RLS catalog poller rescans the upstream for policy and
+    /// RLS-enablement changes. The interval bounds how long a scoped shallow cache can keep
+    /// serving under a stale view of the policies. Clamped to `[1, 86400]`. Applies only to a
+    /// Postgres upstream with RLS support enabled.
+    #[arg(
+        long,
+        env = "RLS_POLL_INTERVAL_SECS",
+        default_value_t = readyset_rls::RlsConfig::default().poll_interval.as_secs()
+    )]
+    rls_poll_interval_secs: u64,
 
     #[command(flatten)]
     pub server_worker_options: WorkerOptions,
@@ -493,24 +581,164 @@ pub struct Options {
 
     /// If set, simulates a startup verification failure.
     #[arg(long, env = "VERIFY_FAIL", hide = true)]
-    pub verify_fail: bool,
+    verify_fail: bool,
 
     /// How Readyset handles CREATE CACHE statements without explicit DEEP or SHALLOW modifiers.
-    #[arg(long, env = "CACHE_MODE", default_value_t = CacheMode::default())]
+    #[arg(
+        long,
+        env = "CACHE_MODE",
+        default_value_t = CacheMode::default(),
+        conflicts_with = "auto_cache"
+    )]
     pub cache_mode: CacheMode,
+
+    /// Allow shallow-caching queries that call non-deterministic functions
+    /// (e.g. `now()`, `rand()`). System-schema and session-variable references
+    /// remain ineligible for shallow caching. Off by default.
+    #[arg(long, env = "SHALLOW_CACHE_ALLOW_NONDETERMINISTIC")]
+    pub shallow_cache_allow_nondeterministic: bool,
+
+    /// Allow shallow-caching queries that call user-defined functions. A UDF may
+    /// have side effects or be non-deterministic, so this is off by default.
+    #[arg(long, env = "SHALLOW_CACHE_ALLOW_UDF")]
+    pub shallow_cache_allow_udf: bool,
+
+    /// Allow shallow-caching queries that reference system schemas
+    /// (`information_schema`, `pg_catalog`, `pg_*`, `mysql`,
+    /// `performance_schema`, ...). Off by default.
+    #[arg(long, env = "SHALLOW_CACHE_ALLOW_SYSTEM_SCHEMA")]
+    pub shallow_cache_allow_system_schema: bool,
+
+    /// Allow shallow-caching queries that reference session or user variables
+    /// (`@var`, `@@var`). A session variable's value differs per connection, so
+    /// caching such a query is incorrect across sessions; off by default.
+    #[arg(long, env = "SHALLOW_CACHE_ALLOW_SESSION_SPECIFIC")]
+    pub shallow_cache_allow_session_specific: bool,
+
+    /// Allow shallow-caching queries that call any function, including
+    /// user-defined, non-deterministic, and ones with side effects. This is
+    /// the broad escape hatch: functions with side effects or that block
+    /// (`nextval`, `set_config`, `pg_notify`, advisory locks, `dblink`,
+    /// `sleep`, ...) have no narrower opt-in because caching one fires the
+    /// effect once at fill and then never again. Non-function guards (system
+    /// schema, session variables, unseeded `TABLESAMPLE`) still apply. Off by
+    /// default.
+    #[arg(long, env = "SHALLOW_CACHE_ALLOW_ALL_FUNCTIONS")]
+    pub shallow_cache_allow_all_functions: bool,
+
+    /// Enable every shallow-cache eligibility opt-in at once: shorthand for
+    /// `--shallow-cache-allow-nondeterministic`, `--shallow-cache-allow-udf`,
+    /// `--shallow-cache-allow-all-functions`, `--shallow-cache-allow-system-schema`,
+    /// and `--shallow-cache-allow-session-specific`. This includes opt-ins that
+    /// are incorrect rather than merely stale (session variables, side effects),
+    /// so enable it only when that is acceptable. Off by default.
+    #[arg(
+        long,
+        env = "SHALLOW_CACHE_ALLOW_ALL",
+        conflicts_with_all = [
+            "shallow_cache_allow_nondeterministic",
+            "shallow_cache_allow_udf",
+            "shallow_cache_allow_all_functions",
+            "shallow_cache_allow_system_schema",
+            "shallow_cache_allow_session_specific",
+        ]
+    )]
+    pub shallow_cache_allow_all: bool,
+
+    /// Enable Readyset's automatic shallow caching mode.
+    ///
+    /// Shorthand for `--cache-mode=shallow --query-caching=inrequestpath`: every
+    /// previously-unseen SELECT becomes a candidate for an automatically-created
+    /// shallow cache.  Mutually exclusive with `--cache-mode` and
+    /// `--query-caching`; pass those explicitly only when you need finer-grained
+    /// control than this flag provides.
+    #[arg(long, env = "AUTO_CACHE")]
+    pub auto_cache: bool,
 
     /// Specifies the default TTL for shallow caches when no TTL is specified.
     #[arg(long, env = "DEFAULT_TTL_MS", default_value = "10000")]
-    pub default_ttl_ms: u64,
+    default_ttl_ms: u64,
 
     /// Specifies the default coalesce interval for shallow caches when none is specified.
     ///
     /// A value of 0 will disable coalescing by default.
     #[arg(long, env = "DEFAULT_COALESCE_MS", default_value = "5000")]
-    pub default_coalesce_ms: u64,
+    default_coalesce_ms: u64,
+
+    /// Opportunistic read-your-writes window (ms). Applies only *outside* transactions:
+    /// after any write on a session, reads on that same session bypass the cache and go
+    /// to the upstream for this many milliseconds. In-transaction routing is governed by
+    /// the per-cache `TrxCachePolicy` (`NEVER` / `ALWAYS` / `UNTIL WRITE`), not this
+    /// window. The intent is to give upstream replication a chance to catch up before
+    /// serving cached reads of just-written rows.
+    ///
+    /// This is opportunistic, not a consistency guarantee. Once the window elapses, reads
+    /// resume from the cache, and the cache may still hold a pre-write value (e.g. a TTL
+    /// that has not yet expired, or a row Readyset has not yet refreshed). Use only when
+    /// occasional stale reads after the window are acceptable.
+    ///
+    /// Unset (the default) disables the window; a value of 0 also disables it.
+    #[arg(long, env = "OPPORTUNISTIC_RYW_MS")]
+    opportunistic_ryw_ms: Option<u64>,
+
+    /// Specifies the name for Readyset's virtual schema.
+    ///
+    /// Make sure this database/schema does not exist on your upstream.
+    #[arg(long, env = "READYSET_SCHEMA", default_value = "readyset")]
+    readyset_schema: String,
 }
 
 impl Options {
+    /// Apply the `--auto-cache` shorthand: when set, force `cache_mode` to
+    /// [`CacheMode::Shallow`] and `query_caching` to
+    /// [`MigrationStyle::InRequestPath`].  Conflicts with the underlying flags
+    /// are caught by clap at parse time, so this only ever overwrites the
+    /// defaults.
+    pub fn resolve_auto_cache(&mut self) {
+        if self.auto_cache {
+            self.cache_mode = CacheMode::Shallow;
+            self.query_caching = MigrationStyle::InRequestPath;
+        }
+    }
+
+    pub fn resolve_parsing_preset(&mut self) {
+        if self.cache_mode.is_shallow() && self.server_worker_options.parsing_preset.is_none() {
+            // We're never going to look at what nom-sql produces in shallow mode.
+            self.server_worker_options.parsing_preset = Some(ParsingPreset::OnlySqlparser);
+        }
+    }
+
+    /// Apply the `--shallow-cache-allow-all` shorthand: when set, enable every
+    /// per-category shallow-cache eligibility opt-in so the rest of the code
+    /// reads only the individual flags.
+    pub fn resolve_shallow_cache_allow_all(&mut self) {
+        if self.shallow_cache_allow_all {
+            warn!(
+                "--shallow-cache-allow-all enables every eligibility opt-in, \
+                 including session/user variables and functions with side \
+                 effects; caching those queries is incorrect, not merely stale"
+            );
+            self.shallow_cache_allow_nondeterministic = true;
+            self.shallow_cache_allow_udf = true;
+            self.shallow_cache_allow_all_functions = true;
+            self.shallow_cache_allow_system_schema = true;
+            self.shallow_cache_allow_session_specific = true;
+        }
+    }
+
+    /// Build the shallow-cache eligibility opt-ins from the CLI flags. Call
+    /// [`Self::resolve_shallow_cache_allow_all`] first so the `--allow-all`
+    /// shorthand is already folded into the per-category flags.
+    pub fn shallow_cache_eligibility(&self) -> ShallowCacheEligibility {
+        ShallowCacheEligibility {
+            allow_nondeterministic: self.shallow_cache_allow_nondeterministic,
+            allow_udf: self.shallow_cache_allow_udf,
+            allow_all_functions: self.shallow_cache_allow_all_functions,
+            allow_system_schema: self.shallow_cache_allow_system_schema,
+            allow_session_specific: self.shallow_cache_allow_session_specific,
+        }
+    }
+
     /// Extract database type from a URL string
     ///
     /// # Input
@@ -524,15 +752,14 @@ impl Options {
         Ok(url.parse::<DatabaseURL>()?.database_type())
     }
 
-    /// Check that the user has provided the same database type for both the upstream and cdc URLs
-    ///
-    /// # Output
-    ///
-    /// - An `anyhow::Result` indicating whether the database types match
-    fn check_replication_and_cdc_urls(&self) -> anyhow::Result<()> {
-        if let Some(url) = &self.server_worker_options.replicator_config.upstream_db_url {
-            let inferred = self.infer_database_type_from_url(url)?;
-            if let Some(cdc_url) = &self.server_worker_options.replicator_config.cdc_db_url {
+    /// Infer the database type from the upstream and/or CDC URLs, validating that they agree if
+    /// both are present. Returns `None` if neither URL is provided.
+    fn infer_database_type_from_urls(&self) -> anyhow::Result<Option<DatabaseType>> {
+        let upstream = &self.server_worker_options.replicator_config.upstream_db_url;
+        let cdc = &self.server_worker_options.replicator_config.cdc_db_url;
+        match (upstream, cdc) {
+            (Some(url), Some(cdc_url)) => {
+                let inferred = self.infer_database_type_from_url(url)?;
                 let cdc_inferred = self.infer_database_type_from_url(cdc_url)?;
                 if inferred != cdc_inferred {
                     bail!(
@@ -542,33 +769,29 @@ impl Options {
                         cdc_inferred
                     );
                 }
+                Ok(Some(inferred))
             }
+            (Some(url), None) | (None, Some(url)) => {
+                Ok(Some(self.infer_database_type_from_url(url)?))
+            }
+            (None, None) => Ok(None),
         }
-
-        Ok(())
     }
 
-    /// Check that the user has provided a database type or an upstream URL
-    /// If the user has provided both, we will check that the database types match
-    ///
-    /// # Output
-    ///
-    /// - An `anyhow::Result` indicating whether the database types match and the database type
+    /// Check that the user has provided a database type or a database URL (upstream or CDC).
+    /// If both are provided, we verify they are consistent.
     pub fn database_type(&self) -> anyhow::Result<DatabaseType> {
-        self.check_replication_and_cdc_urls()?;
-        match (
-            self.database_type,
-            &self.server_worker_options.replicator_config.upstream_db_url,
-        ) {
-            (None, None) => bail!("One of either --database-type or --upstream-db-url is required"),
-            (None, Some(url)) => self.infer_database_type_from_url(url),
-            (Some(dt), None) => Ok(dt),
-            (Some(dt), Some(url)) => {
-                let inferred = self.infer_database_type_from_url(url)?;
+        let inferred = self.infer_database_type_from_urls()?;
+        match (self.database_type, inferred) {
+            (None, None) => {
+                bail!("One of --database-type, --upstream-db-url, or --cdc-db-url is required")
+            }
+            (None, Some(dt)) | (Some(dt), None) => Ok(dt),
+            (Some(dt), Some(inferred)) => {
                 if dt != inferred {
                     bail!(
-                        "Provided --database-type {dt} does not match database type {inferred} for \
-                         --upstream-db-url"
+                        "Provided --database-type {dt} does not match database type {inferred} \
+                         inferred from database URL"
                     );
                 }
                 Ok(dt)
@@ -740,7 +963,7 @@ where
             {
                 match timeout(
                     UPSTREAM_CONNECTION_RETRY_INTERVAL,
-                    U::connect(upstream_config.clone(), None, None),
+                    U::connect(upstream_config.clone(), None, None, false),
                 )
                 .await
                 {
@@ -777,7 +1000,7 @@ async fn load_system_props<U>(
 where
     U: UpstreamDatabase,
 {
-    if no_upstream_conns {
+    if no_upstream_conns || upstream_config.upstream_db_url.is_none() {
         return Arc::new(RwLock::new(Ok(UpstreamSystemProperties {
             search_path: upstream_config.default_schema_search_path(),
             timezone_name: upstream_config.default_timezone_name(),
@@ -789,7 +1012,10 @@ where
         let upstream = connect_upstream::<U>(upstream_config.clone(), no_upstream_conns).await?;
 
         let Some(mut upstream) = upstream else {
-            return Ok(Default::default());
+            return Err(internal_err!(
+                "connect_upstream returned None when upstream_db_url is set"
+            )
+            .into());
         };
 
         let search_path = upstream.schema_search_path().await?;
@@ -797,6 +1023,7 @@ where
         let lower_case_database_names = upstream.lower_case_database_names().await?;
         let lower_case_table_names = upstream.lower_case_table_names().await?;
         let db_version = upstream.version();
+        let group_concat_max_len = upstream.group_concat_max_len().await?;
 
         Ok(UpstreamSystemProperties {
             search_path,
@@ -804,6 +1031,7 @@ where
             lower_case_database_names,
             lower_case_table_names,
             db_version,
+            group_concat_max_len,
         })
     };
 
@@ -864,17 +1092,14 @@ pub fn init_adapter_tracing(
 impl<H> NoriaAdapter<H>
 where
     H: ConnectionHandler + Clone + Send + Sync + 'static,
+    H::UpstreamDatabase: Sync,
+    <H::UpstreamDatabase as UpstreamDatabase>::StatementMeta: Sync,
 {
     pub fn run(&mut self, rt: tokio::runtime::Runtime, options: Options) -> anyhow::Result<()> {
         info!(?options, "Starting Readyset adapter");
 
         if options.deployment_mode.is_standalone() {
-            maybe_increase_nofile_limit(
-                options
-                    .server_worker_options
-                    .replicator_config
-                    .ignore_ulimit_check,
-            )?;
+            init_early_common(&options.server_worker_options.replicator_config)?;
         }
 
         let deployment_dir = options
@@ -886,10 +1111,6 @@ where
             info!(?options, "Cleaning up deployment");
             return rt.block_on(async { self.cleanup(upstream_config, deployment_dir).await });
         }
-        let users = Box::leak(Box::new(
-            options.get_allowed_users(options.allow_unauthenticated_connections)?,
-        ));
-
         info!(version = %VERSION_STR_ONELINE);
 
         if matches!(options.unsupported_set_mode, UnsupportedSetMode::Allow) {
@@ -899,10 +1120,27 @@ where
             )
         }
 
-        let listen_address = options.address.unwrap_or(self.default_address);
-        let listener = rt.block_on(tokio::net::TcpListener::bind(&listen_address))?;
+        let listen_addresses: &[SocketAddr] = if options.address.is_empty() {
+            &self.default_addresses
+        } else {
+            &options.address
+        };
+        ensure!(
+            !listen_addresses.is_empty(),
+            "No listen address configured; pass --address or set a default"
+        );
         let mut all_listeners = SelectAll::new();
-        all_listeners.push(TcpListenerStream::new(listener));
+        for listen_address in listen_addresses {
+            let listener = rt
+                .block_on(tokio::net::TcpListener::bind(listen_address))
+                .map_err(|e| anyhow!("Failed to bind listener on {listen_address}: {e}"))?;
+            all_listeners.push(TcpListenerStream::new(listener));
+            info!(%listen_address, "Listening for new connections");
+        }
+        // Safe: ensured non-empty above.  Used as the address the query sampler
+        // reconnects to the adapter on; for multi-listener setups the first
+        // entry is representative.
+        let listen_address = listen_addresses[0];
 
         if let Some(ref ddl_addr) = options.cache_ddl_address {
             info!(%ddl_addr, "Listening for cache ddl connections");
@@ -910,12 +1148,10 @@ where
             all_listeners.push(TcpListenerStream::new(cache_ddl_listener));
         }
 
-        info!(%listen_address, "Listening for new connections");
-
         let auto_increments: Arc<RwLock<HashMap<Relation, AtomicUsize>>> = Arc::default();
         let view_name_cache = SharedCache::new();
         let view_cache = SharedCache::new();
-        let connections: Arc<SkipSet<SocketAddr>> = Arc::default();
+        let connections: Arc<SkipSet<ConnectionInfo>> = Arc::default();
         let mut health_reporter = AdapterHealthReporter::new();
 
         let rs_connect = span!(Level::INFO, "Connecting to RS server");
@@ -934,6 +1170,23 @@ where
         let adapter_authority =
             Arc::new(authority_type.to_authority(&authority_address, &deployment)?);
 
+        // Resolve the allowed-users set now that the Authority exists. The `allowed_users` key is
+        // the source of truth: on first start it is seeded from `--allowed-users` plus the
+        // upstream URL, and from then on it is authoritative (later `--allowed-users` edits are
+        // ignored; user changes go through `ALTER READYSET ... USER`). Unauthenticated mode has no
+        // users to manage, so it keeps the (empty) bootstrap set without persisting it.
+        let resolved_users = if options.allow_unauthenticated_connections {
+            options.get_allowed_users(true)?
+        } else {
+            let bootstrap = options.get_allowed_users(false)?;
+            rt.block_on(adapter_authority.load_or_init_allowed_users(bootstrap))?
+        };
+        let users = Arc::new(AllowedUsers::new(
+            resolved_users,
+            self.connection_handler.users_sync(),
+        ));
+        self.connection_handler.warm_up(&users.read());
+
         let adapter_rewrite_params = AdapterRewriteParams {
             dialect: self.database_type.into(),
             server_supports_topk: options.server_worker_options.feature_topk,
@@ -942,6 +1195,7 @@ where
             server_supports_mixed_comparisons: options
                 .server_worker_options
                 .feature_mixed_comparisons,
+            autoparameterize: true,
         };
         let no_upstream_connections = options.no_upstream_connections;
 
@@ -975,6 +1229,7 @@ where
             connections.clone(),
             adapter_authority.clone(),
             options.server_worker_options.enabled_features(),
+            &deployment_dir,
         );
         let ctrlc = tokio::signal::ctrl_c();
         let mut sigterm = {
@@ -1002,68 +1257,7 @@ where
 
         let (shutdown_tx, shutdown_rx) = shutdown::channel();
 
-        rs_connect.in_scope(|| info!("Spawning schema catalog synchronizer task"));
-        let (schema_catalog_synchronizer, schema_catalog) =
-            SchemaCatalogSynchronizer::new(rh.clone());
-
-        if options.noria_metrics {
-            warn!("--noria-metrics is deprecated and has no effect. It will be removed in a future release.");
-        }
-
-        let prometheus_handle = if options.prometheus_metrics {
-            let _guard = rt.enter();
-            let database_label = match self.database_type {
-                DatabaseType::MySQL => "mysql",
-                DatabaseType::PostgreSQL => "psql",
-            };
-
-            let recorder = PrometheusBuilder::new()
-                .add_global_label("upstream_db_type", database_label)
-                .add_global_label("deployment", &options.deployment)
-                .build_recorder();
-
-            let handle = recorder.handle();
-            readyset_server::metrics::install_global_recorder(recorder);
-            Some(handle)
-        } else {
-            None
-        };
-
-        rs_connect.in_scope(|| info!("PrometheusHandle created"));
-
-        metrics::gauge!(
-            recorded::READYSET_ADAPTER_VERSION,
-            &[
-                ("release_version", READYSET_VERSION.release_version),
-                ("commit_id", READYSET_VERSION.commit_id),
-                ("platform", READYSET_VERSION.platform),
-                ("rustc_version", READYSET_VERSION.rustc_version),
-                ("profile", READYSET_VERSION.profile),
-                ("profile", READYSET_VERSION.profile),
-                ("opt_level", READYSET_VERSION.opt_level),
-            ]
-        )
-        .set(1.0);
-        metrics::counter!(recorded::READYSET_ADAPTER_STARTUPS).increment(1);
-        let adapter_start_time = SystemTime::now();
-
-        // if we're running in standalone mode, server will already
-        // spawn it's own allocator metrics reporter.
-        if prometheus_handle.is_some() && !options.deployment_mode.is_standalone() {
-            let alloc_shutdown = shutdown_rx.clone();
-            rt.handle().spawn(report_allocator_metrics(alloc_shutdown));
-        }
-
-        let noria_read_behavior = if options.non_blocking_reads {
-            rs_connect.in_scope(|| info!("Will perform NonBlocking Reads"));
-            ReadBehavior::NonBlocking
-        } else {
-            rs_connect.in_scope(|| info!("Will perform Blocking Reads"));
-            ReadBehavior::Blocking
-        };
-
         let migration_style = options.query_caching;
-
         rs_connect.in_scope(|| info!(?migration_style));
 
         let query_status_cache: &'static _ = Box::leak(Box::new(
@@ -1071,6 +1265,67 @@ where
                 .style(migration_style)
                 .set_placeholder_inlining(options.feature_placeholder_inlining),
         ));
+
+        rs_connect.in_scope(|| info!("Spawning schema catalog synchronizer task"));
+        let (schema_catalog_synchronizer, schema_catalog) =
+            SchemaCatalogSynchronizer::new(rh.clone());
+        let schema_catalog_synchronizer = schema_catalog_synchronizer
+            .with_change_handler(Arc::new(QscSchemaChangeAdapter::new(query_status_cache)));
+        rt.handle()
+            .spawn(schema_catalog_synchronizer.run(shutdown_rx.clone()));
+
+        if options.noria_metrics {
+            warn!("--noria-metrics is deprecated and has no effect. It will be removed in a future release.");
+        }
+
+        if options.prometheus_metrics {
+            let _guard = rt.enter();
+            let database_label = match self.database_type {
+                DatabaseType::MySQL => "mysql",
+                DatabaseType::PostgreSQL => "psql",
+            };
+            init_global_recorder(&[
+                ("upstream_db_type", database_label),
+                ("deployment", &options.deployment),
+            ]);
+            rs_connect.in_scope(|| info!("PrometheusHandle created"));
+        }
+
+        gauge!(
+            metric::READYSET_ADAPTER_VERSION,
+            &[
+                ("release_version", READYSET_VERSION.release_version),
+                ("commit_id", READYSET_VERSION.commit_id),
+                ("platform", READYSET_VERSION.platform),
+                ("rustc_version", READYSET_VERSION.rustc_version),
+                ("profile", READYSET_VERSION.profile),
+                ("opt_level", READYSET_VERSION.opt_level),
+            ]
+        )
+        .set(1.0);
+        counter!(metric::READYSET_ADAPTER_STARTUPS).increment(1);
+        let adapter_start_time = SystemTime::now();
+
+        let host = collect_host_info(&deployment_dir);
+        gauge!(metric::HOST_CPUS).set(host.cpus as f64);
+        gauge!(metric::HOST_MEMORY_BYTES).set(host.memory_bytes as f64);
+        gauge!(metric::HOST_DISK_BYTES).set(host.disk_bytes as f64);
+        gauge!(metric::HOST_NUMA_NODES).set(host.numa_nodes as f64);
+        gauge!(
+            metric::HOST_INFO,
+            "arch" => host.arch,
+            "os" => host.os,
+            "kernel" => host.kernel,
+            "container" => host.container.to_string(),
+        )
+        .set(1.0);
+
+        // if we're running in standalone mode, server will already
+        // spawn it's own allocator metrics reporter.
+        if options.prometheus_metrics && !options.deployment_mode.is_standalone() {
+            let alloc_shutdown = shutdown_rx.clone();
+            rt.handle().spawn(report_allocator_metrics(alloc_shutdown));
+        }
 
         let telemetry_sender = rt.block_on(async {
             let proxied_queries_reporter =
@@ -1089,7 +1344,7 @@ where
                 TelemetryEvent::AdapterStart,
                 TelemetryBuilder::new()
                     .adapter_version(option_env!("CARGO_PKG_VERSION").unwrap_or_default())
-                    .db_backend(format!("{:?}", &self.database_type).to_lowercase())
+                    .db_backend(format!("{:?}", self.database_type).to_lowercase())
                     .build(),
             )
             .map_err(|error| warn!(%error, "Failed to initialize telemetry sender"));
@@ -1113,7 +1368,6 @@ where
         };
         let http_server = NoriaAdapterHttpRouter {
             listen_addr: options.metrics_address,
-            prometheus_handle: prometheus_handle.clone(),
             health_reporter: health_reporter.clone(),
             failpoint_channel: tx,
             metrics: Default::default(),
@@ -1121,8 +1375,11 @@ where
         };
 
         let router_shutdown_rx = shutdown_rx.clone();
+        let metrics_addr = options.metrics_address;
         let fut = async move {
-            let http_listener = http_server.create_listener().await.unwrap();
+            let http_listener = http_server.create_listener().await.map_err(|e| {
+                anyhow!("Failed to bind metrics HTTP listener on {metrics_addr}: {e}")
+            })?;
             NoriaAdapterHttpRouter::route_requests(http_server, http_listener, router_shutdown_rx)
                 .await
         };
@@ -1197,7 +1454,6 @@ where
                         auto_increments,
                         view_name_cache.new_local(),
                         view_cache.new_local(),
-                        noria_read_behavior,
                         expr_dialect,
                         parse_dialect,
                         sys_props.search_path,
@@ -1259,7 +1515,7 @@ where
                 .name("Query logger".to_string())
                 .stack_size(2 * 1024 * 1024) // Use the same value tokio is using
                 .spawn_wrapper(move || {
-                    let mut logger = query_logger::QueryLogger::new(
+                    let mut logger = QueryLogger::new(
                         query_log_mode,
                         rewrite_params,
                         dialect,
@@ -1300,9 +1556,51 @@ where
         // from readers on the adapter rather than across a network hop.
         let readers: Readers = Arc::new(Mutex::new(Default::default()));
 
-        let parsing_preset = options.server_worker_options.parsing_preset;
+        let parsing_preset = options
+            .server_worker_options
+            .parsing_preset
+            .unwrap_or_else(ParsingPreset::for_prod);
 
         let memory_limit = options.server_worker_options.memory_limit;
+
+        // Built from the CLI flags before `server_worker_options` is moved into
+        // the server builder below.
+        let shallow_cache_eligibility = options.shallow_cache_eligibility();
+
+        // Extract upstream-db-url credentials for the MCP loopback connection
+        // before `server_worker_options` is moved into the server builder.
+        // These are guaranteed to be in the adapter's `allowed_users` (they're
+        // merged in by `build_allowed_users`) and valid on upstream.
+        //
+        // When `--enable-mcp` is set we require the credentials to be present;
+        // silently starting without the MCP endpoint would hide a
+        // configuration error from the operator.
+        let mcp_sql_creds: Option<(String, String)> = if options.enable_mcp {
+            let parsed = options
+                .server_worker_options
+                .replicator_config
+                .upstream_db_url
+                .as_ref()
+                .and_then(|s| s.parse::<database_utils::DatabaseURL>().ok())
+                .and_then(|url| match (url.user(), url.password()) {
+                    (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
+                    _ => None,
+                });
+            if parsed.is_none() {
+                error!(
+                    "--enable-mcp requires --upstream-db-url to include a \
+                     username and password; the MCP endpoint authenticates \
+                     its loopback SQL connection with them"
+                );
+                process::exit(1);
+            }
+            parsed
+        } else {
+            None
+        };
+
+        let upquery_timeout =
+            Duration::from_millis(options.server_worker_options.upquery_timeout_ms);
 
         // Run a readyset-server instance within this adapter.
         let internal_server_handle = if options.deployment_mode.has_reader_nodes() {
@@ -1360,10 +1658,6 @@ where
             None
         };
 
-        // TODO(mvzink): After REA-6107, move this to when we create the handle. See comment there.
-        rt.handle()
-            .spawn(schema_catalog_synchronizer.run(shutdown_rx.clone()));
-
         health_reporter.set_state(AdapterState::Healthy);
 
         rs_connect
@@ -1400,18 +1694,106 @@ where
                     runtime.shutdown_background();
                 })?;
         }
+        let shallow_max_capacity = options
+            .shallow_memory_percent
+            .filter(|_| memory_limit > 0)
+            .map(|percent| (memory_limit as f64 * percent / 100.0) as u64)
+            .or_else(|| {
+                (memory_limit > 0 && options.cache_mode == CacheMode::Shallow)
+                    .then_some(memory_limit as u64)
+            });
+        info!("Total Shallow memory: {:?}", shallow_max_capacity);
+        let shallow_max_entry_bytes =
+            (options.shallow_max_entry_bytes > 0).then_some(options.shallow_max_entry_bytes);
+        let mut shallow =
+            CacheManager::<_, <H::UpstreamDatabase as UpstreamDatabase>::CacheEntry>::new(
+                shallow_max_capacity,
+                shallow_max_entry_bytes,
+            );
+        shallow
+            .set_adaptive_max_extra_load_percent(options.shallow_adaptive_max_extra_load_percent);
+        let shallow = Arc::new(shallow);
+        rt.handle()
+            .spawn(Arc::clone(&shallow).report_metrics(shutdown_rx.clone()));
 
-        let shallow_max_capacity = options.shallow_memory_percent.and_then(|percent| {
-            if memory_limit > 0 {
-                Some((memory_limit as f64 * percent / 100.0) as u64)
-            } else {
+        // Bootstrap the RLS catalog poller for a Postgres upstream and
+        // build the coordinator that bridges it to the shallow cache.
+        // `bootstrap_from_url` creates the registry and starts the poller
+        // in one call, but the coordinator (the poller's sink) needs that
+        // registry to exist first. A `DeferredSink` breaks the cycle: it
+        // is handed to bootstrap, then has the coordinator installed once
+        // the registry returns. Non-Postgres upstreams yield `None` and
+        // run RLS-disabled (every shallow cache stays plain).
+        let (rls_registry, rls_coordinator, rls_bootstrap_handle) = {
+            let upstream_url = upstream_config
+                .upstream_db_url
+                .as_ref()
+                .map(|u| u.to_string());
+            let deferred_sink = Arc::new(readyset_rls::DeferredSink::new());
+            let rls_config = readyset_rls::RlsConfig::default()
+                .with_poll_interval(Duration::from_secs(options.rls_poll_interval_secs));
+            let handle = if !options.enabled_rls {
+                // Explicit operator opt-out: skip the catalog bootstrap
+                // entirely and run RLS-disabled. Loud because it is unsafe
+                // if any table has or gains RLS.
+                warn!(
+                    "RLS support disabled via --enable-rls=false; every shallow cache will \
+                     be Plain. This is unsafe if any table has or gains RLS -- cached reads \
+                     would then serve one tenant's rows to another."
+                );
                 None
+            } else {
+                upstream_url.as_deref().and_then(|url| {
+                    match rt.block_on(readyset_rls::bootstrap_from_url(
+                        url,
+                        rls_config,
+                        Some(deferred_sink.clone() as Arc<dyn readyset_rls::InvalidationSink>),
+                    )) {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            // A bootstrap error means a Postgres upstream whose RLS
+                            // catalog could not be loaded -- unreachable upstream, TLS
+                            // failure, or the connection role lacking SELECT on the
+                            // pg_catalog relations the snapshot reads. Continuing
+                            // RLS-disabled would cache RLS-protected tables as Plain
+                            // and serve one tenant's rows to another, with no later
+                            // correction (the poller never started). Fail closed:
+                            // refuse to start rather than serve a silent cross-tenant
+                            // leak. Non-Postgres upstreams return Ok(None) and never
+                            // reach this arm.
+                            error!(
+                                error = %e,
+                                "RLS bootstrap failed for a Postgres upstream; refusing to \
+                                 start to avoid caching RLS-protected tables without \
+                                 per-tenant partitioning. Ensure the upstream is reachable \
+                                 and the connection role can SELECT the pg_catalog relations \
+                                 named in the error (and call pg_get_expr)."
+                            );
+                            process::exit(1);
+                        }
+                    }
+                })
+            };
+            match handle {
+                Some(handle) => {
+                    let registry = handle.registry.clone();
+                    let coordinator =
+                        Arc::new(readyset_adapter::rls_coordinator::RlsCoordinator::new(
+                            registry.clone(),
+                            shallow.clone(),
+                            query_status_cache,
+                        ));
+                    deferred_sink
+                        .set(coordinator.clone() as Arc<dyn readyset_rls::InvalidationSink>);
+                    // Retain the bootstrap handle: it owns the poller's only
+                    // shutdown sender, so dropping it here would close the watch
+                    // channel and stop the catalog poller right after startup.
+                    (Some(registry), Some(coordinator), Some(handle))
+                }
+                None => (None, None, None),
             }
-        });
-        let shallow = Arc::new(CacheManager::<
-            _,
-            <H::UpstreamDatabase as UpstreamDatabase>::CacheEntry,
-        >::new(shallow_max_capacity));
+        };
+
         if let Ok(shallow_ddl_requests) =
             rt.block_on(adapter_authority.shallow_cache_ddl_requests())
         {
@@ -1424,10 +1806,34 @@ where
                 adapter_rewrite_params,
                 options.default_ttl_ms,
                 options.default_coalesce_ms,
+                options.cache_mode,
+                rls_registry.clone(),
+                rls_coordinator.clone(),
             )) {
                 error!("Failed to recreate shallow caches: {}", e);
             }
         }
+        // Seed the three shallow-cache allowlists (function, variable, schema)
+        // from the authority so any `ALTER READYSET ... SHALLOW CACHE ALLOWED
+        // ...` persisted by an earlier run survives this restart. The handles are
+        // shared (cloned) into every connection's backend below.
+        let seed_allowlist = |kind: ShallowCacheAllowlistKind| {
+            ShallowCacheAllowlist::new(
+                rt.block_on(adapter_authority.shallow_cache_allowlist(kind))
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            "Failed to load shallow-cache {} allowlist from authority: {e}",
+                            kind.singular_keyword()
+                        );
+                        Vec::new()
+                    }),
+            )
+        };
+        let shallow_cache_allowlists = ShallowCacheAllowlists {
+            functions: seed_allowlist(ShallowCacheAllowlistKind::Function),
+            variables: seed_allowlist(ShallowCacheAllowlistKind::Variable),
+            schemas: seed_allowlist(ShallowCacheAllowlistKind::Schema),
+        };
         let replication_enabled = upstream_config.replication_enabled;
         let upstream_config = Arc::new(RwLock::new(upstream_config));
         let shallow_refresh_pool = ShallowRefreshPool::<H::UpstreamDatabase>::new(
@@ -1435,6 +1841,119 @@ where
             Arc::clone(&upstream_config),
             options.shallow_refresh_workers,
         );
+
+        let controller = rh.clone();
+        let readyset_schema = ReadysetSchema::init(
+            &options.readyset_schema,
+            self.parse_dialect,
+            &shallow,
+            controller,
+            query_status_cache,
+            users.clone(),
+        )?;
+
+        // MCP tool calls dispatch via a loopback SQL connection to the
+        // adapter's own SQL listener — so they reuse the full per-client
+        // Backend pipeline (parsing, rewriting, upstream fallback) instead
+        // of a parallel Backend. The loopback connection authenticates as
+        // the upstream-db-url user (guaranteed to be in allowed_users and
+        // valid on upstream); the bearer token gates HTTP access and tool
+        // scope. All bearers share this single upstream identity.
+        let _mcp_handle: Option<tokio::task::JoinHandle<()>> =
+            if let (true, Some((mcp_user, mcp_password))) = (options.enable_mcp, mcp_sql_creds) {
+                let mcp_authority = adapter_authority.clone();
+                let mcp_http_addr = options.mcp_address;
+                // Resolve a loopback target reachable by one of the bound
+                // listeners. Prefer a literal loopback address (127.0.0.1 or
+                // ::1) if the adapter already binds one; otherwise derive a
+                // family-matched loopback from the first bound address
+                // (0.0.0.0 -> 127.0.0.1, :: -> ::1) so we still reach the
+                // listener on v6-only systems and on macOS where [::] does
+                // not accept v4-mapped clients.
+                let (mcp_sql_host, mcp_sql_port) = listen_addresses
+                    .iter()
+                    .find(|a| a.ip().is_loopback())
+                    .map(|a| (a.ip().to_string(), a.port()))
+                    .unwrap_or_else(|| {
+                        let a = listen_addresses[0];
+                        let host = match a.ip() {
+                            IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
+                            IpAddr::V6(ip) if ip.is_unspecified() => "::1".to_string(),
+                            other => other.to_string(),
+                        };
+                        (host, a.port())
+                    });
+                let mcp_dialect = self.parse_dialect;
+                // If the adapter's SQL listener requires TLS, the loopback
+                // connection from MCP must negotiate TLS too. Verification is
+                // skipped because the adapter's cert is unlikely to be valid
+                // for 127.0.0.1 / ::1, and there is no MITM threat on a
+                // connection from the same process to itself.
+                let mcp_require_tls = matches!(options.tls_mode, TlsMode::Required);
+                let mut mcp_shutdown = shutdown_rx.clone();
+
+                Some(rt.handle().spawn(async move {
+                    let db_type = match mcp_dialect {
+                        readyset_sql::Dialect::MySQL => readyset_mcp::connection::DbType::Mysql,
+                        readyset_sql::Dialect::PostgreSQL => {
+                            readyset_mcp::connection::DbType::Postgres
+                        }
+                    };
+                    let (mcp_tls_mode, mcp_tls_disable_verification) = if mcp_require_tls {
+                        (readyset_mcp::connection::TlsMode::Require, true)
+                    } else {
+                        (readyset_mcp::connection::TlsMode::Disable, false)
+                    };
+                    let config = readyset_mcp::connection::ConnectionConfig {
+                        host: mcp_sql_host,
+                        port: mcp_sql_port,
+                        user: mcp_user,
+                        password: mcp_password,
+                        database: None,
+                        db_type,
+                        tls_mode: mcp_tls_mode,
+                        tls_root_cert: None,
+                        tls_disable_verification: mcp_tls_disable_verification,
+                    };
+
+                    let conn =
+                        match readyset_mcp::connection::ReadysetConnection::new(&config).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "failed to open loopback SQL connection for MCP"
+                                );
+                                return;
+                            }
+                        };
+                    let mcp_server = readyset_mcp::server::ReadysetMcpServer::new(conn);
+
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let cancel_for_shutdown = cancel.clone();
+                    tokio::spawn(async move {
+                        mcp_shutdown.recv().await;
+                        cancel_for_shutdown.cancel();
+                    });
+
+                    let mcp_config = readyset_adapter::mcp_http::McpHttpConfig {
+                        listen_addr: mcp_http_addr,
+                    };
+
+                    if let Err(e) = readyset_adapter::mcp_http::serve(
+                        mcp_authority,
+                        mcp_server,
+                        mcp_config,
+                        cancel,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %e, "MCP HTTP server exited with error");
+                    }
+                }))
+            } else {
+                None
+            };
 
         while let Some(Ok(s)) = rt.block_on(listener.next()) {
             let client_addr = s.peer_addr()?;
@@ -1450,6 +1969,8 @@ where
             let view_cache = view_cache.clone();
             let mut connection_handler = self.connection_handler.clone();
             let shallow = shallow.clone();
+            let shallow_cache_allowlists = shallow_cache_allowlists.clone();
+            let rls_coordinator = rls_coordinator.clone();
             let shallow_refresh_pool = shallow_refresh_pool.clone();
             // If cache_ddl_address is not set, allow cache ddl from all addresses.
             let local_addr = s.local_addr()?;
@@ -1473,24 +1994,32 @@ where
                 .cache_mode(options.cache_mode)
                 .default_ttl_ms(options.default_ttl_ms)
                 .default_coalesce_ms(options.default_coalesce_ms)
+                .opportunistic_ryw_ms(options.opportunistic_ryw_ms)
                 .query_max_failure_seconds(options.query_max_failure_seconds)
                 .telemetry_sender(telemetry_sender.clone())
                 .fallback_recovery_seconds(options.fallback_recovery_seconds)
                 .set_placeholder_inlining(options.feature_placeholder_inlining)
                 .connections(connections.clone())
-                .metrics_handle(prometheus_handle.clone().map(MetricsHandle::new))
                 .sampler_tx(global_sampler_tx.clone())
                 .upstream_config(Some(Arc::clone(&upstream_config)))
-                .replication_enabled(replication_enabled);
+                .replication_enabled(replication_enabled)
+                .readyset_schema(Arc::clone(&readyset_schema))
+                .shallow_cache_eligibility(shallow_cache_eligibility)
+                .shallow_cache_allowlists(shallow_cache_allowlists);
+            let backend_builder = match &rls_registry {
+                Some(registry) => backend_builder.policy_registry(registry.clone()),
+                None => backend_builder,
+            };
             let telemetry_sender = telemetry_sender.clone();
 
             // Initialize the reader layer for the adapter.
             let r = options.deployment_mode.has_reader_nodes().then(|| {
-                // Create a task that repeatedly polls BlockingRead's every `RETRY_TIMEOUT`.
-                // When the `BlockingRead` completes, tell the future to resolve with ack.
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(BlockingRead, Ack)>();
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(
+                    BlockingRead,
+                    tokio::sync::oneshot::Sender<Reply>,
+                )>();
                 rt.handle().spawn(retry_misses(rx));
-                ReadRequestHandler::new(readers.clone(), tx, Duration::from_secs(5))
+                ReadRequestHandler::new(readers.clone(), tx, upquery_timeout)
             });
 
             let upstream_config = Arc::clone(&upstream_config);
@@ -1524,7 +2053,6 @@ where
                                     auto_increments,
                                     view_name_cache.new_local(),
                                     view_cache.new_local(),
-                                    noria_read_behavior,
                                     r,
                                     expr_dialect,
                                     parse_dialect,
@@ -1534,9 +2062,11 @@ where
                                 .instrument(debug_span!("Building noria connector"))
                                 .await;
 
-                                let backend = backend_builder
-                                    .clone()
-                                    .db_version(sys_props.db_version.clone())
+                                let mut builder = backend_builder.clone();
+                                if !sys_props.db_version.is_empty() {
+                                    builder = builder.db_version(sys_props.db_version.clone());
+                                }
+                                let backend = builder
                                     .build(
                                         noria,
                                         upstream,
@@ -1546,6 +2076,7 @@ where
                                         status_reporter_clone,
                                         adapter_start_time,
                                         shallow,
+                                        rls_coordinator,
                                         Some(shallow_refresh_pool),
                                     )
                                     .await;
@@ -1583,6 +2114,13 @@ where
 
         let rs_shutdown = span!(Level::INFO, "RS server Shutting down");
         health_reporter.set_state(AdapterState::ShuttingDown);
+
+        // Signal the RLS catalog poller to stop before we tear down the runtime.
+        // Sending `true` lets its current tick drain any in-flight upstream query
+        // and return cleanly, rather than being aborted mid-request.
+        if let Some(rls_handle) = &rls_bootstrap_handle {
+            let _ = rls_handle.shutdown_tx.send(true);
+        }
 
         // We need to drop the last remaining `ShutdownReceiver` before sending the shutdown
         // signal. If we didn't, `ShutdownSender::shutdown` would hang forever, since it
@@ -1709,6 +2247,302 @@ mod tests {
 
         assert_eq!(opts.max_processing_minutes, 15);
         assert_eq!(opts.migration_task_interval, 20000);
+    }
+
+    #[test]
+    fn rls_poll_interval_defaults_and_parses() {
+        let base = vec![
+            "readyset",
+            "--database-type",
+            "postgresql",
+            "--deployment",
+            "test",
+            "--address",
+            "0.0.0.0:5432",
+            "--authority-address",
+            ".",
+            "--allow-unauthenticated-connections",
+        ];
+        assert_eq!(
+            Options::parse_from(base.clone()).rls_poll_interval_secs,
+            readyset_rls::RlsConfig::default().poll_interval.as_secs(),
+            "default must match RlsConfig::default"
+        );
+
+        let mut with_flag = base;
+        with_flag.push("--rls-poll-interval-secs=5");
+        assert_eq!(Options::parse_from(with_flag).rls_poll_interval_secs, 5);
+    }
+
+    #[test]
+    fn auto_cache_resolves_to_shallow_inrequestpath() {
+        let mut opts = Options::parse_from(vec![
+            "readyset",
+            "--database-type",
+            "mysql",
+            "--deployment",
+            "test",
+            "--address",
+            "0.0.0.0:3306",
+            "--authority-address",
+            ".",
+            "--allow-unauthenticated-connections",
+            "--auto-cache",
+        ]);
+        opts.resolve_auto_cache();
+        assert_eq!(opts.cache_mode, CacheMode::Shallow);
+        assert!(matches!(opts.query_caching, MigrationStyle::InRequestPath));
+    }
+
+    #[test]
+    fn shallow_cache_allow_all_enables_every_opt_in() {
+        let mut opts = Options::parse_from(vec![
+            "readyset",
+            "--database-type",
+            "mysql",
+            "--deployment",
+            "test",
+            "--address",
+            "0.0.0.0:3306",
+            "--authority-address",
+            ".",
+            "--allow-unauthenticated-connections",
+            "--shallow-cache-allow-all",
+        ]);
+        opts.resolve_shallow_cache_allow_all();
+        assert!(opts.shallow_cache_allow_nondeterministic);
+        assert!(opts.shallow_cache_allow_udf);
+        assert!(opts.shallow_cache_allow_system_schema);
+        assert!(opts.shallow_cache_allow_session_specific);
+        assert!(opts.shallow_cache_allow_all_functions);
+    }
+
+    #[test]
+    fn shallow_cache_allow_all_absent_leaves_opt_ins_off() {
+        let mut opts = Options::parse_from(vec![
+            "readyset",
+            "--database-type",
+            "mysql",
+            "--deployment",
+            "test",
+            "--address",
+            "0.0.0.0:3306",
+            "--authority-address",
+            ".",
+            "--allow-unauthenticated-connections",
+        ]);
+        opts.resolve_shallow_cache_allow_all();
+        assert!(!opts.shallow_cache_allow_nondeterministic);
+        assert!(!opts.shallow_cache_allow_udf);
+        assert!(!opts.shallow_cache_allow_system_schema);
+        assert!(!opts.shallow_cache_allow_session_specific);
+        assert!(!opts.shallow_cache_allow_all_functions);
+    }
+
+    #[test]
+    fn shallow_cache_allow_all_conflicts_with_individual_opt_ins() {
+        // `--shallow-cache-allow-all` is a shorthand for the per-category flags,
+        // so combining it with one of them is redundant and clap rejects it.
+        let res = Options::try_parse_from(vec![
+            "readyset",
+            "--database-type",
+            "mysql",
+            "--deployment",
+            "test",
+            "--address",
+            "0.0.0.0:3306",
+            "--authority-address",
+            ".",
+            "--allow-unauthenticated-connections",
+            "--shallow-cache-allow-all",
+            "--shallow-cache-allow-udf",
+        ]);
+        assert!(res.is_err(), "expected clap conflict error, got {res:?}");
+    }
+
+    /// Each individual `--shallow-cache-allow-*` flag must set exactly one
+    /// [`ShallowCacheEligibility`] opt-in and leave the others off. This exercises
+    /// the same `Options::shallow_cache_eligibility` mapping the server startup
+    /// path uses, so a copy-paste swap in that mapping (a flag wired to the wrong
+    /// field) fails here rather than passing the whole suite unnoticed.
+    #[test]
+    fn each_shallow_cache_flag_maps_to_its_own_eligibility_field() {
+        // (flag, [nondeterministic, udf, all_functions, system_schema, session_specific])
+        let cases: [(&str, [bool; 5]); 5] = [
+            (
+                "--shallow-cache-allow-nondeterministic",
+                [true, false, false, false, false],
+            ),
+            (
+                "--shallow-cache-allow-udf",
+                [false, true, false, false, false],
+            ),
+            (
+                "--shallow-cache-allow-all-functions",
+                [false, false, true, false, false],
+            ),
+            (
+                "--shallow-cache-allow-system-schema",
+                [false, false, false, true, false],
+            ),
+            (
+                "--shallow-cache-allow-session-specific",
+                [false, false, false, false, true],
+            ),
+        ];
+        for (flag, expected) in cases {
+            let mut opts = Options::parse_from(vec![
+                "readyset",
+                "--database-type",
+                "mysql",
+                "--deployment",
+                "test",
+                "--address",
+                "0.0.0.0:3306",
+                "--authority-address",
+                ".",
+                "--allow-unauthenticated-connections",
+                flag,
+            ]);
+            opts.resolve_shallow_cache_allow_all();
+            let e = opts.shallow_cache_eligibility();
+            let got = [
+                e.allow_nondeterministic,
+                e.allow_udf,
+                e.allow_all_functions,
+                e.allow_system_schema,
+                e.allow_session_specific,
+            ];
+            assert_eq!(
+                got, expected,
+                "{flag} mapped to the wrong eligibility field(s)"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_cache_conflicts_with_cache_mode() {
+        let res = Options::try_parse_from(vec![
+            "readyset",
+            "--database-type",
+            "mysql",
+            "--deployment",
+            "test",
+            "--address",
+            "0.0.0.0:3306",
+            "--authority-address",
+            ".",
+            "--allow-unauthenticated-connections",
+            "--auto-cache",
+            "--cache-mode",
+            "deep",
+        ]);
+        assert!(res.is_err(), "expected clap conflict error, got {res:?}");
+    }
+
+    #[test]
+    fn auto_cache_conflicts_with_query_caching() {
+        let res = Options::try_parse_from(vec![
+            "readyset",
+            "--database-type",
+            "mysql",
+            "--deployment",
+            "test",
+            "--address",
+            "0.0.0.0:3306",
+            "--authority-address",
+            ".",
+            "--allow-unauthenticated-connections",
+            "--auto-cache",
+            "--query-caching=inrequestpath",
+        ]);
+        assert!(res.is_err(), "expected clap conflict error, got {res:?}");
+    }
+
+    /// Base args for exercising `resolve_parsing_preset`; append cache/parsing flags.
+    fn parsing_preset_opts(extra: &[&str]) -> Options {
+        let mut argv = vec![
+            "readyset",
+            "--database-type",
+            "mysql",
+            "--deployment",
+            "test",
+            "--address",
+            "0.0.0.0:3306",
+            "--authority-address",
+            ".",
+            "--allow-unauthenticated-connections",
+        ];
+        argv.extend_from_slice(extra);
+        Options::parse_from(argv)
+    }
+
+    #[test]
+    fn shallow_resolves_unset_preset_to_only_sqlparser() {
+        let mut opts = parsing_preset_opts(&["--cache-mode", "shallow"]);
+        assert_eq!(opts.server_worker_options.parsing_preset, None);
+        opts.resolve_parsing_preset();
+        assert_eq!(
+            opts.server_worker_options.parsing_preset,
+            Some(ParsingPreset::OnlySqlparser)
+        );
+    }
+
+    #[test]
+    fn auto_cache_resolves_unset_preset_to_only_sqlparser() {
+        let mut opts = parsing_preset_opts(&["--auto-cache"]);
+        opts.resolve_auto_cache();
+        opts.resolve_parsing_preset();
+        assert_eq!(
+            opts.server_worker_options.parsing_preset,
+            Some(ParsingPreset::OnlySqlparser)
+        );
+    }
+
+    #[test]
+    fn parsing_preset_deep_leaves_preset_unset() {
+        let mut opts = parsing_preset_opts(&["--cache-mode", "deep"]);
+        assert_eq!(opts.cache_mode, CacheMode::Deep);
+        opts.resolve_parsing_preset();
+        assert_eq!(opts.server_worker_options.parsing_preset, None);
+    }
+
+    #[test]
+    fn parsing_preset_deep_then_shallow_leaves_preset_unset() {
+        let mut opts = parsing_preset_opts(&["--cache-mode", "deep-then-shallow"]);
+        assert_eq!(opts.cache_mode, CacheMode::DeepThenShallow);
+        opts.resolve_parsing_preset();
+        assert_eq!(opts.server_worker_options.parsing_preset, None);
+    }
+
+    #[test]
+    fn parsing_preset_respects_explicit_parity_preset() {
+        let mut opts = parsing_preset_opts(&[
+            "--cache-mode",
+            "shallow",
+            "--parsing-preset",
+            "both-panic-on-mismatch",
+        ]);
+        opts.resolve_parsing_preset();
+        assert_eq!(
+            opts.server_worker_options.parsing_preset,
+            Some(ParsingPreset::BothPanicOnMismatch)
+        );
+    }
+
+    #[test]
+    fn parsing_preset_respects_explicit_default_preset() {
+        let mut opts = parsing_preset_opts(&[
+            "--cache-mode",
+            "shallow",
+            "--parsing-preset",
+            "both-prefer-sqlparser",
+        ]);
+        opts.resolve_parsing_preset();
+        assert_eq!(
+            opts.server_worker_options.parsing_preset,
+            Some(ParsingPreset::BothPreferSqlparser)
+        );
     }
 
     #[test]

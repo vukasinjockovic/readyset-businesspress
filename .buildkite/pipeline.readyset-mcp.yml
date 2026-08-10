@@ -1,0 +1,75 @@
+# NOTE:  This entire pipeline has a dependency on the 'build-image' step.  Any step that uploads
+# it must have a "depends_on: build-image" set.  Putting "depends_on" on these steps won't do the
+# trick and may in fact interfere with correct buildkite step scheduling.
+
+# Non-buildkite nodes to re-use:
+readyset_mcp_common_values:
+  retry: &retry_on_agent_kill
+    automatic: &agent_kill_conditions
+      - signal_reason: agent_stop  # spot instance killed by AWS
+        limit: 3
+      - exit_status: -1            # agent timed out
+        signal_reason: none
+        limit: 3
+
+steps:
+  - label: ":linux: Build readyset-mcp: {{ matrix.arch }}"
+    key: build-readyset-mcp
+    command: |
+      set -e  # exit on error
+      if [[ {{ matrix.arch }} == "x86" ]]; then
+        MUSL_TARGET="x86_64-unknown-linux-musl"
+      elif [[ {{ matrix.arch }} == "arm" ]]; then
+        MUSL_TARGET="aarch64-unknown-linux-musl"
+      else
+        echo "Unknown musl target: {{ matrix.arch }}"
+        exit 1
+      fi
+      cd /workdir/public
+      rustup target add $$MUSL_TARGET
+      # Must set vendored-openssl feature when building for musl:
+      cargo --locked build --package readyset-mcp --features readyset-mcp/vendored-openssl \
+        --release --target  $$MUSL_TARGET
+      cd /workdir/public/target/$$MUSL_TARGET/release
+      strip readyset-mcp
+      tar -czf readyset-mcp-$$MUSL_TARGET.tar.gz readyset-mcp
+    artifact_paths:
+      - public/target/*-unknown-linux-musl/release/readyset-mcp*.tar.gz
+    plugins:
+      - docker#${DOCKER_PLUGIN_VERSION}:
+          image: '305232526136.dkr.ecr.us-east-2.amazonaws.com/readyset-build:${BUILDKITE_COMMIT}'
+          volumes:
+            - 'target:/workdir/target'
+            - 'cargo-registry:/usr/local/cargo/registry'
+          environment:
+            - SCCACHE_BUCKET=readysettech-build-sccache-us-east-2
+            - SCCACHE_REGION=us-east-2
+            - CARGO_INCREMENTAL=0
+            - RUST_BACKTRACE=full
+            - BUILDKITE_COMMIT
+            - CARGO_TERM_PROGRESS_WHEN=never     # disable progress bars
+          shell: ["/bin/bash", "-c"]
+          mount-buildkite-agent: true
+      - ecr#${ECR_PLUGIN_VERSION}:
+          login: true
+          retries: 3
+    agents:
+      queue: "{{ matrix.queue }}"
+    retry: *retry_on_agent_kill
+    matrix:
+      setup:
+        queue:
+          - "c6a-4xlarge"
+          - "c7g-4xlarge"
+        arch:
+          - "x86"
+          - "arm"
+      adjustments:
+        - with:
+            queue: "c6a-4xlarge"
+            arch: "arm"
+          skip: true
+        - with:
+            queue: "c7g-4xlarge"
+            arch: "x86"
+          skip: true

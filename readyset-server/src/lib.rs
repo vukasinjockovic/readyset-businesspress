@@ -98,8 +98,8 @@
 //!    handles to base tables or views, or inspect the current data-flow, they end up interfacing
 //!    with a `Leader`.
 //!  - `Migration` in `src/controller/migrate/mod.rs`, which orchestrates any changes to the running
-//!    data-flow. This includes drawing domain boundaries, setting up sharding, and deciding what
-//!    nodes should have materialized state. This planning process is split into many files in the
+//!    data-flow. This includes drawing domain boundaries and deciding what nodes should have
+//!    materialized state. This planning process is split into many files in the
 //!    same directory, but the primary entry point is `Migration::commit`, which may be worth
 //!    reading top-to-bottom.
 //!  - `Packet` in `dataflow/src/payload.rs`, which holds all the possible messages that a domain
@@ -375,7 +375,6 @@
 
 mod builder;
 mod controller;
-mod coordination;
 mod handle;
 mod http_router;
 
@@ -391,8 +390,6 @@ mod integration_serial;
 #[cfg(test)]
 mod integration_utils;
 
-pub mod metrics;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReuseConfigType {
     Finkelstein,
@@ -402,7 +399,6 @@ pub enum ReuseConfigType {
 
 use controller::migrate::materialization;
 pub use controller::migrate::materialization::FrontierStrategy;
-pub use controller::replication::{ReplicationOptions, ReplicationStrategy};
 use controller::sql;
 use database_utils::UpstreamConfig;
 pub use dataflow::{DurabilityMode, PersistenceParameters};
@@ -413,7 +409,6 @@ use readyset_sql_parsing::ParsingPreset;
 
 pub use crate::builder::Builder;
 pub use crate::handle::Handle;
-pub use crate::metrics::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
 
 pub mod manual {
     pub use dataflow::node::special::Base;
@@ -432,42 +427,22 @@ use clap::{ArgAction, Args};
 use dataflow::DomainConfig;
 use serde::{Deserialize, Serialize};
 
-/// Configuration for a running ReadySet cluster
-// WARNING: if you change this structure or any of the structures used in its fields, make sure to
-// write a serialized instance of the previous version to tests/config_versions by running the
-// following command *before* your change:
-//
-// ```
-// cargo run --bin make_config_json
-// ```
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
+/// Configuration for a running Readyset cluster.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Config {
-    pub(crate) sharding: Option<usize>,
-    #[serde(default)]
     pub(crate) materialization_config: materialization::Config,
     pub(crate) domain_config: DomainConfig,
     pub(crate) persistence: PersistenceParameters,
-    /// Number of workers to wait for before we start trying to run any domains at all
-    #[serde(alias = "quorum")]
-    pub(crate) min_workers: usize,
     pub(crate) reuse: Option<ReuseConfigType>,
     /// If set to true (the default), failing tokio tasks will cause a full-process abort.
     pub(crate) abort_on_task_failure: bool,
     /// Configuration for converting SQL to MIR
     pub(crate) mir_config: sql::mir::Config,
-    #[serde(flatten)]
     pub(crate) replicator_config: UpstreamConfig,
-    #[serde(default)]
     pub(crate) replicator_statement_logging: bool,
-    #[serde(default)]
-    pub(crate) replication_strategy: ReplicationStrategy,
     /// The duration to wait before canceling the task waiting on an upquery.
     pub(crate) upquery_timeout: Duration,
-    /// The duration to wait before canceling a task waiting on a worker request. Worker requests
-    /// are typically issued as part of migrations.
-    pub(crate) worker_request_timeout: Duration,
     /// Interval on which to automatically run recovery as long as there are unscheduled domains
-    #[serde(default = "default_background_recovery_interval")]
     pub(crate) background_recovery_interval: Duration,
 }
 
@@ -478,10 +453,6 @@ fn default_background_recovery_interval() -> Duration {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            #[cfg(test)]
-            sharding: Some(2),
-            #[cfg(not(test))]
-            sharding: None,
             materialization_config: Default::default(),
             domain_config: DomainConfig {
                 aggressively_update_state_sizes: false,
@@ -495,15 +466,12 @@ impl Default for Config {
                 materialization_persistence: false,
             },
             persistence: Default::default(),
-            min_workers: 1,
             reuse: None,
             abort_on_task_failure: true,
             mir_config: Default::default(),
             replicator_statement_logging: false,
             replicator_config: Default::default(),
-            replication_strategy: Default::default(),
             upquery_timeout: Duration::from_millis(5000),
-            worker_request_timeout: Duration::from_millis(1800000),
             background_recovery_interval: default_background_recovery_interval(),
         }
     }
@@ -574,27 +542,9 @@ pub struct WorkerOptions {
     #[arg(long, hide = true)]
     pub enable_packet_filters: bool,
 
-    /// Number of workers to wait for before starting (including this one)
-    #[arg(long, default_value = "1", env = "MIN_WORKERS", hide = true)]
-    pub min_workers: usize,
-
-    /// Shard the graph this many ways (<= 1 : disable sharding)
-    #[arg(long, default_value = "0", env = "NORIA_SHARDS", hide = true)]
-    pub shards: usize,
-
-    /// Volume associated with the server.
-    #[arg(long, env = "VOLUME_ID", hide = true)]
-    pub volume_id: Option<VolumeId>,
-
     /// Parsing mode that determines which parser(s) to use and how to handle conflicts.
-    #[arg(
-        long,
-        env = "PARSING_PRESET",
-        value_enum,
-        default_value = "both-prefer-sqlparser",
-        hide = true
-    )]
-    pub parsing_preset: ParsingPreset,
+    #[arg(long, env = "PARSING_PRESET", value_enum, hide = true)]
+    pub parsing_preset: Option<ParsingPreset>,
 
     /// Directory in which to store replicated table data. If not specified, defaults to the
     /// current working directory.
@@ -607,19 +557,7 @@ pub struct WorkerOptions {
     working_dir: Option<PathBuf>,
 
     #[command(flatten)]
-    pub domain_replication_options: ReplicationOptions,
-
-    #[command(flatten)]
     pub replicator_config: UpstreamConfig,
-
-    /// Timeout in seconds for all requests made from the controller to workers
-    #[arg(
-        long,
-        env = "WORKER_REQUEST_TIMEOUT_SECONDS",
-        default_value = "1800",
-        hide = true
-    )]
-    pub worker_request_timeout_seconds: u64,
 
     /// Timeout in seconds for table requests issued to domains
     #[arg(
@@ -639,6 +577,25 @@ pub struct WorkerOptions {
         hide = true
     )]
     pub background_recovery_interval_seconds: u64,
+
+    /// Total capacity of the process-wide rocksdb block cache, in MiB. The cache is shared
+    /// across all PersistentState instances; sizing it well is the single biggest lever for
+    /// dataflow read performance on non-trivial cached queries. Default 1024 MiB.
+    #[arg(
+        long,
+        env = "ROCKSDB_BLOCK_CACHE_MB",
+        default_value = "1024",
+        hide = true
+    )]
+    pub rocksdb_block_cache_mb: u64,
+
+    /// How long, in milliseconds, a reader will wait for an in-flight upquery before bailing out
+    /// with `UpqueryTimeout`. The adapter treats `UpqueryTimeout` as a fall-through to upstream,
+    /// so smaller values bound head-of-line blocking on slow upqueries at the cost of letting
+    /// some in-flight upqueries miss their deadline. A value of `0` falls through immediately
+    /// on miss (cache-warming still happens in the background).
+    #[arg(long, env = "UPQUERY_TIMEOUT_MS", default_value = "5000", hide = true)]
+    pub upquery_timeout_ms: u64,
 
     /// Whether to emit verbose metrics for the domains on this worker. This should be used very
     /// sparingly, as the metrics emitted will have high label cardinality and can be quite
@@ -736,20 +693,38 @@ pub struct WorkerOptions {
     )]
     feature_straddled_joins: bool,
 
-    /// NOTE: This feature is experimental and should not be used in production -
-    /// Enable support for Top K in dataflow.
-    ///
-    /// NOTE: If enabled, this must be set for all ReadySet processes (both servers and adapters).
+    /// Enable support for Top K in dataflow. Enabled by default; pass
+    /// `--feature-topk=false` (or `FEATURE_TOPK=false`) to disable. The value must agree
+    /// across all Readyset processes (both servers and adapters).
     // XXX JCD keep features synchronized with readyset-features.json
     #[arg(
         long,
         env = "FEATURE_TOPK",
-        default_value = "false",
+        default_value = "true",
         default_missing_value = "true",
         num_args = 0..=1,
         action = ArgAction::Set
     )]
     pub feature_topk: bool,
+
+    /// Enable non-blocking index builds for base tables during migrations.
+    ///
+    /// When enabled (default), index builds use snapshot-based scanning with WAL catch-up,
+    /// allowing writes to continue during the build. This prevents blocking the domain
+    /// during index creation on large tables.
+    ///
+    /// When disabled, index builds use the original blocking implementation that holds
+    /// the domain until the index is fully built. This is useful for debugging or if
+    /// issues arise with non-blocking builds.
+    #[arg(
+        long,
+        env = "FEATURE_NON_BLOCKING_INDEX_BUILD",
+        default_value = "true",
+        default_missing_value = "true",
+        num_args = 0..=1,
+        action = ArgAction::Set
+    )]
+    pub feature_non_blocking_index_build: bool,
 }
 
 impl WorkerOptions {
@@ -795,10 +770,6 @@ impl WorkerOptions {
     }
 }
 
-// TODO(justin): Change VolumeId type when we know this fixed size.
-/// Id associated with the worker server's volume.
-pub type VolumeId = String;
-
 // Settle time must be longer than the leader state check interval
 // // when using a local authority.
 const DEFAULT_SETTLE_TIME_MS: u64 = 1500;
@@ -832,15 +803,6 @@ mod tests {
         worker_opts: WorkerOptions,
     }
 
-    #[test]
-    fn config_serde_round_trip() {
-        let input = Config::default();
-        let serialized = serde_json::to_string(&input).unwrap();
-        let roundtripped = serde_json::from_str::<Config>(&serialized).unwrap();
-
-        assert_eq!(roundtripped, input);
-    }
-
     /// Test setting the storage directory
     #[test]
     fn storage_and_db_dirs() {
@@ -866,7 +828,8 @@ mod tests {
     fn enabled_features_default() {
         let worker_opts = Wrapper::parse_from(["test"]).worker_opts;
         let enabled = worker_opts.enabled_features();
-        assert!(enabled.is_empty());
+        // Top K is enabled by default; every other feature defaults off.
+        assert_eq!(enabled, vec!["Top K"]);
     }
 
     #[test]

@@ -7,7 +7,6 @@ use metrics::{Gauge, gauge};
 use readyset_client::query::MigrationState;
 use readyset_client::recipe::{CacheInfo, ExprInfo};
 use readyset_client::{ReadySetHandle, ViewCreateRequest};
-use readyset_client_metrics::recorded;
 use readyset_sql::ast::CacheType;
 use readyset_sql::{DialectDisplay, ast::Relation};
 use readyset_util::shared_cache::LocalCache;
@@ -32,23 +31,23 @@ struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self {
-            queries_checked: counter!(recorded::VIEWS_SYNCHRONIZER_QUERIES_CHECKED),
+            queries_checked: counter!(metric::VIEWS_SYNCHRONIZER_QUERIES_CHECKED),
             query_status_cache_id_to_status_size: gauge!(
-                recorded::QUERY_STATUS_CACHE_ID_TO_STATUS_SIZE
+                metric::QUERY_STATUS_CACHE_ID_TO_STATUS_SIZE
             ),
-            query_status_cache_statuses_size: gauge!(recorded::QUERY_STATUS_CACHE_STATUSES_SIZE),
+            query_status_cache_statuses_size: gauge!(metric::QUERY_STATUS_CACHE_STATUSES_SIZE),
             query_status_cache_pending_inline_migrations: gauge!(
-                recorded::QUERY_STATUS_CACHE_PENDING_INLINE_MIGRATIONS
+                metric::QUERY_STATUS_CACHE_PENDING_INLINE_MIGRATIONS
             ),
             view_name_cache_size_local: gauge!(
-                recorded::VIEWS_SYNCHRONIZER_VIEW_NAME_CACHE_SIZE,
+                metric::VIEWS_SYNCHRONIZER_VIEW_NAME_CACHE_SIZE,
                 &[("cache", "local")]
             ),
             view_name_cache_size_shared: gauge!(
-                recorded::VIEWS_SYNCHRONIZER_VIEW_NAME_CACHE_SIZE,
+                metric::VIEWS_SYNCHRONIZER_VIEW_NAME_CACHE_SIZE,
                 &[("cache", "shared")]
             ),
-            views_checked_size: gauge!(recorded::VIEWS_SYNCHRONIZER_VIEWS_CHECKED_SIZE),
+            views_checked_size: gauge!(metric::VIEWS_SYNCHRONIZER_VIEWS_CHECKED_SIZE),
         }
     }
 }
@@ -178,16 +177,20 @@ impl ViewsSynchronizer {
                         );
                         if let Some(info) = info {
                             let name = info.name().clone();
-                            let always = if let ExprInfo::Cache(CacheInfo { always, .. }) = info {
-                                always
+                            let trx_cache_policy = if let ExprInfo::Cache(CacheInfo {
+                                trx_cache_policy,
+                                ..
+                            }) = info
+                            {
+                                trx_cache_policy
                             } else {
-                                false
+                                Default::default()
                             };
                             self.view_name_cache.insert(query.clone(), name).await;
                             self.query_status_cache.update_query_migration_state(
                                 query,
                                 MigrationState::Successful(CacheType::Deep),
-                                Some(always),
+                                Some(trx_cache_policy),
                             );
                             self.views_checked.insert(*hash);
                         }

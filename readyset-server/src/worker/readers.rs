@@ -17,14 +17,18 @@ use dataflow::{
 use failpoint_macros::set_failpoint;
 use futures::pin_mut;
 use futures_util::future::TryFutureExt;
+use metrics::{counter, histogram, Counter};
 use pin_project::pin_project;
-use readyset_client::metrics::recorded;
-use readyset_client::results::ResultIterator;
+use readyset_client::post_processing::{
+    run_post_processing_pipeline, ReadReplyStats, ResultIterator,
+};
+use readyset_client::schema::ColumnSchema;
 use readyset_client::{
-    KeyComparison, LookupResult, ReadQuery, ReadReply, ReadReplyStats, ReaderAddress, Tagged,
-    ViewQuery,
+    KeyComparison, LookupResult, ReadQuery, ReadReply, ReaderAddress, Tagged, ViewQuery,
 };
 use readyset_errors::internal_err;
+use readyset_multiplex::server;
+use readyset_post_lookup::PostLookupPlan;
 #[cfg(feature = "failure_injection")]
 use readyset_util::failpoints;
 use readyset_util::shutdown::ShutdownReceiver;
@@ -35,12 +39,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::StreamExt;
-use tokio_tower::multiplex::server;
 use tower::Service;
 use tracing::{error, warn};
-
-/// Retry consistency missed reads every this often.
-const RETRY_TIMEOUT: Duration = Duration::from_micros(100);
 
 const WAIT_BEFORE_WARNING: Duration = Duration::from_secs(7);
 
@@ -122,10 +122,7 @@ impl serde::Serialize for ServerReadReplyBatch {
     }
 }
 
-type Reply = ReadySetResult<Tagged<ReadReply<ServerReadReplyBatch>>>;
-
-/// An Ack to resolve a blocking read.
-pub type Ack = Option<oneshot::Sender<Reply>>;
+pub type Reply = ReadySetResult<Tagged<ReadReply<ServerReadReplyBatch>>>;
 
 /// Creates a handler that can be used to perform read queries against a set of
 /// Readers.
@@ -133,9 +130,9 @@ pub type Ack = Option<oneshot::Sender<Reply>>;
 pub struct ReadRequestHandler {
     global_readers: Readers,
     readers_cache: ReaderMap,
-    wait: tokio::sync::mpsc::UnboundedSender<(BlockingRead, Ack)>,
-    miss_ctr: metrics::Counter,
-    hit_ctr: metrics::Counter,
+    wait: tokio::sync::mpsc::UnboundedSender<(BlockingRead, oneshot::Sender<Reply>)>,
+    miss_ctr: Counter,
+    hit_ctr: Counter,
     upquery_timeout: Duration,
 }
 
@@ -151,15 +148,15 @@ impl ReadRequestHandler {
     /// Creates a new request handler that can be used to query Readers.
     pub fn new(
         readers: Readers,
-        wait: tokio::sync::mpsc::UnboundedSender<(BlockingRead, Ack)>,
+        wait: tokio::sync::mpsc::UnboundedSender<(BlockingRead, oneshot::Sender<Reply>)>,
         upquery_timeout: Duration,
     ) -> Self {
         Self {
             global_readers: readers,
             readers_cache: Default::default(),
             wait,
-            miss_ctr: metrics::counter!(recorded::SERVER_VIEW_QUERY_MISS),
-            hit_ctr: metrics::counter!(recorded::SERVER_VIEW_QUERY_HIT),
+            miss_ctr: counter!(metric::SERVER_VIEW_QUERY_MISS),
+            hit_ctr: counter!(metric::SERVER_VIEW_QUERY_HIT),
             upquery_timeout,
         }
     }
@@ -175,10 +172,12 @@ impl ReadRequestHandler {
     ) -> CallResult<impl Future<Output = Reply>> {
         let ViewQuery {
             key_comparisons,
-            block,
             filter,
             limit,
             offset,
+            post_lookup_plan,
+            result_schema,
+            dialect,
         } = query;
 
         macro_rules! reply_with_ok {
@@ -210,7 +209,7 @@ impl ReadRequestHandler {
             Err(LookupError::Destroyed) => reply_with_error!(ReadySetError::ViewDestroyed),
             Err(LookupError::Error(e)) => reply_with_error!(e),
             // We missed some keys
-            Err(LookupError::Miss((misses, notifier))) => (misses, Some(notifier)),
+            Err(LookupError::Miss((misses, notifier))) => (misses, notifier),
             // We hit on all keys, but there is a consistency miss. This just counts as a miss,
             // but no keys needs triggering.
             Ok(hit) => {
@@ -218,7 +217,19 @@ impl ReadRequestHandler {
                 // immediately
                 self.hit_ctr.increment(1);
 
-                let results = ResultIterator::new(hit, &reader.post_lookup, limit, offset, filter);
+                let results = match run_post_processing_pipeline(
+                    hit,
+                    result_schema.as_deref().unwrap_or(&[]),
+                    &reader.post_lookup,
+                    post_lookup_plan.as_ref(),
+                    limit,
+                    offset,
+                    filter,
+                    dialect,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => reply_with_error!(e),
+                };
 
                 let results = if raw_result {
                     ServerReadReplyBatch::Unserialized(results)
@@ -226,10 +237,10 @@ impl ReadRequestHandler {
                     ServerReadReplyBatch::serialize(results)
                 };
 
-                reply_with_ok!(LookupResult::Results(
-                    vec![results],
-                    ReadReplyStats::default()
-                ));
+                reply_with_ok!(LookupResult {
+                    results: vec![results],
+                    stats: ReadReplyStats::default(),
+                });
             }
         };
 
@@ -238,6 +249,12 @@ impl ReadRequestHandler {
         // Trigger backfills for all the keys we missed on, regardless of a consistency hit/miss
         if !keys_to_replay.is_empty() {
             reader.upquery(keys_to_replay.into_iter().map(|k| k.into_owned()));
+        }
+
+        // A zero upquery timeout means a miss falls through immediately; the backfill triggered
+        // above still warms the cache in the background.
+        if self.upquery_timeout.is_zero() {
+            reply_with_error!(ReadySetError::UpqueryTimeout);
         }
 
         let read = BlockingRead {
@@ -250,28 +267,24 @@ impl ReadRequestHandler {
             limit,
             offset,
             filter,
+            post_lookup_plan,
+            result_schema,
+            dialect,
             upquery_timeout: self.upquery_timeout,
             raw_result,
             receiver,
             eviction_epoch: reader.eviction_epoch(),
         };
 
-        if !block {
-            let _ = self.wait.send((read, None));
-            reply_with_ok!(LookupResult::NonBlockingMiss);
-        } else {
-            set_failpoint!(failpoints::READER_BEFORE_BLOCKING);
-            let (tx, rx) = oneshot::channel();
+        set_failpoint!(failpoints::READER_BEFORE_BLOCKING);
+        let (tx, rx) = oneshot::channel();
 
-            let r = self.wait.send((read, Some(tx)));
-
-            if r.is_err() {
-                // we're shutting down
-                return CallResult::Immediate(Err(ReadySetError::ServerShuttingDown));
-            }
-
-            CallResult::Async(rx.map_ok_or_else(|e| Err(internal_err!("{e}")), |o| o))
+        if self.wait.send((read, tx)).is_err() {
+            // we're shutting down
+            return CallResult::Immediate(Err(ReadySetError::ServerShuttingDown));
         }
+
+        CallResult::Async(rx.map_ok_or_else(|e| Err(internal_err!("{e}")), |o| o))
     }
 
     fn handle_size_query(&mut self, tag: u32, target: &ReaderAddress) -> Reply {
@@ -290,6 +303,32 @@ impl ReadRequestHandler {
             tag,
             v: ReadReply::Keys(reader.keys()),
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl readyset_client::read::LocalReader for ReadRequestHandler {
+    async fn read_local(
+        &mut self,
+        target: ReaderAddress,
+        query: ViewQuery,
+    ) -> ReadySetResult<ResultIterator> {
+        // Tag is a request-correlation ID for the multiplexed RPC stream; for
+        // in-process calls there's no multiplexing and the caller discards the
+        // tag from the response, so any value works.
+        let result = match self.handle_normal_read_query(0, target, query, true) {
+            CallResult::Immediate(r) => r?,
+            CallResult::Async(chan) => chan.await?,
+        };
+        result
+            .v
+            .into_normal()
+            .ok_or_else(|| internal_err!("Unexpected response type from reader service"))??
+            .results
+            .pop()
+            .ok_or_else(|| internal_err!("Expected a single result set for local reader"))?
+            .into_unserialized()
+            .ok_or_else(|| internal_err!("local reader returned a serialized result"))
     }
 }
 
@@ -334,31 +373,47 @@ impl Service<Tagged<ReadQuery>> for ReadRequestHandler {
 
 /// A spawned task responsible for repeating reads that could not be immediately served from cache,
 /// until they succeed.
-pub async fn retry_misses(mut rx: UnboundedReceiver<(BlockingRead, Ack)>) {
-    let upquery_hist = metrics::histogram!(recorded::SERVER_VIEW_UPQUERY_DURATION);
+pub async fn retry_misses(mut rx: UnboundedReceiver<(BlockingRead, oneshot::Sender<Reply>)>) {
+    let upquery_hist = histogram!(metric::SERVER_VIEW_UPQUERY_DURATION);
+    let upquery_timeout_ctr = counter!(metric::SERVER_VIEW_UPQUERY_TIMEOUT);
     let mut reader_cache: ReaderMap = Default::default();
 
     while let Some((mut pending, ack)) = rx.recv().await {
         loop {
-            if let Some(recv) = &mut pending.receiver {
-                // If a receiver is available (on miss) then we simply wait for a notification that
-                // a hole has been filled, then recheck
-                let _ = recv.recv().await;
-                while !recv.is_empty() {
-                    // This drains all the messages from the notifier so we don't get woken right up
-                    // again
-                    let _ = recv.try_recv();
+            // Race the reader-update notifier against the upquery deadline so the timeout
+            // fires reliably even on quiet readers.
+            let remaining = pending
+                .upquery_timeout
+                .saturating_sub(pending.first.elapsed());
+            tokio::select! {
+                _ = pending.receiver.recv() => {
+                    // Drain queued notifications so we don't immediately re-wake on the same
+                    // state.
+                    while !pending.receiver.is_empty() {
+                        let _ = pending.receiver.try_recv();
+                    }
                 }
-            } else {
-                // For consistency misses we don't get notifications, so check periodically
-                tokio::time::sleep(RETRY_TIMEOUT).await;
+                _ = tokio::time::sleep(remaining) => {}
             }
 
             if let Poll::Ready(res) = pending.check(&mut reader_cache) {
                 upquery_hist.record(pending.first.elapsed().as_micros() as f64);
-                if let Some(a) = ack {
-                    let _ = a.send(res);
+                if matches!(res, Err(ReadySetError::UpqueryTimeout)) {
+                    upquery_timeout_ctr.increment(1);
+                }
+                // Reader-level errors (UpqueryTimeout, ServerShuttingDown, ...) must travel
+                // back in-band as `ReadReply::Normal(Err(_))`. Returning them as the outer
+                // `Reply` error makes the multiplex server treat them as a service failure
+                // and tear down the TCP connection -- every other in-flight RPC on that
+                // connection then sees `ClientDropped`.
+                let reply = match res {
+                    Ok(reply) => Ok(reply),
+                    Err(e) => Ok(Tagged {
+                        tag: pending.tag,
+                        v: ReadReply::Normal(Err(e)),
+                    }),
                 };
+                let _ = ack.send(reply);
                 break;
             }
         }
@@ -387,7 +442,8 @@ pub(crate) async fn listen(
 
         // future that ensures all blocking reads are handled in FIFO order
         // and avoid hogging the executors with read retries
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(BlockingRead, Ack)>();
+        let (tx, rx) =
+            tokio::sync::mpsc::unbounded_channel::<(BlockingRead, oneshot::Sender<Reply>)>();
         let mut retry_misses_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             tokio::select! {
@@ -405,14 +461,18 @@ pub(crate) async fn listen(
                     server::Error::Service(ReadySetError::ServerShuttingDown) => {}
                     server::Error::BrokenTransportRecv(ref e)
                     | server::Error::BrokenTransportSend(ref e) => {
-                        if let bincode::ErrorKind::Io(ref e) = **e {
-                            if e.kind() == std::io::ErrorKind::BrokenPipe
-                                || e.kind() == std::io::ErrorKind::ConnectionReset
-                            {
+                        let io_kind =
+                            e.downcast_ref::<bincode::ErrorKind>()
+                                .and_then(|k| match k {
+                                    bincode::ErrorKind::Io(io) => Some(io.kind()),
+                                    _ => None,
+                                });
+                        match io_kind {
+                            Some(std::io::ErrorKind::BrokenPipe)
+                            | Some(std::io::ErrorKind::ConnectionReset) => {
                                 // client went away
                             }
-                        } else {
-                            error!(error = %e, "client transport error");
+                            _ => error!(error = %e, "client transport error"),
                         }
                     }
                     e => error!(error = %e, "reader service error"),
@@ -439,11 +499,17 @@ pub struct BlockingRead {
     limit: Option<usize>,
     offset: Option<usize>,
     filter: Option<DfExpr>,
+    /// See [`ViewQuery::post_lookup_plan`].
+    post_lookup_plan: Option<PostLookupPlan>,
+    /// See [`ViewQuery::result_schema`].
+    result_schema: Option<Vec<ColumnSchema>>,
+    /// See [`ViewQuery::dialect`].
+    dialect: dataflow_expression::Dialect,
     first: time::Instant,
     warned: bool,
     upquery_timeout: Duration,
     raw_result: bool,
-    receiver: Option<ReaderUpdatedNotifier>,
+    receiver: ReaderUpdatedNotifier,
     eviction_epoch: usize,
 }
 
@@ -476,13 +542,19 @@ impl BlockingRead {
             Err(_) => return Poll::Ready(Err(ReadySetError::ServerShuttingDown)),
             Ok(hit) => {
                 // We hit on all keys, and there is no consistency miss, can return results
-                let results = ResultIterator::new(
+                let results = match run_post_processing_pipeline(
                     hit,
+                    self.result_schema.as_deref().unwrap_or(&[]),
                     &reader.post_lookup,
+                    self.post_lookup_plan.as_ref(),
                     self.limit,
                     self.offset,
                     self.filter.take(),
-                );
+                    self.dialect,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => return Poll::Ready(Err(e)),
+                };
 
                 let results = if self.raw_result {
                     ServerReadReplyBatch::Unserialized(results)
@@ -492,15 +564,14 @@ impl BlockingRead {
 
                 return Poll::Ready(Ok(Tagged {
                     tag: self.tag,
-                    v: ReadReply::Normal(Ok(LookupResult::Results(
-                        vec![results],
-                        ReadReplyStats::default(),
-                    ))),
+                    v: ReadReply::Normal(Ok(LookupResult {
+                        results: vec![results],
+                        stats: ReadReplyStats::default(),
+                    })),
                 }));
             }
         };
 
-        // Check if we reached a warning timeout
         if self.first.elapsed() > WAIT_BEFORE_WARNING && !self.warned {
             warn!(
                 reader = %target.name.display_unquoted(),
@@ -559,8 +630,8 @@ fn get_reader_from_cache<'a>(
 
 #[cfg(test)]
 mod readreply {
-    use readyset_client::results::SharedResults;
-    use readyset_client::{LookupResult, ReadReply, ReadReplyStats, Tagged};
+    use readyset_client::post_processing::{ReadReplyStats, ResultIterator, SharedResults};
+    use readyset_client::{LookupResult, ReadReply, Tagged};
     use readyset_data::DfValue;
     use readyset_errors::ReadySetError;
 
@@ -570,21 +641,22 @@ mod readreply {
         let got: Tagged<ReadReply> = bincode::deserialize(
             &bincode::serialize(&Tagged {
                 tag: 32,
-                v: ReadReply::Normal::<ServerReadReplyBatch>(Ok(LookupResult::Results(
-                    data.iter()
+                v: ReadReply::Normal::<ServerReadReplyBatch>(Ok(LookupResult {
+                    results: data
+                        .iter()
                         .cloned()
                         .map(|d| {
-                            ServerReadReplyBatch::serialize(ResultIterator::new(
+                            ServerReadReplyBatch::serialize(ResultIterator::pipeline(
                                 [d].into(),
-                                &Default::default(),
+                                None,
                                 None,
                                 None,
                                 None,
                             ))
                         })
                         .collect(),
-                    ReadReplyStats::default(),
-                ))),
+                    stats: ReadReplyStats::default(),
+                })),
             })
             .unwrap(),
         )
@@ -592,7 +664,7 @@ mod readreply {
 
         match got {
             Tagged {
-                v: ReadReply::Normal(Ok(LookupResult::Results(got, _))),
+                v: ReadReply::Normal(Ok(LookupResult { results: got, .. })),
                 tag: 32,
             } => {
                 assert_eq!(got.len(), data.len());
@@ -613,10 +685,10 @@ mod readreply {
         let got: Tagged<ReadReply> = bincode::deserialize(
             &bincode::serialize(&Tagged {
                 tag: 32,
-                v: ReadReply::Normal::<ServerReadReplyBatch>(Ok(LookupResult::Results(
-                    Vec::new(),
-                    ReadReplyStats::default(),
-                ))),
+                v: ReadReply::Normal::<ServerReadReplyBatch>(Ok(LookupResult {
+                    results: Vec::new(),
+                    stats: ReadReplyStats::default(),
+                })),
             })
             .unwrap(),
         )
@@ -624,7 +696,7 @@ mod readreply {
 
         match got {
             Tagged {
-                v: ReadReply::Normal(Ok(LookupResult::Results(data, _))),
+                v: ReadReply::Normal(Ok(LookupResult { results: data, .. })),
                 tag: 32,
             } => {
                 assert!(data.is_empty());
@@ -734,21 +806,22 @@ mod readreply {
         for tag in 0..10 {
             w.send(Tagged {
                 tag,
-                v: ReadReply::Normal::<ServerReadReplyBatch>(Ok(LookupResult::Results(
-                    data.iter()
+                v: ReadReply::Normal::<ServerReadReplyBatch>(Ok(LookupResult {
+                    results: data
+                        .iter()
                         .cloned()
                         .map(|d| {
-                            ServerReadReplyBatch::serialize(ResultIterator::new(
+                            ServerReadReplyBatch::serialize(ResultIterator::pipeline(
                                 [d].into(),
-                                &Default::default(),
+                                None,
                                 None,
                                 None,
                                 None,
                             ))
                         })
                         .collect(),
-                    ReadReplyStats::default(),
-                ))),
+                    stats: ReadReplyStats::default(),
+                })),
             })
             .await
             .unwrap();
@@ -763,7 +836,7 @@ mod readreply {
 
             match got {
                 Tagged {
-                    v: ReadReply::Normal(Ok(LookupResult::Results(got, _))),
+                    v: ReadReply::Normal(Ok(LookupResult { results: got, .. })),
                     tag: t,
                 } => {
                     assert_eq!(tag, t);

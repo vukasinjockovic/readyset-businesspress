@@ -36,6 +36,13 @@ pub const CLASS_CORRELATED_PROJECTION: &str = "correlated-scalar-subquery-in-pro
 /// Shape class: correlated subquery (incl. EXISTS/NOT EXISTS/IN) in WHERE.
 pub const CLASS_CORRELATED_WHERE: &str = "correlated-subquery-in-where";
 
+/// Not a shape class from the AST walk: upstream's shallow caches have no
+/// dataflow and therefore no Reader deltas — they are permanently excluded
+/// from RSC twin/HYD eligibility (upstream-sync ruling, 2026-08-10). Every
+/// shallow cache is marked suspect with this class so the PHP side sees the
+/// verdict; `rs:t1_live` can never fire for a shallow cache.
+pub const CLASS_SHALLOW_CACHE: &str = "shallow-cache";
+
 /// Suspect-key TTL: 7 days, matching the rs:t1_live liveness registry.
 const SUSPECT_TTL_SECS: u64 = 604_800;
 

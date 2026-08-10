@@ -8,10 +8,11 @@ use crate::prelude::*;
 use common::DfValue;
 use dataflow_expression::grouped::accumulator::{AccumulationOp, AccumulatorData};
 use readyset_data::{Collation, DfType, Dialect};
-use readyset_errors::{internal_err, invariant_eq, ReadySetResult};
+use readyset_errors::{ReadySetResult, internal_err, invariant_eq};
+use readyset_util::SizeOf;
 use serde::{Deserialize, Serialize};
 
-use super::{hash_grouped_records, GroupHash};
+use super::{GroupHash, hash_grouped_records};
 
 /// The last stored state for a given group.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -22,6 +23,16 @@ struct LastState {
     data: AccumulatorData,
 }
 
+impl SizeOf for LastState {
+    fn deep_size_of(&self) -> usize {
+        self.last_output.deep_size_of() + self.data.deep_size_of()
+    }
+
+    fn size_is_empty(&self) -> bool {
+        self.last_output.is_none() && self.data.size_is_empty()
+    }
+}
+
 /// `Accumulator` implements accumulation-based aggregation operations that collect
 /// multiple input values into a single composite output value.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -30,6 +41,8 @@ pub struct Accumulator {
     over: usize,
     group: Vec<usize>,
     out_ty: DfType,
+    #[serde(default)]
+    skip_finalization: bool,
 }
 
 impl Accumulator {
@@ -41,6 +54,7 @@ impl Accumulator {
         group_by: &[usize],
         over_col_ty: &DfType,
         _dialect: &Dialect,
+        skip_finalization: bool,
     ) -> ReadySetResult<GroupedOperator<Accumulator>> {
         match &op {
             AccumulationOp::ArrayAgg { .. } => {
@@ -80,6 +94,7 @@ impl Accumulator {
                 over,
                 group: group_by.into(),
                 out_ty,
+                skip_finalization,
             },
         ))
     }
@@ -130,7 +145,7 @@ impl GroupedOperation for Accumulator {
         let group = first_diff.group_hash;
 
         let last_state = match auxiliary_node_state {
-            Some(AuxiliaryNodeState::Accumulator(ref mut acc_state)) => &mut acc_state.last_state,
+            Some(AuxiliaryNodeState::Accumulator(acc_state)) => &mut acc_state.last_state,
             Some(_) => internal!("Incorrect auxiliary state for Accumulator node"),
             None => internal!("Missing auxiliary state for Accumulator node"),
         };
@@ -170,12 +185,16 @@ impl GroupedOperation for Accumulator {
 
             invariant_eq!(group_hash, group);
             if is_positive {
-                prev_state.data.add(&self.op, value);
+                prev_state.data.add(&self.op, value)?;
             } else {
                 prev_state.data.remove(&self.op, value)?;
             }
         }
-        let output_value = self.op.apply(&prev_state.data)?;
+        let output_value = if self.skip_finalization {
+            self.op.emit_raw(&mut prev_state.data)
+        } else {
+            self.op.apply(&mut prev_state.data)?
+        };
         prev_state.last_output = Some(output_value.clone());
         last_state.insert(group, prev_state);
         Ok(Some(output_value))
@@ -262,7 +281,17 @@ impl GroupedOperation for Accumulator {
     }
 
     fn empty_value(&self) -> Option<DfValue> {
-        Some("".into())
+        if self.skip_finalization {
+            // Intermediate representation for post-lookup aggregation: an empty array
+            // signals zero rows. finalize_raw converts this to NULL (matching PostgreSQL
+            // ARRAY_AGG semantics) or COALESCE handles it for ARRAY() constructors.
+            Some(DfValue::Array(std::sync::Arc::new(
+                readyset_data::Array::from(vec![]),
+            )))
+        } else {
+            // Non-post-lookup path: ARRAY_AGG over zero rows is NULL in PostgreSQL.
+            Some(DfValue::None)
+        }
     }
 
     fn can_lose_state(&self) -> bool {
@@ -276,12 +305,22 @@ pub struct AccumulatorState {
     last_state: HashMap<GroupHash, LastState>,
 }
 
+impl SizeOf for AccumulatorState {
+    fn deep_size_of(&self) -> usize {
+        self.last_state.deep_size_of()
+    }
+
+    fn size_is_empty(&self) -> bool {
+        self.last_state.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use readyset_sql::ast::{NullOrder, OrderType};
 
     use super::*;
-    use crate::{ops, LookupIndex};
+    use crate::{LookupIndex, ops};
 
     fn setup(mat: bool, op: Option<AccumulationOp>) -> ops::test::MockGraph {
         let mut g = ops::test::MockGraph::new();
@@ -302,6 +341,7 @@ mod tests {
             &[0],
             &DfType::Unknown,
             &Dialect::DEFAULT_MYSQL,
+            false,
         )
         .unwrap();
         g.set_op("concat", &["x", "ys"], c, mat);
@@ -505,7 +545,7 @@ mod tests {
         // multiple positives and negatives should update aggregation value by appropriate amount
         let rs = c.narrow_one(u, true);
         assert_eq!(rs.len(), 5); // one - and one + for each group, except last (new) group
-                                 // group 1 had [2], now has [1,2]
+        // group 1 had [2], now has [1,2]
         assert!(rs.iter().any(|r| if let Record::Negative(ref r) = *r {
             if r[0] == 1.into() {
                 assert_eq!(r[1], "2".into());

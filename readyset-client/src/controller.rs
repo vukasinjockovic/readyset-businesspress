@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use deadpool::managed::{Manager, Metrics, Object, Pool, RecycleResult};
 use futures_util::future;
-use hyper::client::HttpConnector;
 use petgraph::graph::NodeIndex;
 use readyset_errors::{
     internal, internal_err, rpc_err, rpc_err_no_downcast, ReadySetError, ReadySetResult,
@@ -17,24 +17,25 @@ use readyset_errors::{
 use readyset_sql::ast::{NonReplicatedRelation, Relation};
 use readyset_sql_passes::adapter_rewrites::AdapterRewriteParams;
 use replication_offset::ReplicationOffsets;
+use reqwest::StatusCode;
 use schema_catalog::SchemaCatalog;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tower::ServiceExt;
 use tower_service::Service;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 use url::Url;
 
 use crate::consensus::{Authority, AuthorityControl};
 use crate::debug::info::{GraphInfo, MaterializationInfo, NodeSize};
 use crate::debug::stats;
 use crate::events::{ControllerEvent, ControllerEventsClient};
-use crate::internal::{DomainIndex, ReplicaAddress};
+use crate::internal::DomainIndex;
 use crate::query::QueryId;
 use crate::recipe::changelist::ChangeList;
 use crate::recipe::{CacheExpr, ExprInfo, ExtendRecipeResult, ExtendRecipeSpec, MigrationStatus};
-use crate::status::ReadySetControllerStatus;
+use crate::status::{ReadySetControllerStatus, ReplicationLagStatus};
 use crate::table::{PersistencePoint, Table, TableBuilder, TableRpc};
 use crate::view::{View, ViewBuilder, ViewRpc};
 use crate::{
@@ -60,14 +61,15 @@ pub struct ControllerDescriptor {
     pub nonce: u64,
 }
 
-fn make_http_client(timeout: Option<Duration>) -> hyper::Client<hyper::client::HttpConnector> {
-    let mut http_connector = HttpConnector::new();
-    http_connector.set_connect_timeout(timeout);
-    hyper::Client::builder()
-        .http2_only(true)
+fn make_http_client(timeout: Option<Duration>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .http2_prior_knowledge()
         // Sets to the keep alive default if request_timeout is not specified.
-        .http2_keep_alive_timeout(timeout.unwrap_or(Duration::from_secs(20)))
-        .build(http_connector)
+        .http2_keep_alive_timeout(timeout.unwrap_or(Duration::from_secs(20)));
+    if let Some(t) = timeout {
+        builder = builder.connect_timeout(t);
+    }
+    builder.build().expect("failed to build reqwest client")
 }
 
 /// Errors that can occur when making a request to a controller
@@ -96,20 +98,14 @@ where
 
 async fn controller_request(
     url: &Url,
-    client: &hyper::Client<hyper::client::HttpConnector>,
+    client: &reqwest::Client,
     req: ControllerRequest,
     timeout: Duration,
-) -> Result<hyper::body::Bytes, ControllerRequestError> {
-    // FIXME(eta): error[E0277]: the trait bound `Uri: From<&Url>` is not satisfied
-    //             (if you try and use the `url` directly instead of stringifying)
-    #[allow(clippy::unwrap_used)]
-    let string_url = url.join(req.path)?.to_string();
+) -> Result<Bytes, ControllerRequestError> {
+    let request_url = url.join(req.path)?;
 
-    let r = hyper::Request::post(string_url)
-        .body(hyper::Body::from(req.request.clone()))
-        .map_err(|e| internal_err!("http request failed: {}", e))?;
-
-    let res = match tokio::time::timeout(timeout, client.request(r)).await {
+    let send = client.post(request_url).body(req.request.clone()).send();
+    let res = match tokio::time::timeout(timeout, send).await {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             return Err(ControllerRequestError {
@@ -124,19 +120,20 @@ async fn controller_request(
     };
 
     let status = res.status();
-    let body = hyper::body::to_bytes(res.into_body())
+    let body = res
+        .bytes()
         .await
-        .map_err(|he| internal_err!("hyper response failed: {}", he))?;
+        .map_err(|he| internal_err!("reqwest response failed: {}", he))?;
 
     match status {
-        hyper::StatusCode::OK => Ok(body),
-        hyper::StatusCode::INTERNAL_SERVER_ERROR => {
+        StatusCode::OK => Ok(body),
+        StatusCode::INTERNAL_SERVER_ERROR => {
             let err: ReadySetError = bincode::deserialize(&body)?;
             Err(err.into())
         }
         s => Err(ControllerRequestError {
             error: internal_err!("HTTP status {s}"),
-            invalidate_url: s == hyper::StatusCode::SERVICE_UNAVAILABLE,
+            invalidate_url: s == StatusCode::SERVICE_UNAVAILABLE,
             permanent: false,
         }),
     }
@@ -146,7 +143,7 @@ async fn controller_request(
 #[derive(Clone)]
 struct RawController {
     url: Url,
-    client: hyper::Client<hyper::client::HttpConnector>,
+    client: reqwest::Client,
     request_timeout: Option<Duration>,
 }
 
@@ -163,7 +160,7 @@ impl RawController {
 }
 
 impl Service<ControllerRequest> for RawController {
-    type Response = hyper::body::Bytes;
+    type Response = Bytes;
     type Error = ReadySetError;
 
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -188,7 +185,7 @@ impl Service<ControllerRequest> for RawController {
 #[derive(Clone)]
 struct Controller {
     authority: Arc<Authority>,
-    client: hyper::Client<hyper::client::HttpConnector>,
+    client: reqwest::Client,
     /// The last valid leader URL seen by this service. Used to circumvent requests to Consul in
     /// the happy-path.
     leader_url: Arc<parking_lot::RwLock<Option<Url>>>,
@@ -222,7 +219,7 @@ impl ControllerRequest {
 }
 
 impl Service<ControllerRequest> for Controller {
-    type Response = hyper::body::Bytes;
+    type Response = Bytes;
     type Error = ReadySetError;
 
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -442,7 +439,7 @@ impl ReadySetHandle {
         ReadySetHandle {
             views: Default::default(),
             domains: Default::default(),
-            handle: tower::util::Either::A(Controller {
+            handle: tower::util::Either::Left(Controller {
                 authority,
                 client: make_http_client(request_timeout),
                 leader_url: Arc::new(parking_lot::RwLock::new(None)),
@@ -463,7 +460,7 @@ impl ReadySetHandle {
         ReadySetHandle {
             views: Default::default(),
             domains: Default::default(),
-            handle: tower::util::Either::B(RawController::new(url, request_timeout)),
+            handle: tower::util::Either::Right(RawController::new(url, request_timeout)),
             request_timeout,
             migration_timeout,
             controller_events_client: None,
@@ -512,11 +509,11 @@ impl ReadySetHandle {
 
     fn make_events_client(&self) -> ControllerEventsClient {
         match &self.handle {
-            tower::util::Either::A(controller) => ControllerEventsClient::with_dynamic_leader(
+            tower::util::Either::Left(controller) => ControllerEventsClient::with_dynamic_leader(
                 controller.authority(),
                 controller.leader_url.clone(),
             ),
-            tower::util::Either::B(raw_controller) => {
+            tower::util::Either::Right(raw_controller) => {
                 ControllerEventsClient::with_fixed_leader(raw_controller.url.clone())
             }
         }
@@ -537,7 +534,7 @@ impl ReadySetHandle {
     where
         R: DeserializeOwned,
     {
-        let body: hyper::body::Bytes = self
+        let body: Bytes = self
             .handle
             .ready()
             .await
@@ -591,6 +588,26 @@ impl ReadySetHandle {
     simple_request!(
         /// Exit maintenance mode
         exit_maintenance_mode() -> ()
+    );
+
+    simple_request!(
+        /// Stop replication
+        stop_replication() -> ()
+    );
+
+    simple_request!(
+        /// Start replication
+        start_replication() -> ()
+    );
+
+    simple_request!(
+        /// Set the replication position for all tables
+        set_replication_position(position: String) -> ()
+    );
+
+    simple_request!(
+        /// Change the CDC URL used for replication
+        change_cdc_url(url: String) -> ()
     );
 
     /// Return a list of all relations (tables or views) which are known to exist in the upstream
@@ -672,27 +689,13 @@ impl ReadySetHandle {
         self.request_view(request)
     }
 
-    /// Obtain the replica of a `View` with the given replica index
-    ///
-    /// `Self::poll_ready` must have returned `Async::Ready` before you call this method.
-    pub fn view_with_replica<I: Into<Relation>>(
-        &mut self,
-        name: I,
-        replica: usize,
-    ) -> impl Future<Output = ReadySetResult<View>> + '_ {
-        self.request_view(ViewRequest {
-            name: name.into(),
-            filter: Some(ViewFilter::Replica(replica)),
-        })
-    }
-
     /// Obtain a 'ViewBuilder' for a specific view that allows you to build a view.
     ///
     /// `Self::poll_ready` must have returned `Async::Ready` before you call this method.
     /// This is made public for inspection in integration tests and is not meant to be
     /// used to construct views, instead use `view`, which calls this method.
     pub async fn view_builder(&mut self, view_request: ViewRequest) -> ReadySetResult<ViewBuilder> {
-        let body: hyper::body::Bytes = self
+        let body: Bytes = self
             .handle
             .ready()
             .await
@@ -727,13 +730,8 @@ impl ReadySetHandle {
     ) -> impl Future<Output = ReadySetResult<View>> + '_ {
         let views = self.views.clone();
         async move {
-            let replica = if let Some(ViewFilter::Replica(replica)) = &view_request.filter {
-                Some(*replica)
-            } else {
-                None
-            };
             let view_builder = self.view_builder(view_request).await?;
-            view_builder.build(replica, views).await
+            view_builder.build(views).await
         }
     }
 
@@ -780,7 +778,7 @@ impl ReadySetHandle {
     ) -> impl Future<Output = ReadySetResult<Option<Table>>> + '_ {
         let domains = self.domains.clone();
         async move {
-            let body: hyper::body::Bytes = self
+            let body: Bytes = self
                 .handle
                 .ready()
                 .await
@@ -812,30 +810,10 @@ impl ReadySetHandle {
         flush_partial()
     );
 
-    async fn fix_changelist_schema_generation(
-        &mut self,
-        changes: &mut ChangeList,
-    ) -> ReadySetResult<()> {
-        if changes.has_missing_schema_generation() {
-            let generation = self.schema_catalog().await?.generation;
-            if changes.fill_missing_schema_generation(generation) {
-                warn!(
-                    generation = %generation,
-                    "Filled missing schema generation for CreateCache in ChangeList (should only happen in tests)"
-                );
-            }
-        }
-
-        Ok(())
-    }
-
     /// Performs a dry-run migration with the given set of queries.
     ///
     /// `Self::poll_ready` must have returned `Async::Ready` before you call this method.
     pub async fn dry_run(&mut self, changes: ChangeList) -> ReadySetResult<ExtendRecipeResult> {
-        let mut changes = changes;
-        self.fix_changelist_schema_generation(&mut changes).await?;
-
         let request = ExtendRecipeSpec::from(changes);
 
         self.rpc("dry_run", request, self.migration_timeout).await
@@ -845,9 +823,6 @@ impl ReadySetHandle {
     ///
     /// `Self::poll_ready` must have returned `Async::Ready` before you call this method.
     pub async fn extend_recipe(&mut self, changes: ChangeList) -> ReadySetResult<()> {
-        let mut changes = changes;
-        self.fix_changelist_schema_generation(&mut changes).await?;
-
         let request = ExtendRecipeSpec::from(changes);
 
         match self
@@ -875,9 +850,6 @@ impl ReadySetHandle {
     /// Asynchronous version of extend_recipe(). The Controller should immediately return an ID that
     /// can be used to query the migration status.
     pub async fn extend_recipe_async(&mut self, changes: ChangeList) -> ReadySetResult<u64> {
-        let mut changes = changes;
-        self.fix_changelist_schema_generation(&mut changes).await?;
-
         let request = ExtendRecipeSpec::from(changes).concurrently();
 
         match self
@@ -898,9 +870,6 @@ impl ReadySetHandle {
         &mut self,
         changes: ChangeList,
     ) -> ReadySetResult<()> {
-        let mut changes = changes;
-        self.fix_changelist_schema_generation(&mut changes).await?;
-
         let request = ExtendRecipeSpec {
             require_leader_ready: false,
             ..changes.into()
@@ -920,8 +889,6 @@ impl ReadySetHandle {
         require_leader_ready: bool,
     ) -> ReadySetResult<()> {
         let replication_offset = replication_offset.clone();
-        let mut changes = changes;
-        self.fix_changelist_schema_generation(&mut changes).await?;
 
         let request = ExtendRecipeSpec {
             changes,
@@ -1020,16 +987,20 @@ impl ReadySetHandle {
     );
 
     simple_request!(
-        /// Get a map from domain index to a shard->replica mapping of the workers that are running the
-        /// shard replicas of that domain .
+        /// Get a map from domain index to the worker running that domain (if any).
         ///
         /// `Self::poll_ready` must have returned `Async::Ready` before you call this method.
-        domains() -> HashMap<DomainIndex, Vec<Vec<Option<Url>>>>
+        domains() -> HashMap<DomainIndex, Option<Url>>
     );
 
     simple_request!(
         /// Get information about all materializations (stateful nodes) within the graph
         materialization_info() -> Vec<MaterializationInfo>
+    );
+
+    simple_request!(
+        /// Get information about materializations for nodes in a specific cache's subgraph
+        materialization_info_for_cache(cache: Relation) -> Vec<MaterializationInfo>
     );
 
     simple_request!(
@@ -1056,6 +1027,15 @@ impl ReadySetHandle {
         /// See [the documentation for PersistentState](::readyset_dataflow::state::persistent_state)
         /// for more information about replication offsets.
         min_persisted_replication_offset() -> PersistencePoint
+    );
+
+    simple_request!(
+        /// Returns the current replication lag status, if available.
+        ///
+        /// The lag reporter runs as a background task in the replicator and periodically
+        /// updates the status. Returns `None` if the lag reporter has not yet produced
+        /// a result (e.g. replication hasn't started).
+        replication_lag_status() -> Option<ReplicationLagStatus>
     );
 
     /// Poll in a loop to wait for all tables to finish compacting
@@ -1135,10 +1115,5 @@ impl ReadySetHandle {
     simple_request!(
         /// Set a failpoint with provided name and action
         failpoint(name: String, action: String,) -> ()
-    );
-
-    simple_request!(
-        /// Notify the controller that a running domain replica has died
-        domain_died(replica_address: ReplicaAddress) -> ()
     );
 }

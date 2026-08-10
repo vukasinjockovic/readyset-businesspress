@@ -1,6 +1,6 @@
 use std::collections::{hash_map, HashMap, HashSet};
 use std::mem;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
@@ -18,10 +18,10 @@ use {mysql_async as mysql, tokio_postgres as pgsql};
 use database_utils::tls::{get_mysql_tls_config, get_tls_connector, ServerCertVerification};
 use database_utils::{DatabaseURL, UpstreamConfig};
 use failpoint_macros::set_failpoint;
-use readyset_client::metrics::recorded::{self, SnapshotStatusTag};
+use metric::SnapshotStatusTag;
 use readyset_client::recipe::changelist::{Change, ChangeList};
-use readyset_client::{ReadySetHandle, Table, TableOperation, TableStatus};
-use readyset_data::Dialect;
+use readyset_client::{Modification, ReadySetHandle, Table, TableOperation, TableStatus};
+use readyset_data::{DfValue, Dialect, SqlEngine};
 use readyset_errors::{internal_err, set_failpoint_return_err, ReadySetError, ReadySetResult};
 use readyset_sql::ast::{NonReplicatedRelation, NotReplicatedReason, Relation};
 use readyset_sql::DialectDisplay;
@@ -33,13 +33,18 @@ use readyset_util::{retry_with_exponential_backoff, select};
 use replication_offset::{ReplicationOffset, ReplicationOffsets};
 
 use crate::db_util::{CreateSchema, DatabaseSchemas};
-use crate::mysql_connector::{MySqlBinlogConnector, MySqlReplicator};
+use crate::mysql_connector::{is_gtid_mode_enabled, MySqlBinlogConnector, MySqlReplicator};
 use crate::postgres_connector::{
     drop_publication, drop_readyset_schema, drop_replication_slot, PostgresReplicator,
     PostgresWalConnector, PUBLICATION_NAME, REPLICATION_SLOT,
 };
+use crate::replication_lag_reporter::{
+    spawn_lag_reporter, SharedLagStatus, SharedReplicatorProgress, UpstreamLagConfig,
+    MYSQL_HEARTBEAT_TABLE, PG_HEARTBEAT_SCHEMA, PG_HEARTBEAT_TABLE_NAME,
+};
 use crate::table_filter::TableFilter;
 use crate::{ControllerMessage, ReplicatorMessage};
+use tokio_util::sync::CancellationToken;
 
 /// Time to wait for requests to coalesce between snapshotting. Useful for preventing a series of
 /// DDL changes from thrashing snapshotting
@@ -51,7 +56,16 @@ const RESNAPSHOT_SLOT: &str = "readyset_resnapshot";
 pub(crate) enum ReplicationAction {
     TableAction {
         table: Relation,
-        actions: Vec<TableOperation>,
+        /// Each row operation paired with the upstream replication offset
+        /// at which it was logged. Pairing in a single Vec (rather than two
+        /// parallel Vecs) keeps the operation and its position locked
+        /// together under any reordering, filtering, or merge — the shape
+        /// itself prevents desync.
+        ///
+        /// The per-op position lets `handle_table_actions` filter
+        /// already-applied events inside a coalesced batch where the
+        /// batch's own position alone is insufficient. See REA-6582.
+        actions: Vec<(TableOperation, ReplicationOffset)>,
     },
     DdlChange {
         schema: String,
@@ -79,18 +93,17 @@ pub(crate) trait Connector {
         last_pos: &ReplicationOffset,
         until: Option<&ReplicationOffset>,
     ) -> ReadySetResult<(Vec<ReplicationAction>, ReplicationOffset)>;
+
+    /// Stop processing events for the given table. Call this when denying replication for
+    /// a table to keep the connector's table filter in sync with the adapter's.
+    fn deny_replication(&mut self, schema: &str, table: &str);
 }
 
 /// Cleans up replication related assets on the upstream database as supplied by the
 /// UpstreamConfig.
 pub async fn cleanup(config: UpstreamConfig) -> ReadySetResult<()> {
     if let DatabaseURL::PostgreSQL(mut options) = config.get_cdc_db_url()? {
-        let repl_slot_name = match &config.replication_server_id {
-            Some(server_id) => {
-                format!("{REPLICATION_SLOT}_{server_id}")
-            }
-            _ => REPLICATION_SLOT.to_string(),
-        };
+        let repl_slot_name = replication_slot_name(&config);
         let resnapshot_slot_name = resnapshot_slot_name(&repl_slot_name);
 
         let dbname = options
@@ -125,6 +138,16 @@ pub async fn cleanup(config: UpstreamConfig) -> ReadySetResult<()> {
 pub fn resnapshot_slot_name(repl_slot_name: &String) -> String {
     format!("{RESNAPSHOT_SLOT}_{repl_slot_name}")
 }
+
+/// Name of the primary logical replication slot Readyset creates on the upstream Postgres
+/// database. Incorporates the configured replication server id so that multiple Readyset
+/// deployments replicating from the same upstream cluster do not collide on slot names.
+pub fn replication_slot_name(config: &UpstreamConfig) -> String {
+    match &config.replication_server_id {
+        Some(server_id) => format!("{REPLICATION_SLOT}_{server_id}"),
+        None => REPLICATION_SLOT.to_string(),
+    }
+}
 /// An adapter that converts database events into ReadySet API calls
 pub struct NoriaAdapter<'a> {
     /// The ReadySet API handle
@@ -150,6 +173,21 @@ pub struct NoriaAdapter<'a> {
     supports_resnapshot: bool,
     /// Any TableStatus updates sent here will update this controller's state machine.
     table_status_tx: UnboundedSender<(Relation, TableStatus)>,
+    /// Shared replicator-progress snapshot (stream position + last heartbeat timestamp),
+    /// updated by the main replication loop and `handle_action`, read by the lag reporter.
+    progress: SharedReplicatorProgress,
+    /// Whether heartbeat-based staleness measurement is enabled.
+    heartbeat_enabled: bool,
+    /// Instance ID for heartbeat row filtering (UUID, identifies this ReadySet instance).
+    heartbeat_instance_id: String,
+    /// Cancellation token for the lag reporter background task.
+    lag_reporter_cancel: CancellationToken,
+}
+
+impl Drop for NoriaAdapter<'_> {
+    fn drop(&mut self) {
+        self.lag_reporter_cancel.cancel();
+    }
 }
 
 impl<'a> NoriaAdapter<'a> {
@@ -166,6 +204,7 @@ impl<'a> NoriaAdapter<'a> {
         enable_statement_logging: bool,
         parsing_preset: ParsingPreset,
         table_status_tx: UnboundedSender<(Relation, TableStatus)>,
+        lag_status: SharedLagStatus,
     ) -> ReadySetResult<std::convert::Infallible> {
         // Resnapshot when restarting the server to apply changes that may have been made to the
         // replication-tables config parameter.
@@ -193,6 +232,7 @@ impl<'a> NoriaAdapter<'a> {
                         table_filter,
                         parsing_preset,
                         table_status_tx.clone(),
+                        lag_status.clone(),
                     )
                     .await
                 }
@@ -219,12 +259,7 @@ impl<'a> NoriaAdapter<'a> {
                     )
                     .await?;
 
-                    let repl_slot_name = match &config.replication_server_id {
-                        Some(server_id) => {
-                            format!("{REPLICATION_SLOT}_{server_id}")
-                        }
-                        _ => REPLICATION_SLOT.to_string(),
-                    };
+                    let repl_slot_name = replication_slot_name(config);
 
                     // Notify controller that we are about to start a snapshot if we are
                     // restarting to resnapshot.
@@ -247,6 +282,7 @@ impl<'a> NoriaAdapter<'a> {
                         table_filter,
                         parsing_preset,
                         table_status_tx.clone(),
+                        lag_status.clone(),
                     )
                     .await
                 }
@@ -304,9 +340,8 @@ impl<'a> NoriaAdapter<'a> {
         table_filter: &'a mut TableFilter,
         parsing_preset: ParsingPreset,
         table_status_tx: UnboundedSender<(Relation, TableStatus)>,
+        lag_status: SharedLagStatus,
     ) -> ReadySetResult<std::convert::Infallible> {
-        use replication_offset::mysql::MySqlPosition;
-
         let mut mysql_opts_builder = OptsBuilder::from_opts(mysql_options).prefer_socket(false);
 
         let ssl_opts = get_mysql_tls_config(&ServerCertVerification::from(config).await?);
@@ -326,6 +361,51 @@ impl<'a> NoriaAdapter<'a> {
             delay: 250,
             backoff: 2,
         )?;
+
+        // Determine GTID mode: infer from stored offset type when available,
+        // fall back to --require-gtid flag for fresh starts.
+        let gtid_mode = match replication_offsets.min_present_offset()? {
+            Some(offset) if offset.is_gtid() => {
+                // Stored offset is GTID-based — verify server supports it
+                let mut conn = mysql::Conn::new(mysql_opts_builder.clone()).await?;
+                let server_gtid = is_gtid_mode_enabled(&mut conn).await?;
+                if !server_gtid {
+                    return Err(ReadySetError::ReplicationFailed(
+                        "Stored replication offset is GTID-based but the upstream MySQL \
+                         server does not have gtid_mode=ON"
+                            .to_string(),
+                    ));
+                }
+                info!("GTID mode inferred from stored replication offset");
+                true
+            }
+            Some(_) => {
+                // Stored offset is binlog file+pos — use file-based replication
+                false
+            }
+            None => {
+                // Fresh start — use the --require-gtid flag
+                if config.require_gtid {
+                    let mut conn = mysql::Conn::new(mysql_opts_builder.clone()).await?;
+                    let server_gtid = is_gtid_mode_enabled(&mut conn).await?;
+                    if !server_gtid {
+                        return Err(ReadySetError::ReplicationFailed(
+                            "--require-gtid is set but the upstream MySQL server \
+                             does not have gtid_mode=ON. Enable GTID mode on \
+                             the server or remove --require-gtid"
+                                .to_string(),
+                        ));
+                    }
+                    info!(
+                        "GTID mode enabled via --require-gtid, \
+                         server confirms gtid_mode=ON"
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+        };
 
         let pos = match (replication_offsets.min_present_offset()?, resnapshot) {
             (None, _) | (_, true) => {
@@ -370,11 +450,12 @@ impl<'a> NoriaAdapter<'a> {
                     parsing_preset,
                     snapshot_query_comment: config.snapshot_query_comment.clone(),
                     table_status_tx: table_status_tx.clone(),
+                    gtid_mode,
                 };
 
                 let snapshot_start = Instant::now();
                 counter!(
-                    recorded::REPLICATOR_SNAPSHOT_STATUS,
+                    metric::REPLICATOR_SNAPSHOT_STATUS,
                     "status" => SnapshotStatusTag::Started.value(),
                 )
                 .increment(1u64);
@@ -398,7 +479,7 @@ impl<'a> NoriaAdapter<'a> {
                 };
 
                 counter!(
-                    recorded::REPLICATOR_SNAPSHOT_STATUS,
+                    metric::REPLICATOR_SNAPSHOT_STATUS,
                     "status" => status
                 )
                 .increment(1u64);
@@ -417,14 +498,13 @@ impl<'a> NoriaAdapter<'a> {
                 // can do this "catching up" by just starting replication at
                 // the old offset. Note that at the very least we will
                 // always have the schema offset for the minimum.
-                let pos: MySqlPosition = replication_offsets
+                let pos: ReplicationOffset = replication_offsets
                     .min_present_offset()?
                     .expect("Minimal offset must be present after snapshot")
-                    .clone()
-                    .try_into()?;
+                    .clone();
 
                 span.in_scope(|| info!("Snapshot finished"));
-                histogram!(recorded::REPLICATOR_SNAPSHOT_DURATION)
+                histogram!(metric::REPLICATOR_SNAPSHOT_DURATION)
                     .record(snapshot_start.elapsed().as_micros() as f64);
 
                 // Send snapshot complete and redacted schemas telemetry events
@@ -439,8 +519,10 @@ impl<'a> NoriaAdapter<'a> {
 
                 pos
             }
-            (Some(pos), _) => pos.clone().try_into()?,
+            (Some(pos), _) => pos.clone(),
         };
+
+        let lag_opts: mysql_async::Opts = mysql_opts_builder.clone().into();
 
         let connector = Box::new(
             MySqlBinlogConnector::connect(
@@ -454,6 +536,35 @@ impl<'a> NoriaAdapter<'a> {
             )
             .await?,
         );
+        let heartbeat = config.replication_heartbeat;
+        // Allow the heartbeat table through the binlog connector's table filter
+        // so events reach handle_action where we intercept them.
+        if heartbeat {
+            if let Some(db) = lag_opts.db_name() {
+                table_filter.allow_replication(db, MYSQL_HEARTBEAT_TABLE);
+            }
+        }
+        let upstream_lag_config = if gtid_mode {
+            UpstreamLagConfig::MysqlGtid {
+                opts: lag_opts,
+                heartbeat,
+            }
+        } else {
+            UpstreamLagConfig::MysqlFile {
+                opts: lag_opts,
+                heartbeat,
+            }
+        };
+
+        let cancel = CancellationToken::new();
+        let poll_interval = Duration::from_secs(config.replication_lag_interval as u64);
+        let (progress, instance_id) = spawn_lag_reporter(
+            upstream_lag_config,
+            cancel.clone(),
+            lag_status,
+            poll_interval,
+            config.replication_server_uuid,
+        );
 
         let mut adapter = NoriaAdapter {
             noria: noria.clone(),
@@ -465,9 +576,17 @@ impl<'a> NoriaAdapter<'a> {
             supports_resnapshot: true,
             dialect: Dialect::DEFAULT_MYSQL,
             table_status_tx,
+            progress,
+            heartbeat_enabled: heartbeat,
+            heartbeat_instance_id: instance_id,
+            lag_reporter_cancel: cancel,
         };
 
-        let mut current_pos: ReplicationOffset = pos.into();
+        let mut current_pos: ReplicationOffset = pos;
+
+        // Seed the shared progress snapshot so the lag reporter can start reporting
+        // immediately, even on a quiescent database with no replication events.
+        adapter.publish_progress_after_apply(current_pos.clone());
 
         // At this point it is possible that we just finished replication, but
         // our schema and our tables are taken at different position in the binlog.
@@ -477,7 +596,7 @@ impl<'a> NoriaAdapter<'a> {
         // Only once binlog advanced to that point, can we send a ready signal to
         // ReadySet.
         match adapter.replication_offsets.max_offset()? {
-            Some(max) if max > &current_pos => {
+            Some(max) if max.try_partial_cmp(&current_pos)?.is_gt() => {
                 info!(start = %current_pos, end = %max, "Catching up");
                 let max = max.clone();
                 if let Err(err) = adapter
@@ -528,6 +647,7 @@ impl<'a> NoriaAdapter<'a> {
         table_filter: &'a mut TableFilter,
         parsing_preset: ParsingPreset,
         table_status_tx: UnboundedSender<(Relation, TableStatus)>,
+        lag_status: SharedLagStatus,
     ) -> ReadySetResult<std::convert::Infallible> {
         set_failpoint_return_err!(failpoints::START_INNER_POSTGRES);
 
@@ -573,6 +693,15 @@ impl<'a> NoriaAdapter<'a> {
             })?;
 
         let max_parallel_snapshot_tables = config.max_parallel_snapshot_tables();
+
+        // Allow the heartbeat table through the table filter so the WAL reader
+        // doesn't drop heartbeat events before they reach handle_action.
+        // This must happen before the connector is created, because the connector
+        // clones the table_filter and later passes that clone to the WalReader.
+        if config.replication_heartbeat {
+            table_filter.allow_replication(PG_HEARTBEAT_SCHEMA, PG_HEARTBEAT_TABLE_NAME);
+        }
+
         let mut connector = Box::new(
             PostgresWalConnector::connect(
                 pgsql_opts.clone(),
@@ -705,7 +834,7 @@ impl<'a> NoriaAdapter<'a> {
             };
 
             counter!(
-                recorded::REPLICATOR_SNAPSHOT_STATUS,
+                metric::REPLICATOR_SNAPSHOT_STATUS,
                 "status" => status
             )
             .increment(1u64);
@@ -713,7 +842,7 @@ impl<'a> NoriaAdapter<'a> {
             snapshot_result?;
 
             info!("Snapshot finished");
-            histogram!(recorded::REPLICATOR_SNAPSHOT_DURATION)
+            histogram!(metric::REPLICATOR_SNAPSHOT_DURATION)
                 .record(snapshot_start.elapsed().as_micros() as f64);
 
             if replication_slot.slot_name == resnapshot_slot_name {
@@ -753,6 +882,20 @@ impl<'a> NoriaAdapter<'a> {
             }
         };
 
+        let cancel = CancellationToken::new();
+        let poll_interval = Duration::from_secs(config.replication_lag_interval as u64);
+        let (progress, instance_id) = spawn_lag_reporter(
+            UpstreamLagConfig::Postgres {
+                config: Box::new(pgsql_opts.clone()),
+                tls: tls_connector.clone(),
+                heartbeat: config.replication_heartbeat,
+            },
+            cancel.clone(),
+            lag_status,
+            poll_interval,
+            config.replication_server_uuid,
+        );
+
         let mut adapter = NoriaAdapter {
             noria,
             connector,
@@ -763,7 +906,15 @@ impl<'a> NoriaAdapter<'a> {
             supports_resnapshot: true,
             dialect: Dialect::DEFAULT_POSTGRESQL,
             table_status_tx,
+            progress,
+            heartbeat_enabled: config.replication_heartbeat,
+            heartbeat_instance_id: instance_id,
+            lag_reporter_cancel: cancel,
         };
+
+        // Seed the shared progress snapshot so the lag reporter can start reporting
+        // immediately, even on a quiescent database with no replication events.
+        adapter.publish_progress_after_apply(min_pos.clone());
 
         if min_pos != max_pos {
             info!(start = %min_pos, end = %max_pos, "Catching up");
@@ -925,7 +1076,7 @@ impl<'a> NoriaAdapter<'a> {
             Err(e @ ReadySetError::RecipeInvariantViolated(_)) => return Err(e),
             Err(error) => {
                 warn!(%error, "Error extending recipe, DDL statement will not be used");
-                counter!(recorded::REPLICATOR_FAILURE).increment(1u64);
+                counter!(metric::REPLICATOR_FAILURE).increment(1u64);
 
                 let changes = mem::take(changelist.changes_mut());
                 // If something went wrong, mark all the tables and views that we just tried to
@@ -961,14 +1112,30 @@ impl<'a> NoriaAdapter<'a> {
         self.replication_offsets.schema = Some(pos.clone());
         self.clear_mutator_cache();
 
-        // Set the replication offset for each table we just created to this replication offset
-        // (since otherwise they'll get initialized without an offset)
+        // Seed each newly-created table's replication offset to the
+        // *start* of the current transaction rather than the DDL's own
+        // position. PostgreSQL permits transactional DDL — a single
+        // upstream transaction can contain `CREATE TABLE` followed by
+        // `INSERT` row events for that table — and the DDL's batch
+        // position is mid-transaction under the
+        // `(commit_lsn, lsn)` ordering of `PostgresPosition`. Using it
+        // as the per-table seed would let row events from the same
+        // transaction compare equal-or-less and be wrongly dropped by
+        // the per-op already-applied filter in `handle_table_actions`.
+        // `transaction_start` returns `(commit_lsn, 0)` for PostgreSQL
+        // (a strict lower bound for any event in the same commit) and
+        // returns the position unchanged for MySQL (where DDL is
+        // implicitly committed and cannot share a transaction with row
+        // events). Persisting this seed keeps `max_offset()` populated
+        // and avoids triggering a spurious full resnapshot on next
+        // restart. See REA-6582.
+        let init_offset = pos.transaction_start();
         for table in &added_tables {
             self.replication_offsets
                 .tables
-                .insert(table.clone(), Some(pos.clone()));
+                .insert(table.clone(), Some(init_offset.clone()));
             if let Some(mutator) = self.mutator_for_table(table).await? {
-                mutator.set_replication_offset(pos.clone()).await?;
+                mutator.set_replication_offset(init_offset.clone()).await?;
             } else {
                 warn!(
                     table = %table.display_unquoted(),
@@ -1026,9 +1193,38 @@ impl<'a> NoriaAdapter<'a> {
     async fn handle_table_actions(
         &mut self,
         table: Relation,
-        mut actions: Vec<TableOperation>,
+        actions: Vec<(TableOperation, ReplicationOffset)>,
         pos: &ReplicationOffset,
     ) -> ReadySetResult<()> {
+        // Per-op already-applied filter. The caller (handle_action) already
+        // guarantees `pos > table_offset` at the batch level; this strains
+        // out individual operations whose own logged position is <= the
+        // table's persisted offset. That can happen inside coalesced
+        // batches (e.g. MySQL group commit's merge_table_actions) where
+        // the batch-level position alone cannot distinguish stale events
+        // from fresh ones. See REA-6582.
+        //
+        // Snapshot the table offset before acquiring `table_mutator` (which
+        // borrows `self` mutably) so we can read both in the same scope.
+        let table_offset = self
+            .replication_offsets
+            .tables
+            .get(&table)
+            .and_then(Option::as_ref)
+            .cloned();
+        let total = actions.len();
+        let (kept, skipped) = filter_already_applied_ops(actions, table_offset.as_ref())?;
+        if skipped > 0 {
+            trace!(
+                table = %table.display_unquoted(),
+                skipped,
+                total,
+                %pos,
+                "filtered already-applied row events inside coalesced batch"
+            );
+        }
+        let mut kept = kept;
+
         // Send the rows as are
         let table_mutator = if let Some(table) = self.mutator_for_table(&table).await? {
             table
@@ -1042,15 +1238,35 @@ impl<'a> NoriaAdapter<'a> {
             if self.warned_missing_tables.insert(table.clone()) {
                 warn!(
                     table_name = %table.display(readyset_sql::Dialect::PostgreSQL),
-                    num_actions = actions.len(),
+                    num_actions = total,
                     position = %pos,
                     "Could not find table, discarding actions"
                 );
             }
             return Ok(());
         };
-        actions.push(TableOperation::SetReplicationOffset(pos.clone()));
-        table_mutator.perform_all(actions).await?;
+
+        // If everything was filtered, still advance the persisted offset to
+        // `pos`. Otherwise the in-memory `replication_offsets.tables` entry
+        // (which we update below) and the on-disk offset would diverge, and
+        // a restart would re-stream these same events and re-enter this
+        // filter every time.
+        if kept.is_empty() {
+            table_mutator.set_replication_offset(pos.clone()).await?;
+            self.replication_offsets
+                .tables
+                .insert(table, Some(pos.clone()));
+            return Ok(());
+        }
+
+        let batch_size = kept.len();
+        kept.push(TableOperation::SetReplicationOffset(pos.clone()));
+        let start = std::time::Instant::now();
+        table_mutator.perform_all(kept).await?;
+        let duration = start.elapsed();
+        histogram!(metric::REPLICATOR_BATCH_SIZE).record(batch_size as f64);
+        counter!(metric::REPLICATOR_PERFORM_ALL_CALLS).increment(1);
+        histogram!(metric::REPLICATOR_PERFORM_ALL_DURATION).record(duration.as_micros() as f64);
 
         self.replication_offsets
             .tables
@@ -1072,43 +1288,64 @@ impl<'a> NoriaAdapter<'a> {
         // First check if we should skip this action due to insufficient log position or lack of
         // interest
         let mut actionables: Vec<ReplicationAction> = Vec::new();
+        let mut had_heartbeat = false;
+        let mut had_real_table_action = false;
         for action in actions {
             match action {
                 ReplicationAction::DdlChange { .. } | ReplicationAction::LogPosition => {
-                    match &self.replication_offsets.schema {
-                        Some(cur) if pos <= *cur => {
-                            if !catchup {
-                                warn!(%pos, %cur, "Skipping schema update for earlier entry");
-                            }
+                    let already_applied = match &self.replication_offsets.schema {
+                        Some(cur) => pos.try_partial_cmp(cur)?.is_le(),
+                        None => false,
+                    };
+                    if already_applied {
+                        if !catchup {
+                            warn!(%pos, cur = %self.replication_offsets.schema.as_ref().expect("checked above"),
+                                  "Skipping schema update for earlier entry");
                         }
-                        _ => {
-                            actionables.push(action);
-                        }
+                    } else {
+                        actionables.push(action);
                     }
                 }
                 ReplicationAction::TableAction { table, actions } => {
-                    match self.replication_offsets.tables.get(&table) {
-                        Some(Some(cur)) if pos <= *cur => {
-                            if !catchup {
-                                warn!(
-                                    table = %table.display_unquoted(),
-                                    %pos,
-                                    %cur,
-                                    "Skipping table action for earlier entry"
-                                );
-                            }
-                            continue;
-                        }
+                    // Intercept heartbeat table writes: extract the timestamp
+                    // and drop the event so it never reaches the dataflow.
+                    // We extract the timestamp even during catch-up because the lag
+                    // reporter is writing fresh heartbeats concurrently — the 2-poll
+                    // startup guard in the lag reporter handles stale data from
+                    // previous sessions.
+                    if self.heartbeat_enabled && self.is_heartbeat_table(&table) {
+                        self.extract_heartbeat_timestamp(&actions).await;
+                        had_heartbeat = true;
+                        continue;
+                    }
 
+                    let already_applied = match self.replication_offsets.tables.get(&table) {
                         Some(Some(cur)) => {
-                            trace!(table = %table.display_unquoted(), %cur);
+                            let ord = pos.try_partial_cmp(cur)?;
+                            if ord.is_gt() {
+                                trace!(table = %table.display_unquoted(), %cur);
+                            }
+                            ord.is_le()
                         }
                         _ => {
                             trace!(
                                 table = %table.display_unquoted(),
                                 "no replication offset for table"
                             );
+                            false
                         }
+                    };
+                    if already_applied {
+                        if !catchup {
+                            warn!(
+                                table = %table.display_unquoted(),
+                                %pos,
+                                cur = %self.replication_offsets.tables.get(&table)
+                                    .expect("checked above").as_ref().expect("checked above"),
+                                "Skipping table action for earlier entry"
+                            );
+                        }
+                        continue;
                     }
                     if self.table_filter.should_be_processed(
                         table.schema.as_deref().ok_or_else(|| {
@@ -1117,11 +1354,19 @@ impl<'a> NoriaAdapter<'a> {
                         &table.name,
                     ) {
                         actionables.push(ReplicationAction::TableAction { table, actions });
+                        had_real_table_action = true;
                     }
                 }
                 ReplicationAction::Empty => {}
             }
         }
+
+        // If the only table actions in this batch were heartbeats (all intercepted),
+        // skip any LogPosition so the persisted offset reflects real dataflow state,
+        // not heartbeat bookkeeping. This matters for MySQL, whose connector emits
+        // LogPosition alongside table actions; the Postgres connector doesn't emit
+        // LogPosition for table-action-only batches so this is a no-op there.
+        let skip_log_position = had_heartbeat && !had_real_table_action;
 
         for action in actionables {
             match action {
@@ -1131,7 +1376,11 @@ impl<'a> NoriaAdapter<'a> {
                 ReplicationAction::TableAction { table, actions } => {
                     self.handle_table_actions(table, actions, &pos).await?
                 }
-                ReplicationAction::LogPosition => self.handle_log_position(&pos).await?,
+                ReplicationAction::LogPosition => {
+                    if !skip_log_position {
+                        self.handle_log_position(&pos).await?;
+                    }
+                }
                 ReplicationAction::Empty => unreachable!("Should not have an empty action"),
             }
         }
@@ -1161,8 +1410,10 @@ impl<'a> NoriaAdapter<'a> {
                 )
             ));
 
-            if until.as_ref().map(|u| *position >= *u).unwrap_or(false) {
-                return Ok(());
+            if let Some(u) = until.as_ref() {
+                if position.try_partial_cmp(u)?.is_ge() {
+                    return Ok(());
+                }
             }
 
             select! {
@@ -1173,12 +1424,12 @@ impl<'a> NoriaAdapter<'a> {
                         debug!(%position, "Received replication action");
 
                         trace!(?actions);
-                        if let Err(err) = self.handle_action(actions, pos, until.is_some()).await {
+                        if let Err(err) = self.handle_action(actions, pos.clone(), until.is_some()).await {
                             if matches!(err, ReadySetError::ResnapshotNeeded) {
                                 info!("Change in DDL requires partial resnapshot");
                             } else {
                                 error!(error = %err, "Aborting replication task on error");
-                                counter!(recorded::REPLICATOR_FAILURE).increment(1u64);
+                                counter!(metric::REPLICATOR_FAILURE).increment(1u64);
                             }
                             // In some cases, we may fail to replicate because of unsupported operations, stop
                             // replicating a table if we encounter this type of error.
@@ -1188,7 +1439,14 @@ impl<'a> NoriaAdapter<'a> {
                             }
                             return Err(err);
                         };
-                        counter!(recorded::REPLICATOR_SUCCESS).increment(1u64);
+                        counter!(metric::REPLICATOR_SUCCESS).increment(1u64);
+                        // Publish both the stream position and persist frontier now that
+                        // the action has been applied. Writing these together after apply
+                        // keeps `persisted_offset <= stream_position` visible to the lag
+                        // reporter; a pre-apply write of `stream_position` would expose a
+                        // window where `persist_lag > consume_lag` purely as a write-ordering
+                        // artifact.
+                        self.publish_progress_after_apply(pos);
                         debug!(%position, "Successfully applied replication action");
                     }
                     Err(ReadySetError::TableError { table, source }) => {
@@ -1224,6 +1482,91 @@ impl<'a> NoriaAdapter<'a> {
     /// and we need to drop them all
     fn clear_mutator_cache(&mut self) {
         self.mutator_map.clear()
+    }
+
+    /// Publish the replicator's progress — the stream position just applied and the
+    /// current max-persisted offset — to the shared snapshot read by the lag reporter.
+    /// Called after each successfully applied action and from adapter startup so the
+    /// reporter has something to compare against on a quiescent database.
+    ///
+    /// On the error path from `max_present_offset` (e.g. mixed-log-name tables across
+    /// a binlog rotation), we publish `None` for the persist frontier so the reporter
+    /// falls back to the stream position rather than continuing to surface a stale,
+    /// frozen offset.
+    fn publish_progress_after_apply(&self, stream_position: ReplicationOffset) {
+        let persisted = match self.replication_offsets.max_present_offset() {
+            Ok(off) => off.cloned(),
+            Err(e) => {
+                warn!(error = %e, "Failed to compute max persisted offset");
+                None
+            }
+        };
+        self.progress
+            .publish_after_apply(stream_position, persisted);
+    }
+
+    /// Check if the given table is the heartbeat table.
+    fn is_heartbeat_table(&self, table: &Relation) -> bool {
+        match self.dialect.engine() {
+            SqlEngine::PostgreSQL => {
+                table.schema.as_deref() == Some(PG_HEARTBEAT_SCHEMA)
+                    && table.name == PG_HEARTBEAT_TABLE_NAME
+            }
+            // MySQL doesn't use a separate schema for the heartbeat table — it lives
+            // in the replicated database. Match on name only; the _readyset_ prefix
+            // avoids collisions with user tables.
+            SqlEngine::MySQL => table.name == MYSQL_HEARTBEAT_TABLE,
+        }
+    }
+
+    /// Extract the heartbeat timestamp from a set of table operations and store it
+    /// in the shared heartbeat timestamp. Only processes rows matching this instance's
+    /// UUID to avoid reading another ReadySet instance's heartbeat.
+    async fn extract_heartbeat_timestamp(&self, actions: &[(TableOperation, ReplicationOffset)]) {
+        for (action, _) in actions {
+            // The heartbeat table has columns (id TEXT, ts TIMESTAMPTZ).
+            // Extract both: id at index 0, ts at index 1.
+            let (id_value, ts_value): (Option<&DfValue>, Option<&DfValue>) = match action {
+                TableOperation::Insert(row) => (row.first(), row.get(1)),
+                TableOperation::InsertOrUpdate { row, .. } => (row.first(), row.get(1)),
+                TableOperation::Update { key, update } => {
+                    // Postgres ON CONFLICT DO UPDATE delivers subsequent heartbeat
+                    // writes as WAL UPDATE records. The id is in the key (primary
+                    // key) and the ts is in the update modifications (column index 1).
+                    let ts = match update.get(1) {
+                        Some(Modification::Set(v)) => Some(v),
+                        _ => None,
+                    };
+                    (key.first(), ts)
+                }
+                _ => continue,
+            };
+
+            // Filter: only process rows matching this instance's UUID.
+            let matches = match id_value {
+                Some(DfValue::Text(id)) => id.as_str() == self.heartbeat_instance_id,
+                Some(DfValue::TinyText(id)) => id.as_str() == self.heartbeat_instance_id,
+                _ => false,
+            };
+            if !matches {
+                continue;
+            }
+
+            let Some(ts_value) = ts_value else {
+                continue;
+            };
+
+            let system_time: Option<SystemTime> = match ts_value {
+                DfValue::TimestampTz(ts) => Some(ts.to_chrono().into()),
+                _ => {
+                    warn!(?ts_value, "Unexpected heartbeat timestamp type");
+                    None
+                }
+            };
+            if let Some(st) = system_time {
+                self.progress.set_heartbeat_ts(st);
+            }
+        }
     }
 
     /// Get a mutator for a noria table from the cache if available, or fetch a new one
@@ -1352,6 +1695,17 @@ impl<'a> NoriaAdapter<'a> {
 
         self.table_filter
             .deny_replication(schema.as_str(), name.as_str());
+        self.connector
+            .deny_replication(schema.as_str(), name.as_str());
+
+        antithesis_sdk::assert_reachable!(
+            "Replication denied for a single table and continued",
+            &serde_json::json!({
+                "schema": schema.as_str(),
+                "table": name.as_str(),
+                "error": source.to_string(),
+            })
+        );
 
         Ok(())
     }
@@ -1367,4 +1721,103 @@ pub async fn pg_pool(
     };
     let mgr = Manager::from_config(config, tls, mgr_config);
     Pool::builder(mgr).max_size(pool_size).build()
+}
+
+/// Drop operations whose paired position is at or below `table_offset`,
+/// returning the kept operations and the number of operations skipped.
+///
+/// `table_offset = None` means the table has no persisted offset yet
+/// (first delivery), in which case nothing is filtered.
+fn filter_already_applied_ops(
+    actions: Vec<(TableOperation, ReplicationOffset)>,
+    table_offset: Option<&ReplicationOffset>,
+) -> ReadySetResult<(Vec<TableOperation>, usize)> {
+    let total = actions.len();
+    let mut kept: Vec<TableOperation> = Vec::with_capacity(total);
+    for (op, op_pos) in actions {
+        let already_applied = match table_offset {
+            Some(cur) => op_pos.try_partial_cmp(cur)?.is_le(),
+            None => false,
+        };
+        if !already_applied {
+            kept.push(op);
+        }
+    }
+    let skipped = total - kept.len();
+    Ok((kept, skipped))
+}
+
+#[cfg(test)]
+mod tests {
+    use replication_offset::mysql::MySqlPosition;
+
+    use super::*;
+
+    fn pos(p: u64) -> ReplicationOffset {
+        ReplicationOffset::MySql(
+            MySqlPosition::from_file_name_and_position("binlog.000001".to_string(), p)
+                .expect("valid"),
+        )
+    }
+
+    fn ins(v: i64) -> TableOperation {
+        TableOperation::Insert(vec![DfValue::from(v)])
+    }
+
+    #[test]
+    fn filter_keeps_all_when_no_table_offset() {
+        let actions = vec![(ins(1), pos(10)), (ins(2), pos(20))];
+        let (kept, skipped) = filter_already_applied_ops(actions, None).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn filter_drops_ops_at_or_below_table_offset() {
+        // table_offset = 15: ops at <=15 are stale; ops at >15 are fresh.
+        let actions = vec![
+            (ins(1), pos(10)), // stale
+            (ins(2), pos(15)), // stale (== table_offset)
+            (ins(3), pos(20)), // fresh
+            (ins(4), pos(30)), // fresh
+        ];
+        let off = pos(15);
+        let (kept, skipped) = filter_already_applied_ops(actions, Some(&off)).unwrap();
+        assert_eq!(skipped, 2);
+        assert_eq!(kept.len(), 2);
+        // Verify the kept ops are the ones with values 3 and 4.
+        let values: Vec<_> = kept
+            .iter()
+            .filter_map(|op| match op {
+                TableOperation::Insert(row) => Some(row[0].clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(values, vec![DfValue::from(3), DfValue::from(4)]);
+    }
+
+    #[test]
+    fn filter_drops_everything_when_all_stale() {
+        let actions = vec![(ins(1), pos(5)), (ins(2), pos(10))];
+        let off = pos(20);
+        let (kept, skipped) = filter_already_applied_ops(actions, Some(&off)).unwrap();
+        assert_eq!(skipped, 2);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn filter_keeps_everything_when_all_fresh() {
+        let actions = vec![(ins(1), pos(50)), (ins(2), pos(60))];
+        let off = pos(20);
+        let (kept, skipped) = filter_already_applied_ops(actions, Some(&off)).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn filter_handles_empty_input() {
+        let (kept, skipped) = filter_already_applied_ops(vec![], None).unwrap();
+        assert!(kept.is_empty());
+        assert_eq!(skipped, 0);
+    }
 }

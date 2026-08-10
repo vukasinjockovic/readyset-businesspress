@@ -1,6 +1,6 @@
 #![warn(clippy::panic)]
 
-use readyset_client::{ColumnBase, ColumnSchema};
+use readyset_client::schema::{ColumnBase, ColumnSchema};
 use readyset_data::DfType;
 use readyset_errors::{unsupported, ReadySetResult};
 use readyset_sql::ast::{ColumnConstraint, Relation, SqlType};
@@ -279,7 +279,9 @@ pub(crate) fn convert_column(col: &ColumnSchema) -> ReadySetResult<mysql_srv::Co
         DfType::Jsonb => unsupported!("MySQL does not support the JSONB type"),
         DfType::VarBit(_) => unsupported!("MySQL does not support the bit varying type"),
         DfType::Array(_) => unsupported!("MySQL does not support arrays"),
-        DfType::Row => unsupported!("MySQL does not support rows"),
+        // MySQL rejects a row constructor used where a scalar is expected (error 1241, "Operand
+        // should contain 1 column(s)"); it has no projectable row type to map onto.
+        DfType::Row(_) => unsupported!("MySQL does not support rows in the select list"),
         DfType::Tsvector => unsupported!("MySQL does not support the tsvector type"),
 
         // Geometric types - point
@@ -326,6 +328,7 @@ pub(crate) fn convert_column(col: &ColumnSchema) -> ReadySetResult<mysql_srv::Co
     }
 
     Ok(mysql_srv::Column {
+        schema: String::new(),
         table: col
             .column
             .table
@@ -336,7 +339,9 @@ pub(crate) fn convert_column(col: &ColumnSchema) -> ReadySetResult<mysql_srv::Co
             })
             .display(readyset_sql::Dialect::MySQL)
             .to_string(),
+        org_table: String::new(),
         column: col.column.name.to_string(),
+        org_name: String::new(),
         coltype,
         column_length,
         colflags,

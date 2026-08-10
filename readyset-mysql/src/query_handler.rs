@@ -3,15 +3,19 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use lazy_static::lazy_static;
+use metrics::counter;
+use mysql_srv::AuthKeys;
 use readyset_adapter::backend::noria_connector::QueryResult;
-use readyset_adapter::backend::SelectSchema;
-use readyset_adapter::{QueryHandler, SetBehavior};
-use readyset_client::results::Results;
-use readyset_client::ColumnSchema;
+#[cfg(test)]
+use readyset_adapter::SessionTimezone;
+use readyset_adapter::{parse_timezone, QueryHandler, SetBehavior, UpstreamSetRewrite};
+use readyset_client::post_processing::Results;
+use readyset_client::schema::{ColumnSchema, SelectSchema};
 use readyset_data::{Collation, DfType, DfValue, TinyText};
 use readyset_errors::{ReadySetError, ReadySetResult};
 use readyset_sql::ast::{
-    Column, Expr, FieldDefinitionExpr, Literal, SetStatement, SqlIdentifier, SqlQuery,
+    Column, Expr, FieldDefinitionExpr, Literal, SetStatement, SetVariables, ShowStatement,
+    SqlIdentifier, SqlQuery, Variable, VariableScope,
 };
 use tracing::warn;
 
@@ -832,18 +836,18 @@ pub struct MySqlQueryHandler;
 
 impl QueryHandler for MySqlQueryHandler {
     fn requires_fallback(query: &SqlQuery) -> bool {
-        // Currently any query with variables requires a fallback
         match query {
+            // Any query with variables requires a fallback
             SqlQuery::Select(stmt) => stmt.fields.iter().any(|field| match field {
                 FieldDefinitionExpr::Expr { expr, .. } => expr.contains_vars(),
                 _ => false,
             }),
+            SqlQuery::Show(ShowStatement::ReadySetRsaPublicKey) => true,
             _ => false,
         }
     }
 
     fn return_default_response(query: &SqlQuery) -> bool {
-        // For now we only care if we are querying for the `@@version_comment` alone
         match query {
             SqlQuery::Select(stmt) => stmt.fields.iter().any(|field| {
                 matches!(field, FieldDefinitionExpr::Expr {
@@ -851,6 +855,7 @@ impl QueryHandler for MySqlQueryHandler {
                     ..
                 } if var.as_non_user_var() == Some(VERSION_COMMENT_VARIABLE_NAME) && stmt.fields.len() == 1)
             }),
+            SqlQuery::Show(ShowStatement::ReadySetRsaPublicKey) => true,
             _ => false,
         }
     }
@@ -915,6 +920,27 @@ impl QueryHandler for MySqlQueryHandler {
                     vec![Results::new(vec![vec![VERSION_COMMENT_DEFAULT]])],
                 ))
             }
+            SqlQuery::Show(ShowStatement::ReadySetRsaPublicKey) => {
+                let pem = AuthKeys::try_get()
+                    .ok_or_else(|| ReadySetError::Internal("RSA keys not initialized".into()))?
+                    .public_key_pem();
+                let field_name: SqlIdentifier =
+                    "Caching_sha2_password_rsa_public_key".into();
+                Ok(QueryResult::from_owned(
+                    SelectSchema {
+                        schema: Cow::Owned(vec![ColumnSchema {
+                            column: Column {
+                                name: field_name.clone(),
+                                table: None,
+                            },
+                            column_type: DfType::Text(Collation::Utf8),
+                            base: None,
+                        }]),
+                        columns: Cow::Owned(vec![field_name]),
+                    },
+                    vec![Results::new(vec![vec![DfValue::from(pem)]])],
+                ))
+            }
             _ => Ok(QueryResult::empty(SelectSchema {
                 schema: Cow::Owned(vec![]),
                 columns: Cow::Owned(vec![]),
@@ -927,15 +953,25 @@ impl QueryHandler for MySqlQueryHandler {
 
         match stmt {
             SetStatement::Variable(set) => {
+                let mut upstream_vars = Vec::with_capacity(set.variables.len());
                 for (variable, value) in &set.variables {
                     let var_name = variable.name.to_ascii_lowercase();
+                    let mut keep_for_upstream = true;
                     behavior = match var_name.as_str() {
                         "autocommit" => behavior.set_autocommit(
                             matches!(value, Expr::Literal(Literal::Integer(i)) if *i == 1),
                         ),
-                        "time_zone" => behavior.unsupported(
-                            !matches!(value, Expr::Literal(Literal::String(s)) if s == "+00:00"),
-                        ),
+                        "time_zone" => {
+                            if let Expr::Literal(Literal::String(s)) = value {
+                                match parse_timezone(s) {
+                                    Some(tz) if tz.is_utc() => behavior.set_timezone(tz),
+                                    Some(tz) => behavior.set_timezone(tz).unsupported(true),
+                                    None => behavior.unsupported(true),
+                                }
+                            } else {
+                                behavior.unsupported(true)
+                            }
+                        }
                         "sql_mode" => {
                             let supported = if let Expr::Literal(Literal::String(s)) = value {
                                 match raw_sql_modes_to_list(s) {
@@ -959,8 +995,19 @@ impl QueryHandler for MySqlQueryHandler {
                             let encoding = get_encoding_for_charset(value, var_name);
                             behavior.set_results_encoding(encoding)
                         }
-                        "character_set_client" // TODO(mvzink): Remove and support reencoding queries before parsing
-                        | "character_set_connection" // TODO(mvzink): Remove and support plumbing collation through expression lowering
+                        // character_set_client describes the bytes the client sends, but
+                        // Readyset decodes those and sends UTF-8 text upstream, so the upstream
+                        // session's value must stay utf8mb4: handle it internally and drop it
+                        // from the statement forwarded upstream.
+                        "character_set_client" => {
+                            let encoding = get_encoding_for_charset(value, var_name);
+                            keep_for_upstream = encoding.is_none();
+                            behavior.set_client_encoding(encoding)
+                        }
+                        // character_set_connection, by contrast, governs conversion *after* the
+                        // server decodes the statement text, so it composes with the UTF-8 text
+                        // we send and is safe to forward verbatim.
+                        "character_set_connection" // TODO(mvzink): Remove and support plumbing collation through expression lowering
                         | "character_set_server"
                         | "collation_connection"
                         | "collation_server" => {
@@ -969,6 +1016,18 @@ impl QueryHandler for MySqlQueryHandler {
                         }
                         p => behavior.unsupported(!ALLOWED_PARAMETERS_ANY_VALUE.contains(p)),
                     };
+                    if keep_for_upstream {
+                        upstream_vars.push((variable.clone(), value.clone()));
+                    }
+                }
+                if upstream_vars.len() < set.variables.len() {
+                    behavior = behavior.upstream_rewrite(if upstream_vars.is_empty() {
+                        UpstreamSetRewrite::Skip
+                    } else {
+                        UpstreamSetRewrite::Rewrite(SetStatement::Variable(SetVariables {
+                            variables: upstream_vars,
+                        }))
+                    });
                 }
             }
             // TODO(mvzink): Handle `SET CHARACTER SET`
@@ -977,18 +1036,54 @@ impl QueryHandler for MySqlQueryHandler {
                 let encoding = readyset_data::encoding::Encoding::from_mysql_character_set_name(
                     encoding_name.as_str(),
                 );
-                metrics::counter!(
-                    readyset_client_metrics::recorded::CHARACTER_SET_USAGE,
+                counter!(
+                    metric::CHARACTER_SET_USAGE,
                     "type" => "names",
-                    "charset" => encoding_name,
+                    "charset" => encoding_name.clone(),
                 )
                 .increment(1);
 
                 behavior = behavior
                     .set_results_encoding(encoding)
-                    .unsupported(names.collation.is_some());
+                    .set_client_encoding(encoding);
+
+                // SET NAMES sets character_set_client, character_set_connection,
+                // character_set_results, and (with a COLLATE clause) collation_connection.
+                // Readyset decodes client bytes and sends UTF-8 text upstream, so the upstream's
+                // character_set_client must stay utf8mb4; the others apply after the upstream
+                // decodes our text, so they are forwarded to keep literal semantics and proxied
+                // result bytes in the client's charset. Setting collation_connection also sets
+                // character_set_connection to the collation's charset, so a COLLATE clause
+                // replaces the charset assignment.
+                if encoding.is_some() {
+                    let session_var = |name: &str| Variable {
+                        scope: VariableScope::Session,
+                        name: name.into(),
+                    };
+                    let connection_var = match &names.collation {
+                        Some(collation) => (
+                            session_var("collation_connection"),
+                            Expr::Literal(Literal::String(collation.to_ascii_lowercase())),
+                        ),
+                        None => (
+                            session_var("character_set_connection"),
+                            Expr::Literal(Literal::String(encoding_name.clone())),
+                        ),
+                    };
+                    behavior = behavior.upstream_rewrite(UpstreamSetRewrite::Rewrite(
+                        SetStatement::Variable(SetVariables {
+                            variables: vec![
+                                connection_var,
+                                (
+                                    session_var("character_set_results"),
+                                    Expr::Literal(Literal::String(encoding_name)),
+                                ),
+                            ],
+                        }),
+                    ));
+                }
             }
-            SetStatement::PostgresParameter(_) => {
+            SetStatement::PostgresParameter(_) | SetStatement::SessionAuthorization(_) => {
                 behavior = behavior.unsupported(true);
             }
         }
@@ -1012,8 +1107,8 @@ fn get_encoding_for_charset(
         .and_then(|s| readyset_data::encoding::Encoding::from_mysql_character_set_name(s.as_str()));
 
     if let Some(encoding_name) = encoding_name {
-        metrics::counter!(
-            readyset_client_metrics::recorded::CHARACTER_SET_USAGE,
+        counter!(
+            metric::CHARACTER_SET_USAGE,
             "type" => var_name,
             "charset" => encoding_name,
         )
@@ -1155,7 +1250,7 @@ mod tests {
     #[test]
     fn set_character_set_results_string_literal_supported() {
         for (charset, encoding) in [
-            ("latin1", Encoding::Latin1),
+            ("latin1", Encoding::LATIN1),
             ("utf8", Encoding::Utf8),
             ("utf8mb4", Encoding::Utf8),
             ("utf8mb3", Encoding::Utf8),
@@ -1196,7 +1291,7 @@ mod tests {
     #[test]
     fn set_character_set_results_bare_name_supported() {
         for (charset, encoding) in [
-            ("latin1", Encoding::Latin1),
+            ("latin1", Encoding::LATIN1),
             ("utf8", Encoding::Utf8),
             ("utf8mb4", Encoding::Utf8),
             ("utf8mb3", Encoding::Utf8),
@@ -1220,10 +1315,33 @@ mod tests {
         }
     }
 
+    fn session_var(name: &str) -> Variable {
+        Variable {
+            scope: VariableScope::Session,
+            name: name.into(),
+        }
+    }
+
+    /// The upstream rewrite produced for a supported `SET NAMES <charset>`.
+    fn names_rewrite(charset: &str) -> UpstreamSetRewrite {
+        UpstreamSetRewrite::Rewrite(SetStatement::Variable(SetVariables {
+            variables: vec![
+                (
+                    session_var("character_set_connection"),
+                    Expr::Literal(Literal::String(charset.into())),
+                ),
+                (
+                    session_var("character_set_results"),
+                    Expr::Literal(Literal::String(charset.into())),
+                ),
+            ],
+        }))
+    }
+
     #[test]
     fn set_names_supported() {
         for (charset, encoding) in [
-            ("latin1", Encoding::Latin1),
+            ("latin1", Encoding::LATIN1),
             ("utf8", Encoding::Utf8),
             ("utf8mb4", Encoding::Utf8),
             ("utf8mb3", Encoding::Utf8),
@@ -1234,8 +1352,297 @@ mod tests {
             });
             assert_eq!(
                 MySqlQueryHandler::handle_set_statement(&stmt),
-                SetBehavior::default().set_results_encoding(Some(encoding))
+                SetBehavior::default()
+                    .set_results_encoding(Some(encoding))
+                    .set_client_encoding(Some(encoding))
+                    .upstream_rewrite(names_rewrite(charset))
             )
+        }
+    }
+
+    #[test]
+    fn set_names_with_collation_forwards_collation() {
+        let stmt = SetStatement::Names(SetNames {
+            charset: "latin1".to_owned(),
+            collation: Some("latin1_bin".to_owned()),
+        });
+        assert_eq!(
+            MySqlQueryHandler::handle_set_statement(&stmt),
+            SetBehavior::default()
+                .set_results_encoding(Some(Encoding::LATIN1))
+                .set_client_encoding(Some(Encoding::LATIN1))
+                .upstream_rewrite(UpstreamSetRewrite::Rewrite(SetStatement::Variable(
+                    SetVariables {
+                        variables: vec![
+                            (
+                                session_var("collation_connection"),
+                                Expr::Literal(Literal::String("latin1_bin".into())),
+                            ),
+                            (
+                                session_var("character_set_results"),
+                                Expr::Literal(Literal::String("latin1".into())),
+                            ),
+                        ],
+                    }
+                )))
+        )
+    }
+
+    #[test]
+    fn set_names_unsupported_charset_proxies_verbatim() {
+        let stmt = SetStatement::Names(SetNames {
+            charset: "petscii".to_owned(),
+            collation: None,
+        });
+        assert_eq!(
+            MySqlQueryHandler::handle_set_statement(&stmt),
+            SetBehavior::default().unsupported(true)
+        )
+    }
+
+    #[test]
+    fn set_character_set_client_alone_skips_upstream() {
+        let stmt = SetStatement::Variable(SetVariables {
+            variables: vec![(
+                session_var("character_set_client"),
+                Expr::Literal(Literal::String("latin1".into())),
+            )],
+        });
+        assert_eq!(
+            MySqlQueryHandler::handle_set_statement(&stmt),
+            SetBehavior::default()
+                .set_client_encoding(Some(Encoding::LATIN1))
+                .upstream_rewrite(UpstreamSetRewrite::Skip)
+        )
+    }
+
+    #[test]
+    fn set_character_set_client_compound_rewrites_remainder() {
+        let sql_mode = Expr::Literal(Literal::String(
+            "NO_ZERO_DATE,STRICT_ALL_TABLES,ONLY_FULL_GROUP_BY,NO_ZERO_IN_DATE".into(),
+        ));
+        let stmt = SetStatement::Variable(SetVariables {
+            variables: vec![
+                (
+                    session_var("character_set_client"),
+                    Expr::Literal(Literal::String("latin1".into())),
+                ),
+                (session_var("sql_mode"), sql_mode.clone()),
+            ],
+        });
+        assert_eq!(
+            MySqlQueryHandler::handle_set_statement(&stmt),
+            SetBehavior::default()
+                .set_client_encoding(Some(Encoding::LATIN1))
+                .upstream_rewrite(UpstreamSetRewrite::Rewrite(SetStatement::Variable(
+                    SetVariables {
+                        variables: vec![(session_var("sql_mode"), sql_mode)],
+                    }
+                )))
+        )
+    }
+
+    #[test]
+    fn set_character_set_client_unsupported_charset_proxies_verbatim() {
+        let stmt = SetStatement::Variable(SetVariables {
+            variables: vec![(
+                session_var("character_set_client"),
+                Expr::Literal(Literal::String("petscii".into())),
+            )],
+        });
+        assert_eq!(
+            MySqlQueryHandler::handle_set_statement(&stmt),
+            SetBehavior::default().unsupported(true)
+        )
+    }
+
+    #[test]
+    fn set_character_set_connection_proxies_verbatim() {
+        let stmt = SetStatement::Variable(SetVariables {
+            variables: vec![(
+                session_var("character_set_connection"),
+                Expr::Literal(Literal::String("latin1".into())),
+            )],
+        });
+        assert_eq!(
+            MySqlQueryHandler::handle_set_statement(&stmt),
+            SetBehavior::default()
+        )
+    }
+
+    fn fixed(secs: i32) -> super::SessionTimezone {
+        super::SessionTimezone::FixedOffset(chrono::FixedOffset::east_opt(secs).unwrap())
+    }
+
+    #[test]
+    fn set_time_zone_utc() {
+        let stmt = SetStatement::Variable(SetVariables {
+            variables: vec![(
+                Variable {
+                    scope: VariableScope::Session,
+                    name: "time_zone".into(),
+                },
+                Expr::Literal(Literal::String("+00:00".into())),
+            )],
+        });
+        assert_eq!(
+            MySqlQueryHandler::handle_set_statement(&stmt),
+            SetBehavior::default().set_timezone(fixed(0))
+        );
+    }
+
+    /// Until eval supports `SessionTimezone`, non-UTC sessions are flagged
+    /// `unsupported` so the backend's `unsupported_set_mode` (Error/Proxy/Allow)
+    /// decides what to do. The parsed `set_timezone` is still recorded so the
+    /// future eval-side fix can pick it up unchanged.
+    #[test]
+    fn set_time_zone_fixed_offset_non_utc_is_unsupported() {
+        let stmt = SetStatement::Variable(SetVariables {
+            variables: vec![(
+                Variable {
+                    scope: VariableScope::Session,
+                    name: "time_zone".into(),
+                },
+                Expr::Literal(Literal::String("+05:30".into())),
+            )],
+        });
+        assert_eq!(
+            MySqlQueryHandler::handle_set_statement(&stmt),
+            SetBehavior::default()
+                .set_timezone(fixed(19800))
+                .unsupported(true)
+        );
+    }
+
+    #[test]
+    fn set_time_zone_system_is_unsupported() {
+        let stmt = SetStatement::Variable(SetVariables {
+            variables: vec![(
+                Variable {
+                    scope: VariableScope::Session,
+                    name: "time_zone".into(),
+                },
+                Expr::Literal(Literal::String("SYSTEM".into())),
+            )],
+        });
+        assert_eq!(
+            MySqlQueryHandler::handle_set_statement(&stmt),
+            SetBehavior::default()
+                .set_timezone(SessionTimezone::System)
+                .unsupported(true)
+        );
+    }
+
+    #[test]
+    fn set_time_zone_named_non_utc_is_unsupported() {
+        let stmt = SetStatement::Variable(SetVariables {
+            variables: vec![(
+                Variable {
+                    scope: VariableScope::Session,
+                    name: "time_zone".into(),
+                },
+                Expr::Literal(Literal::String("US/Eastern".into())),
+            )],
+        });
+        assert_eq!(
+            MySqlQueryHandler::handle_set_statement(&stmt),
+            SetBehavior::default()
+                .set_timezone(SessionTimezone::Named(chrono_tz::US::Eastern))
+                .unsupported(true)
+        );
+    }
+
+    #[test]
+    fn set_time_zone_named_utc() {
+        let stmt = SetStatement::Variable(SetVariables {
+            variables: vec![(
+                Variable {
+                    scope: VariableScope::Session,
+                    name: "time_zone".into(),
+                },
+                Expr::Literal(Literal::String("UTC".into())),
+            )],
+        });
+        assert_eq!(
+            MySqlQueryHandler::handle_set_statement(&stmt),
+            SetBehavior::default().set_timezone(SessionTimezone::Named(chrono_tz::UTC))
+        );
+    }
+
+    /// Per-dialect properties: these bind `MySqlQueryHandler` and stay here.
+    /// Dialect-agnostic parser properties live next to `parse_timezone` in
+    /// `readyset-adapter::query_handler`.
+    mod proptest_timezone {
+        use proptest::prelude::*;
+        use readyset_sql::ast::{SetVariables, Variable, VariableScope};
+
+        use super::super::*;
+
+        fn valid_offset_strategy() -> impl Strategy<Value = (String, i32)> {
+            prop_oneof![
+                (any::<bool>(), 0u32..=13, 0u32..=59).prop_map(|(positive, h, m)| {
+                    let sign_char = if positive { '+' } else { '-' };
+                    let sign_val: i32 = if positive { 1 } else { -1 };
+                    (
+                        format!("{sign_char}{h:02}:{m:02}"),
+                        sign_val * (h as i32 * 3600 + m as i32 * 60),
+                    )
+                }),
+                Just(("+14:00".to_string(), 14 * 3600)),
+            ]
+        }
+
+        fn named_timezone_strategy() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("US/Eastern".to_string()),
+                Just("America/New_York".to_string()),
+                Just("Europe/London".to_string()),
+                Just("Asia/Tokyo".to_string()),
+                Just("Etc/UTC".to_string()),
+                Just("UTC".to_string()),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn handle_set_named_timezone_unsupported_unless_utc(s in named_timezone_strategy()) {
+                let stmt = SetStatement::Variable(SetVariables {
+                    variables: vec![(
+                        Variable {
+                            scope: VariableScope::Session,
+                            name: "time_zone".into(),
+                        },
+                        Expr::Literal(Literal::String(s.clone())),
+                    )],
+                });
+                let behavior = MySqlQueryHandler::handle_set_statement(&stmt);
+                let parsed_is_utc = matches!(parse_timezone(&s), Some(tz) if tz.is_utc());
+                prop_assert_eq!(behavior.unsupported, !parsed_is_utc);
+                match behavior.set_timezone {
+                    Some(SessionTimezone::Named(_)) => {},
+                    other => panic!("expected Some(Named(_)), got {other:?} for {s:?}"),
+                }
+            }
+
+            #[test]
+            fn handle_set_valid_offset_sets_timezone((s, expected_secs) in valid_offset_strategy()) {
+                let stmt = SetStatement::Variable(SetVariables {
+                    variables: vec![(
+                        Variable {
+                            scope: VariableScope::Session,
+                            name: "time_zone".into(),
+                        },
+                        Expr::Literal(Literal::String(s.clone())),
+                    )],
+                });
+                let behavior = MySqlQueryHandler::handle_set_statement(&stmt);
+                prop_assert_eq!(behavior.unsupported, expected_secs != 0);
+                let expected_offset = chrono::FixedOffset::east_opt(expected_secs).unwrap();
+                prop_assert_eq!(
+                    behavior.set_timezone,
+                    Some(SessionTimezone::FixedOffset(expected_offset))
+                );
+            }
         }
     }
 }

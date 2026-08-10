@@ -1,17 +1,18 @@
 use std::collections::HashMap;
-use std::{fmt, str};
+use std::fmt;
 
 use petgraph::graph::NodeIndex;
+use readyset_client::consensus::{PersistedCustomType, SchemaCatalogEntry};
 use readyset_client::recipe::changelist::ChangeList;
 use readyset_client::recipe::ExprInfo;
 use readyset_client::{TableStatus, ViewCreateRequest};
 use readyset_data::Dialect;
 use readyset_errors::ReadySetResult;
+use readyset_sql::ast::NonReplicatedRelation;
 use readyset_sql::ast::{Relation, SelectStatement};
 use readyset_sql_passes::adapter_rewrites::AdapterRewriteParams;
 use readyset_util::hash::hash;
 use schema_catalog::{SchemaCatalog, SchemaGeneration};
-use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tracing::warn;
 use vec1::Vec1;
@@ -22,7 +23,7 @@ use crate::controller::sql::SqlIncorporator;
 use crate::controller::Migration;
 
 /// Uniquely identifies an expression in the expression registry.
-#[derive(Clone, Copy, Default, Debug, Deserialize, Hash, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Debug, Hash, PartialEq, Eq)]
 #[repr(transparent)]
 pub(crate) struct ExprId(u128);
 
@@ -44,7 +45,9 @@ impl From<&RecipeExpr> for ExprId {
                 hasher.update(hash(name).to_le_bytes());
                 hasher.update(hash(definition).to_le_bytes());
             }
-            RecipeExpr::Cache { statement, .. } => hasher.update(hash(statement).to_le_bytes()),
+            RecipeExpr::Cache { statement, .. } => {
+                hasher.update(hash(statement).to_le_bytes());
+            }
         };
         // Sha1 digest is 20 byte long, so it is safe to consume only 16 bytes
         Self(u128::from_le_bytes(
@@ -70,7 +73,7 @@ impl fmt::Display for ExprId {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub(crate) struct Recipe {
     /// Maintains lower-level state, but not the graph itself. Lazily initialized.
     inc: SqlIncorporator,
@@ -251,6 +254,7 @@ impl Recipe {
             server_supports_mixed_comparisons: self.mir_config().allow_mixed_comparisons,
             server_supports_pagination: self.mir_config().allow_paginate
                 && self.mir_config().allow_topk,
+            autoparameterize: true,
         }
     }
 
@@ -265,5 +269,20 @@ impl Recipe {
     /// between Readyset components.
     pub(crate) fn schema_catalog(&self, generation: SchemaGeneration) -> SchemaCatalog {
         self.inc.schema_catalog(generation)
+    }
+
+    /// Emits the persistent schema catalog: canonical DDL for every table and view Readyset
+    /// has accepted from upstream, suitable for writing to the Authority and replaying at
+    /// startup.
+    pub(crate) fn to_schema_catalog_entries(&self) -> Vec<SchemaCatalogEntry> {
+        self.inc.to_schema_catalog_entries()
+    }
+
+    pub(crate) fn to_persisted_custom_types(&self) -> Vec<PersistedCustomType> {
+        self.inc.to_persisted_custom_types()
+    }
+
+    pub(crate) fn to_persisted_non_replicated_relations(&self) -> Vec<NonReplicatedRelation> {
+        self.inc.to_persisted_non_replicated_relations()
     }
 }

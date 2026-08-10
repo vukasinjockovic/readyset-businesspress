@@ -1,22 +1,90 @@
 use crate::expr::constant_fold::constant_fold_expr;
+use crate::rewrite_joins::try_normalize_joins_conditions;
+use crate::unnest_subqueries::{
+    SubqueryContext, SubqueryPredicateDesc, as_supported_subquery_predicate,
+    is_supported_subquery_predicate,
+};
 use itertools::Either;
 use readyset_data::dialect;
 use readyset_errors::{
     ReadySetError, ReadySetResult, internal, internal_err, invalid_query, invalid_query_err,
-    invariant,
+    invariant, unsupported,
 };
 use readyset_sql::analysis::visit::{Visitor, walk_function_expr, walk_select_statement};
 use readyset_sql::analysis::visit_mut::{VisitorMut, walk_expr};
 use readyset_sql::analysis::{ReferredColumns, is_aggregate, visit, visit_mut};
 use readyset_sql::ast::{
-    BinaryOperator, Column, Expr, FieldDefinitionExpr, FieldReference, FunctionExpr, GroupByClause,
-    InValue, JoinClause, JoinConstraint, JoinOperator, JoinRightSide, LimitClause, Literal,
-    OrderBy, OrderClause, OrderType, Relation, SelectStatement, SqlIdentifier, TableExpr,
-    TableExprInner,
+    ArrayArguments, BinaryOperator, CaseWhenBranch, Column, Expr, FieldDefinitionExpr,
+    FieldReference, FunctionExpr, GroupByClause, InValue, ItemPlaceholder, JoinConstraint,
+    JoinOperator, JoinRightSide, LimitClause, Literal, OrderBy, OrderClause, OrderType, Relation,
+    SelectStatement, SqlIdentifier, TableExpr, TableExprInner,
 };
 use readyset_sql::{Dialect, DialectDisplay};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::{iter, mem};
+use std::iter;
+use std::mem;
+
+/// Gate for LIMIT-preservation in uncorrelated FROM-subqueries and
+/// uncorrelated LATERAL bodies.  When `true` (the default), the TOP-K
+/// rewrite is skipped for those positions: LIMIT/ORDER stay on the
+/// subquery so MIR lowers them to a native `TopK`/`Paginate` node via
+/// `to_query_graph`'s recursive `RelationSource::Subquery` build.
+/// When `false`, `rewrite_top_k_in_place` materialises every `LIMIT N`
+/// into a `ROW_NUMBER() <= K` filter wrapper (the pre-Change-13420
+/// behaviour); kept as a flip-back hatch in case a regression surfaces.
+///
+/// Soundness depends on `hoist_parametrizable_filters` having an
+/// explicit `limit_clause` boundary so filters under LIMIT can't hoist
+/// past it; that boundary was added in Change 13416 alongside the
+/// existing `contains_wf!` guard.
+///
+/// Predicate-subquery callers (IN-in-WHERE, IN-in-SELECT-list, NOT IN,
+/// Scalar via `as_joinable_derived_table_with_opts`) extend the same
+/// preservation path via an identity-derived-table wrap applied at the
+/// entry of that function: the wrap lifts the original LIMIT into a
+/// FROM-position derived table (which the FROM-loop then preserves)
+/// while leaving the outer SELECT with empty `limit_clause` for the
+/// IN/Scalar machinery to add DISTINCT and marker columns to.  For
+/// `SubqueryContext::Exists`, the wrap fires only on the NP_3VL probe
+/// path (`preserve_top_k_for_exists = true`), which needs to detect
+/// NULL specifically in the LIMITed bag.  The EP_3VL probe and plain
+/// EXISTS / NOT EXISTS take the existing LIMIT-stripping simplification
+/// (LIMIT doesn't affect emptiness).
+///
+/// The `top_k_in_subquery_position = false` argument that
+/// `as_joinable_derived_table_with_opts` passes to
+/// `hoist_correlated_from_where_clause_and_rewrite_top_k` is now a
+/// defensive backstop: the pre-wrap clears the outer LIMIT before that
+/// function runs, so `false` only matters if a future caller bypasses
+/// the pre-wrap and arrives there with a preservation-eligible LIMIT.
+///
+/// Per-query eligibility — `limit_clause_eligible_for_native_pagination`
+/// — gates preservation on the engine's `extract_limit_offset` acceptance
+/// set; subqueries with engine-incompatible pagination shape (literal
+/// non-zero OFFSET, NULL literals, etc.) fall back to materialisation.
+#[inline]
+pub(crate) fn preserve_uncorrelated_top_k() -> bool {
+    true
+}
+
+/// Gate for ROW_NUMBER cap preservation through the rewrite pipeline.  When
+/// `true` (the default), the hoist pass keeps `__rn <= K`-shaped predicates
+/// attached to their projecting subquery, and the auto-parameterize pass
+/// preserves the literal `K` rather than swapping it for a placeholder.
+/// Together these route the cap to MIR/dataflow as a Filter immediately
+/// downstream of the ROW_NUMBER() projection, bounding interim materialised
+/// state to K rows per partition.  Companion to `preserve_uncorrelated_top_k`
+/// — the same "keep LIMIT semantics local to the subquery" theme, applied to
+/// the materialised-RN paths that `preserve_uncorrelated_top_k` doesn't
+/// cover (correlated, predicate-subquery, engine-incompatible pagination
+/// shape, organic ROW_NUMBER).  When `false`, the pipeline reverts to the
+/// pre-Change-13420 hoist / autoparam behaviour (caps may drift to outer
+/// WHERE and become parameterised).  Kept as a flip-back hatch.
+#[inline]
+pub(crate) fn preserve_row_number_caps() -> bool {
+    true
+}
 
 const INNER_STMT_ALIAS: &str = "INNER";
 
@@ -73,8 +141,31 @@ macro_rules! as_column {
         if let Expr::Column(column) = $expr {
             column
         } else {
+            // SAFETY: This macro is only used inside `deep_columns_visitor` /
+            // `deep_columns_visitor_mut` callbacks, which guarantee the expression is
+            // `Expr::Column`. TODO: refactor visitor callbacks to return `ReadySetResult`
+            // so this can be replaced with `internal!()`.
             unreachable!("Must be Column")
         }
+    };
+}
+
+#[macro_export]
+macro_rules! is_window_function_expr {
+    ($expr:expr) => {{
+        let mut contains_window_functions = false;
+        let _ = for_each_window_function($expr, &mut |_| contains_window_functions = true);
+        contains_window_functions
+    }};
+}
+
+#[macro_export]
+macro_rules! contains_wf {
+    ($stmt:expr) => {
+        $stmt.fields.iter().any(|f| {
+            let (expr, _) = expect_field_as_expr(f);
+            is_window_function_expr!(expr)
+        })
     };
 }
 
@@ -130,14 +221,14 @@ impl RewriteStatus {
     }
 }
 
-enum ConstraintKind<'a> {
+pub(crate) enum ConstraintKind<'a> {
     EqualityComparison(&'a Expr, &'a Expr),
     OrderingComparison(&'a Expr, BinaryOperator, &'a Expr),
     Other(&'a Expr),
 }
 
 impl<'a> ConstraintKind<'a> {
-    fn new(constraint: &'a Expr) -> Self {
+    pub(crate) fn new(constraint: &'a Expr) -> Self {
         match constraint {
             Expr::BinaryOp {
                 lhs,
@@ -151,7 +242,7 @@ impl<'a> ConstraintKind<'a> {
         }
     }
 
-    fn is_same_as(&self, expr: &'a Expr) -> bool {
+    pub(crate) fn is_same_as(&self, expr: &'a Expr) -> bool {
         match &self {
             ConstraintKind::EqualityComparison(c_lhs, c_rhs) => match expr {
                 Expr::BinaryOp {
@@ -179,7 +270,7 @@ impl<'a> ConstraintKind<'a> {
     }
 
     /// Check if constraint associated with `self` is contained in `expr`
-    fn is_contained_in(&self, expr: &'a Expr) -> bool {
+    pub(crate) fn is_contained_in(&self, expr: &'a Expr) -> bool {
         let mut is_contained = false;
         split_expr_mut(
             expr,
@@ -220,6 +311,11 @@ pub(crate) fn get_from_item_reference_name(tab_expr: &TableExpr) -> ReadySetResu
             inner: TableExprInner::Subquery(_),
             ..
         } => invalid_query!("All subqueries must have an alias"),
+        // Reject unaliased VALUES.
+        TableExpr {
+            inner: TableExprInner::Values { .. },
+            ..
+        } => invalid_query!("All VALUES clauses must have an alias"),
     }
 }
 
@@ -305,6 +401,29 @@ pub(crate) fn and_predicates(acc_expr: Option<Expr>, constraint: Expr) -> Option
     } else {
         Some(constraint)
     }
+}
+
+/// Conjoin a flat collection of conjuncts into a single AND-expression, deduplicating
+/// according to [`ConstraintKind::is_same_as`] and skipping `TRUE` literals.
+///
+/// This replaces the loop-accumulation pattern `for e in items { acc =
+/// and_predicates_skip_true(acc, e); }` which is O(N^2) because each call
+/// decomposes the growing AND-tree via `expr_difference`. Here we compare flat
+/// conjuncts in a Vec, which is O(N^2) in the worst case on the *flat* list but
+/// avoids the repeated tree decomposition overhead.
+pub(crate) fn conjoin_all_dedup(conjuncts: impl IntoIterator<Item = Expr>) -> Option<Expr> {
+    let mut seen: Vec<Expr> = Vec::new();
+    for e in conjuncts {
+        if matches!(&e, Expr::Literal(Literal::Boolean(true))) {
+            continue;
+        }
+        let kind = ConstraintKind::new(&e);
+        if seen.iter().any(|s| kind.is_same_as(s)) {
+            continue;
+        }
+        seen.push(e);
+    }
+    seen.into_iter().reduce(and_expr)
 }
 
 /// Split an AND-expression into predicates matching `predicate` and the remainder.
@@ -404,7 +523,8 @@ pub(crate) fn is_parametrizable_filter_candidate(
     match expr {
         // Handle equality or ordering comparisons
         Expr::BinaryOp { lhs, op, rhs }
-            if matches!(op, BinaryOperator::Equal) || op.is_ordering_comparison() =>
+            if matches!(op, BinaryOperator::Equal | BinaryOperator::NotEqual)
+                || op.is_ordering_comparison() =>
         {
             match (lhs.as_ref(), rhs.as_ref()) {
                 (operand, Expr::Literal(_)) | (Expr::Literal(_), operand)
@@ -438,12 +558,47 @@ pub(crate) fn is_parametrizable_filter_candidate(
     }
 }
 
+pub(crate) fn is_join_single_relation_filter(
+    expr: &Expr,
+    mut predicate: impl FnMut(&Relation) -> bool,
+) -> bool {
+    if contains_select(expr)
+        || is_window_function_expr!(expr)
+        || is_aggregated_expr(expr).unwrap_or(true)
+    {
+        return false;
+    }
+    let mut relation = None;
+    for col in columns_iter(expr) {
+        if let Some(rel) = col.table.as_ref() {
+            match &mut relation {
+                Some(r) => {
+                    if *rel != *r {
+                        return false;
+                    }
+                }
+                None => {
+                    relation = Some(rel.clone());
+                }
+            }
+        } else {
+            // SAFETY: `expand_implied_tables` is called earlier in the rewrite pipeline (adapter_rewrites/mod.rs)
+            unreachable!("Unqualified column {} found.", col.display_unquoted())
+        }
+    }
+    if let Some(rel) = relation {
+        predicate(&rel)
+    } else {
+        false
+    }
+}
+
 /// Classify a leaf `atom` taken from an AND-conjunction in `JOIN ... ON`.
 /// Uses the same primitives as the splitter/checker.
 ///
 /// Policy recap:
 /// - Cross-table `Column = Column` → `CrossEq`
-/// - Simple parametrizable filter over exactly **one** relation → `SingleRelFilter`
+/// - Supported filter over exactly **one** relation → `SingleRelFilter`
 /// - Otherwise → `Other`
 pub fn classify_on_atom(atom: &Expr) -> OnAtom {
     // 1) Cross-table equality: capture the pair while validating lt != rt
@@ -456,15 +611,14 @@ pub fn classify_on_atom(atom: &Expr) -> OnAtom {
             false
         }
     }) {
-        let (lhs, rhs) = pair.expect("predicate must set pair for cross equality");
+        // SAFETY: `matches_eq_constraint` returned true, so its callback set `pair`.
+        let (lhs, rhs) = pair.expect("matches_eq_constraint callback set pair");
         return OnAtom::CrossEq { lhs, rhs };
     }
 
-    // 2) Single-relation simple filter: capture the sole relation
+    // 2) Single-relation filter: capture the sole relation
     let mut rel: Option<Relation> = None;
-    if is_simple_parametrizable_filter(atom, |t, _| {
-        // `is_simple_parametrizable_filter` only exposes one column operand,
-        // so this closure is called once; just capture it.
+    if is_join_single_relation_filter(atom, |t| {
         rel = Some(t.clone());
         true
     }) && let Some(r) = rel
@@ -489,9 +643,22 @@ pub fn decompose_conjuncts(expr: &Expr) -> Option<Vec<Expr>> {
     }
 }
 
-/// Splits a predicate expression into a correlated part (references outer tables)
-/// and a non-correlated part, based on `is_outer_rel` predicate
-pub(crate) fn split_correlated_expression(
+/// Partitions a predicate expression into outer-referencing atoms vs local-only atoms.
+///
+/// Step 1 of the two-step correlation protocol:
+///   1. `partition_correlated_predicates` — separates the WHERE/ON into correlated vs remaining
+///   2. `extract_correlation_keys` — extracts `col = col` equality pairs from the correlated part
+///
+/// The correlated partition includes:
+///   - `col = col` equalities where at least one side references an outer relation
+///   - Single-relation filters referencing an outer relation (e.g., `outer.status > 0`)
+///
+/// The second category (single-relation outer filters) is intentionally included for the
+/// LATERAL path, which places them into the JOIN ON.  For the non-LATERAL path, these
+/// atoms pass through `extract_correlation_keys` unextracted and end up in the hoisted
+/// ON predicate — harmless for INNER joins, but may cause shape validation failures for
+/// LEFT joins.
+pub(crate) fn partition_correlated_predicates(
     expr: &Expr,
     is_outer_rel: &impl Fn(&Relation) -> bool,
 ) -> (Option<Expr>, Option<Expr>) {
@@ -501,7 +668,7 @@ pub(crate) fn split_correlated_expression(
         &|constraint| {
             matches_eq_constraint(constraint, |left_table, right_table| {
                 is_outer_rel(left_table) || is_outer_rel(right_table)
-            }) || is_simple_parametrizable_filter(constraint, |table, _| is_outer_rel(table))
+            }) || matches!(classify_on_atom(constraint), OnAtom::SingleRelFilter { rel } if is_outer_rel(&rel))
         },
         &mut correlated_constraints,
     );
@@ -562,9 +729,13 @@ pub(crate) fn contain_subqueries_with_limit_clause(stmt: &SelectStatement) -> Re
 
 /// Return the **alias** of the first projected field if present; otherwise set it to a default,
 /// update the statement in place, and return it.
-pub fn ensure_first_field_alias(stmt: &mut SelectStatement) -> SqlIdentifier {
+pub(crate) fn ensure_first_field_alias(stmt: &mut SelectStatement) -> SqlIdentifier {
     let (expr, alias) = match stmt.fields.first_mut() {
         Some(FieldDefinitionExpr::Expr { expr, alias }) => (expr, alias),
+        // SAFETY: `expand_stars` runs before all callers, guaranteeing Expr fields.
+        // This function returns `SqlIdentifier` (not `Result`); changing the signature
+        // would require updating all call sites.
+        // TODO: refactor to return `ReadySetResult`.
         _ => panic!(
             "Expected first select field to be an expression in:\n{}",
             stmt.display(Dialect::PostgreSQL)
@@ -580,7 +751,14 @@ pub fn ensure_first_field_alias(stmt: &mut SelectStatement) -> SqlIdentifier {
 pub(crate) fn expect_field_as_expr(fde: &FieldDefinitionExpr) -> (&Expr, &Option<SqlIdentifier>) {
     match fde {
         FieldDefinitionExpr::Expr { expr, alias } => (expr, alias),
-        _ => unreachable!("Expected field definition expression"),
+        // SAFETY: `expand_stars` runs before all gated-block passes, guaranteeing no wildcards
+        // remain. This function is used pervasively in iterator chains where changing the return
+        // type to `ReadySetResult` would require a large-scope refactor.
+        // TODO: refactor callers to use a fallible variant.
+        _ => panic!(
+            r#"Expected field definition expression (Expr variant), but got wildcard.
+            This likely means the `expand_stars` pass has not yet been run."#
+        ),
     }
 }
 
@@ -590,7 +768,12 @@ pub(crate) fn expect_field_as_expr_mut(
 ) -> (&mut Expr, &mut Option<SqlIdentifier>) {
     match fde {
         FieldDefinitionExpr::Expr { expr, alias } => (expr, alias),
-        _ => unreachable!("Expected field definition expression"),
+        // SAFETY: `expand_stars` runs before all gated-block passes, guaranteeing no wildcards
+        // remain. See `expect_field_as_expr` for rationale.
+        _ => panic!(
+            r#"Expected field definition expression (Expr variant), but got wildcard.
+            This likely means the `expand_stars` pass has not yet been run."#
+        ),
     }
 }
 
@@ -627,6 +810,9 @@ pub(crate) fn as_sub_query_with_alias(
 }
 
 /// Mutable unwrap of an aliased subquery, panic if missing.
+///
+/// SAFETY: Callers guarantee the FROM item is an aliased subquery (typically checked by a prior
+/// `as_sub_query_with_alias_mut` guard). TODO: refactor to return `ReadySetResult`.
 pub(crate) fn expect_sub_query_with_alias_mut(
     tab_expr: &mut TableExpr,
 ) -> (&mut SelectStatement, SqlIdentifier) {
@@ -634,6 +820,9 @@ pub(crate) fn expect_sub_query_with_alias_mut(
 }
 
 /// Immutable unwrap of an aliased subquery, panic if missing.
+///
+/// SAFETY: Callers guarantee the FROM item is an aliased subquery (typically checked by a prior
+/// `as_sub_query_with_alias` guard). TODO: refactor to return `ReadySetResult`.
 pub(crate) fn expect_sub_query_with_alias(
     tab_expr: &TableExpr,
 ) -> (&SelectStatement, SqlIdentifier) {
@@ -674,6 +863,59 @@ pub(crate) fn find_group_by_key(
         }
     }
     Ok(None)
+}
+
+/// Resolve concrete expressions used in GROUP BY, replacing alias/positional
+/// references with their underlying SELECT expressions when possible.
+/// Resolve a single `FieldReference` — numeric position or unqualified alias —
+/// against a SELECT field list, returning the underlying expression.
+/// Qualified columns and expressions that don't match any explicit alias
+/// pass through unchanged.
+pub(crate) fn resolve_field_reference(
+    fields: &[FieldDefinitionExpr],
+    fr: &FieldReference,
+) -> ReadySetResult<Expr> {
+    match fr {
+        FieldReference::Numeric(pos) => {
+            if *pos < 1 || *pos > fields.len() as u64 {
+                return Err(invalid_query_err!(
+                    "Out-of-bounds index {} in numeric field reference",
+                    *pos
+                ));
+            }
+            let (expr, _) = expect_field_as_expr(&fields[(*pos - 1) as usize]);
+            Ok(expr.clone())
+        }
+        FieldReference::Expr(e) => {
+            // If the expression is an unqualified column that matches an
+            // explicit SELECT-list alias (`AS name`), resolve to the
+            // underlying expression. Otherwise pass through unchanged.
+            if let Expr::Column(Column { table: None, name }) = e {
+                for fe in fields {
+                    if let FieldDefinitionExpr::Expr {
+                        expr: fe_expr,
+                        alias: Some(a),
+                    } = fe
+                        && a.eq(name)
+                    {
+                        return Ok(fe_expr.clone());
+                    }
+                }
+            }
+            Ok(e.clone())
+        }
+    }
+}
+
+pub(crate) fn resolve_group_by_exprs(stmt: &SelectStatement) -> ReadySetResult<Vec<Expr>> {
+    let Some(group_by) = &stmt.group_by else {
+        return Ok(Vec::new());
+    };
+    group_by
+        .fields
+        .iter()
+        .map(|g| resolve_field_reference(&stmt.fields, g))
+        .collect()
 }
 
 /// Add a grouping expression if it's not already in GROUP BY.
@@ -747,6 +989,41 @@ fn inc_alias(alias: &SqlIdentifier, inc_val: usize) -> SqlIdentifier {
     let mut s = alias.to_string();
     s.push_str(inc_val.to_string().as_str());
     s.into()
+}
+
+/// Return (expression, alias) for a select field.
+pub(crate) fn get_expr_with_alias(fe: &FieldDefinitionExpr) -> (Expr, SqlIdentifier) {
+    let (expr, maybe_alias) = expect_field_as_expr(fe);
+    (expr.clone(), alias_for_expr(expr, maybe_alias))
+}
+
+/// Build a map from an outer column alias to the inner expression,
+/// so we can replace references after inlining.
+///
+/// This function creates a mapping from qualified column references (using the provided
+/// `stmt_alias` as the table qualifier) to their corresponding expressions in the SELECT list.
+/// It validates that no duplicate aliases exist in the SELECT list.
+pub(crate) fn build_ext_to_int_fields_map(
+    stmt: &SelectStatement,
+    stmt_alias: SqlIdentifier,
+) -> ReadySetResult<HashMap<Column, Expr>> {
+    let mut ext_to_int_map = HashMap::new();
+    for field in stmt.fields.iter() {
+        let (expr, alias) = get_expr_with_alias(field);
+        if ext_to_int_map
+            .insert(
+                Column {
+                    name: alias.clone(),
+                    table: Some(stmt_alias.clone().into()),
+                },
+                expr.clone(),
+            )
+            .is_some()
+        {
+            invalid_query!("Duplicate select field alias {}", alias.as_str())
+        }
+    }
+    Ok(ext_to_int_map)
 }
 
 /// Ensure unique select aliases by appending numeric suffixes on duplicates.
@@ -840,7 +1117,8 @@ pub(crate) fn project_columns(
                 fields: Vec::with_capacity(proj_items.len()),
             });
         }
-        let group_by = stmt.group_by.as_mut().unwrap();
+        // SAFETY: the `if stmt.group_by.is_none()` block above guarantees `Some` here.
+        let group_by = stmt.group_by.as_mut().expect("group_by set to Some above");
         for (col, (_, alias)) in proj_items.iter().zip(&proj_aliases) {
             add_group_by_key_if_not_exists(&stmt.fields, &mut group_by.fields, col, alias)?;
         }
@@ -941,7 +1219,10 @@ pub(crate) fn add_expression_to_join_constraint(
         JoinConstraint::On(existing_expr) => and_predicates_skip_true(Some(existing_expr), expr),
         JoinConstraint::Empty => and_predicates_skip_true(None, expr),
         JoinConstraint::Using(_) => {
-            unreachable!("USING should have been rewritten earlier")
+            // SAFETY: `expand_join_on_using` runs before all gated-block passes, guaranteeing
+            // no USING constraints remain. This function returns `JoinConstraint` (not `Result`).
+            // TODO: refactor to return `ReadySetResult`.
+            unreachable!("USING should have been rewritten by expand_join_on_using")
         }
     } {
         JoinConstraint::On(expr)
@@ -950,36 +1231,46 @@ pub(crate) fn add_expression_to_join_constraint(
     }
 }
 
-/// Collect all top-level expressions (SELECT items, JOIN ON, WHERE, HAVING, GROUP BY,
-/// ORDER BY) for immutable analysis.
-pub(crate) fn outermost_expression(stmt: &SelectStatement) -> impl Iterator<Item = &Expr> {
-    stmt.fields
-        .iter()
+macro_rules! outermost_expression_iter {
+    ($stmt:expr, $iter:tt$(, $mutable:tt)?) => {
+    $stmt.fields
+        .$iter()
         .filter_map(|fde| match fde {
             FieldDefinitionExpr::Expr { expr, .. } => Some(expr),
             FieldDefinitionExpr::All | FieldDefinitionExpr::AllInTable(_) => None,
         })
-        .chain(stmt.join.iter().filter_map(|join| match &join.constraint {
-            JoinConstraint::On(expr) => Some(expr),
-            JoinConstraint::Using(_) => None,
-            JoinConstraint::Empty => None,
-        }))
-        .chain(&stmt.where_clause)
-        .chain(&stmt.having)
-        .chain(stmt.group_by.iter().flat_map(|gb| {
-            gb.fields.iter().filter_map(|f| match f {
+        .chain(
+            $stmt.join
+                .$iter()
+                .filter_map(|join| match &$($mutable)? join.constraint {
+                    JoinConstraint::On(expr) => Some(expr),
+                    JoinConstraint::Using(_) => None,
+                    JoinConstraint::Empty => None,
+                }),
+        )
+        .chain(&$($mutable)? $stmt.where_clause)
+        .chain(&$($mutable)? $stmt.having)
+        .chain($stmt.group_by.$iter().flat_map(|gb| {
+            gb.fields.$iter().filter_map(|f| match f {
                 FieldReference::Expr(expr) => Some(expr),
                 _ => None,
             })
         }))
-        .chain(stmt.order.iter().flat_map(|oc| {
+        .chain($stmt.order.$iter().flat_map(|oc| {
             oc.order_by
-                .iter()
+                .$iter()
                 .filter_map(|OrderBy { field, .. }| match field {
                     FieldReference::Expr(expr) => Some(expr),
                     _ => None,
                 })
         }))
+    };
+}
+
+/// Collect all top-level expressions (SELECT items, JOIN ON, WHERE, HAVING, GROUP BY,
+/// ORDER BY) for immutable analysis.
+pub(crate) fn outermost_expression(stmt: &SelectStatement) -> impl Iterator<Item = &Expr> {
+    outermost_expression_iter!(stmt, iter)
 }
 
 /// Collect all top-level expressions (SELECT items, JOIN ON, WHERE, HAVING, GROUP BY,
@@ -987,52 +1278,78 @@ pub(crate) fn outermost_expression(stmt: &SelectStatement) -> impl Iterator<Item
 pub(crate) fn outermost_expression_mut(
     stmt: &mut SelectStatement,
 ) -> impl Iterator<Item = &mut Expr> {
-    stmt.fields
-        .iter_mut()
-        .filter_map(|fde| match fde {
-            FieldDefinitionExpr::Expr { expr, .. } => Some(expr),
-            FieldDefinitionExpr::All | FieldDefinitionExpr::AllInTable(_) => None,
-        })
-        .chain(
-            stmt.join
-                .iter_mut()
-                .filter_map(|join| match &mut join.constraint {
-                    JoinConstraint::On(expr) => Some(expr),
-                    JoinConstraint::Using(_) => None,
-                    JoinConstraint::Empty => None,
-                }),
-        )
-        .chain(&mut stmt.where_clause)
-        .chain(&mut stmt.having)
-        .chain(stmt.group_by.iter_mut().flat_map(|gb| {
-            gb.fields.iter_mut().filter_map(|f| match f {
-                FieldReference::Expr(expr) => Some(expr),
+    outermost_expression_iter!(stmt, iter_mut, mut)
+}
+
+/// Position of an outermost expression relative to a (potentially merged-
+/// in-from-an-inlined-subquery) GROUP BY.  Distinguishes positions whose
+/// semantics requires GROUP BY membership (post-aggregation: SELECT
+/// items, HAVING, ORDER BY) from positions that filter rows before
+/// aggregation (pre-aggregation: WHERE, JOIN ON).
+///
+/// Consumed by `check_group_by_compatibility` to apply per-position
+/// rules when admitting subquery inlining: post-aggregation references
+/// to non-inlinable rels need to be GROUP BY keys (bare Column refs
+/// today; future relaxations could broaden); pre-aggregation references
+/// run before the GROUP BY and need no GROUP BY membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OuterPosition {
+    /// `WHERE`, `JOIN ON` — pre-aggregation filters.  No restriction on
+    /// expression shape for references to non-inlinable rels.
+    PreAgg,
+    /// `SELECT` items, `HAVING`, `ORDER BY` — positions evaluated after
+    /// the GROUP BY (whether the outer's own or one pulled up from an
+    /// inlined inner).  References to non-inlinable rels here must be
+    /// admissible as GROUP BY keys.
+    PostAgg,
+}
+
+/// Iterate `stmt`'s outermost expressions paired with their
+/// [`OuterPosition`].  Iteration order matches [`outermost_expression`]:
+/// SELECT items, JOIN ON, WHERE, HAVING, ORDER BY.  GROUP BY field
+/// expressions are intentionally skipped — they are the keys themselves
+/// and are handled by the GROUP-BY-merging logic at the call site, not
+/// by per-position checks.
+pub(crate) fn tagged_outermost_expressions(
+    stmt: &SelectStatement,
+) -> impl Iterator<Item = (&Expr, OuterPosition)> {
+    let selects = stmt.fields.iter().filter_map(|fde| match fde {
+        FieldDefinitionExpr::Expr { expr, .. } => Some((expr, OuterPosition::PostAgg)),
+        FieldDefinitionExpr::All | FieldDefinitionExpr::AllInTable(_) => None,
+    });
+    let join_ons = stmt.join.iter().filter_map(|join| match &join.constraint {
+        JoinConstraint::On(expr) => Some((expr, OuterPosition::PreAgg)),
+        JoinConstraint::Using(_) | JoinConstraint::Empty => None,
+    });
+    let where_clause = stmt.where_clause.iter().map(|e| (e, OuterPosition::PreAgg));
+    let having = stmt.having.iter().map(|e| (e, OuterPosition::PostAgg));
+    let order_by = stmt.order.iter().flat_map(|oc| {
+        oc.order_by
+            .iter()
+            .filter_map(|OrderBy { field, .. }| match field {
+                FieldReference::Expr(expr) => Some((expr, OuterPosition::PostAgg)),
                 _ => None,
             })
-        }))
-        .chain(stmt.order.iter_mut().flat_map(|oc| {
-            oc.order_by
-                .iter_mut()
-                .filter_map(|OrderBy { field, .. }| match field {
-                    FieldReference::Expr(expr) => Some(expr),
-                    _ => None,
-                })
-        }))
+    });
+    selects
+        .chain(join_ons)
+        .chain(where_clause)
+        .chain(having)
+        .chain(order_by)
 }
 
 /// Gather those as a flat `Vec<&mut Expr::Column(column)>` so we can inspect or replace columns.
-pub(crate) fn collect_outermost_columns_mut(
-    stmt: &mut SelectStatement,
-) -> ReadySetResult<Vec<&mut Expr>> {
-    struct TheVisitor<'a> {
-        expr_columns: Vec<&'a mut Expr>,
+/// Collect mutable references to all `Expr::Column` nodes in a single expression tree,
+/// skipping nested `SelectStatement` subqueries.
+pub(crate) fn collect_columns_in_expr_mut(expr: &mut Expr) -> Vec<&mut Expr> {
+    struct ColVisitor<'a> {
+        columns: Vec<&'a mut Expr>,
     }
-
-    impl<'a> VisitorMut<'a> for TheVisitor<'a> {
+    impl<'a> VisitorMut<'a> for ColVisitor<'a> {
         type Error = ReadySetError;
         fn visit_expr(&mut self, expr: &'a mut Expr) -> Result<(), Self::Error> {
             if matches!(expr, Expr::Column(_)) {
-                self.expr_columns.push(expr);
+                self.columns.push(expr);
             } else {
                 walk_expr(self, expr)?;
             }
@@ -1045,26 +1362,92 @@ pub(crate) fn collect_outermost_columns_mut(
             Ok(())
         }
     }
-
-    let mut visitor = TheVisitor {
-        expr_columns: Vec::new(),
+    let mut v = ColVisitor {
+        columns: Vec::new(),
     };
-
-    for expr in outermost_expression_mut(stmt) {
-        visitor.visit_expr(expr)?;
-    }
-
-    Ok(visitor.expr_columns)
+    // SAFETY: the visitor only collects Column nodes and skips subqueries; it cannot fail.
+    v.visit_expr(expr).expect("column collection is infallible");
+    v.columns
 }
 
+/// Substitutes columns in `expr` using `ext_to_int_fields`, returning the rewritten expression.
+///
+/// Walks the expression tree directly via [`collect_columns_in_expr_mut`], replacing each
+/// `Expr::Column` that appears in `ext_to_int_fields` with its mapped expression.
+pub(crate) fn substitute_columns_in_expr(
+    expr: &Expr,
+    ext_to_int_fields: &HashMap<Column, Expr>,
+    _is_top_select: bool,
+) -> ReadySetResult<Expr> {
+    let mut result = expr.clone();
+    for col_expr in collect_columns_in_expr_mut(&mut result) {
+        if let Expr::Column(col) = col_expr
+            && let Some(inl_expr) = ext_to_int_fields.get(col)
+        {
+            *col_expr = inl_expr.clone();
+        }
+    }
+    Ok(result)
+}
+
+/// Collect immutable references to all `Expr::Column` nodes in a single expression tree,
+/// skipping nested `SelectStatement` subqueries.
+#[allow(dead_code)] // Symmetric counterpart to collect_columns_in_expr_mut; available for future use
+pub(crate) fn collect_columns_in_expr(expr: &Expr) -> Vec<&Expr> {
+    struct ColVisitor<'a> {
+        columns: Vec<&'a Expr>,
+    }
+    impl<'ast> Visitor<'ast> for ColVisitor<'ast> {
+        type Error = ReadySetError;
+        fn visit_expr(&mut self, expr: &'ast Expr) -> Result<(), Self::Error> {
+            if matches!(expr, Expr::Column(_)) {
+                self.columns.push(expr);
+            } else {
+                visit::walk_expr(self, expr)?;
+            }
+            Ok(())
+        }
+        fn visit_select_statement(&mut self, _: &'ast SelectStatement) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+    let mut v = ColVisitor {
+        columns: Vec::new(),
+    };
+    // SAFETY: the visitor only collects Column nodes and skips subqueries; it cannot fail.
+    v.visit_expr(expr).expect("column collection is infallible");
+    v.columns
+}
+
+/// Collect mutable references to all `Expr::Column` nodes across all outermost positions
+/// of a statement (SELECT, JOIN ON, WHERE, HAVING, GROUP BY, ORDER BY), skipping subqueries.
+pub(crate) fn collect_outermost_columns_mut(stmt: &mut SelectStatement) -> Vec<&mut Expr> {
+    outermost_expression_mut(stmt)
+        .flat_map(collect_columns_in_expr_mut)
+        .collect()
+}
+
+/// Walks `expr` and invokes the callback on each *group-level* aggregate call.
+///
+/// Descent behavior at `Expr::WindowFunction { function, partition_by, order_by }`:
+/// - The WF's own `function` field is treated as a windowed operation, NOT as
+///   a group-level aggregate.  The callback does not fire on it.  Descent DOES
+///   continue into its `function.arguments()` — an argument may itself be a
+///   group-level aggregate (as in `sum(sum(x)) OVER()`, where the outer sum is
+///   the WF and the inner sum is group-level).
+/// - Each `partition_by` and `order_by` expression is walked normally; aggregate
+///   calls encountered there are group-level references and DO fire the callback.
+///
+/// Rationale: this matches the semantic distinction between "windowed aggregate
+/// operation" (WF's own function) and "group-level aggregate reference" (bare
+/// aggregate anywhere else, including inside OVER parts).  Callers wanting to
+/// inspect WFs themselves should use `for_each_window_function`.
 pub(crate) fn for_each_aggregate<'a>(
     expr: &'a Expr,
-    visit_window_functions: bool,
     func_visitor: &'a mut impl FnMut(&FunctionExpr),
 ) -> ReadySetResult<()> {
     struct ForEachVisitor<'a> {
         func_visitor: &'a mut dyn FnMut(&FunctionExpr),
-        visit_window_functions: bool,
     }
 
     impl<'ast> Visitor<'ast> for ForEachVisitor<'ast> {
@@ -1081,8 +1464,24 @@ pub(crate) fn for_each_aggregate<'a>(
         }
 
         fn visit_expr(&mut self, expr: &'ast Expr) -> Result<(), Self::Error> {
-            if !self.visit_window_functions && matches!(expr, Expr::WindowFunction { .. }) {
-                // Skip window function
+            if let Expr::WindowFunction {
+                function,
+                partition_by,
+                order_by,
+            } = expr
+            {
+                // Skip the WF's own `function` as a group-level aggregate
+                // candidate, but descend into its arguments (which may be
+                // group-level aggregates), and into every OVER expression.
+                for arg in function.arguments() {
+                    self.visit_expr(arg)?;
+                }
+                for pb in partition_by {
+                    self.visit_expr(pb)?;
+                }
+                for (ob, _, _) in order_by {
+                    self.visit_expr(ob)?;
+                }
                 Ok(())
             } else {
                 visit::walk_expr(self, expr)
@@ -1094,11 +1493,7 @@ pub(crate) fn for_each_aggregate<'a>(
         }
     }
 
-    ForEachVisitor {
-        func_visitor,
-        visit_window_functions,
-    }
-    .visit_expr(expr)
+    ForEachVisitor { func_visitor }.visit_expr(expr)
 }
 
 pub(crate) fn for_each_window_function<'a>(
@@ -1166,9 +1561,9 @@ pub(crate) fn for_each_window_function_mut<'a>(
     .visit_expr(expr)
 }
 
-pub(crate) fn is_aggregated_expr(expr: &Expr) -> ReadySetResult<bool> {
+pub fn is_aggregated_expr(expr: &Expr) -> ReadySetResult<bool> {
     let mut has_aggregates = false;
-    for_each_aggregate(expr, false, &mut |_| has_aggregates = true)?;
+    for_each_aggregate(expr, &mut |_| has_aggregates = true)?;
     Ok(has_aggregates)
 }
 
@@ -1183,6 +1578,15 @@ pub(crate) fn is_aggregated_select(stmt: &SelectStatement) -> ReadySetResult<boo
         && is_aggregated_expr(having_expr)?
     {
         return Ok(true);
+    }
+    if let Some(order_clause) = &stmt.order {
+        for ord in &order_clause.order_by {
+            if let FieldReference::Expr(expr) = &ord.field
+                && is_aggregated_expr(expr)?
+            {
+                return Ok(true);
+            }
+        }
     }
     Ok(false)
 }
@@ -1262,21 +1666,34 @@ pub(crate) fn analyse_lone_aggregates_subquery_fields(
     for fe in &stmt.fields {
         let (f_expr, f_alias) = expect_field_as_expr(fe);
         let f_alias = alias_for_expr(f_expr, f_alias);
-        match calculate_aggregate_only_expression_for_empty_data_set(f_expr.clone())? {
-            Expr::Literal(lit) if !matches!(lit, Literal::Null) => {
-                let f_col = Column {
-                    name: f_alias.clone(),
-                    table: Some(stmt_alias.clone().into()),
-                };
-                fields_map.insert(
-                    f_col.clone(),
-                    Ok(Expr::Call(FunctionExpr::Call {
-                        name: "coalesce".into(),
-                        arguments: Some(vec![Expr::Column(f_col), Expr::Literal(lit)]),
-                    })),
-                );
+        let fallback = calculate_aggregate_only_expression_for_empty_data_set(f_expr.clone())?;
+        if is_constant_non_null(&fallback) {
+            let f_col = Column {
+                name: f_alias.clone(),
+                table: Some(stmt_alias.clone().into()),
+            };
+            // Detect duplicate-key collisions explicitly.  `HashMap::insert` would
+            // silently overwrite the first mapping when two fields share an effective
+            // output name (e.g. two same-aliased aggregates, or one alias colliding
+            // with another field's default-of-bare-column).  Either way the lost
+            // mapping yields a wrong COALESCE rewrite for at least one of the
+            // columns.  Upstream passes typically run `fix_duplicate_aliases` before
+            // reaching here (via correlation-key projection on the body), so a
+            // collision at this point indicates a pipeline-ordering anomaly.
+            match fields_map.entry(f_col.clone()) {
+                Entry::Vacant(e) => {
+                    e.insert(Ok(Expr::Call(FunctionExpr::Coalesce(vec![
+                        Expr::Column(f_col),
+                        fallback,
+                    ]))));
+                }
+                Entry::Occupied(e) => {
+                    internal!(
+                        "Duplicate output column name '{}' in aggregate-fallback mapping",
+                        e.key().name
+                    );
+                }
             }
-            _ => {}
         }
     }
     Ok(())
@@ -1306,10 +1723,71 @@ fn make_aggregate_fallback_for_expr(mut fallback_expr: Expr) -> Option<Expr> {
     // the expression to a literal for fallback value computation.
     constant_fold_expr(&mut fallback_expr, dialect::Dialect::DEFAULT_POSTGRESQL);
 
-    if matches!(fallback_expr, Expr::Literal(ref literal) if !matches!(literal, Literal::Null)) {
+    // After REA-6335, `ARRAY[]` can no longer be folded into a string literal, so
+    // `coalesce(NULL, ARRAY[])` stays unreduced by the constant folder.  Simplify it here by
+    // picking the first non-NULL constant argument, mirroring PostgreSQL's COALESCE semantics.
+    simplify_constant_coalesce(&mut fallback_expr);
+
+    if is_constant_non_null(&fallback_expr) {
         Some(fallback_expr)
     } else {
         None
+    }
+}
+
+/// Returns `true` if the expression is a *structural* constant, non-NULL value
+/// suitable for use as an aggregate fallback.  Recognises:
+///
+/// - non-NULL literals,
+/// - array constructors whose elements are all structural constants
+///   (e.g. `ARRAY[]` or `ARRAY[1, 2]`),
+/// - casts wrapping any of the above (e.g. `ARRAY[]::char(8)[]` as produced by
+///   [`crate::array_constructor`] for typed empty fallbacks).
+///
+/// This is *structural* detection — it pattern-matches on the AST without
+/// invoking the constant folder.  Use [`constant_fold_expr`] first when runtime
+/// evaluation is also needed (e.g. arithmetic reduction); this helper exists
+/// because Array constructors (and their typed-Cast wrappers) cannot be
+/// represented as a single `Literal`, so the folder leaves them intact — see
+/// REA-6335 for the Array case and REA-6187 for the Cast wrapper.
+fn is_constant_non_null(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(lit) => !matches!(lit, Literal::Null),
+        Expr::Array(ArrayArguments::List(elems)) => elems.iter().all(is_constant_non_null),
+        Expr::Cast { expr, .. } => is_constant_non_null(expr),
+        _ => false,
+    }
+}
+
+/// Like [`is_constant_non_null`] but also admits `NULL`.  Used as the
+/// reducibility gate for [`simplify_constant_coalesce`]: every `COALESCE`
+/// argument must be a structural constant-or-NULL for the reduction to be
+/// sound.
+fn is_structural_constant(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(Literal::Null)) || is_constant_non_null(expr)
+}
+
+/// Simplify a `coalesce(args…)` call whose arguments are all *structural*
+/// constants by replacing it with the first non-NULL constant argument.  This
+/// handles the case where the constant folder was unable to reduce the call
+/// because the result type (e.g. `DfValue::Array`) has no `Literal`
+/// representation — including typed `Cast(ARRAY[], …[])` fallbacks produced by
+/// `array_constructor` after REA-6187.
+fn simplify_constant_coalesce(expr: &mut Expr) {
+    let dominated_by_constants = matches!(
+        expr,
+        Expr::Call(FunctionExpr::Coalesce(args))
+            if args.iter().all(is_structural_constant)
+    );
+    if !dominated_by_constants {
+        return;
+    }
+    // Extract the first non-NULL constant argument.
+    if let Expr::Call(FunctionExpr::Coalesce(args)) = expr
+        && let Some(pos) = args.iter().position(is_constant_non_null)
+    {
+        let replacement = args.swap_remove(pos);
+        *expr = replacement;
     }
 }
 
@@ -1357,11 +1835,7 @@ pub(crate) fn extract_aggregate_fallback_for_expr(
         let inner_rel_for_extract: Relation = inner_alias.clone().into();
         map.into_iter().filter_map(|(k, v)| match v {
             Ok(mapped_expr) => {
-                if let Expr::Call(FunctionExpr::Call {
-                                      name,
-                                      arguments: Some(args),
-                                  }) = mapped_expr
-                    && name.as_str().eq_ignore_ascii_case("coalesce")
+                if let Expr::Call(FunctionExpr::Coalesce(args)) = mapped_expr
                     && args.len() == 2
                     && matches!(&args[0], Expr::Column(c0) if c0.name == k.name && is_column_of!(c0, inner_rel_for_extract))
                 {
@@ -1433,20 +1907,33 @@ pub(crate) fn resolve_field_expr_by_alias<'a>(
     // otherwise, compute the *default* alias for the expression and match on that.
     // This keeps consistency with `make_first_field_ref_name` /
     // `as_joinable_derived_table_with_opts`, which assign the same default later.
-    stmt.fields.iter().find_map(|f| match f {
+    //
+    // Returns `None` on ambiguous match (two or more fields whose effective output
+    // names equal `alias_name` — e.g. one explicit alias colliding with another
+    // field's default-of-bare-column).  Pre-fix this returned the first match,
+    // potentially the wrong expression for callers that use the result to drive
+    // substitution / aggregate-fallback rewriting.  None forces callers to
+    // gracefully decline the rewrite rather than silently picking one.
+    let mut iter = stmt.fields.iter().filter_map(|f| match f {
         FieldDefinitionExpr::Expr { expr, alias } => match alias {
             Some(a) if a == alias_name => Some(expr),
             None if default_alias_for_select_item_expression(expr) == alias_name => Some(expr),
             _ => None,
         },
         _ => None,
-    })
+    });
+    let first = iter.next()?;
+    if iter.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
-pub(crate) fn construct_is_not_null_expr(rhs: Expr, negated: bool) -> Expr {
+/// Build `expr IS NULL` (when `is_null = true`) or `expr IS NOT NULL` (when `is_null = false`).
+pub(crate) fn construct_null_check_expr(rhs: Expr, is_null: bool) -> Expr {
     Expr::BinaryOp {
         lhs: Box::new(rhs),
-        op: if negated {
+        op: if is_null {
             BinaryOperator::Is
         } else {
             BinaryOperator::IsNot
@@ -1491,6 +1978,111 @@ pub(crate) fn get_unique_alias(from_items: &HashSet<Relation>, base: &str) -> Sq
     unique_alias
 }
 
+/// When inlining a FROM item, ensure that any alias it used doesn't collide
+/// with names in the outer query—if so, consistently rename them.
+///
+/// This function handles alias collision resolution when merging a subquery's FROM clause
+/// into an outer query. It:
+/// 1. Detects aliases in the inlinable subquery that collide with base statement aliases
+/// 2. Generates unique replacement aliases
+/// 3. Updates column references and FROM item aliases throughout the inlinable statement
+/// 4. Properly handles shadowing by using deep_columns_visitor_mut
+///
+/// # Parameters
+/// - `base_stmt`: The outer/base statement into which we're inlining
+/// - `inl_from_item`: The FROM item (subquery) being inlined (will be mutated)
+/// - `reserved_aliases`: Additional aliases to avoid (e.g., from downstream subquery scopes)
+///
+/// # Returns
+/// `Ok(true)` if any aliases were renamed, `Ok(false)` if no collisions were found
+/// Rename any FROM-item alias inside `inl_stmt` that collides with an alias
+/// visible in `base_stmt`'s FROM clause (excluding `inl_alias` itself, which
+/// will be replaced by the inlinable's internal FROM items after splicing) or
+/// with any alias in `reserved_aliases`. Rewrites all column references inside
+/// `inl_stmt` to use the renamed aliases. Returns `true` if any renames happened.
+///
+/// `reserved_aliases` is intended for aliases bound inside downstream subquery
+/// scopes, which would otherwise shadow the newly-hoisted inner aliases.
+pub(crate) fn make_aliases_distinct_from_base_statement(
+    base_stmt: &SelectStatement,
+    inl_alias: &SqlIdentifier,
+    inl_stmt: &mut SelectStatement,
+    reserved_aliases: &HashSet<Relation>,
+) -> ReadySetResult<bool> {
+    // Collect base statement FROM item names, excluding the one being inlined.
+    // The inlinable's own external alias is removed because it will be replaced
+    // by the inlinable's internal FROM items after splicing.
+    let mut base_locals = get_local_from_items_iter!(base_stmt)
+        .map(get_from_item_reference_name)
+        .collect::<ReadySetResult<HashSet<Relation>>>()?;
+    base_locals.remove(&inl_alias.clone().into());
+
+    // Also reserve aliases that appear inside downstream subquery scopes. After hoisting,
+    // inlinable FROM-item aliases become visible at the base level; if a downstream subquery
+    // already binds the same alias locally, the new base-level alias could be shadowed.
+    base_locals.extend(reserved_aliases.iter().cloned());
+
+    // Iterate the inlinable statement FROM clause, detect the collided names and replace it with
+    // the new distinct ones.
+    // Collect the collided old and new names to replace the columns referencing the old names inside the
+    // inlinable statement outside the loop.
+    let mut update_alias_map = HashMap::new();
+
+    // Helper to efficiently build a combined alias space
+    fn build_combined_aliases(base: &HashSet<Relation>, inl: &[Relation]) -> HashSet<Relation> {
+        let mut out = HashSet::with_capacity(base.len() + inl.len());
+        out.extend(base.iter().cloned());
+        out.extend(inl.iter().cloned());
+        out
+    }
+
+    let mut inl_locals = get_local_from_items_iter!(inl_stmt)
+        .rev()
+        .map(get_from_item_reference_name)
+        .collect::<ReadySetResult<Vec<_>>>()?;
+
+    while let Some(inl_ref_name) = inl_locals.pop() {
+        if !base_locals.insert(inl_ref_name.clone()) {
+            // Make sure the new alias does not collide with either existing base or inlinable aliases.
+            let update_ref_name: Relation = get_unique_alias(
+                &build_combined_aliases(&base_locals, &inl_locals),
+                inl_ref_name.name.as_str(),
+            )
+            .into();
+
+            let existing = update_alias_map.insert(inl_ref_name, update_ref_name.clone());
+            debug_assert!(existing.is_none());
+
+            base_locals.insert(update_ref_name);
+        }
+    }
+
+    let has_duplicate_aliases = !update_alias_map.is_empty();
+
+    // Update the columns referencing the collided FROM item names inside the inlinable statement
+    // Use deep_columns_visitor_mut to properly handle shadowing
+    for (exist_ref_name, update_ref_name) in update_alias_map {
+        deep_columns_visitor_mut(inl_stmt, &exist_ref_name, &mut |expr| {
+            let column = as_column!(expr);
+            if column.table.as_ref() == Some(&exist_ref_name) {
+                column.table = Some(update_ref_name.clone());
+            }
+        })?;
+        if let Some(inl_rel) = get_local_from_items_iter_mut!(inl_stmt).find(|rel| {
+            get_from_item_reference_name(rel).is_ok_and(|rel_name| rel_name == exist_ref_name)
+        }) {
+            inl_rel.alias = Some(update_ref_name.name);
+        } else {
+            internal!(
+                "Inlinable local FROM item {} not found",
+                exist_ref_name.display_unquoted()
+            );
+        }
+    }
+
+    Ok(has_duplicate_aliases)
+}
+
 pub(crate) fn collect_local_from_items(
     stmt: &SelectStatement,
 ) -> ReadySetResult<HashSet<Relation>> {
@@ -1531,7 +2123,7 @@ pub(crate) fn move_correlated_constraints_from_join_to_where(
             // Never move out of a LEFT join (would null-reject).
             JoinConstraint::On(on_expr) if join_clause.operator.is_inner_join() => {
                 if let (Some(correlated_expr), remaining_expr) =
-                    split_correlated_expression(on_expr, is_outer_rel)
+                    partition_correlated_predicates(on_expr, is_outer_rel)
                 {
                     add_to_where_clause =
                         and_predicates_skip_true(add_to_where_clause, correlated_expr);
@@ -1559,7 +2151,711 @@ pub(crate) fn move_correlated_constraints_from_join_to_where(
     Ok(())
 }
 
-pub(crate) fn split_correlated_constraint(
+/// Move subquery-bearing predicates from INNER JOIN ON to WHERE.
+///
+/// Thin wrapper over `try_normalize_joins_conditions` (in
+/// `rewrite_joins.rs`), which for each INNER JOIN's ON splits atoms via
+/// `classify_on_atom`: `OnAtom::Other` (which includes subqueries per
+/// `OnAtom`'s doc-comment at line 174) moves to WHERE; `CrossEq` and
+/// `SingleRelFilter` atoms touching the chosen LHS+RHS stay in ON.
+/// Non-INNER joins are untouched — moving a subquery-bearing predicate
+/// out of a LEFT / RIGHT / FULL OUTER JOIN ON would change null-extension
+/// semantics.  `validate_no_subqueries_in_join_on` in
+/// `validate_query_semantics.rs` continues to reject subqueries in
+/// non-INNER JOIN ON positions.
+///
+/// The delegation is broader than "just subqueries" — `try_normalize_
+/// joins_conditions` also moves top-level `OR`, `NOT`, opaque function
+/// calls, and >2-relation ON conjuncts to WHERE (its primary purpose is
+/// enforcing the ≤2-relation ON invariant per engine limitation §2.1).
+/// This preemptive NSP-time call overlaps with DTR's later invocation
+/// (in `derived_tables_rewrite`); the overlap is bounded and doesn't
+/// affect correctness — downstream passes don't depend on `Other` atoms
+/// being in ON.
+///
+/// Correlation-agnostic: correlated and uncorrelated subqueries move
+/// uniformly.  Downstream `unnest_subqueries` picks up the moved
+/// predicates via its WHERE-position machinery.
+///
+/// Returns `true` if the underlying call rewrote anything.
+pub(crate) fn move_subquery_predicates_from_inner_join_on_to_where(
+    stmt: &mut SelectStatement,
+) -> ReadySetResult<bool> {
+    try_normalize_joins_conditions(stmt)
+}
+
+fn literal_one() -> Expr {
+    Expr::Literal(Literal::UnsignedInteger(1))
+}
+
+fn literal_zero() -> Expr {
+    Expr::Literal(Literal::UnsignedInteger(0))
+}
+
+/// Whether a `SubqueryPredicateDesc` (from `as_supported_subquery_predicate`)
+/// is a shape this wrap can project.  Admits only:
+///
+/// - `Scalar` with a non-subquery LHS (`lhs_and_op` present) and a
+///   single-column subquery — a bare `NestedSelect` boolean predicate is
+///   excluded because it isn't a scalar comparison the wrap can rewrite into
+///   `<target>.<alias> op v`.
+/// - `Exists` (negated and non-negated).
+/// - `In` / `NotIn` with a non-subquery LHS (`lhs_and_op` present) and a
+///   single-column subquery, projected verbatim as a boolean CASE-to-int.
+///
+/// Any other shape is declined; it stays in the ON and is handled downstream.
+fn is_admitted_loj_wrap_shape(desc: &SubqueryPredicateDesc) -> bool {
+    match desc.ctx {
+        SubqueryContext::Scalar | SubqueryContext::In => {
+            desc.lhs_and_op.is_some() && desc.stmt.fields.len() == 1
+        }
+        SubqueryContext::Exists => true,
+    }
+}
+
+/// Build the projected expression that goes into the wrap DT's SELECT list,
+/// plus the ON-side reference that replaces the original conjunct.
+///
+/// Encodes the Option-B canonicalization for EXISTS / NOT EXISTS: both use
+/// the same `EXISTS(subq)` condition inside the CASE, and only the branch
+/// constants differ.  The ON-side reference is uniformly `<target>.
+/// <alias> = 1`.  For Scalar, the projected expression is the raw subquery;
+/// the ON reads `lhs op <target>.<alias>`, with `lhs` and `op` already
+/// normalized by `as_supported_subquery_predicate` (subquery always on the
+/// RHS, ordering ops flipped when the source had it on the LHS).
+fn build_loj_wrap_projection_and_reference(
+    desc: SubqueryPredicateDesc,
+    target_alias: &SqlIdentifier,
+    projected_alias: SqlIdentifier,
+) -> ReadySetResult<(Expr, Expr)> {
+    let projected_col_ref = Expr::Column(Column {
+        name: projected_alias,
+        table: Some(target_alias.clone().into()),
+    });
+    let SubqueryPredicateDesc {
+        ctx,
+        negated,
+        lhs_and_op,
+        stmt,
+    } = desc;
+    match ctx {
+        SubqueryContext::Scalar => {
+            let (lhs, op) = lhs_and_op.ok_or_else(|| {
+                internal_err!("Scalar subquery predicate without lhs_and_op reached LOJ wrap")
+            })?;
+            let projected = Expr::NestedSelect(Box::new(stmt));
+            let reference = construct_scalar_expr(lhs, op, projected_col_ref);
+            Ok((projected, reference))
+        }
+        SubqueryContext::Exists => {
+            let (then_lit, else_lit) = if negated {
+                (literal_zero(), literal_one())
+            } else {
+                (literal_one(), literal_zero())
+            };
+            let projected = Expr::CaseWhen {
+                branches: vec![CaseWhenBranch {
+                    condition: Expr::Exists(Box::new(stmt)),
+                    body: then_lit,
+                }],
+                else_expr: Some(Box::new(else_lit)),
+            };
+            let reference =
+                construct_scalar_expr(projected_col_ref, BinaryOperator::Equal, literal_one());
+            Ok((projected, reference))
+        }
+        SubqueryContext::In => {
+            // Project the IN verbatim as a boolean CASE-to-int; the ON reads
+            // `<target>.<alias> = 1`.  The negation stays inside the IN (NOT IN),
+            // never flipped into the CASE constants, so UNKNOWN falls to ELSE (0)
+            // and the pipeline's 3VL side-joins reproduce IN / NOT IN exactly.
+            let (x, _op) = lhs_and_op.ok_or_else(|| {
+                internal_err!("In subquery predicate without lhs_and_op reached LOJ wrap")
+            })?;
+            let in_expr = Expr::In {
+                lhs: Box::new(x),
+                rhs: InValue::Subquery(Box::new(stmt)),
+                negated,
+            };
+            let projected = Expr::CaseWhen {
+                branches: vec![CaseWhenBranch {
+                    condition: in_expr,
+                    body: literal_one(),
+                }],
+                else_expr: Some(Box::new(literal_zero())),
+            };
+            let reference =
+                construct_scalar_expr(projected_col_ref, BinaryOperator::Equal, literal_one());
+            Ok((projected, reference))
+        }
+    }
+}
+
+/// Wrap `te` in a projecting derived table.  Forwards each column named in
+/// `passthrough_cols` as `<inner_ref>.<col> AS <col>` (where `<inner_ref>` is
+/// the moved table's own identity) and appends each `(alias, expr)` in
+/// `projections` as an additional SELECT-list item.
+///
+/// The new DT is aliased so the outer statement resolves through it: for an
+/// aliased target the alias is preserved; for an unaliased base table the DT
+/// takes the schema-less table name as its alias, and the caller
+/// (`wrap_one_loj_target`) retargets outer references onto that schema-less
+/// alias.  The moved table keeps its own identity, so a projected correlated
+/// subquery's reference to the wrapped relation still resolves inside the DT.
+///
+/// Only base-table `TableExprInner::Table` or aliased subquery
+/// `TableExprInner::Subquery` targets are supported; unaliased subqueries
+/// and `Values` return an internal error.
+///
+/// Target-agnostic: works on any FROM-position `TableExpr` -- a LOJ's RHS, its
+/// LHS partner, or another leading-FROM item.  Callers pick the target based on
+/// where the projected computed columns need to be evaluated in scope.
+fn wrap_table_expr_with_projections(
+    te: &mut TableExpr,
+    passthrough_cols: Vec<SqlIdentifier>,
+    projections: Vec<(SqlIdentifier, Expr)>,
+) -> ReadySetResult<()> {
+    // The inner reference used for passthrough columns is the moved table's
+    // *own* identity, so it matches how references inside the moved table —
+    // including the correlation refs of a projected correlated subquery —
+    // resolve.  For an aliased table that's the (schema-less) alias; for an
+    // unaliased base table it's the full, possibly-schema-qualified relation.
+    // The moved table is left untouched (not re-aliased): a projected subquery
+    // correlated to it references it by its original identity, so the inner
+    // must keep that identity for the correlation to resolve and decorrelate.
+    let inner_ref = table_expr_identity(te).ok_or_else(|| {
+        internal_err!("unsupported TableExpr shape for wrap_table_expr_with_projections")
+    })?;
+    let outer_alias = inner_ref.name.clone();
+
+    let mut fields: Vec<FieldDefinitionExpr> =
+        Vec::with_capacity(passthrough_cols.len() + projections.len());
+    for col_name in passthrough_cols {
+        fields.push(FieldDefinitionExpr::Expr {
+            expr: Expr::Column(Column {
+                name: col_name.clone(),
+                table: Some(inner_ref.clone()),
+            }),
+            alias: Some(col_name),
+        });
+    }
+    for (alias, expr) in projections {
+        fields.push(FieldDefinitionExpr::Expr {
+            expr,
+            alias: Some(alias),
+        });
+    }
+
+    // Move the original `te` into the wrap's inner FROM (bypassing a
+    // clone) via `mem::replace` with a throwaway placeholder that is
+    // overwritten by the enclosing `*te = ...` in the very next statement.
+    let placeholder = TableExpr {
+        inner: TableExprInner::Table(Relation {
+            schema: None,
+            name: SqlIdentifier::from(""),
+        }),
+        alias: None,
+        column_aliases: vec![],
+    };
+    let moved = mem::replace(te, placeholder);
+    *te = TableExpr {
+        inner: TableExprInner::Subquery(Box::new(SelectStatement {
+            fields,
+            tables: vec![moved],
+            ..Default::default()
+        })),
+        alias: Some(outer_alias),
+        column_aliases: vec![],
+    };
+
+    Ok(())
+}
+
+/// Whether the correlation set `corr` is exactly `{rel}` (one relation, equal to
+/// `rel`).  Centralizing the cardinality check keeps callers from accidentally
+/// matching a multi-relation set against one of its members.
+fn corr_is_single(corr: &HashSet<Relation>, rel: &Relation) -> bool {
+    corr.len() == 1 && corr.contains(rel)
+}
+
+/// The single LHS relation a supported LOJ ON joins to its RHS: for each
+/// cross-table equality that references the RHS, the relation on the side
+/// opposite the RHS.  `None` unless exactly one such partner exists: if no
+/// cross-eq references the RHS there is nothing to key the join on; a cross-eq
+/// between two non-RHS relations, or two distinct partners, means the ON spans
+/// more than two relations (which the REA-6129 guardrail forbids).  This is the
+/// only LHS operand a wrap may target: the projected-column reference it leaves
+/// in the ON keeps the ON at the two relations `{partner, RHS}`.  It is the
+/// semantic join partner, which need not be the syntactically-last leading-FROM
+/// item.
+fn infer_loj_lhs_partner(on_atoms: &[Expr], rhs: &Relation) -> Option<Relation> {
+    let mut partners: HashSet<Relation> = HashSet::new();
+    for atom in on_atoms {
+        if let OnAtom::CrossEq { lhs: a, rhs: b } = classify_on_atom(atom) {
+            // Only a cross-eq that references the RHS pins the partner (the other
+            // side).  A cross-eq between two non-RHS relations means the ON
+            // already spans more than two relations -- no single partner.
+            let partner = if &a == rhs {
+                b
+            } else if &b == rhs {
+                a
+            } else {
+                return None;
+            };
+            partners.insert(partner);
+        }
+    }
+    if partners.len() == 1 {
+        partners.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// True if the FROM-item's outer-visible identity is `rel`.
+fn te_is(te: &TableExpr, rel: &Relation) -> bool {
+    table_expr_identity(te).as_ref() == Some(rel)
+}
+
+/// True if `rel` is an LHS operand of the LOJ at `join_idx`: a leading FROM table
+/// or the RHS of a join positioned before `join_idx`.
+fn is_lhs_operand(stmt: &SelectStatement, join_idx: usize, rel: &Relation) -> bool {
+    stmt.tables.iter().any(|te| te_is(te, rel))
+        || stmt.join[..join_idx]
+            .iter()
+            .flat_map(|jc| jc.right.table_exprs())
+            .any(|te| te_is(te, rel))
+}
+
+/// True if `rel` is a NON-nullable LHS operand of the LOJ at `join_idx`: a leading
+/// FROM table (cross-joined, always present) or the RHS of an INNER join before
+/// `join_idx` (the preserved spine).  A LEFT-join RHS is excluded -- it is
+/// null-extendable, so a value projected onto it would be nullified for
+/// null-extended rows.
+fn is_non_nullable_lhs_operand(stmt: &SelectStatement, join_idx: usize, rel: &Relation) -> bool {
+    stmt.tables.iter().any(|te| te_is(te, rel))
+        || (0..join_idx).any(|j| {
+            stmt.join[j].operator.is_inner_join()
+                && stmt.join[j].right.table_exprs().any(|te| te_is(te, rel))
+        })
+}
+
+/// The closest non-nullable LHS operand of the LOJ at `join_idx`, for anchoring an
+/// uncorrelated projected constant: the nearest INNER-join RHS walking left
+/// (LEFT-join RHSs are null-extendable, so skip them), else the last leading FROM
+/// table (leading tables are cross-joined and always present).
+fn closest_non_nullable_lhs(stmt: &SelectStatement, join_idx: usize) -> Option<Relation> {
+    for j in (0..join_idx).rev() {
+        if stmt.join[j].operator.is_inner_join()
+            && let JoinRightSide::Table(te) = &stmt.join[j].right
+            && let Some(rel) = table_expr_identity(te)
+        {
+            return Some(rel);
+        }
+    }
+    stmt.tables.last().and_then(table_expr_identity)
+}
+
+/// Where `synthesize_equi_bare_col_wrap` decided to wrap the projected subquery so
+/// its column forms a two-relation join key.
+struct SynthWrap {
+    /// The LHS relation the wrapped ON keys against.
+    partner: Relation,
+    /// The operand to wrap the projected subquery onto.
+    target: Relation,
+    /// Whether `target` is this LOJ's RHS (vs an LHS operand).
+    target_is_rhs: bool,
+}
+
+/// When no cross-eq pins the LHS partner, a lone Scalar `=` vs a bare column is
+/// still wrappable: projecting the subquery onto the operand OPPOSITE the bare
+/// column makes `bare_col = <target>.__loj_c_N` a cross-eq join key.  Returns
+/// `(partner, target, target_is_rhs)` for that shape, else `None` (bail as before).
+///
+/// Uncorrelated wraps the opposite operand -- the closest non-nullable LHS when the
+/// bare column is on the RHS (a constant projected onto a null-extendable relation
+/// would be nullified), else this LOJ's own RHS.  A correlated subquery must wrap
+/// its owner, so the owner has to BE that opposite operand (and, for the RHS side,
+/// a non-nullable one); otherwise the correlation cannot decorrelate through the
+/// wrap and it bails.  Non-`=`, a non-bare-column LHS, a multi-relation
+/// correlation, or more than one supported subquery predicate all bail.
+fn synthesize_equi_bare_col_wrap(
+    flat: &[Expr],
+    rhs_rel: &Relation,
+    stmt: &SelectStatement,
+    join_idx: usize,
+) -> ReadySetResult<Option<SynthWrap>> {
+    let mut only: Option<&Expr> = None;
+    for atom in flat {
+        if is_supported_subquery_predicate(atom) {
+            if only.is_some() {
+                return Ok(None);
+            }
+            only = Some(atom);
+        }
+    }
+    let Some(atom) = only else {
+        return Ok(None);
+    };
+    let desc = as_supported_subquery_predicate(atom)?;
+    if !is_admitted_loj_wrap_shape(&desc) || !matches!(desc.ctx, SubqueryContext::Scalar) {
+        return Ok(None);
+    }
+    let Some((lhs, op)) = desc.lhs_and_op.as_ref() else {
+        return Ok(None);
+    };
+    if *op != BinaryOperator::Equal {
+        return Ok(None);
+    }
+    let Expr::Column(bare) = lhs else {
+        return Ok(None);
+    };
+    let Some(bare_rel) = bare.table.clone() else {
+        return Ok(None);
+    };
+    let corr = correlated_relations(&desc.stmt)?;
+    let owner = match corr.len() {
+        0 => None,
+        1 => corr.into_iter().next(),
+        _ => return Ok(None),
+    };
+
+    if &bare_rel == rhs_rel {
+        // Bare column on the RHS -> wrap a non-nullable LHS operand: the
+        // correlation owner if it is one, else the closest non-nullable LHS.
+        let anchor = match owner {
+            Some(o) => {
+                if !is_non_nullable_lhs_operand(stmt, join_idx, &o) {
+                    return Ok(None);
+                }
+                o
+            }
+            None => {
+                let Some(a) = closest_non_nullable_lhs(stmt, join_idx) else {
+                    return Ok(None);
+                };
+                a
+            }
+        };
+        Ok(Some(SynthWrap {
+            partner: anchor.clone(),
+            target: anchor,
+            target_is_rhs: false,
+        }))
+    } else if is_lhs_operand(stmt, join_idx, &bare_rel) {
+        // Bare column on an LHS operand -> wrap this LOJ's RHS.  A correlated
+        // subquery must wrap its owner, so the owner has to be that RHS.
+        if owner.is_some_and(|o| &o != rhs_rel) {
+            return Ok(None);
+        }
+        Ok(Some(SynthWrap {
+            partner: bare_rel,
+            target: rhs_rel.clone(),
+            target_is_rhs: true,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Location of a wrappable FROM operand: a leading-FROM table, or the RHS of a
+/// join at or before the LOJ being wrapped.
+enum FromLoc {
+    Table(usize),
+    JoinRhs(usize),
+}
+
+/// Locate the FROM operand whose outer-visible identity is `rel`.  Searches from
+/// the LOJ outward: the RHS and nearer join operands (`join_idx` down to 0),
+/// then the leading FROM tables (last to first).  FROM-item identities are
+/// unique, so the match is unambiguous; the order just visits the common targets
+/// (the RHS and the nearer operands) first.  `join_idx` is included because this
+/// also locates the RHS at `stmt.join[join_idx].right`.
+fn locate_from_operand(stmt: &SelectStatement, join_idx: usize, rel: &Relation) -> Option<FromLoc> {
+    for j in (0..=join_idx).rev() {
+        if let JoinRightSide::Table(te) = &stmt.join[j].right
+            && table_expr_identity(te).as_ref() == Some(rel)
+        {
+            return Some(FromLoc::JoinRhs(j));
+        }
+    }
+    for (i, te) in stmt.tables.iter().enumerate().rev() {
+        if table_expr_identity(te).as_ref() == Some(rel) {
+            return Some(FromLoc::Table(i));
+        }
+    }
+    None
+}
+
+/// The mutable `TableExpr` at `loc`.
+fn from_operand_mut(stmt: &mut SelectStatement, loc: FromLoc) -> Option<&mut TableExpr> {
+    match loc {
+        FromLoc::Table(i) => stmt.tables.get_mut(i),
+        FromLoc::JoinRhs(j) => match &mut stmt.join[j].right {
+            JoinRightSide::Table(te) => Some(te),
+            JoinRightSide::Tables(_) => None,
+        },
+    }
+}
+
+/// Wrap the LOJ FROM operand identified by `wrapped_rel` with `projections`: in
+/// one shadow-aware walk, retarget every reference to `wrapped_rel` in the outer
+/// statement onto the schema-less wrap alias and enumerate the passthrough
+/// columns, then install the derived table.  The retarget keeps sibling
+/// references consistent with the schema-less DT alias so the LOJ ON stays
+/// two-relation (the REA-6129 guardrail).
+fn wrap_one_loj_target(
+    stmt: &mut SelectStatement,
+    join_idx: usize,
+    wrapped_rel: Relation,
+    projections: Vec<(SqlIdentifier, Expr)>,
+) -> ReadySetResult<()> {
+    let wrap_alias_rel = Relation {
+        schema: None,
+        name: wrapped_rel.name.clone(),
+    };
+    let projected_aliases: HashSet<SqlIdentifier> =
+        projections.iter().map(|(alias, _)| alias.clone()).collect();
+    let mut passthrough_set: HashSet<SqlIdentifier> = HashSet::new();
+    deep_columns_visitor_mut(stmt, &wrapped_rel, &mut |expr| {
+        let column = as_column!(expr);
+        if is_column_of!(column, wrapped_rel) {
+            if !projected_aliases.contains(&column.name) {
+                passthrough_set.insert(column.name.clone());
+            }
+            column.table = Some(wrap_alias_rel.clone());
+        }
+    })?;
+    let mut passthrough_cols: Vec<SqlIdentifier> = passthrough_set.into_iter().collect();
+    passthrough_cols.sort();
+
+    let loc = locate_from_operand(stmt, join_idx, &wrapped_rel)
+        .ok_or_else(|| internal_err!("LOJ wrap target disappeared between resolve steps"))?;
+    let target_te = from_operand_mut(stmt, loc)
+        .ok_or_else(|| internal_err!("LOJ wrap target is not a wrappable TableExpr"))?;
+    wrap_table_expr_with_projections(target_te, passthrough_cols, projections)?;
+    Ok(())
+}
+
+/// Wrap the correlation-owning operand of each supported LEFT JOIN whose ON
+/// carries a subquery predicate: the LHS join partner (inferred from the ON's
+/// cross-equalities) for uncorrelated / A-correlated, the RHS for B-correlated.
+/// Moves the subquery into a derived-table projection and rewrites the ON to
+/// reference the projected column, which keeps the ON at the two relations
+/// `{partner, RHS}` (the REA-6129 guardrail).
+///
+/// A subquery whose correlation resolves to neither operand — both operands, a
+/// non-partner leading-FROM table, or a relation in an enclosing scope (the
+/// containing query's FROM, an outer LATERAL) — has no operand that preserves
+/// the two-relation ON and is rejected here with `unsupported!` (graceful
+/// upstream fallback), since this pass owns the correlation analysis.  A join
+/// with no single inferred partner (no cross-eq, or a >2-relation ON) is skipped
+/// entirely.  Shapes NSP does not project — IN / NOT IN, quantified comparisons,
+/// and other non-`is_admitted_loj_wrap_shape` predicates — are left in the ON and
+/// rejected downstream by the join-condition guardrail.  See §12 of the design
+/// memo.
+pub(crate) fn wrap_loj_on_subquery_predicates(stmt: &mut SelectStatement) -> ReadySetResult<bool> {
+    let mut changed = false;
+    let mut projected_alias_counter: usize = 0;
+
+    for join_idx in 0..stmt.join.len() {
+        let is_left = matches!(
+            stmt.join[join_idx].operator,
+            JoinOperator::LeftJoin | JoinOperator::LeftOuterJoin
+        );
+        if !is_left {
+            continue;
+        }
+        let JoinConstraint::On(on_expr) = &stmt.join[join_idx].constraint else {
+            continue;
+        };
+
+        // The RHS must have a wrappable identity (not a comma-list / `Values` /
+        // unaliased subquery): a B-side wrap targets it, and the partner
+        // inference excludes it from the cross-eqs.  Without one, nothing here is
+        // wrappable -- leave the ON for the downstream guardrail.
+        let Some(rhs_rel) = loj_rhs_relation(stmt, join_idx) else {
+            continue;
+        };
+
+        let mut flat: Vec<Expr> = iter_and_conjuncts(on_expr).cloned().collect();
+
+        // The one LHS operand a wrap may target is the join partner inferred
+        // from the ON's cross-equalities (not the syntactically-last FROM item).
+        // With no single partner from a cross-eq, a lone Scalar `=` vs a bare
+        // column is still wrappable -- projecting the subquery onto the operand
+        // opposite the bare column synthesizes the cross-eq.  Otherwise there is no
+        // two-relation ON to preserve, so leave the whole ON for the downstream
+        // guardrail.
+        let (partner_rel, synth_target): (Relation, Option<(Relation, bool)>) =
+            match infer_loj_lhs_partner(&flat, &rhs_rel) {
+                Some(p) => (p, None),
+                None => match synthesize_equi_bare_col_wrap(&flat, &rhs_rel, stmt, join_idx)? {
+                    Some(w) => (w.partner, Some((w.target, w.target_is_rhs))),
+                    None => continue,
+                },
+            };
+
+        // A-side projections wrap the partner; B-side projections wrap the RHS.
+        let mut partner_projs: Vec<(SqlIdentifier, Expr)> = Vec::new();
+        let mut rhs_projs: Vec<(SqlIdentifier, Expr)> = Vec::new();
+
+        for atom in flat.iter_mut() {
+            if !is_supported_subquery_predicate(atom) {
+                continue;
+            }
+            let desc = as_supported_subquery_predicate(atom)?;
+            if !is_admitted_loj_wrap_shape(&desc) {
+                continue;
+            }
+
+            // Classify by the complete correlation set.  Uncorrelated or
+            // A-correlated (to the partner) wraps the partner; B-correlated (to
+            // the RHS) wraps the RHS.  Anything else -- both operands, or a
+            // relation outside the join (a non-partner leading-FROM table, an
+            // enclosing query's FROM, an outer LATERAL) -- has no single operand
+            // that keeps the wrapped ON two-relation, so it is rejected here with
+            // a precise reason rather than left to fail with a generic
+            // join-condition error downstream: this pass did the correlation
+            // analysis and owns the conclusion.  `unsupported!` (not a hard
+            // error) keeps the query on the graceful upstream-fallback path.
+            // Earlier conjuncts/joins in this pass may already be rewritten when
+            // this fires; that is sound because the pipeline discards `stmt` on
+            // any `Err`, so the half-rewritten AST is never observed.
+            //
+            // The partner and the RHS carry distinct identities: an unaliased
+            // self-join is invalid SQL rejected during column resolution before
+            // this pass, so they never collide here.
+            // A synthesized target already fixes the wrap operand, so the
+            // correlation walk (consulted only by the arms below) is skipped there.
+            let mut corr = if synth_target.is_some() {
+                HashSet::new()
+            } else {
+                correlated_relations(&desc.stmt)?
+            };
+            // An IN predicate `x IN S` is projected as a CASE that consumes x, so
+            // its wrap operand is the one x references, unioned with any
+            // correlation of S.  Feeding the augmented set through the
+            // single-operand branches wraps that operand (or declines when x and
+            // S span two operands).
+            if synth_target.is_none()
+                && matches!(desc.ctx, SubqueryContext::In)
+                && let Some((x, _)) = desc.lhs_and_op.as_ref()
+            {
+                corr.extend(columns_iter(x).filter_map(|c| c.table.clone()));
+            }
+            let target_is_rhs;
+            let target_rel = if let Some((target, is_rhs)) = &synth_target {
+                // No cross-eq pinned the partner: the target is fixed to the
+                // operand opposite the bare column, so the equality becomes a
+                // cross-eq join key.
+                target_is_rhs = *is_rhs;
+                target.clone()
+            } else if corr.is_empty() {
+                // Uncorrelated: default to the LHS-neighbor partner, but for a
+                // SCALAR-op whose non-subquery side references the RHS operand with a
+                // non-`=` operator, wrap the RHS instead.  Otherwise the rewritten ON
+                // atom (`<rhs>.col <op> <partner>.__loj_c_0`) spans two relations and
+                // the join guardrail rejects it.  EXISTS projects `= 1` (single-
+                // relation on any target) and IN is declined by
+                // `is_admitted_loj_wrap_shape`, so both keep the partner default; `=`
+                // stays on the partner too, where it forms a supported cross-eq key.
+                let refs_rhs = matches!(desc.ctx, SubqueryContext::Scalar)
+                    && desc.lhs_and_op.as_ref().is_some_and(|(lhs, op)| {
+                        *op != BinaryOperator::Equal
+                            && columns_iter(lhs).any(|c| c.table.as_ref() == Some(&rhs_rel))
+                    });
+                if refs_rhs {
+                    target_is_rhs = true;
+                    rhs_rel.clone()
+                } else {
+                    target_is_rhs = false;
+                    partner_rel.clone()
+                }
+            } else if corr_is_single(&corr, &partner_rel) {
+                target_is_rhs = false;
+                partner_rel.clone()
+            } else if corr_is_single(&corr, &rhs_rel) {
+                target_is_rhs = true;
+                rhs_rel.clone()
+            } else {
+                unsupported!("subquery in LEFT JOIN ON must correlate to a single join operand");
+            };
+
+            let projected_alias = SqlIdentifier::from(format!("__loj_c_{projected_alias_counter}"));
+            projected_alias_counter += 1;
+            let (projected_expr, reference_expr) = build_loj_wrap_projection_and_reference(
+                desc,
+                &target_rel.name,
+                projected_alias.clone(),
+            )?;
+            *atom = reference_expr;
+            if target_is_rhs {
+                rhs_projs.push((projected_alias, projected_expr));
+            } else {
+                partner_projs.push((projected_alias, projected_expr));
+            }
+        }
+
+        if partner_projs.is_empty() && rhs_projs.is_empty() {
+            continue;
+        }
+
+        let new_on = conjoin_all_dedup(flat)
+            .ok_or_else(|| internal_err!("LOJ ON collapsed to empty after wrap"))?;
+        stmt.join[join_idx].constraint = JoinConstraint::On(new_on);
+
+        if !partner_projs.is_empty() {
+            wrap_one_loj_target(stmt, join_idx, partner_rel.clone(), partner_projs)?;
+            changed = true;
+        }
+        if !rhs_projs.is_empty() {
+            wrap_one_loj_target(stmt, join_idx, rhs_rel.clone(), rhs_projs)?;
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
+/// The `TableExpr` on the RHS of the LOJ at `stmt.join[join_idx]`, when it is a
+/// single `JoinRightSide::Table` (not a comma-list).
+fn loj_rhs(stmt: &SelectStatement, join_idx: usize) -> Option<&TableExpr> {
+    match &stmt.join[join_idx].right {
+        JoinRightSide::Table(te) => Some(te),
+        JoinRightSide::Tables(_) => None,
+    }
+}
+
+/// The outer-visible relation identity of the LOJ's RHS, via `table_expr_identity`.
+fn loj_rhs_relation(stmt: &SelectStatement, join_idx: usize) -> Option<Relation> {
+    loj_rhs(stmt, join_idx).and_then(table_expr_identity)
+}
+
+/// The outer-visible relation identity of a FROM-position `TableExpr`: its alias
+/// (schema-less) when set, else the possibly-schema-qualified base table it names.
+/// `None` for shapes the wrap doesn't handle (a `Values` source or an unaliased
+/// subquery).
+fn table_expr_identity(te: &TableExpr) -> Option<Relation> {
+    match (&te.inner, &te.alias) {
+        (_, Some(a)) => Some(Relation {
+            schema: None,
+            name: a.clone(),
+        }),
+        (TableExprInner::Table(rel), None) => Some(rel.clone()),
+        _ => None,
+    }
+}
+
+/// Extracts `col = col` cross-table equality pairs from a correlated expression.
+///
+/// Step 2 of the two-step correlation protocol (see `partition_correlated_predicates`).
+/// Walks the expression tree and collects every `local_col = outer_col` equality into
+/// a `HashSet<(Column, Column)>`.  Non-equality atoms (e.g., single-relation outer
+/// filters) are silently ignored — they remain in the expression but are not treated
+/// as correlation keys.  Per §5.1 of `known_core_limitations.md`, only `col = col`
+/// equalities are supported as correlation shape.
+pub(crate) fn extract_correlation_keys(
     expr: &Expr,
     local_from_items: &HashSet<Relation>,
 ) -> ReadySetResult<HashSet<(Column, Column)>> {
@@ -1647,7 +2943,9 @@ pub(crate) fn construct_projecting_wrapper(
                     let (_, fe_alias) = expect_field_as_expr(fe);
                     FieldDefinitionExpr::Expr {
                         expr: Expr::Column(Column {
-                            name: fe_alias.clone().expect("Already checked"),
+                            // SAFETY: the `for fe in stmt.fields.iter_mut()` loop above ensures every field has
+                            // an alias (fills `None` with a default alias).
+                            name: fe_alias.clone().expect("alias ensured by prior loop"),
                             table: Some(stmt_alias.clone().into()),
                         }),
                         alias: fe_alias.clone(),
@@ -1658,6 +2956,7 @@ pub(crate) fn construct_projecting_wrapper(
             ..Default::default()
         })),
         alias: Some(stmt_alias),
+        column_aliases: vec![],
     })
 }
 
@@ -1682,13 +2981,6 @@ fn project_row_number_field(
     stmt_alias: SqlIdentifier,
 ) -> ReadySetResult<(SqlIdentifier, bool, bool)> {
     //
-    macro_rules! is_window_function_expr {
-        ($expr:expr) => {{
-            let mut contains_window_functions = false;
-            for_each_window_function($expr, &mut |_| contains_window_functions = true)?;
-            contains_window_functions
-        }};
-    }
     let mut require_wrapper = false;
     let mut rn_order_by = if let Some(order_by_clause) = &stmt.order {
         let mut rn_order_by = Vec::new();
@@ -1747,6 +3039,7 @@ fn project_row_number_field(
         let mut dt = construct_projecting_wrapper(TableExpr {
             inner: TableExprInner::Subquery(Box::new(mem::take(stmt))),
             alias: Some(stmt_alias.clone()),
+            column_aliases: vec![],
         })?;
 
         let (wrapper_stmt, _) = expect_sub_query_with_alias_mut(&mut dt);
@@ -1837,6 +3130,28 @@ fn literal_into_positive_number(lit: &Literal, title: &str) -> ReadySetResult<i6
         out_of_range!(title)
     }
     Ok(n)
+}
+
+/// Infallible conversion of a literal to a non-negative integer, returning `None`
+/// for non-numeric or negative literals.  Delegates to `literal_into_positive_number`
+/// and swallows errors.
+fn literal_as_nonneg(lit: &Literal) -> Option<i64> {
+    literal_into_positive_number(lit, "").ok()
+}
+
+/// Returns `true` if the literal represents the integer value 0.
+pub(crate) fn is_literal_zero(lit: &Literal) -> bool {
+    literal_as_nonneg(lit) == Some(0)
+}
+
+/// Returns `true` if the literal represents the integer value 1.
+pub(crate) fn is_literal_one(lit: &Literal) -> bool {
+    literal_as_nonneg(lit) == Some(1)
+}
+
+/// Returns `true` if the literal represents a positive integer (> 0).
+pub(crate) fn is_literal_positive(lit: &Literal) -> bool {
+    literal_as_nonneg(lit).is_some_and(|n| n > 0)
 }
 
 /// Returns `(rn_alias, rn_user_defined, rn_filter, inner_wrapper_inserted)`.
@@ -1946,6 +3261,7 @@ fn rewrite_top_k_in_place_impl(
     let mut outer_derived_table = construct_projecting_wrapper(TableExpr {
         inner: TableExprInner::Subquery(Box::new(mem::take(stmt))),
         alias: Some(INNER_STMT_ALIAS.into()),
+        column_aliases: vec![],
     })?;
     let (outer_stmt, _) = expect_sub_query_with_alias_mut(&mut outer_derived_table);
     *stmt = mem::take(outer_stmt);
@@ -2015,7 +3331,11 @@ fn ensure_partition_keys_visible_and_qualified(
     let mut it_proj = projected_aliases.into_iter();
     let final_aliases: Vec<SqlIdentifier> = resolved
         .into_iter()
-        .map(|maybe_a| maybe_a.unwrap_or_else(|| it_proj.next().expect("alias for missing col")))
+        // SAFETY: `projected_aliases` has exactly as many entries as `None` slots in
+        // `resolved`, because `missing` was built from those same `None` positions.
+        .map(|maybe_a| {
+            maybe_a.unwrap_or_else(|| it_proj.next().expect("one alias per missing col"))
+        })
         .collect();
 
     // 4) Qualify with stmt_alias for use at the parent scope.
@@ -2171,40 +3491,124 @@ pub(crate) fn rewrite_top_k_in_place(stmt: &mut SelectStatement) -> ReadySetResu
     rewrite_top_k_in_place_impl(stmt).map(|_| {})
 }
 
-pub(crate) fn analyse_fix_correlated_subquery_group_by(
+/// Returns `true` iff the GROUP BY keys are exactly the local columns from
+/// correlated `(local_col = outer_col)` equality pairs — no extra keys, no
+/// missing ones.  When `true`, the subquery produces at most one row per
+/// outer row (the GROUP BY keys are fully pinned by the correlation).
+///
+/// This is a **pure analysis** — it never mutates the AST.  For the combined
+/// analysis + rewrite (GROUP BY + HAVING), use
+/// [`align_group_by_and_windows_with_correlation`] instead.
+pub(crate) fn are_group_by_keys_pinned_by_correlation(
     cols_set: &HashSet<(Column, Column)>,
-    group_by: &mut GroupByClause,
+    stmt: &SelectStatement,
 ) -> ReadySetResult<bool> {
+    let Some(group_by) = &stmt.group_by else {
+        return Ok(true); // no GROUP BY — vacuously pinned
+    };
     let mut local_cols = cols_set
         .iter()
         .map(|(local_col, _)| local_col)
         .collect::<HashSet<_>>();
 
     let mut constraint_columns_group_by_only = true;
-    for f in group_by.fields.iter_mut() {
-        match f {
-            FieldReference::Expr(Expr::Column(col)) => {
-                if let Some((local_col, _)) = cols_set.iter().find(|(local_col, correlated_col)| {
-                    if local_col.eq(col) {
-                        true
-                    } else if correlated_col.eq(col) {
-                        let _ = mem::replace(col, local_col.clone());
-                        true
-                    } else {
-                        false
-                    }
-                }) {
+    for f in &group_by.fields {
+        // Resolve to the underlying expression (handles numeric refs and
+        // unqualified alias refs uniformly).
+        let resolved = resolve_field_reference(&stmt.fields, f)?;
+        match &resolved {
+            Expr::Column(col) => {
+                if let Some((local_col, _)) = cols_set
+                    .iter()
+                    .find(|(local_col, correlated_col)| local_col == col || correlated_col == col)
+                {
                     local_cols.remove(local_col);
                 } else {
                     constraint_columns_group_by_only = false;
                 }
             }
-            FieldReference::Expr(Expr::Literal(_)) => {}
+            Expr::Literal(_) => {}
             _ => constraint_columns_group_by_only = false,
         }
     }
 
     Ok(constraint_columns_group_by_only && local_cols.is_empty())
+}
+
+/// Rewrite correlated (outer) column references to their local equivalents
+/// in both GROUP BY and HAVING.
+///
+/// After unnesting hoists the WHERE correlation to the join ON, correlated
+/// columns in GROUP BY and HAVING become dangling references — the outer
+/// table is no longer in scope.  Since the correlation guarantees
+/// `local_col = outer_col` for every surviving row, substituting one for
+/// the other preserves semantics.
+///
+/// Returns `true` using the same criterion as
+/// [`are_group_by_keys_pinned_by_correlation`]: all GROUP BY keys are
+/// exactly the local columns from the correlated pairs.
+fn fix_correlated_columns_in_group_by_and_having(
+    cols_set: &HashSet<(Column, Column)>,
+    stmt: &mut SelectStatement,
+) -> ReadySetResult<bool> {
+    // Pre-normalize GROUP BY: resolve every field reference (numeric or
+    // alias-ref) to its underlying expression so the match below is
+    // shape-agnostic. This keeps the unnesting pass independent of whether
+    // `remove_numeric_field_references` has run upstream.
+    let fields_snapshot = stmt.fields.clone();
+    if let Some(group_by) = &mut stmt.group_by {
+        for f in group_by.fields.iter_mut() {
+            *f = FieldReference::Expr(resolve_field_reference(&fields_snapshot, f)?);
+        }
+    }
+
+    let are_pinned = if let Some(group_by) = &mut stmt.group_by {
+        let mut local_cols: HashSet<_> = cols_set.iter().map(|(l, _)| l).collect();
+        let mut constraint_columns_group_by_only = true;
+
+        for f in group_by.fields.iter_mut() {
+            match f {
+                FieldReference::Expr(Expr::Column(col)) => {
+                    if let Some((local_col, _)) =
+                        cols_set.iter().find(|(local_col, correlated_col)| {
+                            if local_col.eq(col) {
+                                true
+                            } else if correlated_col.eq(col) {
+                                *col = local_col.clone();
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                    {
+                        local_cols.remove(local_col);
+                    } else {
+                        constraint_columns_group_by_only = false;
+                    }
+                }
+                FieldReference::Expr(Expr::Literal(_)) => {}
+                _ => constraint_columns_group_by_only = false,
+            }
+        }
+
+        constraint_columns_group_by_only && local_cols.is_empty()
+    } else {
+        true
+    };
+
+    // Apply the same correlated -> local substitution to HAVING.
+    if let Some(having_expr) = &mut stmt.having {
+        for col in columns_iter_mut(having_expr) {
+            if let Some((local_col, _)) = cols_set
+                .iter()
+                .find(|(_, correlated_col)| correlated_col == col)
+            {
+                *col = local_col.clone();
+            }
+        }
+    }
+
+    Ok(are_pinned)
 }
 
 fn fix_correlated_subquery_with_window_functions(
@@ -2214,8 +3618,10 @@ fn fix_correlated_subquery_with_window_functions(
     for field in stmt.fields.iter_mut() {
         let (field_expr, _) = expect_field_as_expr_mut(field);
         for_each_window_function_mut(field_expr, &mut |wf| {
+            // SAFETY: `for_each_window_function_mut` only calls this closure with
+            // `Expr::WindowFunction` nodes — the match is exhaustive by callback contract.
             let Expr::WindowFunction { partition_by, .. } = wf else {
-                unreachable!("Already checked")
+                unreachable!("for_each_window_function_mut guarantees Expr::WindowFunction")
             };
             for (local_col, _) in cols_set.iter() {
                 if !partition_by.iter().any(|part_expr| {
@@ -2237,13 +3643,10 @@ pub(crate) fn align_group_by_and_windows_with_correlation(
     stmt: &mut SelectStatement,
     cols_set: &HashSet<(Column, Column)>, // (local_column = correlated_column)
 ) -> ReadySetResult<bool> {
-    // Get a flag if either `stmt` has no GROUP BY or all local columns are the only grouping keys,
-    // and fix group by correlated columns occurrences.
-    let are_local_columns_eq_grouping_keys = if let Some(group_by) = &mut stmt.group_by {
-        analyse_fix_correlated_subquery_group_by(cols_set, group_by)?
-    } else {
-        true
-    };
+    // Rewrite correlated → local columns in GROUP BY and HAVING, and check
+    // whether the GROUP BY keys are exactly pinned by the correlation pairs.
+    let are_local_columns_eq_grouping_keys =
+        fix_correlated_columns_in_group_by_and_having(cols_set, stmt)?;
 
     // Make the WF, if present, be partitioned by the local columns equated to the correlated keys.
     fix_correlated_subquery_with_window_functions(cols_set, stmt)?;
@@ -2308,8 +3711,9 @@ pub(crate) fn hoist_parametrizable_join_filters_to_where(
     let mut add_to_where = Vec::new();
 
     for jc in stmt.join.iter_mut() {
-        // Only hoist from INNER joins
-        if !jc.operator.is_inner_join() {
+        // Only hoist from INNER joins. STRAIGHT_JOIN ON predicates are preserved as-is:
+        // the join-order hint requires their constraints to stay on the join itself.
+        if !jc.operator.is_inner_join() || matches!(jc.operator, JoinOperator::StraightJoin) {
             continue;
         }
         if let JoinConstraint::On(join_expr) = &jc.constraint {
@@ -2330,11 +3734,10 @@ pub(crate) fn hoist_parametrizable_join_filters_to_where(
         return Ok(false);
     }
 
-    let mut acc = None;
-    for e in add_to_where {
-        acc = and_predicates_skip_true(acc, e);
-    }
-    stmt.where_clause = and_predicates_skip_true(mem::take(&mut stmt.where_clause), acc.unwrap());
+    // SAFETY: the `if add_to_where.is_empty() { return Ok(false) }` guard above guarantees at
+    // least one element, so `conjoin_all_dedup` returns `Some`.
+    let acc = conjoin_all_dedup(add_to_where).expect("add_to_where verified non-empty");
+    stmt.where_clause = and_predicates_skip_true(mem::take(&mut stmt.where_clause), acc);
 
     Ok(true)
 }
@@ -2348,27 +3751,75 @@ pub(crate) fn hoist_parametrizable_join_filters_to_where(
 /// Correctness of this guard relies on `get_from_item_reference_name` and `is_column_of!`
 /// using the same `Relation` identity that the resolver assigned to aliases.
 fn shadows_rhs_alias(stmt: &SelectStatement, rhs_rel: &Relation) -> bool {
+    shadows_rhs_aliases(stmt, &HashSet::from([rhs_rel.clone()]))
+}
+
+/// Returns true if `stmt`'s local FROM items contain a relation matching any
+/// member of `shadow_rels`.  HashSet generalization of [`shadows_rhs_alias`].
+pub(crate) fn shadows_rhs_aliases(stmt: &SelectStatement, shadow_rels: &HashSet<Relation>) -> bool {
     get_local_from_items_iter!(stmt)
-        .any(|t| get_from_item_reference_name(t).is_ok_and(|rel| rel == *rhs_rel))
+        .any(|t| get_from_item_reference_name(t).is_ok_and(|rel| shadow_rels.contains(&rel)))
 }
 
 pub(crate) fn deep_columns_visitor_mut(
     stmt: &mut SelectStatement,
-    shadow_rel: &Relation,
+    outer_rel: &Relation,
+    visitor: &mut impl FnMut(&mut Expr),
+) -> ReadySetResult<()> {
+    deep_columns_visitor_mut_in_set(stmt, &HashSet::from([outer_rel.clone()]), visitor)
+}
+
+/// HashSet generalization of [`deep_columns_visitor_mut`]: visit
+/// `Expr::Column` nodes whose table is a currently-live outer relation, and
+/// invoke `visitor` on them.  "Currently-live" means: an element of
+/// `outer_rels` that has not been shadowed by any enclosing subquery body's
+/// local FROM.
+///
+/// Entry scope: the top-level `stmt` is treated as the same scope where
+/// `outer_rels` was defined -- its own local FROM items do not shadow
+/// `outer_rels`.  This matches how callers use the helper: rebinding
+/// references to a FROM item within the very stmt that owns it, or
+/// rebinding correlation refs to outer relations inside a subquery body
+/// passed as `stmt`.  Nested subqueries below the top level do shadow
+/// on their own local FROM.
+///
+/// The visitor descends into every nested `SelectStatement` reachable from
+/// `stmt` and at each descent level recomputes the still-live outer set as
+/// `parent_live - this_level_body_locals`.  Columns whose table is not in
+/// the current level's live set are skipped -- either because their table
+/// isn't an outer relation of interest, or because it has been shadowed by
+/// an enclosing body's local FROM.  This is load-bearing for multi-outer
+/// scenarios where a nested body shadows some (but not all) of the outer
+/// relations: refs to the non-shadowed outer relations at deeper levels
+/// remain visible and get invoked.
+pub(crate) fn deep_columns_visitor_mut_in_set(
+    stmt: &mut SelectStatement,
+    outer_rels: &HashSet<Relation>,
     visitor: &mut impl FnMut(&mut Expr),
 ) -> ReadySetResult<()> {
     struct ExprVisitor<'a> {
-        shadow_rel: &'a Relation,
-        visitor: &'a mut dyn FnMut(&mut Expr),
+        // Per-level stack of still-live outer relations.  Depth 1 (top-
+        // level entry) uses `outer_rels` unchanged; deeper levels push
+        // `parent_top - this_body_locals`.  Popped on subtree exit.
+        live_stack: Vec<HashSet<Relation>>,
         depth: usize,
+        visitor: &'a mut dyn FnMut(&mut Expr),
     }
 
     impl<'a> VisitorMut<'a> for ExprVisitor<'a> {
         type Error = ReadySetError;
 
         fn visit_expr(&mut self, expr: &'a mut Expr) -> Result<(), Self::Error> {
-            if matches!(expr, Expr::Column(_)) {
-                (self.visitor)(expr);
+            if let Expr::Column(col) = expr {
+                let live_here = self.live_stack.last();
+                if col
+                    .table
+                    .as_ref()
+                    .zip(live_here)
+                    .is_some_and(|(t, live)| live.contains(t))
+                {
+                    (self.visitor)(expr);
+                }
                 Ok(())
             } else {
                 walk_expr(self, expr)
@@ -2380,18 +3831,35 @@ pub(crate) fn deep_columns_visitor_mut(
             stmt: &'a mut SelectStatement,
         ) -> Result<(), Self::Error> {
             self.depth += 1;
-            if self.depth == 1 || !shadows_rhs_alias(stmt, self.shadow_rel) {
-                visit_mut::walk_select_statement(self, stmt)?;
+            let this_live = if self.depth == 1 {
+                // Top-level entry: stmt is treated as the scope where
+                // outer_rels lives, so its own local FROM does not shadow.
+                self.live_stack.last().cloned().unwrap_or_default()
+            } else {
+                let body_locals = collect_local_from_items(stmt)?;
+                let parent_live = self.live_stack.last().cloned().unwrap_or_default();
+                parent_live.difference(&body_locals).cloned().collect()
+            };
+
+            if this_live.is_empty() && self.depth > 1 {
+                // Nothing outer is still live at this subquery level;
+                // skip the whole subtree.
+                self.depth -= 1;
+                return Ok(());
             }
+
+            self.live_stack.push(this_live);
+            visit_mut::walk_select_statement(self, stmt)?;
+            self.live_stack.pop();
             self.depth -= 1;
             Ok(())
         }
     }
 
     ExprVisitor {
-        shadow_rel,
-        visitor,
+        live_stack: vec![outer_rels.clone()],
         depth: 0,
+        visitor,
     }
     .visit_select_statement(stmt)
 }
@@ -2437,21 +3905,1547 @@ pub(crate) fn deep_columns_visitor(
     .visit_select_statement(stmt)
 }
 
-/// Normalize comma-separated tables in `FROM` to explicit `CROSS JOIN`
-/// clauses. Converts `FROM a, b, c` to `FROM a CROSS JOIN b CROSS JOIN c`.
-/// Idempotent — no-op if `stmt.tables` has 0 or 1 entries.
-pub(crate) fn normalize_comma_separated_lhs(stmt: &mut SelectStatement) -> ReadySetResult<bool> {
-    Ok(if stmt.tables.len() > 1 {
-        stmt.join.splice(
-            0..0,
-            stmt.tables.drain(1..).map(|dt| JoinClause {
-                operator: JoinOperator::CrossJoin,
-                right: JoinRightSide::Table(dt),
-                constraint: JoinConstraint::Empty,
-            }),
-        );
+/// Visit all `Expr::Column` nodes in `expr`, descending into nested subqueries but
+/// skipping any subquery that shadows `shadow_rel` (i.e., defines a local FROM-item
+/// with the same relation identity).
+///
+/// This is the expression-entry-point counterpart of [`deep_columns_visitor`], which
+/// enters via `visit_expr`. Since the entry point here is `visit_expr`,
+/// every `visit_select_statement` call is already a nested subquery, so no depth
+/// tracking is needed — shadowing is checked on every subquery unconditionally.
+pub(crate) fn deep_columns_expr_visitor(
+    expr: &Expr,
+    shadow_rel: &Relation,
+    visitor: &mut impl FnMut(&Expr),
+) -> ReadySetResult<()> {
+    struct ExprVisitor<'a> {
+        shadow_rel: &'a Relation,
+        visitor: &'a mut dyn FnMut(&Expr),
+    }
+
+    impl<'a> Visitor<'a> for ExprVisitor<'a> {
+        type Error = ReadySetError;
+
+        fn visit_expr(&mut self, expr: &'a Expr) -> Result<(), Self::Error> {
+            if matches!(expr, Expr::Column(_)) {
+                (self.visitor)(expr);
+                Ok(())
+            } else {
+                visit::walk_expr(self, expr)
+            }
+        }
+
+        fn visit_select_statement(&mut self, stmt: &'a SelectStatement) -> Result<(), Self::Error> {
+            if !shadows_rhs_alias(stmt, self.shadow_rel) {
+                walk_select_statement(self, stmt)?;
+            }
+            Ok(())
+        }
+    }
+
+    ExprVisitor {
+        shadow_rel,
+        visitor,
+    }
+    .visit_expr(expr)
+}
+
+/// The set of relations `stmt` correlates to, relative to itself: every
+/// relation referenced by a column anywhere in `stmt` (all clauses, all nesting
+/// depths) whose table is not in the cumulative local FROM scope at that depth.
+///
+/// Unlike `util::is_correlated` (built on `outermost_referred_columns`, which
+/// does not recurse into subqueries), this descends into nested subqueries and
+/// accounts for shadowing: a column referencing a relation declared by an
+/// enclosing subquery's own FROM is local, not correlation.
+///
+/// Preconditions (upheld by pipeline position, not asserted here): columns are
+/// fully table-qualified — this runs after `expand_implied_tables`, so a
+/// table-less column is treated as local; and `stmt` carries no CTEs — those are
+/// rejected upstream by `validate_pipeline_invariants`, and a CTE name is not in
+/// the local FROM scope, so it would otherwise read as spurious correlation.
+pub(crate) fn correlated_relations(stmt: &SelectStatement) -> ReadySetResult<HashSet<Relation>> {
+    struct V {
+        local_stack: Vec<HashSet<Relation>>,
+        correlated: HashSet<Relation>,
+    }
+    impl<'a> Visitor<'a> for V {
+        type Error = ReadySetError;
+
+        fn visit_select_statement(&mut self, stmt: &'a SelectStatement) -> Result<(), Self::Error> {
+            let mut cumulative = self.local_stack.last().cloned().unwrap_or_default();
+            cumulative.extend(collect_local_from_items(stmt)?);
+            self.local_stack.push(cumulative);
+            walk_select_statement(self, stmt)?;
+            self.local_stack.pop();
+            Ok(())
+        }
+
+        fn visit_expr(&mut self, expr: &'a Expr) -> Result<(), Self::Error> {
+            if let Expr::Column(col) = expr {
+                if let Some(tbl) = &col.table {
+                    let local = self.local_stack.last();
+                    if !local.is_some_and(|l| l.contains(tbl)) {
+                        self.correlated.insert(tbl.clone());
+                    }
+                }
+                Ok(())
+            } else {
+                visit::walk_expr(self, expr)
+            }
+        }
+    }
+
+    let mut v = V {
+        local_stack: Vec::new(),
+        correlated: HashSet::new(),
+    };
+    v.visit_select_statement(stmt)?;
+    Ok(v.correlated)
+}
+
+struct QuestionMarkPlaceholderVisitor {
+    found: bool,
+}
+
+impl<'ast> Visitor<'ast> for QuestionMarkPlaceholderVisitor {
+    type Error = ReadySetError;
+    fn visit_literal(&mut self, literal: &'ast Literal) -> Result<(), Self::Error> {
+        if !self.found && matches!(literal, Literal::Placeholder(ItemPlaceholder::QuestionMark)) {
+            self.found = true;
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn contains_question_mark_placeholders(query: &SelectStatement) -> ReadySetResult<bool> {
+    let mut visitor = QuestionMarkPlaceholderVisitor { found: false };
+    visitor.visit_select_statement(query)?;
+    Ok(visitor.found)
+}
+
+/// Return true if a SELECT has DISTINCT, aggregates, or GROUP BY.
+pub(crate) fn is_aggregation_or_grouped(stmt: &SelectStatement) -> ReadySetResult<bool> {
+    Ok(stmt.distinct || is_aggregated_select(stmt)? || stmt.group_by.is_some())
+}
+
+/// Extract the left and right table relations from a column equality expression.
+pub(crate) fn get_lhs_rhs_tables_from_eq_constraint(
+    constraint: &Expr,
+) -> Option<(Relation, Relation)> {
+    // Capture table names from equality constraint.
+    let mut lhs_table = None;
+    let mut rhs_table = None;
+    matches_eq_constraint(constraint, |left, right| {
+        lhs_table = Some(left.clone());
+        rhs_table = Some(right.clone());
         true
-    } else {
-        false
+    });
+    match (lhs_table, rhs_table) {
+        (Some(left_table), Some(right_table)) => Some((left_table, right_table)),
+        _ => None,
+    }
+}
+
+pub(crate) fn normalize_having_and_group_by_for_statement(
+    stmt: &mut SelectStatement,
+) -> ReadySetResult<bool> {
+    let mut was_rewritten = false;
+
+    // Split aliased select items into two categories:
+    //  - expr_aliases: non-column expressions → alias (engine requires alias references)
+    //  - column_aliases: alias name → column expr (engine requires actual columns)
+    let mut expr_aliases: HashMap<&Expr, SqlIdentifier> = HashMap::new();
+    let mut column_aliases: HashMap<SqlIdentifier, Expr> = HashMap::new();
+
+    for field in &stmt.fields {
+        if let (expr, Some(alias)) = expect_field_as_expr(field) {
+            if matches!(expr, Expr::Column(_)) {
+                column_aliases.insert(alias.clone(), expr.clone());
+            } else {
+                expr_aliases.insert(expr, alias.clone());
+            }
+        }
+    }
+
+    macro_rules! make_alias_ref {
+        ($alias:expr) => {
+            Expr::Column(Column {
+                name: $alias.clone(),
+                table: None,
+            })
+        };
+    }
+
+    if let Some(having_expr) = stmt.having.as_mut() {
+        struct HavingVisitor<'ast> {
+            expr_aliases: &'ast HashMap<&'ast Expr, SqlIdentifier>,
+            column_aliases: &'ast HashMap<SqlIdentifier, Expr>,
+            rewrites_count: u32,
+        }
+
+        impl<'ast> VisitorMut<'ast> for HavingVisitor<'ast> {
+            type Error = ReadySetError;
+            fn visit_expr(&mut self, expr: &'ast mut Expr) -> Result<(), Self::Error> {
+                // Expression alias: replace expression with alias ref
+                if let Some(alias) = self.expr_aliases.get(expr) {
+                    *expr = make_alias_ref!(alias);
+                    self.rewrites_count += 1;
+                    return Ok(());
+                }
+                // Column alias: replace alias ref with actual column
+                if let Expr::Column(col) = expr
+                    && col.table.is_none()
+                    && let Some(actual_col) = self.column_aliases.get(&col.name)
+                {
+                    *expr = actual_col.clone();
+                    self.rewrites_count += 1;
+                    return Ok(());
+                }
+                walk_expr(self, expr)
+            }
+
+            fn visit_select_statement(
+                &mut self,
+                _stmt: &'ast mut SelectStatement,
+            ) -> Result<(), Self::Error> {
+                // Alias maps are scoped to the containing SELECT.  Subqueries
+                // have their own scope -- e.g. `HAVING count(*) > (SELECT
+                // count(*) FROM j WHERE ...)` has an outer `count(*)` that
+                // may alias to `cnt`, but the inner `count(*)` is the
+                // subquery's own aggregate over `j` and must not be rewritten
+                // to the outer alias.
+                Ok(())
+            }
+        }
+
+        let mut having_visitor = HavingVisitor {
+            expr_aliases: &expr_aliases,
+            column_aliases: &column_aliases,
+            rewrites_count: 0,
+        };
+
+        having_visitor.visit_expr(having_expr)?;
+        if having_visitor.rewrites_count > 0 {
+            was_rewritten = true;
+        }
+    }
+
+    if let Some(group_by) = stmt.group_by.as_mut() {
+        for expr in group_by.fields.iter_mut() {
+            if let FieldReference::Expr(gb_expr) = expr {
+                if let Some(alias) = expr_aliases.get(gb_expr) {
+                    *gb_expr = make_alias_ref!(alias);
+                    was_rewritten = true;
+                } else if let Expr::Column(col) = gb_expr
+                    && col.table.is_none()
+                    && let Some(actual_col) = column_aliases.get(&col.name)
+                {
+                    *gb_expr = actual_col.clone();
+                    was_rewritten = true;
+                }
+            }
+        }
+    }
+
+    if let Some(OrderClause { order_by }) = stmt.order.as_mut() {
+        for ord in order_by.iter_mut() {
+            if let FieldReference::Expr(ord_expr) = &mut ord.field {
+                if let Some(alias) = expr_aliases.get(ord_expr) {
+                    *ord_expr = make_alias_ref!(alias);
+                    was_rewritten = true;
+                } else if let Expr::Column(col) = ord_expr
+                    && col.table.is_none()
+                    && let Some(actual_col) = column_aliases.get(&col.name)
+                {
+                    *ord_expr = actual_col.clone();
+                    was_rewritten = true;
+                }
+            }
+        }
+    }
+
+    Ok(was_rewritten)
+}
+
+pub(crate) fn normalize_having_and_group_by(stmt: &mut SelectStatement) -> ReadySetResult<bool> {
+    let mut was_rewritten = false;
+    for dt in get_local_from_items_iter_mut!(stmt) {
+        let Some((dt_stmt, _)) = as_sub_query_with_alias_mut(dt) else {
+            continue;
+        };
+        was_rewritten |= normalize_having_and_group_by(dt_stmt)?;
+    }
+    was_rewritten |= normalize_having_and_group_by_for_statement(stmt)?;
+    Ok(was_rewritten)
+}
+
+fn build_select_field_alias_to_expr_map(
+    fields: &[FieldDefinitionExpr],
+) -> HashMap<SqlIdentifier, &Expr> {
+    fields
+        .iter()
+        .filter_map(|field| {
+            if let (expr, Some(alias)) = expect_field_as_expr(field) {
+                Some((alias.clone(), expr))
+            } else {
+                None
+            }
+        })
+        .collect::<HashMap<SqlIdentifier, &Expr>>()
+}
+
+pub(crate) fn denormalize_having_and_group_by_for_statement(
+    stmt: &mut SelectStatement,
+) -> ReadySetResult<bool> {
+    let mut was_rewritten = false;
+
+    let aliased_select_items_map = build_select_field_alias_to_expr_map(&stmt.fields);
+
+    let mut bogo_stmt = SelectStatement {
+        having: mem::take(&mut stmt.having),
+        group_by: mem::take(&mut stmt.group_by),
+        order: mem::take(&mut stmt.order),
+        ..SelectStatement::default()
+    };
+
+    for e_col in collect_outermost_columns_mut(&mut bogo_stmt) {
+        let col = as_column!(e_col);
+        if col.table.is_none()
+            && let Some(denorm_expr) = aliased_select_items_map.get(&col.name)
+        {
+            *e_col = (*denorm_expr).clone();
+            was_rewritten = true;
+        }
+    }
+
+    stmt.having = mem::take(&mut bogo_stmt.having);
+    stmt.group_by = mem::take(&mut bogo_stmt.group_by);
+    stmt.order = mem::take(&mut bogo_stmt.order);
+
+    Ok(was_rewritten)
+}
+
+pub(crate) fn denormalize_having_and_group_by(stmt: &mut SelectStatement) -> ReadySetResult<bool> {
+    let mut was_rewritten = false;
+    for dt in get_local_from_items_iter_mut!(stmt) {
+        let Some((dt_stmt, _)) = as_sub_query_with_alias_mut(dt) else {
+            continue;
+        };
+        was_rewritten |= denormalize_having_and_group_by(dt_stmt)?;
+    }
+    was_rewritten |= denormalize_having_and_group_by_for_statement(stmt)?;
+    Ok(was_rewritten)
+}
+
+fn fix_groupby_without_aggregates_for_statement(
+    stmt: &mut SelectStatement,
+) -> ReadySetResult<bool> {
+    // Only consider plain GROUP BY without HAVING and without aggregates
+    // in the SELECT list. If any of these are present, `GROUP BY` cannot be replaced
+    // with `DISTINCT` safely (or even syntactically in the case of HAVING).
+    if let Some(group_by) = &stmt.group_by
+        && stmt.having.is_none()
+        && !is_aggregated_select(stmt)?
+    {
+        // Forbid window functions anywhere in the statement or in ORDER BY.
+        // Evaluation order differs between GROUP BY and DISTINCT; allowing WFs risks
+        // behavioral changes. We conservatively bail out.
+        if contains_wf!(stmt)
+            || stmt.order.as_ref().is_some_and(|oc| {
+                oc.order_by.iter().any(|ob| {
+                    if let FieldReference::Expr(expr) = &ob.field {
+                        is_window_function_expr!(expr)
+                    } else {
+                        false
+                    }
+                })
+            })
+        {
+            return Ok(false);
+        }
+
+        // Build the set of projected expressions, mirroring normalize's canonical form:
+        // - Column aliases (alias for a simple column): use the actual column expression
+        // - Expression aliases (alias for a non-column expr): use an alias ref Column
+        // - Unaliased items: use the expression as-is
+        let select_fields = stmt
+            .fields
+            .iter()
+            .map(|field| {
+                let (expr, alias) = expect_field_as_expr(field);
+                if let Some(alias) = alias {
+                    if matches!(expr, Expr::Column(_)) {
+                        // Column alias → normalize uses the actual column
+                        expr.clone()
+                    } else {
+                        // Expression alias → normalize uses the alias ref
+                        Expr::Column(Column {
+                            name: alias.clone(),
+                            table: None,
+                        })
+                    }
+                } else {
+                    expr.clone()
+                }
+            })
+            .collect::<HashSet<_>>();
+
+        if let Some(OrderClause { order_by }) = &stmt.order {
+            // ORDER BY compatibility check for DISTINCT:
+            // Postgres requires each ORDER BY expression to be a SELECT item (or an ordinal)
+            // when DISTINCT is present. We enforce that here to avoid generating an invalid
+            // query after the rewrite.
+            for ord in order_by.iter() {
+                let ok = match &ord.field {
+                    FieldReference::Expr(expr) => select_fields.contains(expr),
+                    FieldReference::Numeric(idx) => {
+                        // Ordinals are 1-based in SQL; validate the bounds but otherwise accept.
+                        // We don't need to rewrite ordinals for DISTINCT—they remain valid.
+                        if *idx < 1 || *idx as usize > stmt.fields.len() {
+                            invalid_query!("ORDER BY index {} out of bounds", *idx);
+                        }
+                        true
+                    }
+                };
+                if !ok {
+                    return Ok(false);
+                }
+            }
+        }
+
+        // Build the set of GROUP BY expressions, mirroring SELECT normalization:
+        // - direct expressions are copied as-is;
+        // - numeric ordinals are resolved to the corresponding SELECT item;
+        //   if that item has an alias, we convert it to an alias `Column` so that it
+        //   matches the representation used in `select_fields`.
+        let mut group_fields = HashSet::new();
+        for field in group_by.fields.iter() {
+            match field {
+                FieldReference::Expr(expr) => {
+                    group_fields.insert(expr.clone());
+                }
+                FieldReference::Numeric(idx) => {
+                    // Map 1-based ordinal to 0-based index and resolve to the SELECT item,
+                    // mirroring normalize's canonical form: column aliases use the actual
+                    // column, expression aliases use alias refs.
+                    if *idx < 1 || *idx as usize > stmt.fields.len() {
+                        invalid_query!("GROUP BY index {} out of bounds", *idx);
+                    }
+                    let (field_expr, alias) = expect_field_as_expr(&stmt.fields[*idx as usize - 1]);
+                    if let Some(alias) = alias
+                        && !matches!(field_expr, Expr::Column(_))
+                    {
+                        group_fields.insert(Expr::Column(Column {
+                            name: alias.clone(),
+                            table: None,
+                        }));
+                    } else {
+                        group_fields.insert(field_expr.clone());
+                    }
+                }
+            }
+        }
+
+        // Final decision: only rewrite when SELECT and GROUP BY denote the same set.
+        // Using sets makes the check immune to ordering and duplicates.
+        // Rewrite is idempotent: applying it again is a no-op (DISTINCT already set).
+        if select_fields.eq(&group_fields) {
+            stmt.group_by = None;
+            stmt.distinct = true;
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Rewrite `GROUP BY` into `SELECT DISTINCT` when it is provably safe.
+///
+/// # Preconditions we enforce
+/// - The statement has a `GROUP BY` clause.
+/// - There is **no** `HAVING` clause (since `HAVING` is not allowed with `SELECT DISTINCT`).
+/// - The `SELECT` list contains **no** aggregate functions (`!is_aggregated_select(stmt)?`).
+/// - The statement contains **no window functions**, and neither do any `ORDER BY` expressions.
+/// - Every `ORDER BY` item is either:
+///   - a valid 1-based ordinal into the `SELECT` list, or
+///   - **exactly** one of the `SELECT` items (after alias normalization).
+/// - After normalizing aliases and `GROUP BY` ordinals, the **set** of `SELECT` expressions
+///   equals the **set** of `GROUP BY` expressions.
+///
+/// Under these conditions, `SELECT … GROUP BY …` is semantically equivalent to
+/// `SELECT DISTINCT …`:
+/// - there are no aggregates to compute,
+/// - grouping keys are identical to the projection columns,
+/// - and `ORDER BY` remains syntactically valid with `DISTINCT`.
+///
+/// # Returns
+/// - `Ok(true)` if the rewrite was applied (we clear `group_by` and set `distinct = true`);
+/// - `Ok(false)` if any precondition fails then we leave the statement unchanged.
+/// - `invalid_query!(…)` if a numeric ordinal in `ORDER BY`/`GROUP BY` is out of bounds.
+///
+/// # Notes
+/// - This check is **conservative**: it requires **structural** (syntactic) equality of
+///   expressions. Semantically equal but syntactically different expressions will **not**
+///   trigger the rewrite (by design, to avoid false positives).
+/// - We explicitly ban window functions here to avoid phase-ordering differences between
+///   `GROUP BY` and `DISTINCT` evaluation.
+pub(crate) fn fix_groupby_without_aggregates(stmt: &mut SelectStatement) -> ReadySetResult<bool> {
+    let mut was_rewritten = false;
+    for dt in get_local_from_items_iter_mut!(stmt) {
+        let Some((dt_stmt, _)) = as_sub_query_with_alias_mut(dt) else {
+            continue;
+        };
+        was_rewritten |= fix_groupby_without_aggregates(dt_stmt)?;
+    }
+    was_rewritten |= fix_groupby_without_aggregates_for_statement(stmt)?;
+    Ok(was_rewritten)
+}
+
+/// Determines whether a column-free WHERE expression is unconditionally true
+/// and can be safely eliminated (e.g. `WHERE TRUE` left over from constraint movement).
+///
+/// Returns `false` conservatively for any expression it cannot prove is always true.
+///
+/// Two-phase evaluation:
+///   1. **Pre-fold**: handle bare literals directly — `constant_fold_expr` is a no-op
+///      on `Expr::Literal`, so we short-circuit here. NULL is always false (filters all
+///      rows). MySQL treats non-zero integers as truthy (`WHERE 1`); PostgreSQL rejects
+///      integer-typed WHERE, so we conservatively return false.
+///   2. **Post-fold**: for compound constant expressions (e.g. `NOT FALSE`, `1 AND 1`),
+///      `constant_fold_expr` evaluates them and represents boolean results as
+///      `Integer(0/1)` (because `DfValue` stores booleans as `UnsignedInt`).
+///      We match only 0/1 — any other fold result is conservatively false.
+pub(crate) fn is_always_true_filter(expr: &Expr, sql_dialect: Dialect) -> bool {
+    // Expressions containing column references are never statically evaluable.
+    if columns_iter(expr).count() > 0 {
+        return false;
+    }
+    let mut expr = expr.clone();
+    // Phase 1: bare literals — short-circuit before the (no-op) fold.
+    match expr {
+        Expr::Literal(Literal::Null) => return false,
+        Expr::Literal(Literal::Boolean(v)) => return v,
+        Expr::Literal(Literal::Integer(i)) if sql_dialect == Dialect::MySQL => return i != 0,
+        Expr::Literal(Literal::UnsignedInteger(i)) if sql_dialect == Dialect::MySQL => {
+            return i != 0;
+        }
+        Expr::Literal(_) => return false,
+        _ => {}
+    }
+    // Phase 2: compound constant expressions — fold then inspect the result.
+    // constant_fold_expr represents boolean outcomes as Integer(0) / Integer(1).
+    constant_fold_expr(&mut expr, dialect::Dialect::DEFAULT_POSTGRESQL);
+    match expr {
+        Expr::Literal(Literal::Null) => false,
+        Expr::Literal(Literal::Boolean(v)) => v,
+        Expr::Literal(Literal::Integer(0)) | Expr::Literal(Literal::UnsignedInteger(0)) => false,
+        Expr::Literal(Literal::Integer(1)) | Expr::Literal(Literal::UnsignedInteger(1)) => true,
+        _ => false,
+    }
+}
+
+/// Recognized upper bound on a `ROW_NUMBER()` window-function output.
+///
+/// Built by [`is_row_number_cap_predicate`] (against an explicit projection list) or
+/// [`predicate_caps_row_number`] (which resolves the projection list from the
+/// statement's FROM). Recognition is purely structural and matches both the synthetic
+/// `__rn`-aliased filter produced by TOP-K rewrite and organically hand-written
+/// `WHERE rn <= K` patterns over a user-defined `ROW_NUMBER()` projection.
+///
+/// Consumed by the hoist-parametrizable-filters pass, the auto-parameterize visitor,
+/// and CBJR cardinality propagation to skip rewrites that would defeat the cap.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct RowNumberCap {
+    /// The alias of the `ROW_NUMBER()` projection that the predicate references.
+    pub rn_alias: SqlIdentifier,
+    /// Tight integer upper bound on the RN value, normalized from `<`/`<=`/`=` to an
+    /// inclusive cap. Always `>= 1`; predicates implying a bound `< 1` are unsatisfiable
+    /// and rejected by the recognizer.
+    pub bound: u64,
+    /// `PARTITION BY` expressions of the `ROW_NUMBER()` window. Empty means a global
+    /// (unpartitioned) RN, in which case the cap applies directly to the row count.
+    /// When non-empty, downstream consumers must scale the cap by `ndv(partition_keys)`
+    /// to derive the effective row-count cap.
+    pub partition_by: Vec<Expr>,
+    /// FROM-item alias whose subquery projects `rn_alias`. `Some(rel)` for the qualified
+    /// and unqualified-single-FROM-subquery branches; `None` only for the defensive
+    /// `stmt.fields` fallback (RN reference can't resolve to a FROM source). Per-source
+    /// consumers should treat `None` as "not attributable" and skip.
+    pub source: Option<Relation>,
+}
+
+/// Normalize a `(column_op_literal)` shape into an inclusive integer upper bound on the
+/// column. Returns `None` for ops that aren't upper bounds (e.g. `>`, `>=`, `!=`, `IS`),
+/// non-numeric literals, or bounds that resolve to `< 1` (unsatisfiable RN caps).
+fn upper_bound_from_op_and_literal(op: BinaryOperator, lit: &Literal) -> Option<u64> {
+    let n = literal_as_number(lit).ok()?;
+    let bound = match op {
+        BinaryOperator::LessOrEqual | BinaryOperator::Equal => n,
+        BinaryOperator::Less => n.saturating_sub(1),
+        _ => return None,
+    };
+    (bound >= 1).then_some(bound)
+}
+
+/// Match `pred` as a `column op literal` (or its flipped `literal op column`) shape,
+/// returning `(column, normalized_op_with_column_on_lhs, integer_literal)`.
+///
+/// `Equal` is symmetric, so a literal-on-left equality is normalized without a flip.
+/// Ordering ops (`<`, `<=`, `>`, `>=`) on a literal-LHS are flipped via
+/// [`BinaryOperator::flip_ordering_comparison`].
+fn match_column_vs_literal(pred: &Expr) -> Option<(&Column, BinaryOperator, &Literal)> {
+    let Expr::BinaryOp { lhs, op, rhs } = pred else {
+        return None;
+    };
+    match (lhs.as_ref(), rhs.as_ref()) {
+        (Expr::Column(c), Expr::Literal(lit)) => Some((c, *op, lit)),
+        (Expr::Literal(lit), Expr::Column(c)) => {
+            let normalized = if *op == BinaryOperator::Equal {
+                BinaryOperator::Equal
+            } else {
+                op.flip_ordering_comparison().ok()?
+            };
+            Some((c, normalized, lit))
+        }
+        _ => None,
+    }
+}
+
+/// Look up `col_name` among `projections` and, if it aliases a `ROW_NUMBER()` window
+/// function, return that window's PARTITION BY list along with the resolved alias.
+///
+/// Shallow: matches only when the field's expression is itself the `WindowFunction`.
+/// Forwarded references (`Expr::Column(deeper)`) are not followed; for that, see
+/// [`resolve_row_number_through_chain`].
+fn find_row_number_projection<'a>(
+    col_name: &SqlIdentifier,
+    projections: &'a [FieldDefinitionExpr],
+) -> Option<(SqlIdentifier, &'a [Expr])> {
+    for fe in projections {
+        let FieldDefinitionExpr::Expr {
+            expr,
+            alias: Some(a),
+        } = fe
+        else {
+            continue;
+        };
+        if a != col_name {
+            continue;
+        }
+        if let Expr::WindowFunction {
+            function: FunctionExpr::RowNumber,
+            partition_by,
+            ..
+        } = expr
+        {
+            return Some((a.clone(), partition_by.as_slice()));
+        }
+    }
+    None
+}
+
+/// Resolve `col_name` to a `ROW_NUMBER()` window through `stmt`'s projection chain.
+///
+/// At each level: look for an aliased field whose name matches `col_name`. If the field
+/// is itself a `ROW_NUMBER()` window function, return its alias and `PARTITION BY` list.
+/// If the field is a qualified `Expr::Column(forwarded)`, follow the qualifier into the
+/// matching FROM-subquery and recurse on `forwarded.name` there. Any other expression
+/// shape stops the walk and returns `None`.
+///
+/// Handles two cases the shallow [`find_row_number_projection`] misses:
+/// - Organic 2+-level wrappers where each level projects the RN by forwarding through
+///   a `SELECT inner_sub.rn FROM (…) inner_sub` shape.
+/// - Post-`derived_tables_rewrite` states where some wrappers got squashed but a
+///   forwarding level remained (e.g. an aggregated middle layer that DTR couldn't inline).
+///
+/// Termination: each recursion strictly descends into a FROM-subquery, so depth is
+/// bounded by AST nesting depth (small in practice; parser limits enforce an upper bound).
+fn resolve_row_number_through_chain(
+    col_name: &SqlIdentifier,
+    stmt: &SelectStatement,
+) -> Option<(SqlIdentifier, Vec<Expr>)> {
+    for fe in &stmt.fields {
+        let FieldDefinitionExpr::Expr { expr, alias } = fe else {
+            continue;
+        };
+        // The effective name of the field in the parent scope: an explicit `AS …` alias
+        // when present, else the column's own name when the field is a bare column
+        // reference (the canonical implicit-alias rule). Any other expression without an
+        // explicit alias has no name reachable from the parent and is skipped.
+        let effective_name = match (alias, expr) {
+            (Some(a), _) => a,
+            (None, Expr::Column(c)) => &c.name,
+            _ => continue,
+        };
+        if effective_name != col_name {
+            continue;
+        }
+        return match expr {
+            Expr::WindowFunction {
+                function: FunctionExpr::RowNumber,
+                partition_by,
+                ..
+            } => Some((effective_name.clone(), partition_by.clone())),
+            Expr::Column(forwarded) => {
+                let qualifier = forwarded.table.as_ref()?;
+                for te in get_local_from_items_iter!(stmt) {
+                    let Some((inner, alias)) = as_sub_query_with_alias(te) else {
+                        continue;
+                    };
+                    if alias == qualifier.name {
+                        return resolve_row_number_through_chain(&forwarded.name, inner);
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Iterator over the AND-conjuncts of a predicate expression. Only descends through
+/// `BinaryOperator::And` nodes; OR / BETWEEN / IN / non-And BinaryOps and every other
+/// shape is yielded as a single opaque conjunct. Borrowing iterator (no cloning).
+pub(crate) fn iter_and_conjuncts(expr: &Expr) -> Box<dyn Iterator<Item = &Expr> + '_> {
+    match expr {
+        Expr::BinaryOp {
+            lhs,
+            op: BinaryOperator::And,
+            rhs,
+        } => Box::new(iter_and_conjuncts(lhs).chain(iter_and_conjuncts(rhs))),
+        other => Box::new(std::iter::once(other)),
+    }
+}
+
+/// Coerce a numeric `Literal` to a `u64`. Accepts `Integer` (non-negative),
+/// `UnsignedInteger`, and string-shaped variants (`Number`, `String`) that parse
+/// cleanly as `u64`. Negative `Integer` and any non-numeric or unparseable shape
+/// returns `invalid_query!`. Used by LIMIT/OFFSET handling and the ROW_NUMBER()
+/// cap recognizer alike.
+pub(crate) fn literal_as_number(lit: &Literal) -> ReadySetResult<u64> {
+    Ok(match lit {
+        Literal::Integer(i) => {
+            if *i < 0 {
+                invalid_query!("LIMIT/OFFSET must be non-negative")
+            }
+            *i as u64
+        }
+        Literal::UnsignedInteger(i) => *i,
+        Literal::Number(s) | Literal::String(s) => {
+            s.parse::<u64>().map_err(|e| invalid_query_err!("{e}"))?
+        }
+        _ => invalid_query!("Invalid LIMIT/OFFSET value"),
     })
+}
+
+/// Recognize a predicate that upper-bounds a `ROW_NUMBER()` projection in `projections`.
+///
+/// Returns `Some(RowNumberCap)` when `pred` has the shape `rn_col op K` (or its symmetric
+/// flip) for an integer literal `K`, where `rn_col` aliases a `ROW_NUMBER()` window
+/// function in the supplied projection list. The op is normalized to an inclusive upper
+/// bound (`<=`/`<`/`=` accepted; lower-bound and inequality ops rejected). Unsatisfiable
+/// caps (`< 1`, `<= 0`, `= 0`, negative literals) return `None`.
+///
+/// Qualified column references are matched by `name` only: this helper has no view of
+/// FROM-clause aliases. [`predicate_caps_row_number`] is the qualifier-aware entry point.
+pub(crate) fn is_row_number_cap_predicate(
+    pred: &Expr,
+    projections: &[FieldDefinitionExpr],
+) -> Option<RowNumberCap> {
+    let (col, op, lit) = match_column_vs_literal(pred)?;
+    let bound = upper_bound_from_op_and_literal(op, lit)?;
+    let (rn_alias, partition_by) = find_row_number_projection(&col.name, projections)?;
+    Some(RowNumberCap {
+        rn_alias,
+        bound,
+        partition_by: partition_by.to_vec(),
+        source: None,
+    })
+}
+
+/// High-level entry point: recognize a predicate at `stmt`'s WHERE-level that caps a
+/// `ROW_NUMBER()` projected somewhere in `stmt`'s FROM chain (or, defensively, by
+/// `stmt` itself).
+///
+/// Resolution rules:
+/// - Qualified reference `t.rn`: locate FROM item with `alias == t` that is a subquery;
+///   then deep-resolve `rn` through that subquery's projection chain, following any
+///   forwarded `Expr::Column` projections until a `RowNumber` window is found. Plain-
+///   table aliases yield `None`.
+/// - Unqualified reference `rn`: if `stmt` has a single subquery FROM item, deep-resolve
+///   `rn` through that subquery; otherwise fall back to a shallow match against
+///   `stmt.fields` (defensive — direct WHERE references to an RN alias projected at
+///   the same level are ill-formed SQL but the recognizer stays sound).
+#[allow(dead_code)]
+pub(crate) fn predicate_caps_row_number(
+    pred: &Expr,
+    stmt: &SelectStatement,
+) -> Option<RowNumberCap> {
+    let (col, op, lit) = match_column_vs_literal(pred)?;
+    let bound = upper_bound_from_op_and_literal(op, lit)?;
+    match &col.table {
+        Some(rel) => {
+            let want = &rel.name;
+            for te in get_local_from_items_iter!(stmt) {
+                let Some((inner, alias)) = as_sub_query_with_alias(te) else {
+                    continue;
+                };
+                if alias == *want {
+                    let (rn_alias, partition_by) =
+                        resolve_row_number_through_chain(&col.name, inner)?;
+                    return Some(RowNumberCap {
+                        rn_alias,
+                        bound,
+                        partition_by,
+                        source: Some(alias.into()),
+                    });
+                }
+            }
+            None
+        }
+        None => {
+            if is_single_from_item!(stmt)
+                && let Some((inner, alias)) = as_sub_query_with_alias(&stmt.tables[0])
+                && let Some((rn_alias, partition_by)) =
+                    resolve_row_number_through_chain(&col.name, inner)
+            {
+                return Some(RowNumberCap {
+                    rn_alias,
+                    bound,
+                    partition_by,
+                    source: Some(alias.into()),
+                });
+            }
+            // Defensive fallback: shallow match against stmt.fields. No FROM-source
+            // attribution available; per-source consumers should not act on this case.
+            is_row_number_cap_predicate(pred, &stmt.fields)
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_number_cap_tests {
+    use readyset_sql::Dialect;
+    use readyset_sql_parsing::{ParsingPreset, parse_select_with_config};
+
+    use super::*;
+
+    // ROW_NUMBER() and other window functions aren't supported by the nom-sql parser,
+    // so these tests pin to sqlparser only (matching the convention used by
+    // `inline_leading_derived_table`'s tests).
+    const PARSING_CONFIG: ParsingPreset = ParsingPreset::OnlySqlparser;
+
+    fn parse_select(input: &str) -> SelectStatement {
+        parse_select_with_config(PARSING_CONFIG, Dialect::PostgreSQL, input).unwrap()
+    }
+
+    /// Extract the inner subquery's fields from a single-from-item outer SELECT. Useful
+    /// for driving `is_row_number_cap_predicate` directly with the projection list that
+    /// the predicate references.
+    fn inner_fields(stmt: &SelectStatement) -> &[FieldDefinitionExpr] {
+        let TableExprInner::Subquery(inner) = &stmt.tables[0].inner else {
+            panic!("expected single subquery FROM item");
+        };
+        &inner.fields
+    }
+
+    fn where_predicate(stmt: &SelectStatement) -> &Expr {
+        stmt.where_clause
+            .as_ref()
+            .expect("expected WHERE clause on outer SELECT")
+    }
+
+    /// Build a "RN under derived table" query of the form:
+    ///   SELECT id FROM (SELECT id, ROW_NUMBER() OVER (<window>) AS <alias> FROM t) s
+    ///   WHERE <pred>
+    /// The explicit `id` projection (versus a `SELECT *`) sidesteps a nom-sql limitation
+    /// in the `SELECT *, expr` shape; the recognizer is agnostic to surrounding
+    /// projections.
+    fn rn_under_dt(alias: &str, window: &str, pred: &str) -> SelectStatement {
+        let q = format!(
+            "SELECT id FROM (SELECT id, ROW_NUMBER() OVER ({window}) AS {alias} \
+             FROM t) s WHERE {pred}"
+        );
+        parse_select(&q)
+    }
+
+    #[test]
+    fn recognizes_le_ten() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn <= 10");
+        let pred = where_predicate(&stmt);
+        let cap = is_row_number_cap_predicate(pred, inner_fields(&stmt)).unwrap();
+        assert_eq!(cap.rn_alias.as_str(), "rn");
+        assert_eq!(cap.bound, 10);
+        assert!(cap.partition_by.is_empty());
+
+        let cap2 = predicate_caps_row_number(pred, &stmt).unwrap();
+        assert_eq!(cap2.rn_alias.as_str(), "rn");
+        assert_eq!(cap2.bound, 10);
+        assert!(cap2.partition_by.is_empty());
+    }
+
+    #[test]
+    fn recognizes_lt_eleven_as_bound_ten() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn < 11");
+        let pred = where_predicate(&stmt);
+        let cap = is_row_number_cap_predicate(pred, inner_fields(&stmt)).unwrap();
+        assert_eq!(cap.bound, 10);
+
+        let cap2 = predicate_caps_row_number(pred, &stmt).unwrap();
+        assert_eq!(cap2.bound, 10);
+    }
+
+    #[test]
+    fn recognizes_first_row_equality() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn = 1");
+        let pred = where_predicate(&stmt);
+        let cap = is_row_number_cap_predicate(pred, inner_fields(&stmt)).unwrap();
+        assert_eq!(cap.bound, 1);
+
+        let cap2 = predicate_caps_row_number(pred, &stmt).unwrap();
+        assert_eq!(cap2.bound, 1);
+    }
+
+    #[test]
+    fn recognizes_literal_left_ge_flipped_to_cap() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "10 >= rn");
+        let pred = where_predicate(&stmt);
+        let cap = is_row_number_cap_predicate(pred, inner_fields(&stmt)).unwrap();
+        assert_eq!(cap.bound, 10);
+
+        let cap2 = predicate_caps_row_number(pred, &stmt).unwrap();
+        assert_eq!(cap2.bound, 10);
+    }
+
+    #[test]
+    fn recognizes_literal_left_equality() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "1 = rn");
+        let pred = where_predicate(&stmt);
+        let cap = is_row_number_cap_predicate(pred, inner_fields(&stmt)).unwrap();
+        assert_eq!(cap.bound, 1);
+
+        let cap2 = predicate_caps_row_number(pred, &stmt).unwrap();
+        assert_eq!(cap2.bound, 1);
+    }
+
+    #[test]
+    fn recognizes_qualified_reference_to_subquery_alias() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "s.rn <= 5");
+        let pred = where_predicate(&stmt);
+        let cap = predicate_caps_row_number(pred, &stmt).unwrap();
+        assert_eq!(cap.rn_alias.as_str(), "rn");
+        assert_eq!(cap.bound, 5);
+    }
+
+    #[test]
+    fn recognizes_synthetic_topk_shape_under_underscored_alias() {
+        let stmt = rn_under_dt("__rn", "ORDER BY a", "__rn <= 100");
+        let pred = where_predicate(&stmt);
+        let cap = is_row_number_cap_predicate(pred, inner_fields(&stmt)).unwrap();
+        assert_eq!(cap.rn_alias.as_str(), "__rn");
+        assert_eq!(cap.bound, 100);
+
+        let cap2 = predicate_caps_row_number(pred, &stmt).unwrap();
+        assert_eq!(cap2.rn_alias.as_str(), "__rn");
+        assert_eq!(cap2.bound, 100);
+    }
+
+    #[test]
+    fn recognizes_partitioned_row_number() {
+        let stmt = rn_under_dt("rn", "PARTITION BY country ORDER BY ts", "rn <= 3");
+        let pred = where_predicate(&stmt);
+        let cap = is_row_number_cap_predicate(pred, inner_fields(&stmt)).unwrap();
+        assert_eq!(cap.bound, 3);
+        assert_eq!(cap.partition_by.len(), 1);
+        let Expr::Column(c) = &cap.partition_by[0] else {
+            panic!("expected column expression in PARTITION BY");
+        };
+        assert_eq!(c.name.as_str(), "country");
+
+        let cap2 = predicate_caps_row_number(pred, &stmt).unwrap();
+        assert_eq!(cap2.partition_by.len(), 1);
+    }
+
+    #[test]
+    fn rejects_lower_bound_gt() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn > 10");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_lower_bound_ge() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn >= 10");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_not_equal() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn != 5");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_is_null() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn IS NULL");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_lt_one_saturating_to_zero() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn < 1");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_le_zero() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn <= 0");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_equal_zero() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn = 0");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_negative_literal() {
+        // The parser surfaces `-5` as a UnaryOp { op: Neg, expr: Literal(5) } rather than
+        // a bare negative integer literal, so the structural column-vs-literal match
+        // fails. Either way the recognizer returns None.
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn <= -5");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_non_window_column() {
+        let stmt = parse_select("SELECT id FROM (SELECT id, val AS c FROM t) s WHERE c <= 10");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_non_window_aliased_expression() {
+        let stmt = parse_select("SELECT id FROM (SELECT id, val + 1 AS c FROM t) s WHERE c <= 10");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_aggregate_alias() {
+        let stmt =
+            parse_select("SELECT k FROM (SELECT k, SUM(v) AS c FROM t GROUP BY k) s WHERE c <= 10");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_unaliased_row_number_projection() {
+        let stmt = parse_select(
+            "SELECT id FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t) s \
+             WHERE rn <= 10",
+        );
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_string_literal_bound() {
+        let stmt = rn_under_dt("rn", "ORDER BY id", "rn <= 'foo'");
+        let pred = where_predicate(&stmt);
+        assert!(is_row_number_cap_predicate(pred, inner_fields(&stmt)).is_none());
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn rejects_qualified_reference_to_missing_from_alias() {
+        // `nope` is not a FROM-clause alias in this query, so resolution fails.
+        let stmt = rn_under_dt("rn", "ORDER BY id", "nope.rn <= 10");
+        let pred = where_predicate(&stmt);
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+
+    #[test]
+    fn recognizes_two_level_forwarded_qualified_rn() {
+        // Outer SELECT references `outer_sub.rn`. `outer_sub`'s projection forwards `rn`
+        // from `inner_sub`, which is the level that projects ROW_NUMBER() as `rn`. The
+        // deep walk has to follow the forwarded reference through one intermediate level.
+        let stmt = parse_select(
+            "SELECT outer_sub.rn FROM (\
+                SELECT inner_sub.rn FROM (\
+                    SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id) AS rn FROM t\
+                ) inner_sub\
+             ) outer_sub WHERE outer_sub.rn <= 10",
+        );
+        let pred = where_predicate(&stmt);
+        let cap = predicate_caps_row_number(pred, &stmt).expect("deep walk must resolve");
+        assert_eq!(cap.rn_alias.as_str(), "rn");
+        assert_eq!(cap.bound, 10);
+        assert!(cap.partition_by.is_empty());
+        assert_eq!(
+            cap.source.as_ref().map(|r| r.name.as_str()),
+            Some("outer_sub")
+        );
+    }
+
+    #[test]
+    fn recognizes_three_level_forwarded_qualified_rn() {
+        // Three forwarding levels stress the recursion. The deep walk descends:
+        // outer_sub.rn -> mid_sub.rn -> inner_sub.rn -> WindowFunction.
+        let stmt = parse_select(
+            "SELECT outer_sub.rn FROM (\
+                SELECT mid_sub.rn FROM (\
+                    SELECT inner_sub.rn FROM (\
+                        SELECT t.id, ROW_NUMBER() OVER (ORDER BY t.id) AS rn FROM t\
+                    ) inner_sub\
+                ) mid_sub\
+             ) outer_sub WHERE outer_sub.rn <= 5",
+        );
+        let pred = where_predicate(&stmt);
+        let cap = predicate_caps_row_number(pred, &stmt).expect("deep walk must resolve");
+        assert_eq!(cap.bound, 5);
+        assert_eq!(
+            cap.source.as_ref().map(|r| r.name.as_str()),
+            Some("outer_sub")
+        );
+    }
+
+    #[test]
+    fn rejects_two_level_chain_with_non_rn_terminal() {
+        // The forwarding chain terminates at an ordinary column (not a window function),
+        // so the deep walk must return None and not coerce the predicate into a cap.
+        let stmt = parse_select(
+            "SELECT outer_sub.rn FROM (\
+                SELECT inner_sub.rn FROM (\
+                    SELECT t.id AS rn FROM t\
+                ) inner_sub\
+             ) outer_sub WHERE outer_sub.rn <= 10",
+        );
+        let pred = where_predicate(&stmt);
+        assert!(predicate_caps_row_number(pred, &stmt).is_none());
+    }
+}
+
+#[cfg(test)]
+mod resolve_field_expr_by_alias_tests {
+    use readyset_sql::Dialect;
+    use readyset_sql_parsing::parse_select;
+
+    use super::*;
+
+    /// Pre-fix `resolve_field_expr_by_alias` returned the first matching field
+    /// when an explicit alias collided with another field's bare-column default
+    /// name.  For `SELECT t.x + 1 AS foo, t.foo FROM t`, looking up `foo`
+    /// returned `t.x + 1` (the explicit-alias-first match) when the caller may
+    /// have meant `t.foo`.  Callers that drive substitution / aggregate-fallback
+    /// rewriting on the result would silently produce wrong rewrites.
+    ///
+    /// Post-fix the helper returns `None` on ambiguous matches.  All three
+    /// callers (`unnest_subqueries.rs::extract_aggregate_fallback_for_first_field`,
+    /// the `ForEachVisitor` in `rewrite_utils.rs`, and
+    /// `array_constructor.rs::derived_table_projection`) gracefully handle
+    /// `None` by skipping their respective rewrites — strictly safer than the
+    /// first-match-wins prior behavior.
+    #[test]
+    fn returns_none_on_ambiguous_alias_vs_default_collision() {
+        let stmt = parse_select(Dialect::PostgreSQL, "SELECT t.x + 1 AS foo, t.foo FROM t")
+            .expect("parses");
+        let result = resolve_field_expr_by_alias(&stmt, &"foo".into());
+        assert!(
+            result.is_none(),
+            "expected None on ambiguous match (one explicit alias `foo` collides with another field's default-of-bare-column `foo`); got Some({result:?})",
+        );
+    }
+
+    /// Two explicit aliases sharing a name are ambiguous in PG output as well;
+    /// helper returns None rather than picking the first.
+    #[test]
+    fn returns_none_on_two_explicit_aliases_colliding() {
+        let stmt = parse_select(Dialect::PostgreSQL, "SELECT t.x AS foo, t.y AS foo FROM t")
+            .expect("parses");
+        let result = resolve_field_expr_by_alias(&stmt, &"foo".into());
+        assert!(result.is_none(), "expected None; got Some({result:?})");
+    }
+
+    /// Single matching field: helper returns the matching `Expr`.  Sanity check
+    /// that the post-fix early-return-on-second-match doesn't regress the
+    /// common single-match path.
+    #[test]
+    fn returns_some_on_unique_alias_match() {
+        let stmt = parse_select(Dialect::PostgreSQL, "SELECT t.x AS foo, t.y AS bar FROM t")
+            .expect("parses");
+        let result = resolve_field_expr_by_alias(&stmt, &"foo".into());
+        assert!(matches!(result, Some(Expr::Column(c)) if c.name.as_str() == "x"));
+    }
+
+    /// Default-alias match (no explicit alias) when there's only one bare
+    /// column with the requested name.
+    #[test]
+    fn returns_some_on_unique_default_alias_match() {
+        let stmt = parse_select(Dialect::PostgreSQL, "SELECT t.x, t.y FROM t").expect("parses");
+        let result = resolve_field_expr_by_alias(&stmt, &"x".into());
+        assert!(matches!(result, Some(Expr::Column(c)) if c.name.as_str() == "x"));
+    }
+}
+
+#[cfg(test)]
+mod simplify_constant_coalesce_tests {
+    use readyset_sql::Dialect;
+    use readyset_sql_parsing::parse_expr;
+
+    use super::*;
+
+    /// Bare `ARRAY[]` fallback (pre-REA-6187 shape) — `simplify_constant_coalesce`
+    /// reduces `COALESCE(NULL, ARRAY[])` to the empty array directly.  Pins
+    /// behaviour the structural recognizer must continue to handle.
+    #[test]
+    fn reduces_coalesce_with_bare_array_fallback() {
+        let mut expr = parse_expr(Dialect::PostgreSQL, "coalesce(NULL, ARRAY[])").expect("parses");
+        simplify_constant_coalesce(&mut expr);
+        assert!(
+            matches!(&expr, Expr::Array(ArrayArguments::List(elems)) if elems.is_empty()),
+            "expected bare empty Array, got {expr:?}",
+        );
+        assert!(is_constant_non_null(&expr));
+    }
+
+    /// Typed `ARRAY[]::char(8)[]` fallback (post-REA-6187 shape produced by
+    /// `array_constructor::rewrite_single_array_constructor` at `:609-617`).
+    /// Pre-fix the structural recognizer didn't peek through the Cast, so the
+    /// COALESCE reduction silently failed and `analyse_lone_aggregates_subquery_fields`
+    /// never registered the outer-substitution mapping for ARRAY(SELECT)
+    /// LATERAL bodies — the outer projection ended up bare, and LEFT OUTER
+    /// JOIN null-extension produced NULL where the original semantics demand
+    /// an empty array.
+    #[test]
+    fn reduces_coalesce_with_cast_wrapped_array_fallback() {
+        let mut expr =
+            parse_expr(Dialect::PostgreSQL, "coalesce(NULL, ARRAY[]::char(8)[])").expect("parses");
+        simplify_constant_coalesce(&mut expr);
+        // Cast preserved — type annotation is load-bearing for lowering after
+        // REA-6187.
+        assert!(
+            matches!(&expr, Expr::Cast { .. }),
+            "expected Cast, got {expr:?}"
+        );
+        assert!(is_constant_non_null(&expr));
+    }
+
+    /// Non-empty typed array literal: `COALESCE(NULL, ARRAY[1, 2]::int[])`.
+    /// Cast recursion still recognises this as constant.
+    #[test]
+    fn reduces_coalesce_with_cast_wrapped_non_empty_array() {
+        let mut expr =
+            parse_expr(Dialect::PostgreSQL, "coalesce(NULL, ARRAY[1, 2]::int[])").expect("parses");
+        simplify_constant_coalesce(&mut expr);
+        assert!(
+            matches!(&expr, Expr::Cast { .. }),
+            "expected Cast, got {expr:?}"
+        );
+        assert!(is_constant_non_null(&expr));
+    }
+
+    /// Non-constant Array element (a column reference): the helper must NOT
+    /// reduce — the array's value can't be determined statically.
+    #[test]
+    fn does_not_reduce_coalesce_with_column_reference_array() {
+        let mut expr =
+            parse_expr(Dialect::PostgreSQL, "coalesce(NULL, ARRAY[t.x])").expect("parses");
+        let before = expr.clone();
+        simplify_constant_coalesce(&mut expr);
+        assert_eq!(
+            expr, before,
+            "COALESCE with non-constant Array element must not reduce"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tagged_outermost_expressions_tests {
+    use super::*;
+    use readyset_sql::Dialect;
+    use readyset_sql_parsing::parse_select;
+
+    /// Comprehensive shape: SELECT items + JOIN ON + WHERE + HAVING +
+    /// GROUP BY + ORDER BY.  Verifies (a) every non-GROUP-BY position
+    /// emits with the correct tag and (b) GROUP BY field expressions are
+    /// skipped entirely.
+    #[test]
+    fn tags_every_position_correctly_and_skips_group_by() {
+        let stmt = parse_select(
+            Dialect::PostgreSQL,
+            "SELECT t.a, t.b
+             FROM t
+             INNER JOIN u ON u.id = t.id
+             WHERE t.x > 0
+             GROUP BY t.a, t.b
+             HAVING SUM(t.x) > 10
+             ORDER BY t.a",
+        )
+        .expect("parses");
+        let tagged: Vec<OuterPosition> = tagged_outermost_expressions(&stmt)
+            .map(|(_, pos)| pos)
+            .collect();
+        // Expected order: SELECT items (t.a, t.b — PostAgg), JOIN ON
+        // (PreAgg), WHERE (PreAgg), HAVING (PostAgg), ORDER BY (PostAgg).
+        // GROUP BY field exprs skipped.
+        assert_eq!(
+            tagged,
+            vec![
+                OuterPosition::PostAgg, // SELECT t.a
+                OuterPosition::PostAgg, // SELECT t.b
+                OuterPosition::PreAgg,  // JOIN ON u.id = t.id
+                OuterPosition::PreAgg,  // WHERE t.x > 0
+                OuterPosition::PostAgg, // HAVING SUM(t.x) > 10
+                OuterPosition::PostAgg, // ORDER BY t.a
+            ],
+        );
+    }
+
+    /// Minimal shape — only a SELECT.  Confirms the iterator handles the
+    /// absence of every optional position cleanly.
+    #[test]
+    fn handles_absent_positions() {
+        let stmt = parse_select(Dialect::PostgreSQL, "SELECT t.a FROM t").expect("parses");
+        let tagged: Vec<OuterPosition> = tagged_outermost_expressions(&stmt)
+            .map(|(_, pos)| pos)
+            .collect();
+        assert_eq!(tagged, vec![OuterPosition::PostAgg]);
+    }
+
+    /// `JoinConstraint::Using` and `JoinConstraint::Empty` carry no
+    /// expression — must not yield anything for the JOIN position.
+    #[test]
+    fn skips_using_and_empty_join_constraints() {
+        let stmt = parse_select(
+            Dialect::PostgreSQL,
+            "SELECT t.a FROM t INNER JOIN u USING (id)",
+        )
+        .expect("parses");
+        let tagged: Vec<OuterPosition> = tagged_outermost_expressions(&stmt)
+            .map(|(_, pos)| pos)
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![OuterPosition::PostAgg],
+            "USING constraint carries no ON expression"
+        );
+    }
+
+    /// `SELECT *` (FieldDefinitionExpr::All) carries no Expr — skipped.
+    #[test]
+    fn skips_select_star() {
+        let stmt =
+            parse_select(Dialect::PostgreSQL, "SELECT * FROM t WHERE t.x > 0").expect("parses");
+        let tagged: Vec<OuterPosition> = tagged_outermost_expressions(&stmt)
+            .map(|(_, pos)| pos)
+            .collect();
+        // `*` skipped; only WHERE remains.
+        assert_eq!(tagged, vec![OuterPosition::PreAgg]);
+    }
+}
+
+#[cfg(test)]
+mod for_each_aggregate_tests {
+    use super::*;
+    use readyset_sql::Dialect;
+    use readyset_sql_parsing::{ParsingPreset, parse_select_with_config};
+
+    // Window-function syntax is not supported by the nom-sql parser; pin to
+    // sqlparser only, matching the convention used by other WF-aware tests
+    // in this file.
+    const PARSING_CONFIG: ParsingPreset = ParsingPreset::OnlySqlparser;
+
+    fn parse(input: &str) -> SelectStatement {
+        parse_select_with_config(PARSING_CONFIG, Dialect::PostgreSQL, input).unwrap()
+    }
+
+    /// Extract the expression of the first SELECT-list field.
+    fn first_field_expr(stmt: &SelectStatement) -> &Expr {
+        let fe = &stmt.fields[0];
+        let FieldDefinitionExpr::Expr { expr, .. } = fe else {
+            panic!("expected FieldDefinitionExpr::Expr, got {fe:?}");
+        };
+        expr
+    }
+
+    fn count_aggregates(expr: &Expr) -> usize {
+        let mut n = 0;
+        for_each_aggregate(expr, &mut |_| n += 1).expect("walk succeeds");
+        n
+    }
+
+    #[test]
+    fn bare_aggregate_visited_once() {
+        let stmt = parse("SELECT count(*) FROM t");
+        assert_eq!(count_aggregates(first_field_expr(&stmt)), 1);
+    }
+
+    #[test]
+    fn wf_own_function_skipped() {
+        // `count(*) OVER (PARTITION BY city)` — the WF's own function is
+        // a windowed operation, not a group-level aggregate.  Callback
+        // must NOT fire on it.
+        let stmt = parse("SELECT count(*) OVER (PARTITION BY city) FROM t");
+        assert_eq!(count_aggregates(first_field_expr(&stmt)), 0);
+    }
+
+    #[test]
+    fn aggregate_in_partition_by_visited() {
+        // `RANK() OVER (PARTITION BY count(*))` — RANK is not an aggregate
+        // and is skipped as WF's own function anyway; the count(*) inside
+        // PARTITION BY is a bare group-level aggregate and must be visited.
+        let stmt = parse("SELECT RANK() OVER (PARTITION BY count(*)) FROM t");
+        assert_eq!(count_aggregates(first_field_expr(&stmt)), 1);
+    }
+
+    #[test]
+    fn aggregate_in_order_by_visited() {
+        // `RANK() OVER (ORDER BY count(*))` — the count(*) inside ORDER BY
+        // is a bare group-level aggregate reference.
+        let stmt = parse("SELECT RANK() OVER (ORDER BY count(*)) FROM t");
+        assert_eq!(count_aggregates(first_field_expr(&stmt)), 1);
+    }
+
+    #[test]
+    fn wf_wrapping_group_aggregate_visits_inner_only() {
+        // `sum(sum(x)) OVER ()` — outer sum is the WF's own function
+        // (skipped); inner sum(x) is a group-level aggregate argument
+        // and must be visited.
+        let stmt = parse("SELECT sum(sum(x)) OVER () FROM t GROUP BY y");
+        assert_eq!(count_aggregates(first_field_expr(&stmt)), 1);
+    }
+
+    #[test]
+    fn no_aggregate_when_wf_has_only_columns() {
+        // `RANK() OVER (PARTITION BY city ORDER BY sn)` — no aggregates
+        // anywhere; callback never fires.
+        let stmt = parse("SELECT RANK() OVER (PARTITION BY city ORDER BY sn) FROM t");
+        assert_eq!(count_aggregates(first_field_expr(&stmt)), 0);
+    }
+
+    #[test]
+    fn bare_and_wf_over_aggregate_both_visited() {
+        // `count(*) + (rank() OVER (ORDER BY count(*)))` — the bare
+        // count(*) on the LHS AND the count(*) inside OVER's ORDER BY are
+        // both group-level aggregate references.  Two visits expected.
+        let stmt =
+            parse("SELECT count(*) + (RANK() OVER (ORDER BY count(*))) AS r FROM t GROUP BY y");
+        assert_eq!(count_aggregates(first_field_expr(&stmt)), 2);
+    }
+
+    // `is_aggregated_expr` re-tests via the walker.  These pin the
+    // now-correct classification of WF-containing expressions.
+
+    #[test]
+    fn is_aggregated_expr_true_for_bare_aggregate() {
+        let stmt = parse("SELECT count(*) FROM t");
+        assert!(is_aggregated_expr(first_field_expr(&stmt)).unwrap());
+    }
+
+    #[test]
+    fn is_aggregated_expr_false_for_windowed_aggregate_over_columns() {
+        // `count(*) OVER (PARTITION BY city)` — windowed count does its
+        // own grouping over the partition; expression itself does not
+        // require the input rows to be grouped upstream.
+        let stmt = parse("SELECT count(*) OVER (PARTITION BY city) FROM t");
+        assert!(!is_aggregated_expr(first_field_expr(&stmt)).unwrap());
+    }
+
+    #[test]
+    fn is_aggregated_expr_true_for_wf_with_aggregate_in_over() {
+        // `RANK() OVER (ORDER BY count(*))` — the count(*) in OVER is a
+        // group-level aggregate reference; expression is aggregating.
+        let stmt = parse("SELECT RANK() OVER (ORDER BY count(*)) FROM t");
+        assert!(is_aggregated_expr(first_field_expr(&stmt)).unwrap());
+    }
+
+    #[test]
+    fn is_aggregated_expr_true_for_windowed_wrapping_group_aggregate() {
+        // `sum(sum(x)) OVER ()` — inner sum(x) is group-level.
+        let stmt = parse("SELECT sum(sum(x)) OVER () FROM t GROUP BY y");
+        assert!(is_aggregated_expr(first_field_expr(&stmt)).unwrap());
+    }
+
+    #[test]
+    fn is_aggregated_expr_false_for_non_aggregate_wf() {
+        // `RANK() OVER (PARTITION BY city)` — no aggregates anywhere.
+        let stmt = parse("SELECT RANK() OVER (PARTITION BY city) FROM t");
+        assert!(!is_aggregated_expr(first_field_expr(&stmt)).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod correlated_relations_tests {
+    use super::*;
+    use readyset_sql::Dialect;
+    use readyset_sql_parsing::{ParsingPreset, parse_select_with_config};
+
+    fn subq(sql: &str) -> SelectStatement {
+        parse_select_with_config(ParsingPreset::OnlySqlparser, Dialect::PostgreSQL, sql)
+            .expect("parses")
+    }
+    fn rel(name: &str) -> Relation {
+        Relation {
+            schema: None,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn uncorrelated_is_empty() {
+        let s = subq("SELECT count(*) FROM cfg WHERE cfg.k = 'active'");
+        assert!(correlated_relations(&s).unwrap().is_empty());
+    }
+
+    #[test]
+    fn correlation_via_where() {
+        let s = subq("SELECT count(*) FROM j WHERE j.city = a.city");
+        assert_eq!(correlated_relations(&s).unwrap(), [rel("a")].into());
+    }
+
+    #[test]
+    fn correlation_via_join_on_and_having() {
+        let s =
+            subq("SELECT count(*) FROM j JOIN k ON j.x = a.x GROUP BY j.c HAVING count(*) > b.n");
+        assert_eq!(
+            correlated_relations(&s).unwrap(),
+            [rel("a"), rel("b")].into()
+        );
+    }
+
+    #[test]
+    fn correlation_inside_nested_subquery() {
+        let s = subq("SELECT count(*) FROM c WHERE c.x IN (SELECT d.y FROM d WHERE d.z = a.w)");
+        assert_eq!(correlated_relations(&s).unwrap(), [rel("a")].into());
+    }
+
+    #[test]
+    fn nested_local_from_shadows() {
+        let s = subq("SELECT count(*) FROM c WHERE c.x IN (SELECT a.y FROM a WHERE a.w > 0)");
+        assert!(correlated_relations(&s).unwrap().is_empty());
+    }
 }
