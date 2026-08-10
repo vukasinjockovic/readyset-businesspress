@@ -204,7 +204,13 @@ impl From<Column> for IndexKeyPart {
 impl DialectDisplay for IndexKeyPart {
     fn display(&self, dialect: Dialect) -> impl fmt::Display + '_ {
         fmt_with(move |f| match self {
-            IndexKeyPart::Column(col) => write!(f, "{}", col.display(dialect)),
+            IndexKeyPart::Column(col) => {
+                // Bare name, never table-qualified: index/key column lists are
+                // not grammatically allowed to be qualified, and the persisted
+                // schema catalog must parse its own Display output back
+                // (qualified output forced a full resnapshot on every restart).
+                write!(f, "{}", dialect.quote_identifier(&col.name))
+            }
             IndexKeyPart::Expr(expr) => write!(f, "({})", expr.display(dialect)),
         })
     }
@@ -717,9 +723,9 @@ impl DialectDisplay for TableKey {
                         f,
                         "FOREIGN KEY {} ({}) REFERENCES {} ({})",
                         index_name,
-                        columns.iter().map(|c| c.display(dialect)).join(", "),
+                        columns.iter().map(|c| dialect.quote_identifier(&c.name)).join(", "),
                         target_table.display(dialect),
-                        target_columns.iter().map(|c| c.display(dialect)).join(", ")
+                        target_columns.iter().map(|c| dialect.quote_identifier(&c.name)).join(", ")
                     )?;
                     if let Some(on_delete) = on_delete {
                         write!(f, " ON DELETE {on_delete}")?;
@@ -1024,6 +1030,49 @@ impl fmt::Display for TimestampField {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_key_display_never_qualifies_key_columns() {
+        // Regression (upstream-sync 2026-08-10): the persisted schema catalog
+        // stores CREATE TABLE via this Display and re-parses it on every
+        // restart. Qualified columns inside PRIMARY KEY / FOREIGN KEY lists
+        // are not grammatical; emitting them forced a full resnapshot on
+        // every restart ("Schema catalog replay failed").
+        let qual = |name: &str| Column {
+            name: name.into(),
+            table: Some(Relation {
+                schema: Some("public".into()),
+                name: "bp_order_items".into(),
+            }),
+        };
+        let pk = TableKey::PrimaryKey {
+            constraint_name: None,
+            constraint_timing: None,
+            index_name: None,
+            columns: vec![IndexKeyPart::Column(qual("id"))],
+        };
+        assert_eq!(
+            pk.display(Dialect::PostgreSQL).to_string(),
+            "PRIMARY KEY (\"id\")"
+        );
+        let fk = TableKey::ForeignKey {
+            constraint_name: None,
+            index_name: None,
+            columns: vec![qual("parent_order_item_id")],
+            target_table: Relation {
+                schema: Some("public".into()),
+                name: "bp_order_items".into(),
+            },
+            target_columns: vec![qual("id")],
+            on_delete: None,
+            on_update: None,
+        };
+        let out = fk.display(Dialect::PostgreSQL).to_string();
+        assert!(
+            out.contains("(\"parent_order_item_id\") REFERENCES \"public\".\"bp_order_items\" (\"id\")"),
+            "{out}"
+        );
+    }
 
     #[test]
     fn test_has_functional_expressions_primary_key_no_exprs() {
