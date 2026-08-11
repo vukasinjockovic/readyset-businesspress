@@ -21,12 +21,32 @@
 //! (`rs:t1_live:{cache_name}`, written by the dataflow notifier on every
 //! delivered delta): admission flags *suspected* zombies at creation,
 //! liveness *proves* which caches actually receive deltas.
+//!
+//! # Which statement gets classified (and why it matters)
+//!
+//! The classifier must see the statement **as submitted**. The adapter's
+//! `CREATE CACHE` path runs `adapter_rewrites::rewrite_query` →
+//! `rewrite_equivalent_deep` before it builds the `ViewCreateRequest`, and that
+//! pipeline includes `unnest_subqueries`, which *decorrelates* correlated
+//! subqueries (an `EXISTS`/`IN`/scalar subquery becomes a join against a
+//! grouped derived table). Classifying the post-rewrite form therefore finds
+//! nothing to flag: the correlation the class is named after has been rewritten
+//! away. Decorrelation makes those shapes *serve reads*; it does not make them
+//! *deliver Reader deltas*, so they remain zombies while looking healthy to an
+//! AST walk.
+//!
+//! [`classify_for_admission`] is the entry point the backend uses: it inspects
+//! the submitted statement first and falls back to the rewritten one (both for
+//! `CREATE CACHE FROM <query_id>`, where no submitted statement exists, and as
+//! a belt so the pre-existing post-rewrite verdicts remain a subset of the
+//! verdicts reached today).
 
 use std::env;
 use std::sync::OnceLock;
 
 use readyset_sql::ast::{
-    Expr, FieldDefinitionExpr, InValue, JoinRightSide, SelectStatement, TableExpr, TableExprInner,
+    CacheInner, Expr, FieldDefinitionExpr, InValue, JoinRightSide, SelectStatement, TableExpr,
+    TableExprInner,
 };
 use readyset_sql_passes::is_correlated;
 use tracing::warn;
@@ -70,11 +90,52 @@ pub fn admission_mode() -> AdmissionMode {
     })
 }
 
+/// The statement as the client submitted it, when this `CacheInner` carries one.
+///
+/// `CREATE CACHE FROM <query_id>` (`CacheInner::Id`) has no submitted statement:
+/// the only form available is the one already stored in the query status cache,
+/// which is post-rewrite. Same for a `CREATE CACHE` whose inner SELECT failed to
+/// parse — there is nothing to classify and cache creation fails anyway.
+pub fn submitted_statement(inner: &CacheInner) -> Option<&SelectStatement> {
+    match inner {
+        CacheInner::Statement { deep: Ok(stmt), .. } => Some(stmt.as_ref()),
+        CacheInner::Statement { deep: Err(_), .. } | CacheInner::Id(_) => None,
+    }
+}
+
+/// Admission verdict for a `CREATE CACHE`.
+///
+/// `submitted` is the statement as written by the client (pre-rewrite), when one
+/// is available; `rewritten` is the statement the `ViewCreateRequest` was built
+/// from, i.e. after `adapter_rewrites::rewrite_query`.
+///
+/// The submitted form is authoritative because the pipeline's
+/// `unnest_subqueries` pass decorrelates correlated subqueries before the
+/// `ViewCreateRequest` exists (see the module docs). The rewritten form is still
+/// checked as a fallback so that:
+///
+/// - `CREATE CACHE FROM <query_id>`, which has no submitted statement, keeps the
+///   only classification it can get, and
+/// - every verdict the pre-fix code reached is still reached (the new verdict set
+///   is a strict superset — this is a plumbing fix, not a policy change).
+pub fn classify_for_admission(
+    submitted: Option<&SelectStatement>,
+    rewritten: &SelectStatement,
+) -> Option<&'static str> {
+    submitted
+        .and_then(classify_zombie_shape)
+        .or_else(|| classify_zombie_shape(rewritten))
+}
+
 /// Classify a SELECT against the known zombie shape classes.
 ///
 /// Returns the first matching class, or `None` for shapes with reliable delta
 /// maintenance (plain selects, joins — including LEFT JOIN + GROUP BY derived
 /// tables — and *uncorrelated* subqueries).
+///
+/// Callers on the `CREATE CACHE` path want [`classify_for_admission`]: this
+/// function is a pure AST walk and will not recognise a shape whose correlation
+/// the rewrite pipeline has already removed.
 pub fn classify_zombie_shape(stmt: &SelectStatement) -> Option<&'static str> {
     // 1. Correlated scalar subquery in the projection list.
     for field in &stmt.fields {
@@ -334,5 +395,221 @@ mod tests {
             classify_zombie_shape(&stmt),
             Some(CLASS_CORRELATED_PROJECTION)
         );
+    }
+
+    /// End-to-end: statement → the **real** adapter rewrite pipeline
+    /// (`adapter_rewrites::rewrite_query`, the same entry point
+    /// `Backend::query_from_cache_inner` calls) → admission classification.
+    ///
+    /// The tests above parse their own SQL and hand it straight to
+    /// `classify_zombie_shape`. That is precisely why they stayed green while the
+    /// live gate went blind: the 2026-08-10 upstream merge added
+    /// `unnest_subqueries` to `rewrite_equivalent_deep`, which decorrelates the
+    /// zombie shapes *before* the `ViewCreateRequest` — and hence before the gate
+    /// — ever sees them. Anything that guards this behaviour has to traverse the
+    /// pipeline.
+    mod through_rewrite_pipeline {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        use readyset_sql::ast::{CacheInner, SqlIdentifier};
+        use readyset_sql_parsing::{parse_create_table, parse_select};
+        use readyset_sql_passes::adapter_rewrites::{self, AdapterRewriteParams};
+        use schema_catalog::{RewriteContext, SchemaCatalog, SchemaGeneration};
+
+        use super::*;
+
+        const ORDERS_DDL: &str = "CREATE TABLE public.bp_orders (\
+             id int NOT NULL PRIMARY KEY, user_id int NOT NULL, shop_id int NOT NULL, \
+             total int NOT NULL, email text NOT NULL, shipping_status text NOT NULL)";
+        const INVOICES_DDL: &str = "CREATE TABLE public.bp_invoices (\
+             id int NOT NULL PRIMARY KEY, order_id int NOT NULL, user_id int NOT NULL, \
+             total int NOT NULL, deleted_at timestamp)";
+
+        /// A real [`RewriteContext`] (the production context type) over a
+        /// two-table catalog, so the pipeline's schema-dependent passes —
+        /// `unnest_subqueries` among them — actually run.
+        fn rewrite_context() -> RewriteContext {
+            let mut base_schemas = HashMap::new();
+            let mut view_schemas = HashMap::new();
+            for ddl in [ORDERS_DDL, INVOICES_DDL] {
+                let stmt = parse_create_table(Dialect::PostgreSQL, ddl).unwrap();
+                let body = stmt.body.clone().unwrap();
+                let cols: Vec<SqlIdentifier> =
+                    body.fields.iter().map(|f| f.column.name.clone()).collect();
+                view_schemas.insert(stmt.table.clone(), cols);
+                base_schemas.insert(stmt.table.clone(), body);
+            }
+            let catalog = SchemaCatalog {
+                generation: SchemaGeneration::INITIAL,
+                base_schemas,
+                uncompiled_views: HashMap::new(),
+                custom_types: HashMap::new(),
+                view_schemas,
+                non_replicated_relations: HashSet::new(),
+            };
+            RewriteContext::new(
+                readyset_data::Dialect::DEFAULT_POSTGRESQL,
+                Arc::new(catalog),
+                vec![SqlIdentifier::from("public")],
+            )
+        }
+
+        fn rewrite_params() -> AdapterRewriteParams {
+            AdapterRewriteParams {
+                dialect: Dialect::PostgreSQL,
+                server_supports_topk: true,
+                server_supports_pagination: true,
+                server_supports_mixed_comparisons: true,
+                autoparameterize: true,
+            }
+        }
+
+        /// `(submitted, rewritten)` — exactly the pair `create_deep_cache` sees.
+        fn submitted_and_rewritten(sql: &str) -> (SelectStatement, SelectStatement) {
+            let submitted = parse_select(Dialect::PostgreSQL, sql).unwrap();
+            let mut rewritten = submitted.clone();
+            adapter_rewrites::rewrite_query(&mut rewritten, rewrite_params(), &rewrite_context())
+                .expect("rewrite pipeline succeeds");
+            (submitted, rewritten)
+        }
+
+        /// The blinding itself, asserted rather than assumed: after the real
+        /// pipeline runs, a correlated `EXISTS` in WHERE is gone from the AST, so
+        /// a raw walk of the rewritten statement finds nothing.
+        ///
+        /// This test also protects the two below from becoming vacuous — if the
+        /// pipeline ever stops decorrelating (or the harness stops reaching the
+        /// unnest pass), this assertion fails and says so, instead of letting the
+        /// gate tests pass for the wrong reason.
+        #[test]
+        fn pipeline_decorrelates_and_blinds_the_raw_classifier() {
+            let (submitted, rewritten) = submitted_and_rewritten(
+                "SELECT o.id FROM bp_orders o \
+                 WHERE EXISTS (SELECT 1 FROM bp_invoices i WHERE i.order_id = o.id)",
+            );
+            assert_eq!(
+                classify_zombie_shape(&submitted),
+                Some(CLASS_CORRELATED_WHERE),
+                "the submitted statement is a correlated-WHERE zombie"
+            );
+            assert_eq!(
+                classify_zombie_shape(&rewritten),
+                None,
+                "the rewrite pipeline decorrelated the subquery, so a raw walk of the \
+                 rewritten statement is blind to it — this is the regression that let \
+                 zombie shapes through the gate"
+            );
+        }
+
+        /// The gate's contract: a correlated subquery in WHERE is still flagged
+        /// after the pipeline has run.
+        #[test]
+        fn admission_flags_correlated_where_after_rewrite() {
+            let (submitted, rewritten) = submitted_and_rewritten(
+                "SELECT o.id FROM bp_orders o \
+                 WHERE EXISTS (SELECT 1 FROM bp_invoices i WHERE i.order_id = o.id)",
+            );
+            assert_eq!(
+                classify_for_admission(Some(&submitted), &rewritten),
+                Some(CLASS_CORRELATED_WHERE)
+            );
+        }
+
+        /// Same contract for the `withCount()` shape — a correlated scalar
+        /// subquery in the projection.
+        #[test]
+        fn admission_flags_correlated_projection_after_rewrite() {
+            let (submitted, rewritten) = submitted_and_rewritten(
+                "SELECT o.id, o.email, \
+                 (SELECT count(*) FROM bp_invoices i \
+                  WHERE i.order_id = o.id AND i.deleted_at IS NULL) AS total_invoices_count \
+                 FROM bp_orders o WHERE o.shipping_status = 'sent'",
+            );
+            assert_eq!(
+                classify_for_admission(Some(&submitted), &rewritten),
+                Some(CLASS_CORRELATED_PROJECTION)
+            );
+        }
+
+        /// Correlated `IN`, the third live class, through the pipeline.
+        #[test]
+        fn admission_flags_correlated_in_after_rewrite() {
+            let (submitted, rewritten) = submitted_and_rewritten(
+                "SELECT o.id FROM bp_orders o \
+                 WHERE o.id IN (SELECT i.order_id FROM bp_invoices i WHERE i.user_id = o.user_id)",
+            );
+            assert_eq!(
+                classify_for_admission(Some(&submitted), &rewritten),
+                Some(CLASS_CORRELATED_WHERE)
+            );
+        }
+
+        /// No false positives: healthy shapes stay admitted through the pipeline.
+        /// `gb_ctrl_flat` is the flat control used on the live box; the
+        /// LEFT JOIN + GROUP BY derived table is the decorrelated replacement the
+        /// gate's error message tells operators to write.
+        #[test]
+        fn admission_admits_healthy_shapes_after_rewrite() {
+            for sql in [
+                "SELECT id, email, shipping_status FROM bp_orders \
+                 WHERE shipping_status = 'sent' ORDER BY id DESC",
+                "SELECT o.id, o.email, coalesce(t.cnt, 0) AS total_invoices_count \
+                 FROM bp_orders o \
+                 LEFT JOIN (SELECT order_id, count(*) AS cnt FROM bp_invoices \
+                            WHERE deleted_at IS NULL GROUP BY order_id) t \
+                 ON o.id = t.order_id \
+                 WHERE o.shipping_status = 'sent'",
+                "SELECT i.order_id, count(*) AS cnt FROM bp_invoices i \
+                 WHERE i.deleted_at IS NULL GROUP BY i.order_id",
+                "SELECT o.id FROM bp_orders o \
+                 WHERE o.shop_id IN (SELECT id FROM bp_invoices WHERE total > 0)",
+            ] {
+                let (submitted, rewritten) = submitted_and_rewritten(sql);
+                assert_eq!(
+                    classify_for_admission(Some(&submitted), &rewritten),
+                    None,
+                    "healthy shape must not be flagged: {sql}"
+                );
+            }
+        }
+
+        /// `CREATE CACHE <name> FROM SELECT …` carries the submitted statement;
+        /// `CREATE CACHE FROM <query_id>` cannot, and falls back to the rewritten
+        /// form (pre-fix behaviour) rather than skipping classification.
+        #[test]
+        fn submitted_statement_extraction() {
+            let stmt = parse("SELECT id FROM bp_orders");
+            let inner = CacheInner::Statement {
+                deep: Ok(Box::new(stmt.clone())),
+                shallow: Err("no shallow".to_string()),
+            };
+            assert_eq!(submitted_statement(&inner), Some(&stmt));
+
+            let by_id = CacheInner::Id(SqlIdentifier::from("q_0000000000000000"));
+            assert!(submitted_statement(&by_id).is_none());
+
+            let unparseable = CacheInner::Statement {
+                deep: Err("nope".to_string()),
+                shallow: Err("nope".to_string()),
+            };
+            assert!(submitted_statement(&unparseable).is_none());
+        }
+
+        /// With no submitted statement the rewritten form is still classified —
+        /// the fallback must not silently admit everything.
+        #[test]
+        fn falls_back_to_rewritten_when_no_submitted_statement() {
+            let zombie = parse(
+                "SELECT o.id FROM bp_orders o \
+                 WHERE EXISTS (SELECT 1 FROM bp_invoices i WHERE i.order_id = o.id)",
+            );
+            assert_eq!(
+                classify_for_admission(None, &zombie),
+                Some(CLASS_CORRELATED_WHERE)
+            );
+            let healthy = parse("SELECT id FROM bp_orders WHERE shipping_status = 'sent'");
+            assert_eq!(classify_for_admission(None, &healthy), None);
+        }
     }
 }

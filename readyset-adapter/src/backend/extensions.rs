@@ -35,8 +35,9 @@ use readyset_sql::ast::{
     ChangeCdcStatement, ChangeUpstreamStatement, CreateCacheStatement, CreateMcpTokenStatement,
     DropAllCachesStatement, DropMcpTokenStatement, DropUserStatement, ExplainStatement,
     FlushCacheStatement, McpTokenExpiresChange, McpTokenScope as ParserMcpTokenScope,
-    ModifyUserStatement, ProxiedQueriesOptions, Relation, ShallowCacheAllowlistChange,
-    ShallowCacheAllowlistKind, ShowStatement, SqlQuery, TrxCachePolicy,
+    ModifyUserStatement, ProxiedQueriesOptions, Relation, SelectStatement,
+    ShallowCacheAllowlistChange, ShallowCacheAllowlistKind, ShowStatement, SqlQuery,
+    TrxCachePolicy,
 };
 use readyset_sql_passes::shallow::rewrite_shallow;
 use readyset_sql_passes::{DetectBucketFunctions, adapter_rewrites};
@@ -171,6 +172,7 @@ where
         manual_mapping: Option<ManualMappingInfo>,
         mut ddl_req: Option<CacheDDLRequest>,
         quiet: bool,
+        submitted: Option<&SelectStatement>,
     ) -> ReadySetResult<noria_connector::QueryResult<'static>> {
         let deep = deep?;
         let (query_id, name) = Self::resolve_id_and_name(name, QueryId::from(&deep));
@@ -180,10 +182,18 @@ where
         // deltas ("zombie caches"). See crate::rsc_admission for details.
         // Re-anchored here (formerly backend.rs create_cache_command) after
         // the upstream backend split — this is the sole deep-cache entry.
+        //
+        // `submitted` is the statement as the client wrote it. It must be
+        // classified in preference to `deep.statement`: the latter has been
+        // through `adapter_rewrites::rewrite_query`, whose `unnest_subqueries`
+        // pass decorrelates correlated subqueries, so the shapes this gate
+        // exists to catch are invisible in it (rsc_admission module docs).
         match rsc_admission::admission_mode() {
             rsc_admission::AdmissionMode::Off => {}
             mode => {
-                if let Some(class) = rsc_admission::classify_zombie_shape(&deep.statement) {
+                if let Some(class) =
+                    rsc_admission::classify_for_admission(submitted, &deep.statement)
+                {
                     let cache_name = name.display_unquoted().to_string();
                     warn!(
                         "RSC admission: cache '{}' has shape '{}' with unreliable delta maintenance",
@@ -1652,6 +1662,10 @@ where
                 let (deep, shallow, schema_generation, manual_mapping) =
                     Self::query_from_cache_inner(connectors, settings, state, inner, *autoparam)
                         .await?;
+                // The statement as submitted, kept for the RSC admission gate: the
+                // rewritten form in `deep` has been decorrelated by
+                // `unnest_subqueries` and no longer carries the zombie shapes.
+                let submitted = rsc_admission::submitted_statement(inner);
 
                 // Log a telemetry event
                 if let Some(ref telemetry_sender) = state.telemetry_sender {
@@ -1695,6 +1709,7 @@ where
                         manual_mapping,
                         ddl_req,
                         false,
+                        submitted,
                     )
                     .await
                 } else if shallow_requested || (cache_mode.is_shallow() && !deep_requested) {
@@ -1727,6 +1742,7 @@ where
                         manual_mapping,
                         ddl_req.clone(),
                         true,
+                        submitted,
                     )
                     .await;
                     match res {
