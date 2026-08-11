@@ -337,7 +337,12 @@ async fn handle_row_invalidation(
     // 2d. Reverb HTTP broadcast (after Redis writes complete)
     if ws_server == "reverb" {
         if let (Some(cfg), Some(client)) = (reverb_config, http_client) {
-            reverb_http::broadcast_to_reverb(cfg, client, &grouped).await;
+            // Per-channel broadcast epochs: INCR rs:epoch:{authHash} once per
+            // channel for this delivered batch, executed and AWAITED before
+            // the HTTP POST (INCR visible before any client can receive the
+            // event). After the DEL pipeline — marker-before-DEL untouched.
+            let epochs = reverb_http::incr_epochs(conn, prefix, &grouped).await;
+            reverb_http::broadcast_to_reverb(cfg, client, &grouped, &epochs).await;
         }
     }
 
@@ -604,7 +609,10 @@ async fn handle_table_invalidation(
 
     if ws_server == "reverb" {
         if let (Some(cfg), Some(client)) = (reverb_config, http_client) {
-            reverb_http::broadcast_to_reverb(cfg, client, &grouped).await;
+            // Per-channel broadcast epochs — INCR awaited before the POST
+            // (see handle_row_invalidation 2d for the ordering contract).
+            let epochs = reverb_http::incr_epochs(conn, prefix, &grouped).await;
+            reverb_http::broadcast_to_reverb(cfg, client, &grouped, &epochs).await;
         }
     }
 
@@ -619,6 +627,240 @@ pub fn notify_table_change(schema: &str, table: &str) {
         table: table.to_string(),
         qualified: format!("{}.{}", schema, table),
     });
+}
+
+// ---------------------------------------------------------------------------
+// rs:lsn — engine-applied WAL position (consistency-token groundwork)
+// ---------------------------------------------------------------------------
+//
+// `{prefix}rs:lsn` holds, as a decimal u64 string (pg LSN = (hi<<32)|lo), a
+// WAL position whose effects are guaranteed visible through the engine's
+// readers (port 5435 SELECTs). PHP stamps RSC cache values with this at
+// rebuild start and serves a cached value to a client bearing token LSN T
+// only if stamp >= T.
+//
+// THE INVARIANT (absolute): rs:lsn must NEVER exceed the LSN whose effects
+// are reader-visible. Over-stating = stale data served as fresh. Under-
+// stating = a client briefly bypasses cache (safe). When in doubt, lag.
+//
+// MECHANISM (holdback publisher — the "double-buffer lag" fallback,
+// strengthened from one-batch to a fixed time bound):
+//
+// Readers carry no replication offsets — dataflow Update/eviction packets are
+// offset-less, so the Tier-1 notifier cannot know which WAL position a reader
+// delta corresponds to. The position IS known in the replicator's main loop:
+// after `handle_action` returns Ok, the batch's table ops have been
+// `perform_all().await`-acked by the base-table domains. From there the only
+// remaining lag is inter-domain propagation to the readers, measured end-to-
+// end (upstream write -> Tier-1 invalidation fired, which is strictly AFTER
+// reader publish) at p50 11.4ms / max 16.9ms on this deployment.
+//
+// So: the main loop feeds every applied batch position into a single writer
+// task, which publishes a position only after READYSET_LSN_HOLDBACK_MS
+// (default 250ms ≈ 15x the measured max propagation, same margin rationale as
+// READYSET_REVAL_TTL_MS) has elapsed since that batch was acked. Two
+// additional guards:
+//
+// - COMPLETE TRANSACTIONS ONLY: a mid-transaction position (event lsn <
+//   commit_lsn) is never published — publishing commit_lsn while only part of
+//   the transaction's rows were applied would over-state within the batch.
+//   Only commit-end / keepalive positions (lsn >= commit_lsn) qualify, and
+//   what is published is commit_lsn itself (the conservative end of the pair;
+//   any PHP token captured inside that transaction is < its COMMIT record).
+// - MONOTONIC: the writer keeps a local high-watermark (single-threaded task
+//   => no CAS needed), seeded from any existing rs:lsn value at startup
+//   (read-modify-write), and never writes a smaller value.
+//
+// LAG BOUND: holdback + poll tick, i.e. ~250-313ms with defaults — during
+// that window after a write, token-bearing clients bypass cache. That window
+// is deliberately aligned with the rs:reval window (250ms) in which the PHP
+// rebuild path bypasses the engine anyway.
+//
+// A failed SET simply drops that publish; a later (larger) position heals it
+// — again the safe direction. TTL 7d, refreshed on every write; expiry on a
+// >7d-idle deployment makes PHP treat every token as unsatisfiable (bypass —
+// safe).
+
+/// Channel into the rs:lsn writer task. Carries already-gated (commit-end
+/// only) u64 LSNs.
+static LSN_TX: OnceLock<mpsc::UnboundedSender<u64>> = OnceLock::new();
+
+/// TTL for the rs:lsn key: 7 days, refreshed on every write.
+const LSN_TTL_SECS: u64 = 7 * 86400;
+
+/// Parse READYSET_LSN_HOLDBACK_MS. Unset, unparsable or zero fall back to
+/// 250ms (a 0ms holdback would publish positions whose effects may not yet
+/// be reader-visible — the unsafe direction).
+pub(crate) fn parse_lsn_holdback_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(250)
+}
+
+/// Extract the publishable applied-LSN from a replication offset.
+///
+/// Returns `Some(commit_lsn as u64)` only for Postgres positions at or past
+/// their transaction's commit end (`lsn >= commit_lsn`): batch positions
+/// mid-transaction (data-record LSNs are strictly below the COMMIT record's)
+/// return None so a partially applied transaction is never claimed visible.
+/// MySQL/GTID offsets return None (feature is Postgres-only).
+pub(crate) fn applied_lsn_from_offset(
+    offset: &replication_offset::ReplicationOffset,
+) -> Option<u64> {
+    match offset {
+        replication_offset::ReplicationOffset::Postgres(p)
+            if p.lsn.as_i64() >= p.commit_lsn.as_i64() =>
+        {
+            u64::try_from(p.commit_lsn.as_i64()).ok()
+        }
+        _ => None,
+    }
+}
+
+/// Holdback + monotonic-watermark state for the rs:lsn writer. Pure (no I/O)
+/// so the publish gating is unit-testable.
+pub(crate) struct LsnHoldback {
+    holdback: Duration,
+    /// (lsn, first-observed) in strictly increasing lsn order — `observe`
+    /// drops non-increasing positions, so the front is always the oldest AND
+    /// smallest pending entry.
+    pending: std::collections::VecDeque<(u64, std::time::Instant)>,
+    newest_seen: u64,
+    /// Last value published to Redis (or adopted from it at startup). Never
+    /// decreases.
+    watermark: u64,
+}
+
+impl LsnHoldback {
+    pub(crate) fn new(holdback: Duration, initial_watermark: u64) -> Self {
+        Self {
+            holdback,
+            pending: Default::default(),
+            newest_seen: initial_watermark,
+            watermark: initial_watermark,
+        }
+    }
+
+    /// Record an applied position. Non-increasing positions are dropped (the
+    /// replicator feed is monotonic per PostgresPosition ordering; duplicates
+    /// arrive from keepalive re-reports).
+    pub(crate) fn observe(&mut self, lsn: u64, now: std::time::Instant) {
+        if lsn > self.newest_seen {
+            self.newest_seen = lsn;
+            self.pending.push_back((lsn, now));
+        }
+    }
+
+    /// The largest pending position whose holdback has fully elapsed, if it
+    /// beats the watermark. Advances the watermark — the caller MUST attempt
+    /// the Redis write for every returned value (a failed SET under-states
+    /// until the next larger position, which is the safe direction).
+    pub(crate) fn publishable(&mut self, now: std::time::Instant) -> Option<u64> {
+        let mut ripe = None;
+        while let Some(&(lsn, seen)) = self.pending.front() {
+            if now.duration_since(seen) >= self.holdback {
+                ripe = Some(lsn);
+                self.pending.pop_front();
+            } else {
+                break;
+            }
+        }
+        match ripe {
+            Some(lsn) if lsn > self.watermark => {
+                self.watermark = lsn;
+                Some(lsn)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Feed an applied batch position into the rs:lsn writer. Called from the
+/// replication main loop AFTER `handle_action` returns Ok (i.e. after
+/// `perform_all().await` acked every table op in the batch). Cheap no-op for
+/// mid-transaction or non-Postgres positions.
+pub fn notify_applied_position(offset: &replication_offset::ReplicationOffset) {
+    if let Some(lsn) = applied_lsn_from_offset(offset) {
+        let _ = get_or_init_lsn_tx().send(lsn);
+    }
+}
+
+fn get_or_init_lsn_tx() -> &'static mpsc::UnboundedSender<u64> {
+    LSN_TX.get_or_init(|| {
+        let (tx, mut rx) = mpsc::unbounded_channel::<u64>();
+
+        tokio::spawn(async move {
+            let redis_url = env::var("READYSET_REDIS_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+            let prefix = env::var("READYSET_REDIS_PREFIX").unwrap_or_default();
+            let holdback_ms =
+                parse_lsn_holdback_ms(env::var("READYSET_LSN_HOLDBACK_MS").ok().as_deref());
+
+            let client = match redis::Client::open(redis_url.as_str()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(%e, "Failed to create Redis client for rs:lsn writer");
+                    while rx.recv().await.is_some() {}
+                    return;
+                }
+            };
+            let mut conn = match client.get_multiplexed_async_connection().await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(%e, "Failed to connect to Redis for rs:lsn writer");
+                    while rx.recv().await.is_some() {}
+                    return;
+                }
+            };
+
+            let key = format!("{}rs:lsn", prefix);
+
+            // Monotonic guard across restarts: adopt any existing value as the
+            // floor (read-modify-write; safe because this task is the single
+            // writer). The pre-restart value was reader-visible when written
+            // and base tables restore at-or-past it (positions are persisted
+            // with the applied data itself).
+            let initial: u64 = redis::cmd("GET")
+                .arg(&key)
+                .query_async::<Option<String>>(&mut conn)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            let mut hb = LsnHoldback::new(Duration::from_millis(holdback_ms), initial);
+            // Poll tick: flushes ripe positions when the feed goes quiet.
+            let tick = Duration::from_millis((holdback_ms / 4).clamp(25, 250));
+
+            info!(holdback_ms, initial_watermark = initial, key = %key,
+                  "rs:lsn writer started (applied-position holdback publisher)");
+
+            loop {
+                tokio::select! {
+                    msg = rx.recv() => match msg {
+                        Some(lsn) => hb.observe(lsn, std::time::Instant::now()),
+                        None => break,
+                    },
+                    _ = tokio::time::sleep(tick) => {}
+                }
+                if let Some(lsn) = hb.publishable(std::time::Instant::now()) {
+                    if let Err(e) = redis::cmd("SET")
+                        .arg(&key)
+                        .arg(lsn.to_string())
+                        .arg("EX")
+                        .arg(LSN_TTL_SECS)
+                        .query_async::<()>(&mut conn)
+                        .await
+                    {
+                        warn!(%e, lsn, "rs:lsn SET failed — will heal on next larger position");
+                    }
+                }
+            }
+        });
+
+        tx
+    })
 }
 
 /// Phase 5B: one-shot cold-start flush of the twin layer, fired when
@@ -748,7 +990,10 @@ async fn run_startup_twin_flush() -> Result<(), redis::RedisError> {
                 .build()
             {
                 let grouped = group_by_auth_hash(&payloads);
-                reverb_http::broadcast_to_reverb(&cfg, &http, &grouped).await;
+                // Same epoch contract as live invalidation: INCR per channel,
+                // awaited before the POST.
+                let epochs = reverb_http::incr_epochs(&mut conn, &prefix, &grouped).await;
+                reverb_http::broadcast_to_reverb(&cfg, &http, &grouped, &epochs).await;
             }
         }
     }
@@ -821,6 +1066,99 @@ mod tests {
         assert_eq!(parse_reval_ttl_ms(Some("")), 3000);
         assert_eq!(parse_reval_ttl_ms(Some("abc")), 3000);
         assert_eq!(parse_reval_ttl_ms(Some("0")), 3000);
+    }
+
+    /// READYSET_LSN_HOLDBACK_MS parsing: unset/garbage/zero fall back to the
+    /// 250ms default (0 would publish positions before their effects are
+    /// reader-visible — the unsafe direction).
+    #[test]
+    fn test_parse_lsn_holdback_ms_default_250() {
+        assert_eq!(parse_lsn_holdback_ms(None), 250);
+        assert_eq!(parse_lsn_holdback_ms(Some("100")), 100);
+        assert_eq!(parse_lsn_holdback_ms(Some(" 500 ")), 500);
+        assert_eq!(parse_lsn_holdback_ms(Some("")), 250);
+        assert_eq!(parse_lsn_holdback_ms(Some("abc")), 250);
+        assert_eq!(parse_lsn_holdback_ms(Some("0")), 250);
+        assert_eq!(parse_lsn_holdback_ms(Some("-1")), 250);
+    }
+
+    /// Commit-end gate: only Postgres positions with lsn >= commit_lsn are
+    /// publishable (complete transactions / keepalives), and what is
+    /// published is commit_lsn itself. Mid-transaction and non-Postgres
+    /// offsets are rejected.
+    #[test]
+    fn test_applied_lsn_gates_on_commit_end() {
+        use replication_offset::ReplicationOffset;
+        use replication_offset::mysql::MySqlPosition;
+        use replication_offset::postgres::{CommitLsn, PostgresPosition};
+
+        let commit = CommitLsn::from(0x16_B374D848_i64);
+
+        // commit_end: lsn == commit_lsn -> publish commit_lsn
+        let off: ReplicationOffset = PostgresPosition::commit_end(commit).into();
+        assert_eq!(applied_lsn_from_offset(&off), Some(0x16_B374D848_u64));
+
+        // keepalive-style: lsn PAST the commit record -> still commit_lsn
+        let off: ReplicationOffset = PostgresPosition::commit_end(commit)
+            .with_lsn(0x16_B374D900_i64)
+            .into();
+        assert_eq!(applied_lsn_from_offset(&off), Some(0x16_B374D848_u64));
+
+        // mid-transaction: data-record lsn below the commit record -> None
+        let off: ReplicationOffset = PostgresPosition::commit_start(commit)
+            .with_lsn(0x16_B374D000_i64)
+            .into();
+        assert_eq!(applied_lsn_from_offset(&off), None);
+
+        // commit_start: (commit_lsn, 0) -> None
+        let off: ReplicationOffset = PostgresPosition::commit_start(commit).into();
+        assert_eq!(applied_lsn_from_offset(&off), None);
+
+        // MySQL offsets never publish
+        let off = ReplicationOffset::MySql(
+            MySqlPosition::from_file_name_and_position("binlog.000001".to_string(), 4)
+                .expect("valid binlog position"),
+        );
+        assert_eq!(applied_lsn_from_offset(&off), None);
+    }
+
+    /// Holdback gating: a position becomes publishable only after the full
+    /// holdback has elapsed, the newest ripe position wins, and the watermark
+    /// (incl. one adopted from Redis at startup) is strictly monotonic.
+    #[test]
+    fn test_lsn_holdback_delay_and_monotonic_watermark() {
+        use std::time::Instant;
+        let hold = Duration::from_millis(250);
+        let t0 = Instant::now();
+
+        let mut hb = LsnHoldback::new(hold, 0);
+        hb.observe(100, t0);
+        assert_eq!(hb.publishable(t0), None, "not ripe yet");
+        assert_eq!(
+            hb.publishable(t0 + Duration::from_millis(249)),
+            None,
+            "still inside the holdback"
+        );
+        assert_eq!(hb.publishable(t0 + hold), Some(100), "ripe at exactly holdback");
+        assert_eq!(hb.publishable(t0 + hold), None, "already published — watermark holds");
+
+        // Burst: multiple ripe positions collapse to the newest.
+        hb.observe(110, t0 + Duration::from_millis(300));
+        hb.observe(120, t0 + Duration::from_millis(301));
+        hb.observe(120, t0 + Duration::from_millis(302)); // duplicate keepalive — dropped
+        hb.observe(115, t0 + Duration::from_millis(303)); // non-increasing — dropped
+        let later = t0 + Duration::from_millis(600);
+        assert_eq!(hb.publishable(later), Some(120), "newest ripe position wins");
+        assert_eq!(hb.publishable(later), None);
+
+        // Startup adoption: positions at or below the adopted Redis value
+        // never re-publish (never write a smaller value than present).
+        let mut hb = LsnHoldback::new(hold, 500);
+        hb.observe(400, t0);
+        hb.observe(500, t0);
+        assert_eq!(hb.publishable(t0 + hold), None, "<= adopted watermark stays unpublished");
+        hb.observe(600, t0 + hold);
+        assert_eq!(hb.publishable(t0 + hold + hold), Some(600));
     }
 
     /// The marker command is `SET {prefix}rs:reval:{key} 1 PX {ttl_ms}` —

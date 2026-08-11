@@ -33,6 +33,7 @@ uuid = { workspace = true, features = ["v4"] }
 hex = { workspace = true }
 hmac = { workspace = true }
 md5 = { workspace = true }
+redis = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]

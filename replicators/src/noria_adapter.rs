@@ -1440,6 +1440,11 @@ impl<'a> NoriaAdapter<'a> {
                             return Err(err);
                         };
                         counter!(metric::REPLICATOR_SUCCESS).increment(1u64);
+                        // rs:lsn consistency-token feed: `pos` is now fully
+                        // applied (perform_all acked). The writer task adds
+                        // the holdback + commit-end + monotonic guards — see
+                        // redis_notifier::notify_applied_position.
+                        crate::redis_notifier::notify_applied_position(&pos);
                         // Publish both the stream position and persist frontier now that
                         // the action has been applied. Writing these together after apply
                         // keeps `persisted_offset <= stream_position` visible to the lag

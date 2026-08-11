@@ -80,12 +80,47 @@ pub(crate) fn add_reval_marker(
 }
 
 /// Lazily initialize the background Redis publisher task.
+///
+/// LIFECYCLE (critical): the first `notify_invalidation` call arrives on a
+/// DOMAIN thread, and each domain runs its own current-thread tokio runtime
+/// (readyset-server worker/mod.rs `new_current_thread`) that is DROPPED when
+/// that domain shuts down (cache removal, rebalance). A task `tokio::spawn`ed
+/// from here would die with that runtime while the static sender lives on —
+/// every later Tier-1 message process-wide would be silently dropped forever
+/// (observed live 2026-08-11: DROP CACHE of the probe cache that happened to
+/// initialize the notifier killed Tier-1 until restart). The notifier loop
+/// therefore runs on its OWN dedicated thread with its own runtime, tied to
+/// the process, not to whichever domain fired the first delta.
 fn get_or_init_tx() -> &'static mpsc::UnboundedSender<InvalidationMsg> {
     INVALIDATION_TX.get_or_init(|| {
-        let (tx, mut rx) = mpsc::unbounded_channel::<InvalidationMsg>();
+        let (tx, rx) = mpsc::unbounded_channel::<InvalidationMsg>();
 
-        tokio::spawn(async move {
-            let redis_url = env::var("READYSET_REDIS_URL")
+        if let Err(e) = std::thread::Builder::new()
+            .name("rsc-tier1-notifier".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        error!(%e, "Tier 1 notifier: failed to build runtime — Tier 1 disabled");
+                        return;
+                    }
+                };
+                rt.block_on(notifier_loop(rx));
+            })
+        {
+            error!(%e, "Tier 1 notifier: failed to spawn thread — Tier 1 disabled");
+        }
+
+        tx
+    })
+}
+
+/// The Tier-1 notifier receive loop (runs on the dedicated notifier thread).
+async fn notifier_loop(mut rx: mpsc::UnboundedReceiver<InvalidationMsg>) {
+    let redis_url = env::var("READYSET_REDIS_URL")
                 .unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
             let prefix = env::var("READYSET_REDIS_PREFIX")
                 .unwrap_or_default();
@@ -231,10 +266,6 @@ fn get_or_init_tx() -> &'static mpsc::UnboundedSender<InvalidationMsg> {
                     }
                 }
             }
-        });
-
-        tx
-    })
 }
 
 /// Append delta-liveness telemetry commands to an existing pipeline so they
@@ -694,7 +725,15 @@ async fn handle_invalidation(
     // 3d. Reverb HTTP broadcast (after Redis writes complete)
     if ws_server == "reverb" {
         if let (Some(cfg), Some(client)) = (reverb_config, http_client) {
-            reverb_http::broadcast_to_reverb(cfg, client, &grouped).await;
+            // Per-channel broadcast epochs: INCR rs:epoch:{authHash} once per
+            // channel for this delivered batch, in its own small pipeline,
+            // executed and AWAITED before the HTTP POST (ordering contract:
+            // the counter must be visible in Redis before any client can
+            // receive the event carrying it). Runs after the DEL pipeline, so
+            // the Phase 5B marker-before-DEL order is untouched. Fail-open:
+            // on INCR failure the events ship without the epoch field.
+            let epochs = reverb_http::incr_epochs(conn, prefix, &grouped).await;
+            reverb_http::broadcast_to_reverb(cfg, client, &grouped, &epochs).await;
         }
     }
 
@@ -904,6 +943,33 @@ mod tests {
             cache_name: cache.to_string(),
             key_values: kvs.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// Lifecycle regression (2026-08-11): the notifier receiver must NOT die
+    /// with the runtime of whichever domain thread initialized it. Each
+    /// domain runs a private current-thread runtime that is dropped on
+    /// domain shutdown (cache removal); when the receive loop was
+    /// tokio::spawn'ed from that context, dropping the runtime killed Tier-1
+    /// process-wide while the static sender lived on. The loop now runs on
+    /// its own dedicated thread, so the channel must still accept sends
+    /// after the initializing runtime is gone.
+    #[test]
+    fn tier1_notifier_survives_initializing_runtime_drop() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        // Initialize the notifier from inside a short-lived runtime, exactly
+        // like the first reader delta arriving on a doomed domain thread.
+        rt.block_on(async {
+            notify_invalidation("lifecycle_probe_cache", vec![]);
+        });
+        drop(rt);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            get_or_init_tx().send(msg("lifecycle_probe_cache", &[])).is_ok(),
+            "Tier 1 notifier receiver died with the initializing domain runtime"
+        );
     }
 
     /// Phase 5A fix: a broad message (empty key_values) in a debounce window

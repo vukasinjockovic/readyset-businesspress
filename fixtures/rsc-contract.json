@@ -17,6 +17,13 @@
         "  a lone value \"_\" collides with the empty-params form; timestamp params may",
         "  mismatch the engine's TimestampTz Display - all documented, accepted).",
         "  Empty params -> param_key \"\" -> twin key rs:hyd:{cache_name}:_",
+        "invalidation_events: wire shape of the Reverb `rsc.invalidated` event emitted by the Rust bridge.",
+        "  data is the DOUBLE-ENCODED (Pusher protocol) JSON string; fields serialize in ALPHABETICAL order",
+        "  (serde_json without preserve_order): {\"epoch\":N,\"keys\":[...]}. epoch = post-INCR value of the",
+        "  per-channel counter rs:epoch:{authHash} (literal `anon` suffix for the shared channel), INCRed",
+        "  once per channel per delivered batch and visible in Redis BEFORE the event is broadcast.",
+        "  epoch null = the INCR failed; the event then ships WITHOUT the field (legacy shape) - consumers",
+        "  MUST treat a missing epoch as uncomparable, never as 0.",
         "Regenerate ONLY via the generator script and re-vendor the Rust copy (check-rsc-contract-sync.sh)."
     ],
     "twin_identities": [
@@ -428,6 +435,45 @@
                 "rs:demo:top-products:21ffce5b8a6cc8cc6a41448dd69623c9",
                 "rs:demo:top-products:21ffce5b8a6cc8cc6a41448dd69623c9:stale"
             ]
+        }
+    ],
+    "invalidation_events": [
+        {
+            "auth_hash": "faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "keys": [
+                "rs:gql:dashboard:en:faf0aaf988d0a32dadc93dd8c3e9adc7:ff33f1b12213e021c2c4a888141953ba"
+            ],
+            "epoch": 7,
+            "expected_event_name": "rsc.invalidated",
+            "expected_channel": "private-rsc.faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_epoch_key": "rs:epoch:faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_data": "{\"epoch\":7,\"keys\":[\"rs:gql:dashboard:en:faf0aaf988d0a32dadc93dd8c3e9adc7:ff33f1b12213e021c2c4a888141953ba\"]}",
+            "note": "private channel: epoch key suffix is the authHash; epoch is the post-INCR counter value, INCR visible in Redis before the broadcast; alphabetical field order (epoch before keys)"
+        },
+        {
+            "auth_hash": "anon",
+            "keys": [
+                "rs:gql:storefront:en:anon:ff33f1b12213e021c2c4a888141953ba",
+                "rs:demo:top-products:21ffce5b8a6cc8cc6a41448dd69623c9"
+            ],
+            "epoch": 1,
+            "expected_event_name": "rsc.invalidated",
+            "expected_channel": "private-rsc.anon",
+            "expected_epoch_key": "rs:epoch:anon",
+            "expected_data": "{\"epoch\":1,\"keys\":[\"rs:gql:storefront:en:anon:ff33f1b12213e021c2c4a888141953ba\",\"rs:demo:top-products:21ffce5b8a6cc8cc6a41448dd69623c9\"]}",
+            "note": "shared anon channel: suffix is the literal 'anon'; many keys, ONE epoch - the epoch counts deliveries per channel, not keys"
+        },
+        {
+            "auth_hash": "faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "keys": [
+                "rs:lw:faf0aaf988d0a32dadc93dd8c3e9adc7:OrderTable_orders:ec6ef230f1828039ee794566b9c58adc"
+            ],
+            "epoch": null,
+            "expected_event_name": "rsc.invalidated",
+            "expected_channel": "private-rsc.faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_epoch_key": "rs:epoch:faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_data": "{\"keys\":[\"rs:lw:faf0aaf988d0a32dadc93dd8c3e9adc7:OrderTable_orders:ec6ef230f1828039ee794566b9c58adc\"]}",
+            "note": "fail-open: epoch INCR failed - the event ships WITHOUT the epoch field (legacy shape); a missing epoch is uncomparable, never 0"
         }
     ]
 }

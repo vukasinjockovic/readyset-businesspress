@@ -155,16 +155,106 @@ pub fn channel_for_auth_hash(auth_hash: &str) -> String {
     format!("private-rsc.{}", auth_hash)
 }
 
+/// Wire event name for RSC invalidation broadcasts. Locked by
+/// fixtures/rsc-contract.json `invalidation_events[].expected_event_name`.
+pub const EVENT_NAME: &str = "rsc.invalidated";
+
+/// Unprefixed per-channel broadcast-epoch counter key: `rs:epoch:{suffix}`,
+/// where suffix is the channel's authHash (the literal `anon` for the shared
+/// channel). The counter is INCRed once per channel per DELIVERED event batch
+/// (not per key) — it counts deliveries, and the client only ever compares
+/// equality (epoch reconnect-skip groundwork). Locked by
+/// fixtures/rsc-contract.json `invalidation_events[].expected_epoch_key`.
+pub fn epoch_key(auth_hash: &str) -> String {
+    format!("rs:epoch:{auth_hash}")
+}
+
+/// Sliding TTL for `rs:epoch:*` counters: 7 days, refreshed on every INCR.
+/// Expiry resets the counter to 1 on the next INCR — safe, because clients
+/// compare equality only (any change, including a reset, means "refetch").
+pub const EPOCH_TTL_SECS: u64 = 7 * 86400;
+
+/// Queue `INCR {prefix}rs:epoch:{auth_hash}` + sliding `EXPIRE` on `pipe`.
+/// The INCR result is NOT ignored — callers read the post-INCR value out of
+/// the pipeline reply and embed it as the event's `"epoch"` field. The EXPIRE
+/// reply is ignored, so a pipeline built purely from this helper yields
+/// exactly one integer per channel, in queue order.
+pub fn add_epoch_incr(pipe: &mut redis::Pipeline, prefix: &str, auth_hash: &str) {
+    let key = format!("{}{}", prefix, epoch_key(auth_hash));
+    pipe.cmd("INCR").arg(&key);
+    pipe.cmd("EXPIRE").arg(&key).arg(EPOCH_TTL_SECS).ignore();
+}
+
+/// INCR the per-channel epoch counters for every channel in `grouped`, in one
+/// dedicated Redis pipeline, and return the post-INCR values by authHash.
+///
+/// ORDERING CONTRACT: this must be executed AND awaited BEFORE the HTTP
+/// broadcast that carries the returned epochs — the counter must be visible
+/// to any Redis reader before any WebSocket client can possibly receive the
+/// event carrying that epoch value. All callers (Tier 1/2/3 notifiers and the
+/// startup twin flush) call this after their DEL write pipeline completes and
+/// immediately before `broadcast_to_reverb`.
+///
+/// Fail-open: on a Redis error the map is empty, the events ship WITHOUT the
+/// `"epoch"` field (legacy payload shape), and clients must treat the missing
+/// field as uncomparable — never as 0. Locked by the fixture's epoch-null case.
+pub async fn incr_epochs(
+    conn: &mut redis::aio::MultiplexedConnection,
+    prefix: &str,
+    grouped: &HashMap<String, Vec<String>>,
+) -> HashMap<String, u64> {
+    if grouped.is_empty() {
+        return HashMap::new();
+    }
+    // Snapshot iteration order so replies pair with the right channel.
+    let hashes: Vec<&String> = grouped.keys().collect();
+    let mut pipe = redis::pipe();
+    for h in &hashes {
+        add_epoch_incr(&mut pipe, prefix, h);
+    }
+    match pipe.query_async::<Vec<i64>>(conn).await {
+        Ok(counts) => hashes
+            .into_iter()
+            .zip(counts)
+            .map(|(h, c)| (h.clone(), c.max(0) as u64))
+            .collect(),
+        Err(e) => {
+            warn!(%e, "rs:epoch INCR pipeline failed — events ship without epoch (fail-open)");
+            HashMap::new()
+        }
+    }
+}
+
+/// Inner (to-be-double-encoded) event data JSON for an `rsc.invalidated`
+/// event: `{"epoch":N,"keys":[...]}` — or `{"keys":[...]}` when no epoch is
+/// available (INCR failure fail-open). Field order is ALPHABETICAL (serde_json
+/// without preserve_order uses a BTreeMap), so `epoch` precedes `keys`; byte
+/// shape locked by fixtures/rsc-contract.json `invalidation_events`.
+pub fn event_data_json(keys: &[String], epoch: Option<u64>) -> String {
+    let mut obj = serde_json::Map::new();
+    if let Some(e) = epoch {
+        obj.insert("epoch".to_string(), serde_json::Value::from(e));
+    }
+    obj.insert("keys".to_string(), serde_json::json!(keys));
+    serde_json::Value::Object(obj).to_string()
+}
+
 /// Broadcast invalidation events to Reverb via the Pusher batch_events HTTP API.
 ///
 /// Groups events by authHash into a single batch request. Each authHash maps to
 /// a private channel `private-rsc.{authHash}` with event name `rsc.invalidated`.
+///
+/// `epochs` carries the post-INCR per-channel counter values from
+/// `incr_epochs` (which the caller MUST have executed and awaited before
+/// calling this — see the ordering contract there). A channel missing from
+/// the map ships the legacy payload without the `"epoch"` field.
 ///
 /// Fire-and-forget: logs errors but never blocks the invalidation pipeline.
 pub async fn broadcast_to_reverb(
     config: &ReverbConfig,
     client: &reqwest::Client,
     grouped: &HashMap<String, Vec<String>>,
+    epochs: &HashMap<String, u64>,
 ) {
     if grouped.is_empty() {
         return;
@@ -175,10 +265,10 @@ pub async fn broadcast_to_reverb(
     for (auth_hash, keys) in grouped {
         let channel = channel_for_auth_hash(auth_hash);
         // data must be a JSON string (double-encoded per Pusher protocol)
-        let data = serde_json::json!({ "keys": keys }).to_string();
+        let data = event_data_json(keys, epochs.get(auth_hash).copied());
 
         batch.push(serde_json::json!({
-            "name": "rsc.invalidated",
+            "name": EVENT_NAME,
             "channel": channel,
             "data": data,
         }));
@@ -463,6 +553,85 @@ mod tests {
             canonical.display(),
             vendored_fixture_path().display()
         );
+    }
+
+    /// Contract: `rsc.invalidated` event wire shape — event name, channel,
+    /// epoch counter key and the exact (inner, to-be-double-encoded) data
+    /// bytes, including the epoch-null fail-open case where the field is
+    /// absent entirely.
+    #[test]
+    fn test_contract_invalidation_events() {
+        let fixture = load_fixture();
+        for row in fixture["invalidation_events"]
+            .as_array()
+            .expect("invalidation_events")
+        {
+            let auth_hash = row["auth_hash"].as_str().unwrap();
+            let keys: Vec<String> = row["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            let epoch = row["epoch"].as_u64(); // null -> None (fail-open case)
+
+            assert_eq!(
+                EVENT_NAME,
+                row["expected_event_name"].as_str().unwrap(),
+                "event name drifted"
+            );
+            assert_eq!(
+                channel_for_auth_hash(auth_hash),
+                row["expected_channel"].as_str().unwrap(),
+                "channel naming drifted for authHash {auth_hash:?}"
+            );
+            assert_eq!(
+                epoch_key(auth_hash),
+                row["expected_epoch_key"].as_str().unwrap(),
+                "epoch key drifted for authHash {auth_hash:?}"
+            );
+            assert_eq!(
+                event_data_json(&keys, epoch),
+                row["expected_data"].as_str().unwrap(),
+                "event data bytes drifted for authHash {auth_hash:?} (epoch {epoch:?})"
+            );
+        }
+    }
+
+    /// The epoch pipeline helper: INCR (result kept) then sliding EXPIRE
+    /// (result ignored) on the SAME prefixed key, INCR queued first — the
+    /// caller pairs one integer reply per channel in queue order.
+    #[test]
+    fn test_add_epoch_incr_pipeline_shape() {
+        let mut pipe = redis::pipe();
+        add_epoch_incr(&mut pipe, "pfx-", HASH_A);
+        add_epoch_incr(&mut pipe, "pfx-", "anon");
+        let packed = String::from_utf8_lossy(&pipe.get_packed_pipeline()).into_owned();
+        assert!(packed.contains(&format!("pfx-rs:epoch:{HASH_A}")));
+        assert!(packed.contains("pfx-rs:epoch:anon"));
+        assert!(packed.contains("INCR"));
+        assert!(packed.contains("EXPIRE"));
+        assert!(
+            packed.find("INCR").unwrap() < packed.find("EXPIRE").unwrap(),
+            "INCR must be queued before its sliding EXPIRE"
+        );
+        assert!(
+            packed.contains(&EPOCH_TTL_SECS.to_string()),
+            "7d sliding TTL must be emitted"
+        );
+    }
+
+    /// event_data_json: epoch present -> alphabetical field order (epoch
+    /// before keys); epoch absent -> legacy `{"keys":[...]}` byte shape.
+    #[test]
+    fn test_event_data_json_shapes() {
+        let keys = vec!["rs:lw:anon:C_x:p1".to_string()];
+        assert_eq!(
+            event_data_json(&keys, Some(3)),
+            r#"{"epoch":3,"keys":["rs:lw:anon:C_x:p1"]}"#
+        );
+        assert_eq!(event_data_json(&keys, None), r#"{"keys":["rs:lw:anon:C_x:p1"]}"#);
+        assert_eq!(event_data_json(&[], Some(1)), r#"{"epoch":1,"keys":[]}"#);
     }
 
     #[test]
