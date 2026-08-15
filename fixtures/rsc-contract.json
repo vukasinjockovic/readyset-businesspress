@@ -204,6 +204,24 @@
             "note": "2-char locale"
         },
         {
+            "key": "rs:gql:dashboard:en:faf0aaf988d0a32dadc93dd8c3e9adc7:v3:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": "faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_channel": "private-rsc.faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "note": "entitlement-versioned gql key - v{N} is never 32-hex, the scan must skip it"
+        },
+        {
+            "key": "rs:gql:storefront:en:anon:v0:ff33f1b12213e021c2c4a888141953ba",
+            "expected_auth_hash": "anon",
+            "expected_channel": "private-rsc.anon",
+            "note": "anon is always entitlement version v0"
+        },
+        {
+            "key": "rs:gql:dashboard:en:faf0aaf988d0a32dadc93dd8c3e9adc7:v12:ff33f1b12213e021c2c4a888141953ba:stale",
+            "expected_auth_hash": "faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "expected_channel": "private-rsc.faf0aaf988d0a32dadc93dd8c3e9adc7",
+            "note": "versioned SWR :stale twin maps to the same hash"
+        },
+        {
             "key": "rs:gql:c9550d5fad73447fc24ba47f95d1c6b7:en:anon:ff33f1b12213e021c2c4a888141953ba",
             "expected_auth_hash": "anon",
             "expected_channel": "private-rsc.anon",
