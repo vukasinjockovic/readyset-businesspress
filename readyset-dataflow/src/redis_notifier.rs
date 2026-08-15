@@ -161,7 +161,7 @@ async fn notifier_loop(mut rx: mpsc::UnboundedReceiver<InvalidationMsg>) {
                 }
             };
 
-            let mut conn = match client.get_multiplexed_async_connection().await {
+            let mut conn = match readyset_util::redis_conn::reconnecting(&client).await {
                 Ok(c) => {
                     info!(url = %redis_url, channel = INVALIDATION_CHANNEL,
                           ws_server = %ws_server, publish_legacy = publish_legacy,
@@ -450,7 +450,7 @@ pub(crate) fn merge_unique(dest: &mut Vec<String>, extra: impl IntoIterator<Item
 /// - Phase 2 (read): pipeline SMEMBERS for key_pdeps + key_deps reverse lookups
 /// - Phase 3 (write): pipeline all DEL + SREM + broadcast in one round-trip
 async fn handle_invalidation(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: &mut (impl redis::aio::ConnectionLike + Send),
     cache_name: &str,
     key_values: &[String],
     prefix: &str,

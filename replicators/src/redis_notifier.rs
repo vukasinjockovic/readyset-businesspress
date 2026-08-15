@@ -114,7 +114,7 @@ fn get_or_init_row_tx() -> &'static mpsc::UnboundedSender<RowChangeMsg> {
                 }
             };
 
-            let mut conn = match client.get_multiplexed_async_connection().await {
+            let mut conn = match readyset_util::redis_conn::reconnecting(&client).await {
                 Ok(c) => {
                     info!(url = %redis_url, channel = ROW_CHANGES_CHANNEL,
                           ws_server = %ws_server, publish_legacy = publish_legacy,
@@ -250,7 +250,7 @@ fn get_or_init_row_tx() -> &'static mpsc::UnboundedSender<RowChangeMsg> {
 /// - key_row_deps are overwritten on each MISS re-registration
 /// - Worker recycling (--max-requests) prevents unbounded accumulation
 async fn handle_row_invalidation(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: &mut (impl redis::aio::ConnectionLike + Send),
     row_key: &str,
     prefix: &str,
     ws_server: &str,
@@ -467,7 +467,7 @@ fn get_or_init_table_tx() -> &'static mpsc::UnboundedSender<TableChangeMsg> {
                 }
             };
 
-            let mut conn = match client.get_multiplexed_async_connection().await {
+            let mut conn = match readyset_util::redis_conn::reconnecting(&client).await {
                 Ok(c) => {
                     info!(url = %redis_url, ws_server = %ws_server,
                           "Redis table change notifier connected (Tier 3 — declared deps)");
@@ -533,7 +533,7 @@ fn get_or_init_table_tx() -> &'static mpsc::UnboundedSender<TableChangeMsg> {
 /// Same policy as Tiers 1/2: cache VALUES are deleted, dep mappings persist
 /// (see handle_row_invalidation for the re-registration race rationale).
 async fn handle_table_invalidation(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: &mut (impl redis::aio::ConnectionLike + Send),
     table: &str,
     qualified: &str,
     prefix: &str,
@@ -804,7 +804,7 @@ fn get_or_init_lsn_tx() -> &'static mpsc::UnboundedSender<u64> {
                     return;
                 }
             };
-            let mut conn = match client.get_multiplexed_async_connection().await {
+            let mut conn = match readyset_util::redis_conn::reconnecting(&client).await {
                 Ok(c) => c,
                 Err(e) => {
                     error!(%e, "Failed to connect to Redis for rs:lsn writer");
@@ -1003,7 +1003,7 @@ async fn run_startup_twin_flush() -> Result<(), redis::RedisError> {
 
 /// Full incremental SCAN (never KEYS) for a match pattern.
 async fn scan_keys(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: &mut (impl redis::aio::ConnectionLike + Send),
     pattern: &str,
 ) -> Result<Vec<String>, redis::RedisError> {
     let mut keys = Vec::new();

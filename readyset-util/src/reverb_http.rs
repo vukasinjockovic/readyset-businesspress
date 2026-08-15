@@ -199,7 +199,7 @@ pub fn add_epoch_incr(pipe: &mut redis::Pipeline, prefix: &str, auth_hash: &str)
 /// `"epoch"` field (legacy payload shape), and clients must treat the missing
 /// field as uncomparable — never as 0. Locked by the fixture's epoch-null case.
 pub async fn incr_epochs(
-    conn: &mut redis::aio::MultiplexedConnection,
+    conn: &mut (impl redis::aio::ConnectionLike + Send),
     prefix: &str,
     grouped: &HashMap<String, Vec<String>>,
 ) -> HashMap<String, u64> {

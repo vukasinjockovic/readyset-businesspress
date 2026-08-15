@@ -230,7 +230,7 @@ querystring = "1.1.0"
 quote = "1.0.36"
 rand = "0.10.1"
 rayon = "1.11"
-redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+redis = { version = "0.27", features = ["tokio-comp", "aio", "connection-manager"] }
 rand_distr = "0.6"
 rand_regex = "0.19.0"
 regex = "1.10.4"
