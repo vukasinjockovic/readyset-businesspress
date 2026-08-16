@@ -111,7 +111,14 @@ pub fn extract_auth_hash(key: &str) -> Option<String> {
         // Predicate deps (INSERT-phantom narrowing): rs:pred_deps:{schema}.
         // {table}:{column}:{value} -> cache keys, rs:pred_cols:{schema}.{table}
         // -> advertised columns, plus the PHP-side reverse mappings.
-        | "pred_deps" | "pred_cols" | "key_pred_deps" | "cache_pred_deps" => None,
+        | "pred_deps" | "pred_cols" | "key_pred_deps" | "cache_pred_deps"
+        // Twin/engine plumbing: hydration twins + reverse indexes, twin-mode
+        // flags, Tier-1 liveness/admission registries, access-version
+        // counters, engine WAL position, epoch counters, the app_settings
+        // ingredient map, and daily metric counters.
+        | "hyd" | "hyd_idx" | "hyd_deps" | "twin_on" | "twin_off" | "t1_live"
+        | "t1_echo" | "t1_suspect" | "t1_seen" | "accessver" | "lsn" | "epoch"
+        | "ing" | "metric" => None,
         // withDeps value keys (rs:{cacheName}:{paramHash}) — shared channel
         _ => Some("anon".to_string()),
     }

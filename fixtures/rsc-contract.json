@@ -438,6 +438,90 @@
             "note": "bookkeeping"
         },
         {
+            "key": "rs:hyd:gql_dashboard_abc:not_sent|0",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (engine-hydrated twin value key, never a broadcast target)"
+        },
+        {
+            "key": "rs:hyd_idx:gql_dashboard_abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (per-cache index of hydrated twin param keys)"
+        },
+        {
+            "key": "rs:hyd_deps:gql_dashboard_abc:_",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (deps snapshot for a hydrated twin)"
+        },
+        {
+            "key": "rs:twin_on:gql_dashboard_abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (twin-mode promotion flag)"
+        },
+        {
+            "key": "rs:twin_off:gql_dashboard_abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (operator demotion block)"
+        },
+        {
+            "key": "rs:t1_live:gql_dashboard_abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (Tier-1 delta-liveness registry)"
+        },
+        {
+            "key": "rs:t1_echo:gql_dashboard_abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (engine identity-echo arity sample)"
+        },
+        {
+            "key": "rs:t1_suspect:gql_dashboard_abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (admission-gate zombie-suspect mark)"
+        },
+        {
+            "key": "rs:t1_seen:gql_dashboard_abc",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (legacy Tier-1 audit key)"
+        },
+        {
+            "key": "rs:accessver:42",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (per-user access-version counter)"
+        },
+        {
+            "key": "rs:lsn:aux",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (engine WAL position; the live key is bare rs:lsn)"
+        },
+        {
+            "key": "rs:epoch:anon",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (delivery epoch counter; embeds a channel suffix but is never a broadcast target)"
+        },
+        {
+            "key": "rs:ing:app_settings:ids",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (app_settings ingredient id map)"
+        },
+        {
+            "key": "rs:metric:token_bypass:20260816",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (daily metric counter)"
+        },
+        {
             "key": "not_rs:gql:x:y:z",
             "expected_auth_hash": null,
             "expected_channel": null,
