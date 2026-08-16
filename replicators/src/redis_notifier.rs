@@ -9,6 +9,12 @@
 //!    - Reverb HTTP batch API (default, READYSET_WEBSOCKET_SERVER=reverb)
 //!    - Centrifugo Redis XADD (READYSET_WEBSOCKET_SERVER=centrifugo)
 //! 5. Optionally publishes to legacy Redis PUBLISH channel (READYSET_PUBLISH_LEGACY=true)
+//!
+//! Tier 3 (table-level declared deps, `rs:deps:{table}`) fires on INSERT to
+//! catch phantoms Tier 2 structurally cannot see, and predicate deps
+//! (`rs:pred_deps:{schema}.{table}:{column}:{value}`, flag READYSET_PRED_DEPS)
+//! narrow that same phantom case from whole-table to only the envelopes whose
+//! scanned FK predicates match the inserted row.
 
 use std::collections::HashMap;
 use std::env;
@@ -273,37 +279,63 @@ async fn handle_row_invalidation(
 
     debug!(row_key, keys = dependent_keys.len(), "Tier 2: invalidating dependent keys");
 
-    // --- Write pipeline: DEL cache keys + broadcast (no dep cleanup) ---
+    invalidate_dependent_keys(
+        conn,
+        &dependent_keys,
+        prefix,
+        ws_server,
+        centrifugo_stream,
+        reverb_config,
+        http_client,
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Build the shared invalidation WRITE pipeline.
+///
+/// Extracted verbatim from the (previously duplicated) Tier-2 and Tier-3 write
+/// phases so all invalidation sources — row deps, declared table deps and
+/// predicate deps — emit byte-identical command shapes. Pure (no I/O) so the
+/// packed RESP bytes are unit-testable.
+///
+/// Queue order is a contract, not an implementation detail:
+/// 1. `SET {prefix}rs:reval:{key} 1 PX {ttl}` per key. The PHP MISS path checks
+///    rs:reval:{key} and, when present, routes the rebuild's reads to the direct
+///    Postgres write connection instead of ReadySet — closing the window where a
+///    refetch races the dataflow's replication lag and re-caches pre-change data.
+///    TTL = READYSET_REVAL_TTL_MS (default 3000ms): well above replication lag
+///    (measured max 16.9ms), well below cache TTL.
+/// 2. ONE `DEL` covering every dependent cache key AND its stale-while-
+///    revalidate twin (`{key}:stale`, kept by PHP at ~3x TTL). SWR exists to
+///    smooth TTL expiry, not to serve known-stale data: without the twin DEL,
+///    concurrent clients could be served pre-change data from `:stale` for up to
+///    the extended TTL when the rebuild fails.
+/// 3. Centrifugo `XADD` per authHash channel — only when ws_server is centrifugo.
+///
+/// Phase 5B ORDER CONTRACT: markers BEFORE the DELs, so marker visibility >=
+/// deletion visibility for every concurrent observer (the PHP post-store guard
+/// and the GET-nil/EXISTS MISS path both rely on it).
+fn build_invalidation_pipe(
+    prefix: &str,
+    dependent_keys: &[String],
+    ws_server: &str,
+    centrifugo_stream: &str,
+    grouped: &HashMap<String, Vec<String>>,
+    reval_ttl: u64,
+) -> redis::Pipeline {
     let mut write_pipe = redis::pipe();
 
-    // 2a. Revalidation markers: the PHP MISS path checks rs:reval:{key} and,
-    // when present, routes the rebuild's reads to the direct Postgres write
-    // connection instead of ReadySet — closing the window where a refetch
-    // races the dataflow's replication lag and re-caches pre-change data.
-    // TTL = READYSET_REVAL_TTL_MS (default 3000ms): well above replication
-    // lag (measured max 16.9ms), well below cache TTL.
-    //
-    // Phase 5B ORDER CONTRACT: markers BEFORE the DELs, so marker visibility
-    // >= deletion visibility for every concurrent observer (the PHP
-    // post-store guard and the GET-nil/EXISTS MISS path both rely on it).
-    let reval_ttl = reval_ttl_ms();
-    for k in &dependent_keys {
+    for k in dependent_keys {
         add_reval_marker(&mut write_pipe, prefix, k, reval_ttl);
     }
 
-    // 2b. DEL all dependent cache keys (with prefix), PLUS their
-    // stale-while-revalidate twins ("{key}:stale", kept by PHP at ~3x TTL).
-    // SWR exists to smooth TTL expiry, not to serve known-stale data: without
-    // this, concurrent clients could be served pre-change data from :stale
-    // for up to the extended TTL if the rebuild fails.
-    let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
+    let prefixed_keys = reverb_http::expand_keys_for_del(prefix, dependent_keys);
     write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
 
-    // 2c. Centrifugo XADD (only when ws_server is centrifugo)
-    let grouped = group_by_auth_hash(&dependent_keys);
-
     if ws_server == "centrifugo" {
-        for (auth_hash, keys) in &grouped {
+        for (auth_hash, keys) in grouped {
             let channel = if auth_hash == "anon" {
                 "rsc:anon".to_string()
             } else {
@@ -327,26 +359,56 @@ async fn handle_row_invalidation(
                 .arg(payload.to_string())
                 .ignore();
 
-            debug!(channel, key_count = keys.len(), "Tier 2: published to Centrifugo");
+            debug!(channel, key_count = keys.len(), "Published invalidation batch to Centrifugo");
         }
     }
+
+    write_pipe
+}
+
+/// Execute the shared invalidation write phase for a resolved set of dependent
+/// cache keys: reval markers + DEL (+ optional Centrifugo XADD) in ONE
+/// round-trip, then the Reverb epoch INCR and HTTP broadcast.
+///
+/// The Reverb epoch INCR is executed AND awaited before the HTTP POST: the
+/// counter must be visible to any Redis reader before a WebSocket client can
+/// receive the event carrying that epoch. After the DEL pipeline —
+/// marker-before-DEL untouched.
+///
+/// Shared by Tier 2 (row deps), Tier 3 (declared table deps) and predicate deps.
+async fn invalidate_dependent_keys(
+    conn: &mut (impl redis::aio::ConnectionLike + Send),
+    dependent_keys: &[String],
+    prefix: &str,
+    ws_server: &str,
+    centrifugo_stream: &str,
+    reverb_config: Option<&ReverbConfig>,
+    http_client: Option<&reqwest::Client>,
+) {
+    if dependent_keys.is_empty() {
+        return;
+    }
+
+    let grouped = group_by_auth_hash(dependent_keys);
+
+    let write_pipe = build_invalidation_pipe(
+        prefix,
+        dependent_keys,
+        ws_server,
+        centrifugo_stream,
+        &grouped,
+        reval_ttl_ms(),
+    );
 
     // Execute all writes in one round-trip
     write_pipe.query_async::<()>(conn).await.ok();
 
-    // 2d. Reverb HTTP broadcast (after Redis writes complete)
     if ws_server == "reverb" {
         if let (Some(cfg), Some(client)) = (reverb_config, http_client) {
-            // Per-channel broadcast epochs: INCR rs:epoch:{authHash} once per
-            // channel for this delivered batch, executed and AWAITED before
-            // the HTTP POST (INCR visible before any client can receive the
-            // event). After the DEL pipeline — marker-before-DEL untouched.
             let epochs = reverb_http::incr_epochs(conn, prefix, &grouped).await;
             reverb_http::broadcast_to_reverb(cfg, client, &grouped, &epochs).await;
         }
     }
-
-    Ok(())
 }
 
 /// WAL ops for which Tier 3 (table-level declared deps) fires.
@@ -561,60 +623,16 @@ async fn handle_table_invalidation(
 
     debug!(table = %qualified, keys = dependent_keys.len(), "Tier 3: invalidating declared-dep keys");
 
-    let mut write_pipe = redis::pipe();
-    // Revalidation markers (rs:reval:{key}, TTL READYSET_REVAL_TTL_MS,
-    // default 3000ms): tell the PHP MISS path to rebuild from the direct
-    // Postgres connection instead of ReadySet, closing the replication-lag
-    // re-cache race — see handle_row_invalidation.
-    // Phase 5B order contract: markers BEFORE the DELs (see 2a there).
-    let reval_ttl = reval_ttl_ms();
-    for k in &dependent_keys {
-        add_reval_marker(&mut write_pipe, prefix, k, reval_ttl);
-    }
-
-    // DEL values AND their ":stale" SWR twins — see handle_row_invalidation.
-    let prefixed_keys = reverb_http::expand_keys_for_del(prefix, &dependent_keys);
-    write_pipe.cmd("DEL").arg(&prefixed_keys).ignore();
-
-    let grouped = group_by_auth_hash(&dependent_keys);
-
-    if ws_server == "centrifugo" {
-        for (auth_hash, keys) in &grouped {
-            let channel = if auth_hash == "anon" {
-                "rsc:anon".to_string()
-            } else {
-                format!("rsc:{}", auth_hash)
-            };
-
-            let payload = serde_json::json!({
-                "channel": channel,
-                "data": { "keys": keys }
-            });
-
-            write_pipe.cmd("XADD")
-                .arg(centrifugo_stream)
-                .arg("MAXLEN")
-                .arg("~")
-                .arg("10000")
-                .arg("*")
-                .arg("method")
-                .arg("publish")
-                .arg("payload")
-                .arg(payload.to_string())
-                .ignore();
-        }
-    }
-
-    write_pipe.query_async::<()>(conn).await.ok();
-
-    if ws_server == "reverb" {
-        if let (Some(cfg), Some(client)) = (reverb_config, http_client) {
-            // Per-channel broadcast epochs — INCR awaited before the POST
-            // (see handle_row_invalidation 2d for the ordering contract).
-            let epochs = reverb_http::incr_epochs(conn, prefix, &grouped).await;
-            reverb_http::broadcast_to_reverb(cfg, client, &grouped, &epochs).await;
-        }
-    }
+    invalidate_dependent_keys(
+        conn,
+        &dependent_keys,
+        prefix,
+        ws_server,
+        centrifugo_stream,
+        reverb_config,
+        http_client,
+    )
+    .await;
 
     Ok(())
 }
@@ -626,6 +644,480 @@ pub fn notify_table_change(schema: &str, table: &str) {
     let _ = get_or_init_table_tx().send(TableChangeMsg {
         table: table.to_string(),
         qualified: format!("{}.{}", schema, table),
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Predicate deps — precise INSERT-phantom invalidation
+// ---------------------------------------------------------------------------
+//
+// THE GAP. Tier 2 (rs:row_deps:{schema}.{table}:{pk}) is precise but blind to
+// INSERTs: a brand-new row has no dep registered against it, because nothing
+// has ever rendered it. Tier 3 catches the phantom, but at whole-table
+// granularity — one attach on a join table flushes every declared listing
+// cache for every user.
+//
+// THE FIX. PHP knows the FK predicates each cached envelope actually scanned
+// (e.g. `subject_id IN (...)`) and registers them:
+//
+//     rs:pred_deps:{schema}.{table}:{column}:{value} -> SET of cache keys
+//
+// plus, per table, the set of columns worth looking at:
+//
+//     rs:pred_cols:{schema}.{table} -> SET of column names
+//
+// On a WAL INSERT we read the new row's values for the advertised columns and
+// invalidate only the cache keys registered against those exact (column, value)
+// pairs. An attach then invalidates only the envelopes that displayed that
+// parent.
+//
+// STALENESS IS FAIL-SAFE. The advertised-column map is a periodically refreshed
+// snapshot; an unknown table or a not-yet-seen column simply means "no lookup",
+// i.e. the pre-feature status quo (Tier 3 still fires). It can never
+// over-invalidate or serve stale data on its own.
+//
+// FLAG-GATED. READYSET_PRED_DEPS, default OFF. When off, `notify_pred_change`
+// returns after one atomic load and the poll task never starts.
+
+/// READYSET_PRED_DEPS gate. Parsed once on the first INSERT.
+static PRED_DEPS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn pred_deps_enabled() -> bool {
+    *PRED_DEPS_ENABLED.get_or_init(|| {
+        let enabled = parse_pred_deps_enabled(env::var("READYSET_PRED_DEPS").ok().as_deref());
+        info!(enabled, "Predicate deps (precise INSERT-phantom invalidation)");
+        enabled
+    })
+}
+
+/// Parse READYSET_PRED_DEPS. OFF unless explicitly "1" or "true"
+/// (case-insensitive, whitespace-tolerant). Deliberately narrower than the
+/// usual truthy zoo: a hot-path WAL hook must not switch on because someone
+/// wrote "yes".
+fn parse_pred_deps_enabled(raw: Option<&str>) -> bool {
+    match raw {
+        None => false,
+        Some(s) => {
+            let s = s.trim();
+            s == "1" || s.eq_ignore_ascii_case("true")
+        }
+    }
+}
+
+/// Parse READYSET_PRED_COLS_POLL_MS (advertised-column refresh interval).
+/// Unset/garbage -> 30s; floored at 1s so a typo cannot turn the poller into a
+/// SCAN hot loop.
+fn parse_pred_cols_poll_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(30_000)
+        .max(1_000)
+}
+
+/// Snapshot of `rs:pred_cols:*`: qualified table -> advertised column names.
+/// Replaced WHOLESALE by the poll task (never mutated in place), so a reader
+/// either sees the previous complete snapshot or the next one.
+static PRED_COLS: OnceLock<std::sync::Mutex<HashMap<String, std::sync::Arc<[String]>>>> =
+    OnceLock::new();
+
+fn pred_cols_map() -> &'static std::sync::Mutex<HashMap<String, std::sync::Arc<[String]>>> {
+    PRED_COLS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Recover the qualified table name from a `{prefix}rs:pred_cols:{qualified}`
+/// key. Returns None for anything that is not such a key (the SCAN pattern is
+/// authoritative, but a mis-parse would poison the advertised-column map).
+fn pred_cols_table_from_key(prefix: &str, key: &str) -> Option<String> {
+    let rest = key.strip_prefix(prefix)?.strip_prefix("rs:pred_cols:")?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// Refresh the advertised-column snapshot: SCAN for `rs:pred_cols:*`, one
+/// pipelined SMEMBERS batch for all of them, then swap the map. Returns the
+/// number of tables in the new snapshot.
+async fn refresh_pred_cols(
+    conn: &mut (impl redis::aio::ConnectionLike + Send),
+    prefix: &str,
+) -> Result<usize, redis::RedisError> {
+    let keys = scan_keys(conn, &format!("{}rs:pred_cols:*", prefix)).await?;
+
+    let mut snapshot: HashMap<String, std::sync::Arc<[String]>> = HashMap::new();
+
+    if !keys.is_empty() {
+        let mut read_pipe = redis::pipe();
+        for k in &keys {
+            read_pipe.cmd("SMEMBERS").arg(k);
+        }
+        let results: Vec<Vec<String>> = read_pipe.query_async(conn).await?;
+
+        for (key, cols) in keys.iter().zip(results) {
+            if cols.is_empty() {
+                continue;
+            }
+            if let Some(table) = pred_cols_table_from_key(prefix, key) {
+                snapshot.insert(table, cols.into());
+            }
+        }
+    }
+
+    let n = snapshot.len();
+    if let Ok(mut guard) = pred_cols_map().lock() {
+        *guard = snapshot;
+    }
+    Ok(n)
+}
+
+/// Start the advertised-column poll task exactly once (only ever reached with
+/// the flag on). Refreshes immediately, then every
+/// READYSET_PRED_COLS_POLL_MS.
+fn ensure_pred_cols_poller() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        tokio::spawn(async move {
+            let redis_url = env::var("READYSET_REDIS_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+            let prefix = env::var("READYSET_REDIS_PREFIX").unwrap_or_default();
+            let poll_ms =
+                parse_pred_cols_poll_ms(env::var("READYSET_PRED_COLS_POLL_MS").ok().as_deref());
+
+            let client = match redis::Client::open(redis_url.as_str()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(%e, "Failed to create Redis client for rs:pred_cols poller — predicate deps stay dark");
+                    return;
+                }
+            };
+            let mut conn = match readyset_util::redis_conn::reconnecting(&client).await {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(%e, "Failed to connect to Redis for rs:pred_cols poller — predicate deps stay dark");
+                    return;
+                }
+            };
+
+            info!(poll_ms, "rs:pred_cols poller started (advertised predicate columns)");
+
+            let mut last_count = usize::MAX;
+            loop {
+                match refresh_pred_cols(&mut conn, &prefix).await {
+                    Ok(n) => {
+                        if n != last_count {
+                            info!(tables = n, "Predicate deps: advertised-column snapshot refreshed");
+                            last_count = n;
+                        } else {
+                            debug!(tables = n, "Predicate deps: advertised-column snapshot refreshed");
+                        }
+                    }
+                    Err(e) => {
+                        // Fail-safe: keep the previous snapshot. Worst case is
+                        // the pre-feature status quo.
+                        warn!(%e, "Predicate deps: rs:pred_cols refresh failed, keeping previous snapshot");
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+            }
+        });
+    });
+}
+
+/// Message type for the predicate-dep notifier: one INSERT's worth of
+/// (column, value) pairs for the columns its table advertised.
+struct PredChangeMsg {
+    /// Schema-qualified table, e.g. "public.bp_term_relationships"
+    table: String,
+    /// (column, Display-encoded value) pairs
+    pairs: Vec<(String, String)>,
+}
+
+static PRED_CHANGE_TX: OnceLock<mpsc::UnboundedSender<PredChangeMsg>> = OnceLock::new();
+
+/// Pair the advertised columns with this row's values.
+///
+/// `columns[i]` names `tuple[i]` (alignment guaranteed by the WAL Relation
+/// mapping — see `Relation::col_names`). NULLs are skipped: `DfValue::None`
+/// Displays as the literal "NULL", which PHP never registers as a predicate
+/// value, and treating it as one would conflate NULL with the text 'NULL'.
+fn build_pred_pairs(
+    advertised: &[String],
+    columns: &[String],
+    tuple: &[readyset_data::DfValue],
+) -> Vec<(String, String)> {
+    if advertised.is_empty() {
+        return Vec::new();
+    }
+
+    let mut pairs = Vec::with_capacity(advertised.len());
+    for (i, col) in columns.iter().enumerate() {
+        if i >= tuple.len() {
+            break;
+        }
+        if matches!(tuple[i], readyset_data::DfValue::None) {
+            continue;
+        }
+        if advertised.iter().any(|a| a == col) {
+            // Same Display encoding the Tier-2 pk path uses, which is what PHP
+            // registers (bare uuid/text/int, no quoting).
+            pairs.push((col.clone(), format!("{}", tuple[i])));
+        }
+    }
+    pairs
+}
+
+/// The Redis key PHP registers cache keys under for a predicate:
+/// `{prefix}rs:pred_deps:{schema}.{table}:{column}:{value}`.
+fn pred_lookup_key(prefix: &str, table: &str, col: &str, value: &str) -> String {
+    format!("{}rs:pred_deps:{}:{}:{}", prefix, table, col, value)
+}
+
+/// Collapse a whole debounce window into ONE dedup'd list of lookup keys.
+///
+/// Tier-1 merge semantics, deliberately NOT Tier-2's per-message sequential
+/// loop: M inserts in a window become one pipelined SMEMBERS batch (O(1-2)
+/// round trips) instead of M. First-seen order is preserved so the batch is
+/// deterministic and testable.
+fn merge_pred_lookup_keys(prefix: &str, msgs: &[PredChangeMsg]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for msg in msgs {
+        for (col, value) in &msg.pairs {
+            let key = pred_lookup_key(prefix, &msg.table, col, value);
+            if seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// One pipelined SMEMBERS per merged lookup key — the whole read phase for a
+/// debounce window in a single round trip.
+fn build_pred_smembers_pipe(lookup_keys: &[String]) -> redis::Pipeline {
+    let mut pipe = redis::pipe();
+    for k in lookup_keys {
+        pipe.cmd("SMEMBERS").arg(k);
+    }
+    pipe
+}
+
+fn get_or_init_pred_tx() -> &'static mpsc::UnboundedSender<PredChangeMsg> {
+    PRED_CHANGE_TX.get_or_init(|| {
+        let (tx, mut rx) = mpsc::unbounded_channel::<PredChangeMsg>();
+
+        tokio::spawn(async move {
+            let redis_url = env::var("READYSET_REDIS_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
+            let prefix = env::var("READYSET_REDIS_PREFIX").unwrap_or_default();
+            let ws_server = env::var("READYSET_WEBSOCKET_SERVER")
+                .unwrap_or_else(|_| "centrifugo".to_string());
+            let centrifugo_stream = env::var("READYSET_CENTRIFUGO_STREAM")
+                .unwrap_or_else(|_| "centrifugo:rsc".to_string());
+            let debounce_ms: u64 = env::var("READYSET_DEBOUNCE_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+
+            let reverb_config = if ws_server == "reverb" {
+                ReverbConfig::from_env()
+            } else {
+                None
+            };
+            let http_client = reverb_config.as_ref().map(|_| {
+                reqwest::Client::builder()
+                    .timeout(Duration::from_millis(500))
+                    .build()
+                    .expect("Failed to build HTTP client for Reverb")
+            });
+
+            let client = match redis::Client::open(redis_url.as_str()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(%e, "Failed to create Redis client for predicate dep notifier");
+                    while rx.recv().await.is_some() {}
+                    return;
+                }
+            };
+
+            let mut conn = match readyset_util::redis_conn::reconnecting(&client).await {
+                Ok(c) => {
+                    info!(url = %redis_url, ws_server = %ws_server,
+                          "Redis predicate dep notifier connected (precise INSERT phantoms)");
+                    c
+                }
+                Err(e) => {
+                    error!(%e, "Failed to connect to Redis for predicate dep notifier");
+                    while rx.recv().await.is_some() {}
+                    return;
+                }
+            };
+
+            // Predicate events arrive once per advertised INSERT, so the
+            // debounce window carries real weight: a bulk attach of M rows to
+            // one parent collapses to a single lookup key.
+            let debounce_duration = Duration::from_millis(debounce_ms.max(10));
+
+            loop {
+                let first = match rx.recv().await {
+                    Some(msg) => msg,
+                    None => break,
+                };
+
+                let mut batch = vec![first];
+
+                let deadline = tokio::time::Instant::now() + debounce_duration;
+                loop {
+                    match tokio::time::timeout_at(deadline, rx.recv()).await {
+                        Ok(Some(msg)) => batch.push(msg),
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+
+                if let Err(e) = handle_pred_invalidation(
+                    &mut conn,
+                    &batch,
+                    &prefix,
+                    &ws_server,
+                    &centrifugo_stream,
+                    reverb_config.as_ref(),
+                    http_client.as_ref(),
+                )
+                .await
+                {
+                    warn!(%e, batch = batch.len(), "Predicate deps: invalidation failed");
+                }
+            }
+        });
+
+        tx
+    })
+}
+
+/// Handle one debounce window's worth of predicate changes.
+///
+/// Merge -> ONE pipelined SMEMBERS batch -> union/dedup of the returned cache
+/// keys -> ONE shared write phase. Same policy as Tiers 1/2/3: cache VALUES are
+/// deleted, the `rs:pred_deps:*` mappings persist (they are PHP-owned,
+/// self-healing, and re-registered on the next MISS — see
+/// handle_row_invalidation for the re-registration race rationale).
+async fn handle_pred_invalidation(
+    conn: &mut (impl redis::aio::ConnectionLike + Send),
+    batch: &[PredChangeMsg],
+    prefix: &str,
+    ws_server: &str,
+    centrifugo_stream: &str,
+    reverb_config: Option<&ReverbConfig>,
+    http_client: Option<&reqwest::Client>,
+) -> Result<(), redis::RedisError> {
+    let lookup_keys = merge_pred_lookup_keys(prefix, batch);
+    if lookup_keys.is_empty() {
+        return Ok(());
+    }
+
+    debug!(
+        batch = batch.len(),
+        lookups = lookup_keys.len(),
+        "Predicate deps: resolving merged predicate lookups"
+    );
+
+    let member_sets: Vec<Vec<String>> = build_pred_smembers_pipe(&lookup_keys)
+        .query_async(conn)
+        .await
+        .unwrap_or_default();
+
+    // Union + dedup: one parent may back many envelopes, and one envelope may
+    // be registered under several predicates in the same window.
+    let mut dependent_keys: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for members in member_sets {
+        for k in members {
+            if seen.insert(k.clone()) {
+                dependent_keys.push(k);
+            }
+        }
+    }
+
+    if dependent_keys.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        batch = batch.len(),
+        lookups = lookup_keys.len(),
+        keys = dependent_keys.len(),
+        "Predicate deps: invalidating envelopes matching inserted rows"
+    );
+
+    invalidate_dependent_keys(
+        conn,
+        &dependent_keys,
+        prefix,
+        ws_server,
+        centrifugo_stream,
+        reverb_config,
+        http_client,
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Notify that a row was INSERTed, for precise predicate-dep invalidation.
+///
+/// Called from the Postgres connector's Insert arm alongside
+/// `notify_row_change` — the column names and full tuple only exist there.
+///
+/// Hot path, so the bail-outs come first and in cost order: flag (one atomic
+/// load), empty snapshot (one mutex lock), unknown table (one hash miss). Only
+/// a table that PHP has explicitly advertised ever allocates.
+pub fn notify_pred_change(
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    tuple: &[readyset_data::DfValue],
+) {
+    if !pred_deps_enabled() {
+        return;
+    }
+
+    // Started here rather than on first send: the send path is gated on a map
+    // hit, so a poller started from the sender would never run.
+    ensure_pred_cols_poller();
+
+    let qualified;
+    let advertised = {
+        let Ok(guard) = pred_cols_map().lock() else {
+            return;
+        };
+        if guard.is_empty() {
+            // No table advertises predicate columns (or the first poll has not
+            // landed yet) — bail before allocating the qualified name.
+            return;
+        }
+        qualified = format!("{}.{}", schema, table);
+        match guard.get(&qualified) {
+            Some(cols) => std::sync::Arc::clone(cols),
+            None => return,
+        }
+    };
+
+    let pairs = build_pred_pairs(&advertised, columns, tuple);
+    if pairs.is_empty() {
+        return;
+    }
+
+    debug!(
+        table = %qualified,
+        pairs = pairs.len(),
+        "Predicate deps: queued INSERT predicates"
+    );
+
+    let _ = get_or_init_pred_tx().send(PredChangeMsg {
+        table: qualified,
+        pairs,
     });
 }
 
@@ -1159,6 +1651,237 @@ mod tests {
         assert_eq!(hb.publishable(t0 + hold), None, "<= adopted watermark stays unpublished");
         hb.observe(600, t0 + hold);
         assert_eq!(hb.publishable(t0 + hold + hold), Some(600));
+    }
+
+    // -----------------------------------------------------------------------
+    // Predicate deps (INSERT-phantom narrowing)
+    // -----------------------------------------------------------------------
+
+    /// READYSET_PRED_DEPS gating: OFF unless explicitly set to "1"/"true"
+    /// (case-insensitive, whitespace-tolerant). Anything else — including
+    /// "yes", "on" and garbage — leaves the feature dark, because a
+    /// half-understood truthy value must not silently enable a hot-path hook.
+    #[test]
+    fn test_pred_deps_flag_defaults_off_and_parses_truthy() {
+        assert!(!parse_pred_deps_enabled(None));
+        assert!(parse_pred_deps_enabled(Some("1")));
+        assert!(parse_pred_deps_enabled(Some("true")));
+        assert!(parse_pred_deps_enabled(Some("TRUE")));
+        assert!(parse_pred_deps_enabled(Some("True")));
+        assert!(parse_pred_deps_enabled(Some(" true ")));
+        assert!(!parse_pred_deps_enabled(Some("0")));
+        assert!(!parse_pred_deps_enabled(Some("false")));
+        assert!(!parse_pred_deps_enabled(Some("")));
+        assert!(!parse_pred_deps_enabled(Some("yes")));
+        assert!(!parse_pred_deps_enabled(Some("on")));
+    }
+
+    /// The lookup key PHP registers under. Exact shape is a cross-layer
+    /// contract: `{prefix}rs:pred_deps:{schema}.{table}:{column}:{value}`.
+    #[test]
+    fn test_pred_lookup_key_format_is_exact() {
+        assert_eq!(
+            pred_lookup_key(
+                "",
+                "public.bp_term_relationships",
+                "subject_id",
+                "0198e0d2-6a1f-7000-8000-1c2f3b4a5d6e"
+            ),
+            "rs:pred_deps:public.bp_term_relationships:subject_id:0198e0d2-6a1f-7000-8000-1c2f3b4a5d6e"
+        );
+        // Deployment prefix rides in front of the whole key, as everywhere else.
+        assert_eq!(
+            pred_lookup_key("gz:", "public.bp_posts", "author_id", "42"),
+            "gz:rs:pred_deps:public.bp_posts:author_id:42"
+        );
+    }
+
+    /// Poll interval: unset/garbage -> 30s, floored at 1s so a typo cannot
+    /// turn the advertised-column poller into a SCAN hot loop.
+    #[test]
+    fn test_pred_cols_poll_ms_default_and_floor() {
+        assert_eq!(parse_pred_cols_poll_ms(None), 30_000);
+        assert_eq!(parse_pred_cols_poll_ms(Some("5000")), 5_000);
+        assert_eq!(parse_pred_cols_poll_ms(Some(" 60000 ")), 60_000);
+        assert_eq!(parse_pred_cols_poll_ms(Some("abc")), 30_000);
+        assert_eq!(parse_pred_cols_poll_ms(Some("0")), 30_000);
+        assert_eq!(parse_pred_cols_poll_ms(Some("10")), 1_000, "floored");
+    }
+
+    /// Advertised columns select which (column, value) pairs leave the hot
+    /// path. Positional alignment with the tuple must be honoured, unadvertised
+    /// columns dropped, NULLs skipped (DfValue::None Displays as the literal
+    /// "NULL", which PHP never registers as a predicate value), and
+    /// out-of-range advertised columns must not panic.
+    #[test]
+    fn test_build_pred_pairs_selects_advertised_columns_only() {
+        use readyset_data::DfValue;
+
+        let columns: Vec<String> = ["id", "subject_id", "term_id", "note"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let tuple = vec![
+            DfValue::from("row-uuid"),
+            DfValue::from("subject-uuid"),
+            DfValue::from(7i64),
+            DfValue::None,
+        ];
+
+        let advertised: Vec<String> = ["subject_id", "term_id", "note", "missing_col"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(
+            build_pred_pairs(&advertised, &columns, &tuple),
+            vec![
+                ("subject_id".to_string(), "subject-uuid".to_string()),
+                ("term_id".to_string(), "7".to_string()),
+            ]
+        );
+
+        // Nothing advertised for this table -> no pairs, no allocation churn.
+        assert!(build_pred_pairs(&[], &columns, &tuple).is_empty());
+
+        // Short tuple (defensive: mapping/tuple arity mismatch upstream) must
+        // not index out of bounds.
+        let short = vec![DfValue::from("row-uuid")];
+        assert!(build_pred_pairs(&advertised, &columns, &short).is_empty());
+    }
+
+    /// A debounce window merges EVERY message into ONE dedup'd lookup-key set
+    /// (Tier-1 merge semantics, not Tier-2's per-key sequential loop): M
+    /// inserts touching the same parent collapse to a single SMEMBERS.
+    #[test]
+    fn test_merge_pred_lookup_keys_dedups_across_messages() {
+        let msgs = vec![
+            PredChangeMsg {
+                table: "public.bp_term_relationships".to_string(),
+                pairs: vec![
+                    ("subject_id".to_string(), "aaa".to_string()),
+                    ("term_id".to_string(), "7".to_string()),
+                ],
+            },
+            // Same parent attached again in the same window — must not duplicate.
+            PredChangeMsg {
+                table: "public.bp_term_relationships".to_string(),
+                pairs: vec![("subject_id".to_string(), "aaa".to_string())],
+            },
+            // Different value on the same column — distinct lookup.
+            PredChangeMsg {
+                table: "public.bp_term_relationships".to_string(),
+                pairs: vec![("subject_id".to_string(), "bbb".to_string())],
+            },
+            // Different table, same column/value — distinct lookup.
+            PredChangeMsg {
+                table: "public.bp_comments".to_string(),
+                pairs: vec![("subject_id".to_string(), "aaa".to_string())],
+            },
+        ];
+
+        let keys = merge_pred_lookup_keys("gz:", &msgs);
+        assert_eq!(
+            keys,
+            vec![
+                "gz:rs:pred_deps:public.bp_term_relationships:subject_id:aaa".to_string(),
+                "gz:rs:pred_deps:public.bp_term_relationships:term_id:7".to_string(),
+                "gz:rs:pred_deps:public.bp_term_relationships:subject_id:bbb".to_string(),
+                "gz:rs:pred_deps:public.bp_comments:subject_id:aaa".to_string(),
+            ],
+            "5 pairs across 4 messages must collapse to 4 unique lookups, in first-seen order"
+        );
+        assert!(merge_pred_lookup_keys("gz:", &[]).is_empty());
+    }
+
+    /// The read phase is ONE pipelined SMEMBERS batch covering every merged
+    /// lookup key — bounding a window of M inserts to O(1) read round-trips.
+    #[test]
+    fn test_pred_smembers_pipeline_batches_every_lookup_key() {
+        let keys = vec![
+            "gz:rs:pred_deps:public.bp_term_relationships:subject_id:aaa".to_string(),
+            "gz:rs:pred_deps:public.bp_term_relationships:subject_id:bbb".to_string(),
+        ];
+        let pipe = build_pred_smembers_pipe(&keys);
+        let packed = String::from_utf8_lossy(&pipe.get_packed_pipeline()).into_owned();
+
+        for k in &keys {
+            assert!(packed.contains(k.as_str()), "missing lookup key {k} in batch");
+        }
+        assert_eq!(packed.matches("SMEMBERS").count(), 2, "one SMEMBERS per unique key");
+    }
+
+    /// `rs:pred_cols:{qualified}` -> `{qualified}`, prefix stripped. Keys that
+    /// are not pred_cols keys are rejected (the SCAN pattern is authoritative,
+    /// but a mis-parse would silently poison the advertised-column map).
+    #[test]
+    fn test_pred_cols_table_from_key() {
+        assert_eq!(
+            pred_cols_table_from_key("gz:", "gz:rs:pred_cols:public.bp_term_relationships"),
+            Some("public.bp_term_relationships".to_string())
+        );
+        assert_eq!(
+            pred_cols_table_from_key("", "rs:pred_cols:public.bp_posts"),
+            Some("public.bp_posts".to_string())
+        );
+        assert_eq!(pred_cols_table_from_key("gz:", "rs:pred_cols:public.x"), None);
+        assert_eq!(pred_cols_table_from_key("", "rs:pred_deps:public.x:c:v"), None);
+        assert_eq!(pred_cols_table_from_key("", "rs:pred_cols:"), None);
+    }
+
+    /// REFACTOR PIN: the shared write phase extracted from the Tier-2 and
+    /// Tier-3 handlers must still emit, in this order, a `SET rs:reval:{key}`
+    /// marker per key and ONE `DEL` covering both the value key and its
+    /// `:stale` SWR twin. Any drift here is a live invalidation regression.
+    #[test]
+    fn test_invalidation_pipe_emits_reval_markers_then_del_with_stale_twins() {
+        let keys = vec![
+            "rs:gql:dashboard:en:anon:q1".to_string(),
+            "rs:lw:anon:Comp_x:p1".to_string(),
+        ];
+        let grouped = group_by_auth_hash(&keys);
+        let pipe = build_invalidation_pipe("gz:", &keys, "reverb", "centrifugo:rsc", &grouped, 250);
+        let packed = String::from_utf8_lossy(&pipe.get_packed_pipeline()).into_owned();
+
+        // Markers, one per key, with the configured PX TTL.
+        assert_eq!(packed.matches("rs:reval:").count(), 2);
+        assert!(packed.contains("gz:rs:reval:rs:gql:dashboard:en:anon:q1"));
+        assert!(packed.contains("gz:rs:reval:rs:lw:anon:Comp_x:p1"));
+        assert!(packed.contains("PX"));
+        assert!(packed.contains("250"));
+
+        // Value keys AND their :stale twins, in a single DEL.
+        assert_eq!(packed.matches("DEL").count(), 1);
+        assert!(packed.contains("gz:rs:gql:dashboard:en:anon:q1:stale"));
+        assert!(packed.contains("gz:rs:lw:anon:Comp_x:p1:stale"));
+
+        // Order contract (Phase 5B): every marker is queued BEFORE the DEL.
+        let del_at = packed.find("DEL").expect("DEL present");
+        assert!(
+            packed.match_indices("rs:reval:").all(|(i, _)| i < del_at),
+            "rs:reval markers must precede the DEL"
+        );
+
+        // ws_server=reverb must NOT queue a Centrifugo XADD.
+        assert!(!packed.contains("XADD"));
+    }
+
+    /// Same builder under Centrifugo: one XADD per authHash channel, appended
+    /// after the DEL — unchanged from the pre-refactor handlers.
+    #[test]
+    fn test_invalidation_pipe_adds_centrifugo_xadd_when_configured() {
+        let keys = vec!["rs:gql:dashboard:en:anon:q1".to_string()];
+        let grouped = group_by_auth_hash(&keys);
+        let pipe = build_invalidation_pipe("", &keys, "centrifugo", "centrifugo:rsc", &grouped, 3000);
+        let packed = String::from_utf8_lossy(&pipe.get_packed_pipeline()).into_owned();
+
+        assert_eq!(packed.matches("XADD").count(), 1);
+        assert!(packed.contains("centrifugo:rsc"));
+        assert!(packed.contains("rsc:anon"));
+        assert!(
+            packed.find("DEL").unwrap() < packed.find("XADD").unwrap(),
+            "XADD is queued after the DEL, as in the original handlers"
+        );
     }
 
     /// The marker command is `SET {prefix}rs:reval:{key} 1 PX {ttl_ms}` —

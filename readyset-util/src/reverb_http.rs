@@ -107,7 +107,11 @@ pub fn extract_auth_hash(key: &str) -> Option<String> {
         "deps" | "pdeps" | "row_deps" | "key_deps" | "key_pdeps" | "key_row_deps"
         | "cache_row_deps" | "tag" | "registered" | "reval" | "dep_refresh"
         | "lock" | "meta" | "cache_name" | "cache_names" | "cache_params"
-        | "kill" | "listener" | "lw_throttle" | "t1_unsupported" => None,
+        | "kill" | "listener" | "lw_throttle" | "t1_unsupported"
+        // Predicate deps (INSERT-phantom narrowing): rs:pred_deps:{schema}.
+        // {table}:{column}:{value} -> cache keys, rs:pred_cols:{schema}.{table}
+        // -> advertised columns, plus the PHP-side reverse mappings.
+        | "pred_deps" | "pred_cols" | "key_pred_deps" | "cache_pred_deps" => None,
         // withDeps value keys (rs:{cacheName}:{paramHash}) — shared channel
         _ => Some("anon".to_string()),
     }
@@ -415,6 +419,38 @@ mod tests {
         assert_eq!(extract_auth_hash("rs:row_deps:public.bp_orders:abc"), None);
         assert_eq!(extract_auth_hash("rs:tag:user:some-uuid"), None);
         assert_eq!(extract_auth_hash("rs:registered:gql_dashboard_x"), None);
+    }
+
+    /// Predicate-deps bookkeeping keys (RSC "pred deps": PHP registers the FK
+    /// predicates each cached envelope scanned, plus the per-table advertised
+    /// column list the replicator polls) are internal mappings, never
+    /// broadcast targets — without these arms the `_` fallback would classify
+    /// them as anon-broadcastable value keys, and `rs:key_pred_deps:*` even
+    /// embeds a full gql key that the `gql` arm would happily mine a hash from.
+    ///
+    /// The sample keys are copied verbatim from the canonical PHP contract
+    /// fixture's `keys` rows (all four carry `expected_auth_hash: null`), so
+    /// this assertion holds independently of when the fixture is re-vendored.
+    #[test]
+    fn test_extract_auth_hash_pred_deps_are_bookkeeping() {
+        assert_eq!(
+            extract_auth_hash(
+                "rs:pred_deps:public.bp_term_relationships:subject_id:0195aaaa-0000-7000-8000-000000000001"
+            ),
+            None
+        );
+        assert_eq!(
+            extract_auth_hash("rs:pred_cols:public.bp_term_relationships"),
+            None
+        );
+        assert_eq!(
+            extract_auth_hash("rs:key_pred_deps:rs:gql:dashboard:abc:v0:def"),
+            None
+        );
+        assert_eq!(
+            extract_auth_hash("rs:cache_pred_deps:rs:gql:dashboard:abc:v0:def"),
+            None
+        );
     }
 
     #[test]

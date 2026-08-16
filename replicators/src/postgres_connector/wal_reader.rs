@@ -37,6 +37,17 @@ struct Relation {
     schema: String,
     table: String,
     mapping: RelationMapping,
+    /// Column names of `mapping.cols`, in tuple order, computed ONCE when the
+    /// Relation message is processed (RSC predicate-deps needs to pair a
+    /// tuple's values with their column names on every INSERT; rebuilding this
+    /// Vec per row would allocate one String per column per row).
+    ///
+    /// Alignment with `WalEvent::Insert::tuple` holds because
+    /// `TupleData::into_noria_vec(.., is_key = false)` zips `self.cols` with
+    /// `relation.cols` 1:1 without filtering (it errors out unless
+    /// `n_cols` matches), and generated columns are already excluded from the
+    /// Relation message by Postgres itself.
+    col_names: Arc<[String]>,
 }
 
 pub struct WalReader {
@@ -66,6 +77,11 @@ pub(crate) enum WalEvent {
         schema: String,
         table: String,
         tuple: Vec<DfValue>,
+        /// Column names positionally aligned with `tuple` (shared, built once
+        /// per Relation message — see `Relation::col_names`). Consumed by the
+        /// RSC predicate-deps hook, which needs (column, value) pairs for the
+        /// new row; the dataflow write path ignores it.
+        columns: Arc<[String]>,
         lsn: Lsn,
     },
     DeleteRow {
@@ -218,12 +234,20 @@ impl WalReader {
                             v.as_bytes()
                         ))
                     })?;
+                    // Snapshot the column names once, here — every INSERT for
+                    // this relation reuses the same Arc (see Relation::col_names).
+                    let col_names: Arc<[String]> = mapping
+                        .cols
+                        .iter()
+                        .map(|c| String::from_utf8_lossy(&c.name).into_owned())
+                        .collect();
                     relations.insert(
                         id,
                         Relation {
                             schema,
                             table,
                             mapping,
+                            col_names,
                         },
                     );
                 }
@@ -236,12 +260,14 @@ impl WalReader {
                         schema,
                         table,
                         mapping,
+                        col_names,
                     }) = relations.get(&relation_id)
                     {
                         return Ok(
                             WalEvent::Insert {
                                 schema: schema.clone(),
                                 table: table.clone(),
+                                columns: Arc::clone(col_names),
                                 tuple: new_tuple
                                     .into_noria_vec(mapping, custom_types, false)?
                                     .into_iter()
@@ -275,6 +301,7 @@ impl WalReader {
                         schema,
                         table,
                         mapping,
+                        ..
                     } = match relations.get(&relation_id) {
                         None => continue,
                         Some(relation) => relation,
@@ -418,6 +445,7 @@ impl WalReader {
                         schema,
                         table,
                         mapping,
+                        ..
                     }) = relations.get(&relation_id)
                     {
                         // We only ever going to have a `key_tuple` *OR* `old_tuple`

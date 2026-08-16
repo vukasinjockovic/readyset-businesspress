@@ -336,6 +336,30 @@
             "note": "bookkeeping"
         },
         {
+            "key": "rs:pred_deps:public.bp_term_relationships:subject_id:0195aaaa-0000-7000-8000-000000000001",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (FK predicate -> cacheKeys, INSERT-phantom cover)"
+        },
+        {
+            "key": "rs:pred_cols:public.bp_term_relationships",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (per-table advertisement of scanned FK columns)"
+        },
+        {
+            "key": "rs:key_pred_deps:rs:gql:dashboard:abc:v0:def",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (reverse index; embeds a gql key but is never a broadcast target)"
+        },
+        {
+            "key": "rs:cache_pred_deps:rs:gql:dashboard:abc:v0:def",
+            "expected_auth_hash": null,
+            "expected_channel": null,
+            "note": "bookkeeping (persisted pred dep list for the HIT path)"
+        },
+        {
             "key": "rs:tag:user:some-uuid",
             "expected_auth_hash": null,
             "expected_channel": null,

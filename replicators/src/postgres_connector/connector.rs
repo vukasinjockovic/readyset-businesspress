@@ -1032,10 +1032,16 @@ impl Connector for PostgresWalConnector {
             // hook — row events below are consumed exactly once (never re-peeked),
             // so this fires once per row event.
             match &event {
-                WalEvent::Insert { schema, table, tuple, .. } => {
+                WalEvent::Insert { schema, table, tuple, columns, .. } => {
                     if let Some(pk) = tuple.first() {
                         redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "INSERT");
                     }
+                    // Predicate deps (flag-gated, default off): the INSERT
+                    // phantom that Tier 2 cannot see, narrowed from Tier 3's
+                    // whole-table blast to only the envelopes whose scanned FK
+                    // predicates match this new row's values. Needs the column
+                    // names + full tuple, which only exist here.
+                    redis_notifier::notify_pred_change(schema, table, columns, tuple);
                 }
                 WalEvent::DeleteRow { schema, table, tuple, .. } => {
                     if let Some(pk) = tuple.first() {
@@ -1209,6 +1215,7 @@ impl Connector for PostgresWalConnector {
                     schema,
                     table,
                     tuple,
+                    columns: _,
                     lsn,
                 } => {
                     cur_pos = cur_pos.with_lsn(lsn);
