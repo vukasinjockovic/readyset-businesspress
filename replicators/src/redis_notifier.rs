@@ -704,6 +704,53 @@ fn parse_pred_deps_enabled(raw: Option<&str>) -> bool {
     }
 }
 
+/// Which WAL ops feed the predicate-dep pipeline (READYSET_PRED_DEPS_OPS,
+/// subordinate to the READYSET_PRED_DEPS master flag). Parsed once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PredDepsOps {
+    insert: bool,
+    update: bool,
+}
+
+static PRED_DEPS_OPS: OnceLock<PredDepsOps> = OnceLock::new();
+
+fn pred_deps_ops() -> PredDepsOps {
+    *PRED_DEPS_OPS.get_or_init(|| {
+        let ops = parse_pred_deps_ops(env::var("READYSET_PRED_DEPS_OPS").ok().as_deref());
+        info!(?ops, "Predicate deps fire for ops");
+        ops
+    })
+}
+
+/// Parse READYSET_PRED_DEPS_OPS: comma-separated op names, case-insensitive,
+/// whitespace-tolerant. `None` (unset) defaults to INSERT-only — exactly the
+/// pre-feature behavior, so the update path ships dark. Unknown tokens are
+/// ignored (an explicitly set garbage-only value therefore disables every op,
+/// same fail-dark posture as the master flag).
+fn parse_pred_deps_ops(raw: Option<&str>) -> PredDepsOps {
+    match raw {
+        None => PredDepsOps {
+            insert: true,
+            update: false,
+        },
+        Some(s) => {
+            let mut ops = PredDepsOps {
+                insert: false,
+                update: false,
+            };
+            for tok in s.split(',') {
+                let tok = tok.trim();
+                if tok.eq_ignore_ascii_case("insert") {
+                    ops.insert = true;
+                } else if tok.eq_ignore_ascii_case("update") {
+                    ops.update = true;
+                }
+            }
+            ops
+        }
+    }
+}
+
 /// Parse READYSET_PRED_COLS_POLL_MS (advertised-column refresh interval).
 /// Unset/garbage -> 30s; floored at 1s so a typo cannot turn the poller into a
 /// SCAN hot loop.
@@ -823,13 +870,16 @@ fn ensure_pred_cols_poller() {
     });
 }
 
-/// Message type for the predicate-dep notifier: one INSERT's worth of
+/// Message type for the predicate-dep notifier: one row event's worth of
 /// (column, value) pairs for the columns its table advertised.
 struct PredChangeMsg {
     /// Schema-qualified table, e.g. "public.bp_term_relationships"
     table: String,
     /// (column, Display-encoded value) pairs
     pairs: Vec<(String, String)>,
+    /// Originating WAL op ("insert" | "update") — carried so the invalidation
+    /// log line can attribute what fired it (live kill-tests grep it).
+    op: &'static str,
 }
 
 static PRED_CHANGE_TX: OnceLock<mpsc::UnboundedSender<PredChangeMsg>> = OnceLock::new();
@@ -861,6 +911,86 @@ fn build_pred_pairs(
             // Same Display encoding the Tier-2 pk path uses, which is what PHP
             // registers (bare uuid/text/int, no quoting).
             pairs.push((col.clone(), format!("{}", tuple[i])));
+        }
+    }
+    pairs
+}
+
+/// UPDATE-by-key variant of `build_pred_pairs`: pair the advertised columns
+/// with the NEW values an UpdateByKey carries.
+///
+/// `set` is full-width and positionally aligned with `columns` (one
+/// `Modification` per relation column — see the WalEvent::UpdateByKey
+/// construction sites). Only `Modification::Set(v)` emits: `None` means the
+/// WAL message carried no new value for that column (unchanged TOASTed
+/// value), and `Apply` never comes from the replication path. NULL new values
+/// are skipped for the same reason as on INSERT (a row re-parented to NULL
+/// joins no parent's envelope).
+fn build_pred_pairs_update_by_key(
+    advertised: &[String],
+    columns: &[String],
+    set: &[readyset_client::Modification],
+) -> Vec<(String, String)> {
+    if advertised.is_empty() {
+        return Vec::new();
+    }
+
+    let mut pairs = Vec::with_capacity(advertised.len());
+    for (i, col) in columns.iter().enumerate() {
+        if i >= set.len() {
+            break;
+        }
+        let readyset_client::Modification::Set(v) = &set[i] else {
+            continue;
+        };
+        if matches!(v, readyset_data::DfValue::None) {
+            continue;
+        }
+        if advertised.iter().any(|a| a == col) {
+            pairs.push((col.clone(), format!("{}", v)));
+        }
+    }
+    pairs
+}
+
+/// UPDATE-with-full-row variant of `build_pred_pairs` (UpdateRow only occurs
+/// under REPLICA IDENTITY FULL, so the complete old tuple is available):
+/// emit a (column, NEW value) pair only where the advertised column's value
+/// actually CHANGED — firing on unchanged FK values would over-invalidate
+/// every parent envelope on every row touch. NULL new values are skipped as
+/// everywhere else.
+///
+/// If the old tuple is unusable (arity mismatch — should not happen, but a
+/// defensive upstream bug must not turn into a missed invalidation), fall
+/// back to emitting the new values for all advertised columns; over-
+/// invalidation is safe, a stale envelope is not.
+fn build_pred_pairs_update_row(
+    advertised: &[String],
+    columns: &[String],
+    old_tuple: &[readyset_data::DfValue],
+    new_tuple: &[readyset_data::DfValue],
+) -> Vec<(String, String)> {
+    if advertised.is_empty() {
+        return Vec::new();
+    }
+
+    if old_tuple.len() != new_tuple.len() {
+        return build_pred_pairs(advertised, columns, new_tuple);
+    }
+
+    let mut pairs = Vec::with_capacity(advertised.len());
+    for (i, col) in columns.iter().enumerate() {
+        if i >= new_tuple.len() {
+            break;
+        }
+        if matches!(new_tuple[i], readyset_data::DfValue::None) {
+            continue;
+        }
+        if new_tuple[i] == old_tuple[i] {
+            continue;
+        }
+        if advertised.iter().any(|a| a == col) {
+            pairs.push((col.clone(), format!("{}", new_tuple[i])));
         }
     }
     pairs
@@ -1044,11 +1174,17 @@ async fn handle_pred_invalidation(
         return Ok(());
     }
 
+    // Op attribution: live kill-tests grep this line to prove which WAL op
+    // (insert vs update) drove an invalidation.
+    let inserts = batch.iter().filter(|m| m.op == "insert").count();
+    let updates = batch.len() - inserts;
     info!(
         batch = batch.len(),
+        inserts,
+        updates,
         lookups = lookup_keys.len(),
         keys = dependent_keys.len(),
-        "Predicate deps: invalidating envelopes matching inserted rows"
+        "Predicate deps: invalidating envelopes matching changed rows"
     );
 
     invalidate_dependent_keys(
@@ -1079,32 +1215,96 @@ pub fn notify_pred_change(
     columns: &[String],
     tuple: &[readyset_data::DfValue],
 ) {
-    if !pred_deps_enabled() {
+    if !pred_deps_enabled() || !pred_deps_ops().insert {
         return;
     }
 
-    // Started here rather than on first send: the send path is gated on a map
-    // hit, so a poller started from the sender would never run.
-    ensure_pred_cols_poller();
-
-    let qualified;
-    let advertised = {
-        let Ok(guard) = pred_cols_map().lock() else {
-            return;
-        };
-        if guard.is_empty() {
-            // No table advertises predicate columns (or the first poll has not
-            // landed yet) — bail before allocating the qualified name.
-            return;
-        }
-        qualified = format!("{}.{}", schema, table);
-        match guard.get(&qualified) {
-            Some(cols) => std::sync::Arc::clone(cols),
-            None => return,
-        }
+    let Some((qualified, advertised)) = pred_advertised_columns(schema, table) else {
+        return;
     };
 
-    let pairs = build_pred_pairs(&advertised, columns, tuple);
+    send_pred_pairs(qualified, build_pred_pairs(&advertised, columns, tuple), "insert");
+}
+
+/// Notify that a row was UPDATEd (by-key form), for precise predicate-dep
+/// invalidation of FK re-parenting: the parent GAINING the row cached a world
+/// without it — the same phantom shape as INSERT. Same hot-path bail-out
+/// ordering as `notify_pred_change`, plus the "update" op gate
+/// (READYSET_PRED_DEPS_OPS — the update path ships dark).
+///
+/// Only the new-parent side: the losing parent's old FK value is structurally
+/// absent from an UpdateByKey message (it would need REPLICA IDENTITY FULL)
+/// and its displayed rows are already covered by Tier-2 row deps.
+pub fn notify_pred_change_update_by_key(
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    set: &[readyset_client::Modification],
+) {
+    if !pred_deps_enabled() || !pred_deps_ops().update {
+        return;
+    }
+
+    let Some((qualified, advertised)) = pred_advertised_columns(schema, table) else {
+        return;
+    };
+
+    send_pred_pairs(
+        qualified,
+        build_pred_pairs_update_by_key(&advertised, columns, set),
+        "update",
+    );
+}
+
+/// Notify that a row was UPDATEd (full-row form, REPLICA IDENTITY FULL), for
+/// precise predicate-dep invalidation of FK re-parenting. The old tuple
+/// enables a changed-only comparison — see `build_pred_pairs_update_row`.
+pub fn notify_pred_change_update_row(
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    old_tuple: &[readyset_data::DfValue],
+    new_tuple: &[readyset_data::DfValue],
+) {
+    if !pred_deps_enabled() || !pred_deps_ops().update {
+        return;
+    }
+
+    let Some((qualified, advertised)) = pred_advertised_columns(schema, table) else {
+        return;
+    };
+
+    send_pred_pairs(
+        qualified,
+        build_pred_pairs_update_row(&advertised, columns, old_tuple, new_tuple),
+        "update",
+    );
+}
+
+/// Shared gate tail for every predicate-dep entry point: resolve the table's
+/// advertised predicate columns, or bail as cheaply as possible.
+///
+/// Poller note: started here rather than on first send — the send path is
+/// gated on a map hit, so a poller started from the sender would never run.
+fn pred_advertised_columns(
+    schema: &str,
+    table: &str,
+) -> Option<(String, std::sync::Arc<[String]>)> {
+    ensure_pred_cols_poller();
+
+    let guard = pred_cols_map().lock().ok()?;
+    if guard.is_empty() {
+        // No table advertises predicate columns (or the first poll has not
+        // landed yet) — bail before allocating the qualified name.
+        return None;
+    }
+    let qualified = format!("{}.{}", schema, table);
+    let cols = guard.get(&qualified).map(std::sync::Arc::clone)?;
+    Some((qualified, cols))
+}
+
+/// Shared send tail for every predicate-dep entry point.
+fn send_pred_pairs(qualified: String, pairs: Vec<(String, String)>, op: &'static str) {
     if pairs.is_empty() {
         return;
     }
@@ -1112,12 +1312,14 @@ pub fn notify_pred_change(
     debug!(
         table = %qualified,
         pairs = pairs.len(),
-        "Predicate deps: queued INSERT predicates"
+        op,
+        "Predicate deps: queued predicates"
     );
 
     let _ = get_or_init_pred_tx().send(PredChangeMsg {
         table: qualified,
         pairs,
+        op,
     });
 }
 
@@ -1676,6 +1878,198 @@ mod tests {
         assert!(!parse_pred_deps_enabled(Some("on")));
     }
 
+    /// READYSET_PRED_DEPS_OPS gating: unset defaults to INSERT-only — byte-
+    /// identical to the pre-feature behavior, so the update path ships dark.
+    #[test]
+    fn test_pred_deps_ops_default_is_insert_only() {
+        assert_eq!(
+            parse_pred_deps_ops(None),
+            PredDepsOps {
+                insert: true,
+                update: false,
+            }
+        );
+    }
+
+    /// Explicit op lists: comma-separated, case-insensitive, whitespace-
+    /// tolerant; unknown tokens are ignored (a garbage-only value therefore
+    /// disables every op — fail-dark, like the master flag).
+    #[test]
+    fn test_pred_deps_ops_parses_lists() {
+        let both = PredDepsOps {
+            insert: true,
+            update: true,
+        };
+        let update_only = PredDepsOps {
+            insert: false,
+            update: true,
+        };
+        let neither = PredDepsOps {
+            insert: false,
+            update: false,
+        };
+
+        assert_eq!(parse_pred_deps_ops(Some("insert,update")), both);
+        assert_eq!(parse_pred_deps_ops(Some("update")), update_only);
+        assert_eq!(parse_pred_deps_ops(Some("UPDATE")), update_only, "case-insensitive");
+        assert_eq!(parse_pred_deps_ops(Some(" Update , INSERT ")), both, "whitespace-tolerant");
+        assert_eq!(
+            parse_pred_deps_ops(Some("insert,delete,garbage")),
+            PredDepsOps {
+                insert: true,
+                update: false,
+            },
+            "unknown tokens ignored"
+        );
+        assert_eq!(parse_pred_deps_ops(Some("bogus")), neither);
+        assert_eq!(parse_pred_deps_ops(Some("")), neither, "explicit empty disables");
+    }
+
+    /// UpdateByKey extraction: `set` is full-width and column-order-aligned;
+    /// only `Modification::Set` emits (None = no new value in the WAL
+    /// message), non-advertised columns are dropped, NULL new values are
+    /// skipped, and a short `set` must not panic.
+    #[test]
+    fn test_build_pred_pairs_update_by_key_set_only_and_aligned() {
+        use readyset_client::Modification;
+        use readyset_data::DfValue;
+
+        let columns: Vec<String> = ["id", "shop_id", "author_id", "note"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let advertised: Vec<String> = ["shop_id", "note"].iter().map(|s| s.to_string()).collect();
+
+        let set = vec![
+            // Key column changed too — not advertised, must be ignored.
+            Modification::Set(DfValue::from("row-uuid")),
+            Modification::Set(DfValue::from("new-shop-uuid")),
+            // Advertised elsewhere? No — author_id is not advertised here, and
+            // even a Set on it must not emit.
+            Modification::Set(DfValue::from("author-uuid")),
+            // Advertised but carried no new value — must not emit.
+            Modification::None,
+        ];
+        assert_eq!(
+            build_pred_pairs_update_by_key(&advertised, &columns, &set),
+            vec![("shop_id".to_string(), "new-shop-uuid".to_string())]
+        );
+
+        // NULL new value: re-parenting to no parent joins no envelope.
+        let set_null = vec![
+            Modification::Set(DfValue::from("row-uuid")),
+            Modification::Set(DfValue::None),
+            Modification::None,
+            Modification::None,
+        ];
+        assert!(build_pred_pairs_update_by_key(&advertised, &columns, &set_null).is_empty());
+
+        // Nothing advertised -> nothing emitted, no allocation churn.
+        assert!(build_pred_pairs_update_by_key(&[], &columns, &set).is_empty());
+
+        // Short set (defensive) must not index out of bounds.
+        let short = vec![Modification::Set(DfValue::from("row-uuid"))];
+        assert!(build_pred_pairs_update_by_key(&advertised, &columns, &short).is_empty());
+    }
+
+    /// UpdateRow extraction (REPLICA IDENTITY FULL): only advertised columns
+    /// whose value actually CHANGED emit — firing on unchanged FK values
+    /// would over-invalidate every parent envelope on every row touch. If the
+    /// old tuple is unusable (arity mismatch), fall back to emitting the new
+    /// values (over-invalidation is safe, a stale envelope is not).
+    #[test]
+    fn test_build_pred_pairs_update_row_changed_only() {
+        use readyset_data::DfValue;
+
+        let columns: Vec<String> = ["id", "shop_id", "author_id"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let advertised: Vec<String> = ["shop_id", "author_id"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let old_tuple = vec![
+            DfValue::from("row-uuid"),
+            DfValue::from("old-shop-uuid"),
+            DfValue::from("author-uuid"),
+        ];
+        let new_tuple = vec![
+            DfValue::from("row-uuid"),
+            DfValue::from("new-shop-uuid"),
+            DfValue::from("author-uuid"), // unchanged — must not emit
+        ];
+        assert_eq!(
+            build_pred_pairs_update_row(&advertised, &columns, &old_tuple, &new_tuple),
+            vec![("shop_id".to_string(), "new-shop-uuid".to_string())]
+        );
+
+        // Nothing changed -> nothing emitted.
+        assert!(
+            build_pred_pairs_update_row(&advertised, &columns, &old_tuple, &old_tuple).is_empty()
+        );
+
+        // NULL -> value counts as changed; value -> NULL is skipped (NULL
+        // joins no parent's envelope).
+        let old_null = vec![
+            DfValue::from("row-uuid"),
+            DfValue::None,
+            DfValue::from("author-uuid"),
+        ];
+        assert_eq!(
+            build_pred_pairs_update_row(&advertised, &columns, &old_null, &new_tuple),
+            vec![("shop_id".to_string(), "new-shop-uuid".to_string())]
+        );
+        assert!(
+            build_pred_pairs_update_row(&advertised, &columns, &new_tuple, &old_null).is_empty()
+        );
+
+        // Unusable old tuple (arity mismatch) -> fall back to new values.
+        let short_old = vec![DfValue::from("row-uuid")];
+        assert_eq!(
+            build_pred_pairs_update_row(&advertised, &columns, &short_old, &new_tuple),
+            vec![
+                ("shop_id".to_string(), "new-shop-uuid".to_string()),
+                ("author_id".to_string(), "author-uuid".to_string()),
+            ]
+        );
+    }
+
+    /// End-to-end shape for an update-derived pair: it must ride the SAME
+    /// merge -> pipelined-SMEMBERS path as inserts, producing an exact
+    /// `SMEMBERS rs:pred_deps:{schema}.{table}:{column}:{value}` lookup.
+    #[test]
+    fn test_pred_smembers_pipeline_for_update_derived_pair() {
+        use readyset_client::Modification;
+        use readyset_data::DfValue;
+
+        let columns: Vec<String> = ["id", "shop_id"].iter().map(|s| s.to_string()).collect();
+        let advertised: Vec<String> = vec!["shop_id".to_string()];
+        let set = vec![
+            Modification::None,
+            Modification::Set(DfValue::from("new-shop-uuid")),
+        ];
+
+        let msgs = vec![PredChangeMsg {
+            table: "public.bp_products".to_string(),
+            pairs: build_pred_pairs_update_by_key(&advertised, &columns, &set),
+            op: "update",
+        }];
+
+        let keys = merge_pred_lookup_keys("gz:", &msgs);
+        assert_eq!(
+            keys,
+            vec!["gz:rs:pred_deps:public.bp_products:shop_id:new-shop-uuid".to_string()]
+        );
+
+        let packed =
+            String::from_utf8_lossy(&build_pred_smembers_pipe(&keys).get_packed_pipeline())
+                .into_owned();
+        assert!(packed.contains("SMEMBERS"));
+        assert!(packed.contains("rs:pred_deps:public.bp_products:shop_id:new-shop-uuid"));
+    }
+
     /// The lookup key PHP registers under. Exact shape is a cross-layer
     /// contract: `{prefix}rs:pred_deps:{schema}.{table}:{column}:{value}`.
     #[test]
@@ -1762,21 +2156,27 @@ mod tests {
                     ("subject_id".to_string(), "aaa".to_string()),
                     ("term_id".to_string(), "7".to_string()),
                 ],
+                op: "insert",
             },
             // Same parent attached again in the same window — must not duplicate.
             PredChangeMsg {
                 table: "public.bp_term_relationships".to_string(),
                 pairs: vec![("subject_id".to_string(), "aaa".to_string())],
+                op: "insert",
             },
-            // Different value on the same column — distinct lookup.
+            // Different value on the same column — distinct lookup. An
+            // update-derived message merges identically to an insert-derived
+            // one (the op tag is log attribution only).
             PredChangeMsg {
                 table: "public.bp_term_relationships".to_string(),
                 pairs: vec![("subject_id".to_string(), "bbb".to_string())],
+                op: "update",
             },
             // Different table, same column/value — distinct lookup.
             PredChangeMsg {
                 table: "public.bp_comments".to_string(),
                 pairs: vec![("subject_id".to_string(), "aaa".to_string())],
+                op: "insert",
             },
         ];
 

@@ -101,6 +101,11 @@ pub(crate) enum WalEvent {
         table: String,
         old_tuple: Vec<DfValue>,
         new_tuple: Vec<DfValue>,
+        /// Column names positionally aligned with `old_tuple`/`new_tuple`
+        /// (shared, built once per Relation message — see
+        /// `Relation::col_names`). Consumed by the RSC predicate-deps hook for
+        /// FK re-parenting UPDATEs; the dataflow write path ignores it.
+        columns: Arc<[String]>,
         lsn: Lsn,
     },
     UpdateByKey {
@@ -108,6 +113,11 @@ pub(crate) enum WalEvent {
         table: String,
         key: Vec<DfValue>,
         set: Vec<readyset_client::Modification>,
+        /// Column names positionally aligned with `set` (`set` is full-width,
+        /// one Modification per relation column — see the construction sites
+        /// below). Consumed by the RSC predicate-deps hook for FK re-parenting
+        /// UPDATEs; the dataflow write path ignores it.
+        columns: Arc<[String]>,
         lsn: Lsn,
     },
     Truncate {
@@ -301,7 +311,7 @@ impl WalReader {
                         schema,
                         table,
                         mapping,
-                        ..
+                        col_names,
                     } = match relations.get(&relation_id) {
                         None => continue,
                         Some(relation) => relation,
@@ -351,6 +361,7 @@ impl WalReader {
                             WalEvent::UpdateRow {
                                 schema: schema.clone(),
                                 table: table.clone(),
+                                columns: Arc::clone(col_names),
                                 old_tuple: old_tuple
                                     .into_noria_vec(mapping, custom_types, false)?
                                     .into_iter()
@@ -384,6 +395,7 @@ impl WalReader {
                             WalEvent::UpdateByKey {
                                 schema: schema.clone(),
                                 table: table.clone(),
+                                columns: Arc::clone(col_names),
                                 key: key_tuple
                                     .into_noria_vec(mapping, custom_types, true)?
                                     .into_iter()
@@ -412,6 +424,7 @@ impl WalReader {
                             WalEvent::UpdateByKey {
                                 schema: schema.clone(),
                                 table: table.clone(),
+                                columns: Arc::clone(col_names),
                                 key: new_tuple
                                     .clone()
                                     .into_noria_vec(mapping, custom_types, true)?

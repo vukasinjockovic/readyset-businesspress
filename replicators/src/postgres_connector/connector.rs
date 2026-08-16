@@ -1053,15 +1053,27 @@ impl Connector for PostgresWalConnector {
                         redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "DELETE");
                     }
                 }
-                WalEvent::UpdateRow { schema, table, new_tuple, .. } => {
+                WalEvent::UpdateRow { schema, table, old_tuple, new_tuple, columns, .. } => {
                     if let Some(pk) = new_tuple.first() {
                         redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "UPDATE");
                     }
+                    // Predicate deps for FK re-parenting (flag- AND op-gated,
+                    // default off): the parent GAINING this row cached a world
+                    // without it — the same phantom shape as INSERT. UpdateRow
+                    // only occurs under REPLICA IDENTITY FULL, so the old
+                    // tuple is available for a changed-only comparison.
+                    redis_notifier::notify_pred_change_update_row(
+                        schema, table, columns, old_tuple, new_tuple,
+                    );
                 }
-                WalEvent::UpdateByKey { schema, table, key, .. } => {
+                WalEvent::UpdateByKey { schema, table, key, set, columns, .. } => {
                     if let Some(pk) = key.first() {
                         redis_notifier::notify_row_change(schema, table, &format!("{}", pk), "UPDATE");
                     }
+                    // Predicate deps for FK re-parenting: `set` is full-width
+                    // and column-order-aligned, carrying the NEW value of each
+                    // column present in the WAL update message.
+                    redis_notifier::notify_pred_change_update_by_key(schema, table, columns, set);
                 }
                 _ => {}
             }
@@ -1274,6 +1286,7 @@ impl Connector for PostgresWalConnector {
                     table,
                     old_tuple,
                     new_tuple,
+                    columns: _,
                     lsn,
                 } => {
                     cur_pos = cur_pos.with_lsn(lsn);
@@ -1297,6 +1310,7 @@ impl Connector for PostgresWalConnector {
                     table,
                     key,
                     set,
+                    columns: _,
                     lsn,
                 } => {
                     cur_pos = cur_pos.with_lsn(lsn);
